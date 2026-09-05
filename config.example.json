@@ -1,0 +1,34 @@
+{
+  "qr_enabled": true,
+  "notify_enabled": true,
+  "notify_archive": false,
+  "notify_success": false,
+  "notify_failure": true,
+  "notify_error": true,
+  "qr_clipboard_action": "code",
+  "qr_url_redirect": true,
+  "promote_merge": true,
+  "qr_url_enabled": true,
+  "url_exclude_temp_password": true,
+  "translation_move_enabled": true,
+  "log_colors_enabled": true,
+  "hotkey_enabled": true,
+  "hotkey": "Alt+1",
+  "url_redirect_rules": [
+    {
+      "from": "drive.uc.cn",
+      "to": "fast.uc.cn"
+    }
+  ],
+  "poll_interval": 2,
+  "passwords": [],
+  "auto_add_clipboard_password": false,
+  "watch_paths": [
+    {
+      "path": "C:/example/watch",
+      "enabled": true,
+      "output_dir": "",
+      "delete_source": true
+    }
+  ]
+}

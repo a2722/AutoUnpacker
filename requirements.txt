@@ -1,0 +1,10 @@
+# Smart Toolbox - Python dependencies (Python 3.10, Windows 64-bit)
+# pip-installable only. NOTE: extracting RAR/7z/tar/gz still requires the
+# system-wide 7-Zip (7z.exe) which pip cannot install.
+
+PyQt5>=5.15.9,<5.16
+pywin32>=305; sys_platform == "win32"
+Pillow>=10.0.0,<11
+pyzbar>=0.1.9; sys_platform == "win32"
+numpy>=1.24.0,<2.0
+opencv-python>=4.6.0,<4.10

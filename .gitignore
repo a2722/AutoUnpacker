@@ -1,0 +1,40 @@
+# ===== 用户本地数据（隐私，绝不提交） =====
+# 用户配置：推送更新时不会覆盖本地 config.json
+config.json
+# 临时密码（含剪贴板捕获的密码/路径）
+temp_passwords.json
+# 长期密码本数据库
+toolbox.db
+# 删除回溯记录（含真实文件路径）
+deletion_trail.json
+# 运行日志（含明文密码和文件路径）
+logs/
+# 崩溃日志（含用户路径）
+crash.log
+
+# ===== 历史备份（含敏感数据副本） =====
+backup/
+
+# ===== 本地排查/笔记文件 =====
+新建文件夹/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 第三方二进制 =====
+*.dll
+*.exe
+
+# ===== 运行时临时目录 =====
+.stage_*/
+ExtractTemp/
+*.tmp
+
+# ===== 编辑器/系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

@@ -134,7 +134,11 @@ def _full_scan_for_archive(path):
     except OSError:
         return None
     if size > POLYGLOT_FULL_SCAN_LIMIT:
-        return None
+        # 大文件：全量扫描会拖垮 IO。改为「前部扫描」——伪装格式的
+        # 压缩包签名通常紧跟图片/视频头之后（如 JPEG 头 + 7z 数据，
+        # 签名在文件 0.01% 处）。只扫前 32MB 就足够覆盖这类伪装，
+        # 避免对整个 1GB+ 文件逐块读。
+        return _scan_front_for_archive(path)
     found = None
     try:
         with open(path, "rb") as f:
@@ -148,6 +152,25 @@ def _full_scan_for_archive(path):
     except OSError:
         return None
     return found
+
+
+# 大文件前部扫描窗口：图片/视频头 + 紧随其后的压缩包签名通常落在这段
+POLYGLOT_FRONT_SCAN_LIMIT = 32 * 1024 * 1024
+
+
+def _scan_front_for_archive(path):
+    """扫描大文件开头一段（前 32MB）找压缩包签名。
+
+    适用场景：JPEG/PNG/视频头（几 KB~几 MB）+ 紧跟的真实压缩包数据
+    （如 JPEG Exif 头 + 7z 加密包，签名在文件前部约 0.01% 处）。
+    这类伪装不在文件末尾，尾部扫描找不到；又因文件巨大全量扫描被跳过，
+    前部扫描是唯一可行且廉价的检测方式。"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(POLYGLOT_FRONT_SCAN_LIMIT)
+    except OSError:
+        return None
+    return _scan_chunk_for_archive(data)
 
 
 def _confirm_polyglot(path, fmt):
@@ -991,8 +1014,35 @@ def strip_embedded_zip(path, dest_dir):
         return None
 
 
+# 常见伪装载体扩展名：这些后缀不是压缩包，但内容可能是伪装压缩包
+# （JPEG 头 + 7z 数据、MP4 + zip 等）。监听器对这类文件做深层格式探测，
+# 其他无关后缀（.txt/.log/.py 等）不做 IO 扫描，避免无谓开销。
+DISGUISE_CARRIER_EXTS = {
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "tif", "tiff",
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mp3", "wav",
+    "flac", "m4a", "aac", "pdf", "doc", "docx", "xls", "xlsx",
+}
+
+
 def is_archive_file(path):
-    return path.suffix.lower().lstrip(".") in ARCHIVE_EXTS
+    """判断文件是否可能是压缩包（含伪装格式）。
+
+    - 扩展名是压缩包后缀 → True
+    - 扩展名是常见伪装载体（图片/视频/音频/文档）→ 用深层格式探测
+      （detect_archive_format 会扫头部 magic + 尾部 + 前部 + 全量小文件），
+      识别「头部伪装 + 内嵌真实压缩包」的多段伪装文件
+    - 其他扩展名 → False
+    """
+    ext = path.suffix.lower().lstrip(".")
+    if ext in ARCHIVE_EXTS:
+        return True
+    if ext in DISGUISE_CARRIER_EXTS:
+        try:
+            fmt, _ = detect_archive_format(path)
+            return fmt is not None
+        except Exception:
+            return False
+    return False
 
 
 def _stage_rar_volumes(source):
@@ -1823,7 +1873,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     src_dir = top_dirs[0]
     try:
         # 提升目标若与输出目录是同一位置（如 1.mp4 内层文件夹也叫 1，
-        # output_dir=e:\test\1 且 dest=e:\test\1），说明内容已到位，
+        # output_dir 与 dest 指向同一目录），说明内容已到位，
         # 视为 same_place：不移动、不回收 output_dir（否则连内容一起回收）。
         same_place = (promote_to.resolve() == output_dir.resolve()
                       or (promote_to / src_dir.name).resolve() == output_dir.resolve())

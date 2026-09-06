@@ -351,6 +351,102 @@ class SettingsDialog(QDialog):
         ut["builtin_blacklist"] = bool(checked)
         self.state.set("url_trust", ut)
 
+    # ---------- 版本与更新 ----------
+    def _check_update(self):
+        """点击「检查更新」：后台线程请求 GitHub Releases API。
+
+        绝不主动调用；结果以文本行展示（不弹窗）：
+        - 网络失败 → 「无法连接 GitHub，请稍后再试」
+        - 有新版本 → 启用「前往下载更新」按钮
+        - 已是最新 → 提示当前已是最新版本
+        """
+        from .. import updater
+        self._check_btn.setEnabled(False)
+        self._update_btn.setEnabled(False)
+        self._update_status.setText("正在检查更新…")
+        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+
+        def _worker():
+            status, latest = updater.check_latest_version()
+            self._update_result_cache = (status, latest)
+            # 投递回主线程执行 UI 更新（跨线程安全）
+            QTimer.singleShot(0, self._check_update_done)
+
+        self._update_result_cache = None   # 先置空，再启动线程（避免竞态覆盖）
+        threading.Thread(target=_worker, daemon=True).start()
+        # Qt 跨线程结果回传：worker 线程完成后用 QTimer.singleShot(0) 把
+        # 回调投递回主线程执行（Qt 定时器队列线程安全，不直接跨线程碰 UI）。
+
+    def _check_update_done(self):
+        """worker 完成后在主线程执行（QTimer.singleShot 投递回主线程）。"""
+        from .. import updater
+        self._check_btn.setEnabled(True)
+        status, latest = self._update_result_cache
+        try:
+            from .. import __version__ as _ver
+        except Exception:
+            _ver = "0.0.0"
+        if status != updater.STATUS_OK or not latest:
+            # 网络失败 / 解析失败：不弹窗，提示行告知无法连接
+            self._update_status.setText("无法连接 GitHub，请检查网络后重试")
+            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            return
+        cmp = updater.compare_versions(_ver, latest)
+        if cmp == 1:
+            self._update_status.setText(
+                f"发现新版本 {latest}（当前 {_ver}）")
+            self._update_status.setStyleSheet("color: #2e86c1; font-size: 12px;")
+            self._latest_version = latest            # 供「前往下载更新」使用
+            self._update_btn.setEnabled(True)   # 有更新才允许点击
+        elif cmp == 0:
+            self._update_status.setText(f"当前已是最新版本（{_ver}）")
+            self._update_status.setStyleSheet("color: #27ae60; font-size: 12px;")
+        else:
+            self._update_status.setText(f"当前版本（{_ver}）高于远端最新版")
+            self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+
+    def _open_update_page(self):
+        """点击「前往下载更新」：执行自动更新（下载→校验→更新脚本→重启）。
+
+        进度显示在状态行（不弹窗）；数据文件（config/toolbox.db/日志等）
+        不会被覆盖。"""
+        from .. import updater
+        latest = getattr(self, "_latest_version", None)
+        if not latest:
+            self._update_status.setText("请先点击「检查更新」")
+            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            return
+        self._update_btn.setEnabled(False)
+        self._check_btn.setEnabled(False)
+        self._update_status.setText("正在准备更新…")
+        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+
+        def _progress(text):
+            self._update_status.setText(text)
+            self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+
+        def _worker():
+            status, msg = updater.apply_update(latest, progress_cb=_progress)
+            self._update_result_cache = (status, msg)
+            QTimer.singleShot(0, self._update_apply_done)
+
+        self._update_result_cache = None
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_apply_done(self):
+        """自动更新流程结束后的 UI 收尾。"""
+        status, msg = self._update_result_cache
+        if status == "ok":
+            self._update_status.setText(msg)
+            self._update_status.setStyleSheet("color: #27ae60; font-size: 12px;")
+            # 更新脚本已启动，程序即将被重启；给用户一点阅读时间
+            QTimer.singleShot(1500, self.close)
+        else:
+            self._update_status.setText(msg)
+            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            self._check_btn.setEnabled(True)
+            self._update_btn.setEnabled(True)
+
     def _trust_list_editor(self, key):
         """黑白名单编辑框：每行一个域名，停止输入 400ms 后自动保存。"""
         ut = self.state.snapshot().get("url_trust") or {}
@@ -564,8 +660,35 @@ class SettingsDialog(QDialog):
         if cur in self._close_rbs:
             self._close_rbs[cur].setChecked(True)
         self._close_grp.buttonClicked.connect(self._on_close_action)
+
+        # 版本与更新：只显示版本号；「检查更新」需用户手动点击才联网，
+        # 绝不主动拉取；结果以文本行展示（不弹窗），发现新版本才启用更新按钮。
+        ver_box = QGroupBox("版本与更新")
+        ver_lay = QVBoxLayout(ver_box)
+        ver_row = QHBoxLayout()
+        try:
+            from .. import __version__ as _ver
+        except Exception:
+            _ver = "未知"
+        self._ver_label = QLabel(f"当前版本：{_ver}")
+        ver_row.addWidget(self._ver_label)
+        ver_row.addStretch(1)
+        self._check_btn = QPushButton("检查更新")
+        self._check_btn.setObjectName("primary")
+        self._check_btn.clicked.connect(self._check_update)
+        ver_row.addWidget(self._check_btn)
+        self._update_btn = QPushButton("前往下载更新")
+        self._update_btn.setEnabled(False)
+        self._update_btn.clicked.connect(self._open_update_page)
+        ver_row.addWidget(self._update_btn)
+        ver_lay.addLayout(ver_row)
+        # 检查结果文本行（状态提示 / 新版本提示 / 网络失败提示）
+        self._update_status = QLabel("")
+        self._update_status.setWordWrap(True)
+        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+        ver_lay.addWidget(self._update_status)
         pages.append(("常规", self._page_widget(
-            "常规", interval_row, self.logcolor_cb, close_box)))
+            "常规", interval_row, self.logcolor_cb, close_box, ver_box)))
 
         # 填充左侧分类列表与右侧页面栈
         for name, widget in pages:

@@ -3,6 +3,7 @@
 import html
 import queue
 import threading
+import types
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QPlainTextEdit, QSystemTrayIcon, QMenu, QSplitter, QProgressBar, QShortcut)
 from PyQt5.QtCore import Qt, QTimer
@@ -37,6 +38,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AutoUnpacker")
         self.resize(760, 640)
         self.setWindowIcon(make_tray_icon())
+        self.setAcceptDrops(True)   # 支持拖入文件临时解压
         self._build_ui()
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain)
@@ -146,6 +148,129 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         root.addWidget(self.splitter, 1)
+
+    # ---------- 拖放临时解压 ----------
+    def dragEnterEvent(self, e):
+        """只接受拖入的文件（含多个），目录或链接不接受。"""
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if urls and any(u.isLocalFile() for u in urls):
+                e.acceptProposedAction()
+                return
+        e.ignore()
+
+    def dropEvent(self, e):
+        """拖入一个或多个文件：每个文件在后台线程做智能解压。
+
+        - 只处理拖入的文件本身；同目录其他文件不处理（除非是它自己的分卷兄弟）
+        - 输出到文件所在目录（default_output_dir 自动建同名目录）
+        - 分卷：拖入首卷（.001）正常处理；拖入非首卷（.002）提示跳过，
+          等待首卷；伪装分卷名的完整包正常处理
+        """
+        paths = []
+        for u in e.mimeData().urls():
+            if u.isLocalFile():
+                from pathlib import Path
+                p = Path(u.toLocalFile())
+                if p.is_file():
+                    paths.append(p)
+        if not paths:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        for p in paths:
+            self._handle_drop_file(p)
+
+    def _handle_drop_file(self, path):
+        """后台线程处理单个拖入文件（不阻塞界面）。"""
+        import os as _os
+        from pathlib import Path
+        path = Path(path)
+
+        # 目录：不支持，跳过
+        if path.is_dir():
+            self.hub.log(f"拖放: 目录不可解压，跳过: {path.name}")
+            return
+
+        # 下载未完成：跳过
+        if smart_extract.is_incomplete_download(path):
+            self.hub.log(f"拖放: 文件未下载完成，暂不解压: {path.name}")
+            return
+
+        # 非首卷分卷：等待首卷，不单独解压
+        if smart_extract.is_non_first_volume(path.name):
+            self.hub.log(f"拖放: 这是非首卷分卷，请拖入首卷（如 .001）统一处理: {path.name}")
+            return
+
+        # 移动安装包等不自动解压
+        if smart_extract.is_do_not_extract(path.name):
+            self.hub.log(f"拖放: 移动安装包/交付物，保持原样: {path.name}")
+            return
+
+        # 非压缩包且不是分卷：跳过
+        if not smart_extract.is_archive_file(path) and not smart_extract.is_volume_name(path.name):
+            self.hub.log(f"拖放: 不是压缩包，跳过: {path.name}")
+            return
+
+        self.hub.notify("发现压缩包", f"拖放解压: {path.name}")
+
+        def _run():
+            try:
+                try:
+                    engine = smart_extract.create_engine("auto")
+                except BaseException as e:
+                    try:
+                        engine = smart_extract.create_engine("zip")
+                    except BaseException:
+                        self.hub.log(f"拖放: {path.name} 无法初始化解压引擎: {e}")
+                        self.hub.notify("智能解压失败", f"{path.name}\n7-Zip 不可用")
+                        return
+                passwords = self.state.all_passwords()
+                options = {
+                    "enable_nested": True,
+                    "max_depth": 10,
+                    "max_size_ratio": 100.0,
+                    "use_dict": False,
+                    "default_password": None,
+                    "mode": "direct",
+                }
+                args = types.SimpleNamespace(
+                    move_to=None,
+                    delete_source=False,   # 拖放不删除源文件
+                    run_script=None, script_args=[],
+                    promote_to=None,
+                    promote_merge=bool(self.state.snapshot().get("promote_merge", True)),
+                )
+                self.hub.q.put({"type": "progress_start"})
+                try:
+                    result = smart_extract.extract_one(
+                        engine, str(path), None, passwords, options, args,
+                        progress_cb=self._progress_cb, pauser=self.pauser)
+                finally:
+                    self.hub.q.put({"type": "progress_done"})
+                if result and result["success"]:
+                    msg = (f"拖放解压完成: {path.name} 穿透 "
+                           f"{result['depth_reached']} 层，共 "
+                           f"{len(result['extracted_files'])} 个文件")
+                    self.hub.log(msg)
+                    self.hub.notify("智能解压完成", msg)
+                else:
+                    err = (result or {}).get("error") or "未知错误"
+                    self.hub.log(f"拖放解压失败: {path.name} ({err})")
+                    self.hub.notify("智能解压失败", f"{path.name}\n{err}")
+            except Exception as ex:
+                self.hub.log(f"拖放处理出错: {path.name}: {ex}")
+                self.hub.notify("智能解压出错", f"{path.name}\n{ex}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _progress_cb(self, ratio, layer, name):
+        """解压引擎进度回调 → GUI 队列（_drain 更新进度条）。ratio=None=忙碌。"""
+        try:
+            self.hub.q.put({"type": "progress", "ratio": ratio,
+                            "layer": layer, "name": name})
+        except Exception:
+            pass
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(make_tray_icon(), self)

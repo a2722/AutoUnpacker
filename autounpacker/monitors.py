@@ -791,7 +791,16 @@ class QRMonitor(threading.Thread):
         self._handle_decoded_texts(texts)
 
     def _handle_decoded_texts(self, texts):
-        """对解码出的文本做统一处理：识别 URL → 重定向 → 信任判定 → 打开浏览器 → 剪贴板联动。
+        """对解码出的文本做统一处理。
+
+        三种情况：
+        A. 无 URL（普通内容 / 单二维码多个链接无法唯一确定）：
+           → 全部内容写剪贴板 + 记日志（不做提取码抬升）
+        B. 纯链接（解码文本本身就是 URL）：
+           → 信任判定 → 打开浏览器 → 按设置做剪贴板联动（含提取码抬升）
+        C. 含链接但不是纯链接（链接夹杂其他内容）：
+           → 截取 URL 打开（走黑白名单）+ 全部内容写剪贴板 + 记日志
+             （不做提取码抬升）
 
         信任判定（decide_host）在重定向之后执行：未信任的域名不自动打开
         浏览器，投递到主窗口询问；黑名单/内置敏感地址直接静默拒绝。"""
@@ -803,8 +812,12 @@ class QRMonitor(threading.Thread):
             for text in texts:
                 url = self._extract_url(text)
                 if not url:
+                    # 情况A：无链接（普通内容 / 多链接）
                     self.hub.log(f"识别到二维码（非 URL）: {text[:60]}")
+                    self._copy_all_to_clipboard(text)
                     continue
+                is_pure_url = (text.strip() == url
+                               or re.match(r"^https?://\S+$", text.strip(), re.I))
                 if redirect:
                     new_url = self._redirect_url(url, rules)
                     if new_url != url:
@@ -815,22 +828,40 @@ class QRMonitor(threading.Thread):
                 decision, cat = decide_host(cfg, host)
                 if decision == "deny":
                     self.hub.log(f"已阻止打开未信任的网址: {url[:80]}")
+                    # 链接被阻止不代表内容无用：非纯链接仍把全部内容写剪贴板
+                    if not is_pure_url:
+                        self._copy_all_to_clipboard(text)
                     continue
                 if decision == "ask":
                     self.hub.log(f"新网址等待确认，暂不打开: {url[:80]}")
                     self._queue_trust_ask(url, host, cat, "open")
+                    if not is_pure_url:
+                        self._copy_all_to_clipboard(text)
                     continue
                 self._open_browser(url)
-                # 剪贴板联动：按设置把「最近的非图片内容(提取码)」或
-                # 「二维码解码内容」写回剪贴板，方便直接 Ctrl+V
-                if action == "code":
-                    self._restore_last_text()
-                elif action == "url":
-                    if self._set_clipboard(text):
-                        self.hub.log(f"已把二维码解码内容写回剪贴板: {text[:40]}")
+                if is_pure_url:
+                    # 情况B：纯链接 → 按设置做剪贴板联动（含提取码抬升）
+                    if action == "code":
+                        self._restore_last_text()
+                    elif action == "url":
+                        if self._set_clipboard(text):
+                            self.hub.log(f"已把二维码解码内容写回剪贴板: {text[:40]}")
+                else:
+                    # 情况C：含链接但不是纯链接 → 全部内容写剪贴板（不抬升）
+                    self._copy_all_to_clipboard(text)
                 break
         except Exception as e:
             self.hub.log(f"二维码解码失败: {e}")
+
+    def _copy_all_to_clipboard(self, text):
+        """把二维码全部解码内容写回剪贴板 + 记日志（不做提取码抬升）。
+
+        适用：无链接的普通内容、单二维码多个链接、含链接的混合内容。
+        """
+        if self._set_clipboard(text):
+            self.hub.log(f"已把二维码内容写回剪贴板: {text[:60]}")
+        else:
+            self.hub.log(f"二维码内容写回剪贴板失败: {text[:60]}")
 
     def _queue_trust_ask(self, url, host, category, purpose):
         """把待用户确认的网址投递给主窗口（可见则弹窗，隐藏则挂起）。"""

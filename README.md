@@ -69,7 +69,6 @@ AutoUnpacker/
 
 - 数据文件都在项目根目录：`config.json`、`toolbox.db`（密码）、`temp_passwords.json`、`deletion_trail.json`、`logs/`、`crash.log`
 - 7-Zip 隔离版装在 `%APPDATA%\AutoUnpacker\7z`，不污染项目目录
-- 向 GitHub 推送前请确认 `.gitignore` 已排除 `config.json`、`*.db`、`temp_passwords.json`、`deletion_trail.json`、`logs/`（这些含密码/路径等敏感信息）
 
 ## 技术要点
 

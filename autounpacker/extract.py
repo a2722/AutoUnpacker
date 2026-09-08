@@ -1737,10 +1737,10 @@ def _series_base(name):
 
 
 def is_volume_file(source_name, candidate, stem):
-    """candidate 是否为 source_name 的分卷兄弟（如 2056.7z.002 之于 2056.7z.001）。
+    """candidate 是否为 source_name 的分卷兄弟（如 xx.7z.002 之于 xx.7z.001）。
 
-    严格按「去掉末尾编号后基础名一致」判断，避免 2056.7z.002 被误认成
-    xx.mp4（stem 都是 "2056"）的分卷而误删。
+    严格按「去掉末尾编号后基础名一致」判断，避免 xx.7z.002 被误认成
+    xx.mp4（stem 都是 "xx"）的分卷而误删。
     """
     if candidate == source_name:
         return False
@@ -1847,7 +1847,7 @@ def _merge_dir(src, dst):
 def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=False):
     """解压后处理：输出目录顶层只有 1 个文件夹时，把该文件夹提升到指定地区。
 
-    然后源文件 + 输出目录（含 xx.mp4 这类中间文件）移入回收站，并回调 hook
+    然后源文件 + 输出目录（含中间文件）移入回收站，并回调 hook
     标记删除回溯。条件不满足（0 个或多于 1 个顶层文件夹）时退化为仅删除源文件。
     merge=True 且目标同名文件夹无文件冲突时，直接并入（不建 (N) 文件夹）；
     有同名文件冲突时仍按原逻辑重命名为 name(N)。
@@ -1872,7 +1872,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
 
     src_dir = top_dirs[0]
     try:
-        # 提升目标若与输出目录是同一位置（如 xx.mp4 内层文件夹也叫 1，
+        # 提升目标若与输出目录是同一位置（如 xx.mp4 内层文件夹也叫 xx，
         # output_dir 与 dest 指向同一目录），说明内容已到位，
         # 视为 same_place：不移动、不回收 output_dir（否则连内容一起回收）。
         same_place = (promote_to.resolve() == output_dir.resolve()

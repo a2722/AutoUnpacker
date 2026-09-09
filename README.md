@@ -78,6 +78,26 @@ AutoUnpacker/
 - **配置向后兼容**：新增配置键自动用默认值补齐，旧配置升级不崩
 - **原子写入**：配置/临时密码先写临时文件再 `os.replace`，崩溃不留半截 JSON
 
+## 第三方依赖与致谢
+
+本项目代码为原创（MIT 许可）。运行时依赖以下开源项目，各自版权归其作者所有，
+使用方式均为通过 pip / 独立安装获取，未修改、未捆绑其代码：
+
+| 依赖 | 用途 | 许可 |
+|---|---|---|
+| [PyQt5](https://riverbankcomputing.com/software/pyqt/) | 图形界面 | GPL v3 / Riverbank 商业双许可 |
+| [pywin32](https://github.com/mhammond/pywin32) | Windows API（剪贴板/注册表/快捷键） | PSF |
+| [Pillow](https://python-pillow.org/) | 图像处理 | HPND（MIT 兼容） |
+| [pyzbar](https://github.com/NaturalHistoryMuseum/pyzbar) | 二维码解码 | MIT（底层 [zbar](https://github.com/mchehab/zbar) 为 LGPL-2.1） |
+| [numpy](https://numpy.org/) | 数值计算 | BSD 3-Clause |
+| [opencv-python](https://github.com/opencv/opencv-python) | 图像增强 | Apache 2.0（部分组件 LGPL） |
+| [7-Zip](https://www.7-zip.org/) | 压缩/解压引擎 | LGPL（外部调用，隔离安装到 `%APPDATA%\AutoUnpacker\7z`，不链接不修改） |
+
+> 关于 PyQt5 许可：本项目通过 `requirements.txt` 声明依赖、由用户自行安装
+> （不捆绑分发 PyQt5 二进制），按 Riverbank 官方说明属于与 GPL 代码分开分发，
+> 项目本身可保持 MIT 许可。若未来改为打包分发（PyInstaller 等），需按 GPL v3
+> 要求重新评估（开源你的应用或购买商业许可）。
+
 ## License
 
 MIT

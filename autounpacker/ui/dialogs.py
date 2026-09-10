@@ -543,13 +543,57 @@ class SettingsDialog(QDialog):
                                      opts[self.clip_group.id(b)][0]))
         self.qr_url_cb = self._cfg_cb(
             "qr_url_enabled", "复制 http(s) 网址时自动识别二维码图片并打开", True)
+
+        # 临时密码：父（宽松：网址排除）→ 子（更严格：智能过滤），以及有效期/上限
+        tp_box = QGroupBox("临时密码")
+        tp_lay = QVBoxLayout(tp_box)
         self.url_exclude_cb = self._cfg_cb(
-            "url_exclude_temp_password",
-            "带 :// 的网址不记录为临时密码（xxxx.com 域名形式仍记录）", True)
+            "url_exclude_temp_password", "网址排除（不记 :// 链接）", True)
+        self.url_exclude_cb.setToolTip(
+            "带 :// 的网址不记为临时密码；xxxx.com 这类无协议头的域名形式仍会记录。\n"
+            "关闭则照单全收（连网址也收）。")
+        tp_lay.addWidget(self.url_exclude_cb)
+        # 子项：比父更严格，缩进显示，仅在父项开启时可用
+        self.tempfilter_cb = self._cfg_cb(
+            "temp_password_filter", "智能过滤（再排路径/文件名/句子）", True)
+        self.tempfilter_cb.setToolTip(
+            "在「网址排除」基础上更严格：再排除多行文本、文件路径/UNC、\n"
+            "带常见扩展名的文件名、含句读标点的句子（且只收 <60 字符）。")
+        child_wrap = QWidget()
+        child_lay = QVBoxLayout(child_wrap)
+        child_lay.setContentsMargins(24, 0, 0, 0)
+        child_lay.addWidget(self.tempfilter_cb)
+        tp_lay.addWidget(child_wrap)
+        self.tempfilter_cb.setEnabled(self.url_exclude_cb.isChecked())
+        self.url_exclude_cb.stateChanged.connect(
+            lambda s: self.tempfilter_cb.setEnabled(bool(s)))
+
+        # 有效期 + 保留上限（均可自行设置，默认 24h / 200 条）
+        temp_row = QHBoxLayout()
+        temp_row.addWidget(QLabel("有效期(h)"))
+        self.temp_ttl_spin = QSpinBox()
+        self.temp_ttl_spin.setRange(1, 24 * 365)
+        self.temp_ttl_spin.setValue(
+            int(self.state.snapshot().get("temp_password_ttl_hours", 24)))
+        self.temp_ttl_spin.valueChanged.connect(
+            lambda v: self.state.set("temp_password_ttl_hours", int(v)))
+        temp_row.addWidget(self.temp_ttl_spin)
+        temp_row.addSpacing(16)
+        temp_row.addWidget(QLabel("保留上限(条)"))
+        self.temp_max_spin = QSpinBox()
+        self.temp_max_spin.setRange(1, 100000)
+        self.temp_max_spin.setValue(
+            int(self.state.snapshot().get("temp_password_max", 200)))
+        self.temp_max_spin.valueChanged.connect(
+            lambda v: self.state.set("temp_password_max", int(v)))
+        temp_row.addWidget(self.temp_max_spin)
+        temp_row.addStretch(1)
+        tp_lay.addLayout(temp_row)
+
         pages.append(("二维码与剪贴板",
                       self._page_widget("二维码与剪贴板", self.qr_cb,
                                         self.redirect_cb, clip_box,
-                                        self.qr_url_cb, self.url_exclude_cb)))
+                                        self.qr_url_cb, tp_box)))
 
         # ---------- 网址信任 ----------
         ut = self.state.snapshot().get("url_trust") or {}

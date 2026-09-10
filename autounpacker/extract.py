@@ -950,6 +950,17 @@ def create_engine(kind, custom_path=None):
 
 
 def should_skip_volume(name):
+    """是否为「非首卷」分卷（应跳过，只让首卷进队列，避免整套分卷被拆成多个独立项）。
+
+    兼容 .partN.rar / .partN(N).rar（下载批次括号标记）/ .z01 / .r00 / .001 等。
+    首卷（.part1/.part01/.z01/.r00/.001）不跳过；否则整套因首卷缺失而无法解压，
+    且嵌套文件留在临时目录会被清理丢失。
+
+    注意：不能只看正则（旧的 \\.part\\d{2,}\\.rar$ 会把首卷 .part01 也当非首卷、
+    也不认 .part01(1).rar 这类括号命名）。"""
+    info = _part_info(name)
+    if info:
+        return info[1] > 1   # part01 → 首卷(不跳)，part02.. → 跳过
     return any(p.search(name) for p in VOLUME_SKIP_PATTERNS)
 
 
@@ -1031,8 +1042,11 @@ def is_archive_file(path):
     - 扩展名是常见伪装载体（图片/视频/音频/文档）→ 用深层格式探测
       （detect_archive_format 会扫头部 magic + 尾部 + 前部 + 全量小文件），
       识别「头部伪装 + 内嵌真实压缩包」的多段伪装文件
-    - 其他扩展名 → False
+    -     其他扩展名 → False
     """
+    path = Path(path)
+    if not path.is_file():
+        return False  # 不存在/已被消费：不视为压缩包，避免下游对幽灵文件操作
     ext = path.suffix.lower().lstrip(".")
     if ext in ARCHIVE_EXTS:
         return True
@@ -1071,19 +1085,27 @@ def _stage_rar_volumes(source):
         return None
     if not vols:
         return None
-    # 全套卷都是标准 .rar 命名时无需处理；任一卷非标准就整体规范化
-    if all(v.name.lower().endswith(".rar") for _, v in vols):
+    # 全套卷都是标准 .partN.rar 命名时无需处理（7-Zip 可直接识别为同套分卷）；
+    # 任一卷非标准（如 .part1.除rar、part3.删除rar、feal.part01(2).rar 这类
+    # 带括号/多余标记的命名）就整体规范化——否则 7-Zip 会按字面名去找
+    # "feal.part01(3).rar" 这类不存在的兄弟卷而报 Missing volume。
+    def _standard_name(n):
+        return bool(PART_RE.match(n))
+    if all(_standard_name(v.name) for _, v in vols):
         return None
+    # 临时文件名用「去掉批次标记」的基础名（feal(1) → feal），交给 7-Zip
+    # 的仍是干净的 .partN.rar 命名；集合标识 base 含标记仅用于分组。
+    plain_base = re.sub(r"\.part\d+(?:\([^)]*\))?\.[^.]+$", "", source.name, flags=re.I)
     stage = source.parent / f".stage_{uuid.uuid4().hex[:6]}"
     try:
         stage.mkdir(exist_ok=True)
         for pn, entry in vols:
-            dest = stage / f"{base}.part{pn}.rar"
+            dest = stage / f"{plain_base}.part{pn}.rar"
             try:
-                os.link(str(entry), str(dest))  # 同卷硬链接，瞬时完成不占空间
+                os.link(str(entry), str(dest))
             except OSError:
                 shutil.copy2(str(entry), str(dest))
-        master = stage / f"{base}.part1.rar"
+        master = stage / f"{plain_base}.part1.rar"
         if not master.exists():
             raise OSError("staging master missing")
         return master, stage
@@ -1148,6 +1170,9 @@ class ExtractService:
         for p in self.temp_dirs:
             shutil.rmtree(p, ignore_errors=True)
         self.temp_dirs.clear()
+        for p in getattr(self, "stage_dirs", []):
+            shutil.rmtree(p, ignore_errors=True)
+        self.stage_dirs.clear()
 
     @staticmethod
     def _retry_unlink(path, max_attempts=5):
@@ -1166,6 +1191,7 @@ class ExtractService:
 
     def extract(self, task):
         self.temp_root = self._temp_root_for(task.get("output_dir"))
+        self.stage_dirs = []
         try:
             return self._extract_inner(task)
         finally:
@@ -1211,6 +1237,17 @@ class ExtractService:
             info = analyze_file(item["archive"])
             self.emit(f"[第{depth}层] 开始解压: {item['archive'].name} (格式: {info['detected_format'] or '未知'})")
 
+            # 嵌套层也可能是非标准命名分卷（如 feal.part01(1).rar 这类带括号
+            # 批次标记、或 .part1.除rar 改后缀）：7-Zip 按字面名找兄弟卷会报
+            # Missing volume。规范化成 .partN.rar（硬链接到临时子目录）再解压。
+            extract_src = item["archive"]
+            if info.get("detected_format") == "rar":
+                staged_info = _stage_rar_volumes(extract_src)
+                if staged_info:
+                    extract_src, stage_dir = staged_info
+                    self.stage_dirs.append(stage_dir)
+                    self.emit(f"[第{depth}层] 分卷命名不规范，已规范化后交由引擎: {extract_src.name}")
+
             # 嵌套层密码优先沿用上一层成功密码（内外层常共用同一密码，
             # 机械按层序号取密码列表第 N 个容易取错，如外层用第 1 个、
             # 内层却是第 2 个）。再补上本层序号映射与其余候选。
@@ -1229,7 +1266,7 @@ class ExtractService:
 
             layer_task = {
                 "id": f"{task_id}-layer-{depth}",
-                "source_path": item["archive"],
+                "source_path": extract_src,
                 "output_dir": extract_dir,
                 "passwords": passwords,
                 "progress_cb": task.get("progress_cb"),
@@ -1417,6 +1454,7 @@ class ExtractService:
                                         self.emit(f"[第{depth}层] 已归拢分卷兄弟: {cand.name} -> {dest.name}")
                                     except OSError as e:
                                         self.emit(f"[第{depth}层] 归拢分卷兄弟失败: {cand.name}: {e}")
+                    queued_any = False
                     for f in nested_files:
                         # 假分卷名的完整压缩包（改后缀迷惑）不是分卷，应继续剥壳；
                         # 真分卷（如 .z01 的兄弟 .z02）才跳过，留给首卷一起处理
@@ -1425,6 +1463,13 @@ class ExtractService:
                             self.emit(f"[第{depth}层] 跳过分卷文件: {f.name}")
                             continue
                         queue.append({"archive": f, "depth": depth + 1})
+                        queued_any = True
+                    if not queued_any and not is_direct:
+                        # 所有嵌套文件都是非首卷（缺首卷）等异常：不能留在临时目录
+                        # 被清理丢弃，移入输出目录保留，避免数据丢失。
+                        for f in nested_files:
+                            self.move_file(f, extract_dir, output_dir)
+                        self.emit(f"[第{depth}层] 嵌套分卷缺少首卷，已保留到输出目录（未丢弃）")
             else:
                 if not is_direct:
                     self.move_to_output(extract_dir, output_dir)
@@ -1591,11 +1636,26 @@ PART_RE = re.compile(r"^(?P<name>.+)\.part\d+\.rar$")
 
 
 def _part_info(name):
-    """解析 .partN.<后缀> 分卷名（含 .part1.除rar 这类非标准后缀）。
-    返回 (基础名, 序号) 或 None。"""
-    m = re.match(r"^(?P<base>.+)\.part(?P<num>\d+)\.[^.]+$", name, re.I)
+    """解析 .partN.<后缀> 分卷名，返回 (集合标识, 序号) 或 None。
+
+    集合标识包含 (N) 批次标记：不同批次的同名分卷组是彼此独立的包，
+    不能互相视为分卷兄弟。例：
+    - feal.part01(2).rar / feal.part02(2).rar → 集合 "feal(2)"
+    - feal.part01(1).rar / feal.part02(1).rar → 集合 "feal(1)"
+    - feal.part01.rar / feal.part02.rar       → 集合 "feal"
+    三者基础名都是 feal，但不加标记就会把 feal.part02.rar 误当成
+    feal.part01(1).rar 的兄弟卷，导致解压后把下一层的源卷误删。
+
+    兼容：标准 .partN.rar、非标准后缀 .partN.除rar、带括号 .partN(2).rar。"""
+    m = re.match(
+        r"^(?P<base>.+)\.part(?P<num>\d+)(?:\((?P<mark>[^)]*)\))?\.(?P<ext>[^.]+)$",
+        name, re.I)
     if m:
-        return (m.group("base"), int(m.group("num")))
+        base = m.group("base")
+        mark = m.group("mark")
+        if mark is not None:
+            base = f"{base}({mark})"
+        return (base, int(m.group("num")))
     return None
 
 

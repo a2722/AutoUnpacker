@@ -10,7 +10,7 @@ from . import db
 from .config import load_config, save_config
 from .utils import _install_crash_log
 from .state import AppState
-from .hub import Hub
+from .hub import Hub, install_stdout_capture
 from .monitors import FolderWatcher, QRMonitor, QR_AVAILABLE
 
 # 把项目根目录加入 DLL 搜索路径（pyzbar 依赖 libzbar-64.dll / libiconv.dll，
@@ -144,6 +144,10 @@ def main():
     state = AppState(cfg)
     hub = Hub(state)
     pauser = smart_extract.PauseController(hub)
+
+    # pythonw（无控制台）下，让 extract.py 的用户可见 print 进入 GUI 日志框。
+    # 在进程入口幂等安装一次，而不是在工作线程里改进程级全局 stdout。
+    install_stdout_capture(hub)
 
     watcher = FolderWatcher(state, hub, pauser)
     qr = QRMonitor(state, hub, pauser)

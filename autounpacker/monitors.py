@@ -19,7 +19,6 @@ from . import paths
 from . import extract as smart_extract   # noqa: F401  保留原名引用
 from . import trail as deletion_trail     # noqa: F401
 from . import db                          # noqa: F401
-from .hub import StdoutCapture
 from .trust import (_host_of, decide_host)
 from .utils import _can_open_append
 
@@ -118,7 +117,7 @@ class FolderWatcher(threading.Thread):
             return str(path)
 
     def run(self):
-        sys.stdout = StdoutCapture(self.hub)
+        # stdout 捕获由进程入口（app.main）统一幂等安装，这里不再改进程级全局。
         while True:
             cfg = self.state.snapshot()
             interval = max(1, int(cfg.get("poll_interval", 2)))
@@ -640,9 +639,52 @@ class FolderWatcher(threading.Thread):
 
 
 # ==================== 剪贴板二维码识别 ====================
+# 带这些扩展名的文本基本是文件名（如 MAKO202608.jpg / 画面.png），不是提取码
+_FILE_EXT_RE = re.compile(
+    r"\.(png|jpe?g|gif|bmp|webp|tiff?|svg|mp4|mkv|avi|mov|wmv|flv|"
+    r"rar|zip|7z|tar|gz|txt|json|xml|lnk|exe|dll|msi|pdf|db|log|"
+    r"vmd|pmx|pmd|fx|fxsub|dds)$", re.I)
+
+
+def _looks_like_non_password(text):
+    """严格过滤（对应「智能过滤」子项）：多行/路径/文件名/句子等明显不是提取码。
+
+    不含网址判断——网址由更宽松的父项「网址排除」负责。"""
+    t = text.strip().strip('"').strip("'").strip()
+    if not t:
+        return True
+    if "\n" in t or "\r" in t:
+        return True                                       # 提取码都是单行
+    if any(c in t for c in "，。！？；：、…"):
+        return True                                       # 含句读标点 → 是句子不是提取码
+    if (re.match(r"^[A-Za-z]:[\\/]", t) or t.startswith("\\\\")
+            or t.startswith("//")):
+        return True                                       # 盘符 / UNC / 网络路径
+    if "\\" in t and re.search(r"[A-Za-z]", t):
+        return True                                       # 含反斜杠的路径样文本
+    if _FILE_EXT_RE.search(t):
+        return True                                       # 带常见扩展名的文件名
+    return False
+
+
+def _should_capture_temp_password(text, cfg):
+    """剪贴板文本是否记为临时密码（父子两级过滤）。
+
+    - 父（宽松）url_exclude_temp_password：带 :// 的网址不记；关闭则照单全收。
+    - 子（更严格）temp_password_filter：在父级基础上再排除多行/路径/文件名/
+      句子，且只收 <60 字符；仅在父项开启时才有意义。
+    """
+    if not bool(cfg.get("url_exclude_temp_password", True)):
+        return True                                   # 父关 → 照单全收
+    if "://" in text.strip():
+        return False                                  # 父级：网址不记
+    if bool(cfg.get("temp_password_filter", True)):
+        return len(text) < 60 and not _looks_like_non_password(text)
+    return True
+
+
 class QRMonitor(threading.Thread):
     """剪贴板监控线程：二维码识别（可选） + 短文本临时密码捕获"""
-
     def __init__(self, state, hub, pauser=None):
         super().__init__(daemon=True)
         self.state = state
@@ -727,20 +769,14 @@ class QRMonitor(threading.Thread):
             self.last_text = text
             self._recent_texts.append(text[:200])
             cfg = self.state.snapshot()
-            if len(text) < 60:
-                # 文件路径（盘符路径/UNC）不是提取码：复制文件时剪贴板会被
-                # 塞进路径，不记录为临时密码（避免污染临时/长期密码本）。
-                if not (re.match(r"^[A-Za-z]:[\\/]", text)
-                        or text.startswith("\\\\")):
-                    # 带 :// 的网址不是提取码，不记临时密码（可开关）。
-                    # xxxx.com / xxxx.top 这类无协议头的域名形式照常记录。
-                    if not (cfg.get("url_exclude_temp_password", True) and "://" in text):
-                        added = self.state.add_temp_password(text)
-                        if added:
-                            self.hub.log(f"已捕获临时密码: {text}")
-                            if self.state.auto_add():
-                                self.state.add_long_password(text)
-                                self.hub.log(f"已自动加入长期密码本: {text}")
+            # 是否记录为临时密码：受「智能过滤」「网址排除」两个开关控制
+            if _should_capture_temp_password(text, cfg):
+                added = self.state.add_temp_password(text)
+                if added:
+                    self.hub.log(f"已捕获临时密码: {text}")
+                    if self.state.auto_add():
+                        self.state.add_long_password(text)
+                        self.hub.log(f"已自动加入长期密码本: {text}")
             return text
         except Exception as e:
             self.hub.log(f"临时密码捕获出错: {e}")

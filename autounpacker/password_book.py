@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """共享密码本模块：所有监听目录共用一个长期密码本 + 运行期临时密码"""
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPlainTextEdit, QCheckBox, QPushButton, QMessageBox,
+    QSplitter, QWidget,
 )
 
 def parse_password_text(text):
@@ -40,7 +41,7 @@ class PasswordBookDialog(QDialog):
             "所有监听目录共用一个密码本，解压时按从上到下的顺序依次尝试。\n"
             "每行一个密码（用换行分隔，不再使用逗号）。\n"
             "程序运行期间，剪贴板复制的短文本（少于 60 字符）会自动作为临时密码\n"
-            "参与解压尝试；退出程序即清空。勾选下方选项可自动加入长期密码本。"
+            "参与解压尝试；超过有效期或保留上限会自动清理。勾选下方选项可自动加入长期密码本。"
         )
         guide.setWordWrap(True)
         lay.addWidget(guide)
@@ -48,7 +49,6 @@ class PasswordBookDialog(QDialog):
         self.edit = QPlainTextEdit()
         self.edit.setPlaceholderText("每行一个密码，例如：\n1234\nabc123\nqwerty")
         self.edit.setPlainText("\n".join(state.passwords()))
-        lay.addWidget(self.edit, 1)
 
         # 排序 / 查重
         tool_row = QHBoxLayout()
@@ -62,26 +62,47 @@ class PasswordBookDialog(QDialog):
         tool_row.addWidget(dedup_btn)
         tool_row.addStretch(1)
         tool_row.addWidget(self.count_lbl)
-        lay.addLayout(tool_row)
-        self._update_count()
 
         self.auto_cb = QCheckBox("自动将剪贴板捕获的临时密码添加到长期密码本")
         self.auto_cb.setChecked(state.auto_add())
-        lay.addWidget(self.auto_cb)
 
-        temp_row = QHBoxLayout()
-        temp_row.addWidget(QLabel("本次运行临时密码："))
-        # 临时密码可能积压很多，用只读文本框 + 最大高度限制显示，
-        # 超出部分滚动查看，避免把密码本区域挤占。
+        # 长期密码区（编辑框 + 工具行 + 自动加入开关）
+        perm_box = QWidget()
+        perm_lay = QVBoxLayout(perm_box)
+        perm_lay.setContentsMargins(0, 0, 0, 0)
+        perm_lay.setSpacing(8)
+        perm_lay.addWidget(self.edit, 1)
+        perm_lay.addLayout(tool_row)
+        perm_lay.addWidget(self.auto_cb)
+
+        # 临时密码区（标题行 + 只读框 + 清空按钮）
         self.temp_edit = QPlainTextEdit()
         self.temp_edit.setReadOnly(True)
-        self.temp_edit.setMaximumHeight(110)
+        self.temp_edit.setMinimumHeight(50)
         self.temp_edit.setPlaceholderText("（无）")
+        temp_box = QWidget()
+        temp_lay = QVBoxLayout(temp_box)
+        temp_lay.setContentsMargins(0, 0, 0, 0)
+        temp_lay.setSpacing(8)
+        temp_head = QHBoxLayout()
+        temp_head.addWidget(QLabel("临时密码（本次开机内，超有效期/上限自动清理）："))
+        temp_head.addStretch(1)
         clear_btn = QPushButton("清空临时密码")
         clear_btn.clicked.connect(self._clear_temp)
-        temp_row.addWidget(self.temp_edit, 1)
-        temp_row.addWidget(clear_btn)
-        lay.addLayout(temp_row)
+        temp_head.addWidget(clear_btn)
+        temp_lay.addLayout(temp_head)
+        temp_lay.addWidget(self.temp_edit, 1)
+
+        # 上下两块用分隔条隔开，可拖动调节高度（拉高窗口不再只让上方变高）
+        split = QSplitter(Qt.Vertical)
+        split.addWidget(perm_box)
+        split.addWidget(temp_box)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([340, 140])
+        lay.addWidget(split, 1)
+
+        self._update_count()
 
         btns = QHBoxLayout()
         btns.addStretch(1)

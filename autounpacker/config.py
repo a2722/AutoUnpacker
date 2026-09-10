@@ -19,6 +19,9 @@ DEFAULT_CONFIG = {
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
     "qr_url_enabled": True,          # 复制 http(s) 网址时尝试访问并识别二维码图片
     "url_exclude_temp_password": True,  # 带 :// 的网址不记录为临时密码（xxxx.com 域名形式仍记录）
+    "temp_password_filter": True,       # 临时密码智能过滤（排除路径/文件名/句子等；关闭则照单全收）
+    "temp_password_max": 200,           # 临时密码最多保留条数（超出丢最旧）
+    "temp_password_ttl_hours": 24,      # 临时密码有效期（小时），超时自动清理
     "translation_move_enabled": True,   # 翻译 JSON 自动归位（<10MB 单 json 移入同名大文件夹）
     "log_colors_enabled": True,         # 运行日志按事件类型着色
     "hotkey_enabled": True,             # 全局快捷键唤起主界面
@@ -95,6 +98,16 @@ def _sanitize_cfg(cfg):
         cfg["promote_merge"] = bool(cfg.get("promote_merge", True))
         cfg["qr_url_enabled"] = bool(cfg.get("qr_url_enabled", True))
         cfg["url_exclude_temp_password"] = bool(cfg.get("url_exclude_temp_password", True))
+        cfg["temp_password_filter"] = bool(cfg.get("temp_password_filter", True))
+        try:
+            cfg["temp_password_max"] = max(1, min(100000, int(cfg.get("temp_password_max", 200))))
+        except Exception:
+            cfg["temp_password_max"] = 200
+        try:
+            cfg["temp_password_ttl_hours"] = max(
+                1, min(24 * 365, int(cfg.get("temp_password_ttl_hours", 24))))
+        except Exception:
+            cfg["temp_password_ttl_hours"] = 24
         cfg["translation_move_enabled"] = bool(cfg.get("translation_move_enabled", True))
         cfg["log_colors_enabled"] = bool(cfg.get("log_colors_enabled", True))
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))

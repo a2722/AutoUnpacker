@@ -12,7 +12,23 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _force_utf8_stdio():
+    """把 stdout/stderr 强制为 UTF-8。
+
+    子进程 stdout 被管道接走时，Python 默认用系统编码（中文 Windows 为
+    cp936/GBK）写文本；父进程 _decode_qr_file 按 UTF-8 解码，中文就会变成
+    「�」乱码（URL/提取码等 ASCII 不受影响）。这里与父进程对齐为 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main():
+    _force_utf8_stdio()
     if len(sys.argv) < 2:
         return 2
     path = sys.argv[1]

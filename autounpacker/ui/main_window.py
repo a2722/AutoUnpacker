@@ -318,7 +318,9 @@ class MainWindow(QMainWindow):
             if win32event.WaitForSingleObject(self.show_event, 0) == win32event.WAIT_OBJECT_0:
                 win32event.ResetEvent(self.show_event)
                 self._show_window()
-                if hasattr(self, "tray") and self.state.snapshot().get("notify_enabled", True):
+                snap = self.state.snapshot()
+                if (hasattr(self, "tray") and snap.get("notify_enabled", True)
+                        and snap.get("notify_already_running", True)):
                     self.tray.showMessage(
                         "AutoUnpacker", "程序已在运行，已打开主界面。",
                         QSystemTrayIcon.Information, 2000)
@@ -363,7 +365,8 @@ class MainWindow(QMainWindow):
         return CloseActionDialog.ask(self)
 
     def _notify_trayed(self):
-        if self.state.snapshot().get("notify_enabled", True):
+        cfg = self.state.snapshot()
+        if cfg.get("notify_enabled", True) and cfg.get("notify_trayed", True):
             self.tray.showMessage(
                 "AutoUnpacker", "已最小化到托盘，右键托盘图标可退出。",
                 QSystemTrayIcon.Information, 2500)
@@ -487,7 +490,9 @@ class MainWindow(QMainWindow):
                 self._pending_trust.append(req)   # 已有弹窗打开，排队等下一个
         else:
             self._pending_trust.append(req)
-            if self.state.snapshot().get("notify_enabled", True) and hasattr(self, "tray"):
+            snap = self.state.snapshot()
+            if (snap.get("notify_enabled", True) and hasattr(self, "tray")
+                    and snap.get("notify_trust_pending", True)):
                 try:
                     self.tray.showMessage(
                         "网址信任确认", "有新的网址等待确认，打开主界面后处理。",

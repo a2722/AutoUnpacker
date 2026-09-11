@@ -19,7 +19,7 @@ from . import paths
 from . import extract as smart_extract   # noqa: F401  保留原名引用
 from . import trail as deletion_trail     # noqa: F401
 from . import db                          # noqa: F401
-from .trust import (_host_of, decide_host)
+from .trust import (_host_of, decide_host, remember_auto_domain)
 from .utils import _can_open_append
 
 # 剪贴板/二维码可用性：改为惰性探测（首次用到时才 import 并缓存结果）。
@@ -831,12 +831,13 @@ class QRMonitor(threading.Thread):
 
         三种情况：
         A. 无 URL（普通内容 / 单二维码多个链接无法唯一确定）：
-           → 全部内容写剪贴板 + 记日志（不做提取码抬升）
+           → 按设置写剪贴板：action=code 且内容含提取码时只抬升提取码，
+             否则写回全部内容 + 记日志
         B. 纯链接（解码文本本身就是 URL）：
            → 信任判定 → 打开浏览器 → 按设置做剪贴板联动（含提取码抬升）
         C. 含链接但不是纯链接（链接夹杂其他内容）：
-           → 截取 URL 打开（走黑白名单）+ 全部内容写剪贴板 + 记日志
-             （不做提取码抬升）
+           → 截取 URL 打开（走黑白名单）+ 按设置写剪贴板：
+             action=code 且文本内含提取码 → 抬升该提取码；否则写回全部内容
 
         信任判定（decide_host）在重定向之后执行：未信任的域名不自动打开
         浏览器，投递到主窗口询问；黑名单/内置敏感地址直接静默拒绝。"""
@@ -848,9 +849,10 @@ class QRMonitor(threading.Thread):
             for text in texts:
                 url = self._extract_url(text)
                 if not url:
-                    # 情况A：无链接（普通内容 / 多链接）
+                    # 情况A：无链接（普通内容 / 多链接）。内容里若含提取码，
+                    # 同样按设置抬升，否则整段写回。
                     self.hub.log(f"识别到二维码（非 URL）: {text[:60]}")
-                    self._copy_all_to_clipboard(text)
+                    self._write_qr_result(text, action)
                     continue
                 is_pure_url = (text.strip() == url
                                or re.match(r"^https?://\S+$", text.strip(), re.I))
@@ -862,6 +864,7 @@ class QRMonitor(threading.Thread):
                 # 检查点B：打开浏览器前的信任判定
                 host = _host_of(url)
                 decision, cat = decide_host(cfg, host)
+                self._remember_auto_trust(cfg, host)
                 if decision == "deny":
                     self.hub.log(f"已阻止打开未信任的网址: {url[:80]}")
                     # 链接被阻止不代表内容无用：非纯链接仍把全部内容写剪贴板
@@ -883,8 +886,11 @@ class QRMonitor(threading.Thread):
                         if self._set_clipboard(text):
                             self.hub.log(f"已把二维码解码内容写回剪贴板: {text[:40]}")
                 else:
-                    # 情况C：含链接但不是纯链接 → 全部内容写剪贴板（不抬升）
-                    self._copy_all_to_clipboard(text)
+                    # 情况C：含链接但不是纯链接。文本里常内嵌提取码
+                    #（如「…链接 提取码：Zdjn」）：按设置优先把提取码单独抬升
+                    # 到剪贴板（整段文本没法直接粘进网盘密码框），取不到再整段
+                    # 写回。
+                    self._write_qr_result(text, action)
                 break
         except Exception as e:
             self.hub.log(f"二维码解码失败: {e}")
@@ -899,6 +905,31 @@ class QRMonitor(threading.Thread):
         else:
             self.hub.log(f"二维码内容写回剪贴板失败: {text[:60]}")
 
+    def _write_qr_result(self, text, action):
+        """按设置把解码文本写回剪贴板。
+
+        action=code 且文本内含提取码 → 只写回提取码（抬升，便于直接粘进网盘
+        密码框）；否则整段写回。"""
+        code = self._extract_pwd_code(text)
+        if action == "code" and code:
+            if self._set_clipboard(code):
+                self.hub.log(f"已提取并写回提取码: {code}")
+                return
+        self._copy_all_to_clipboard(text)
+
+    @staticmethod
+    def _extract_pwd_code(text):
+        """从二维码解码文本里提取内嵌的提取码/密码（如「提取码：Zdjn」→ Zdjn）。
+
+        取不到返回 None。只认关键字后紧跟的短代码，避免误抓整段文本。"""
+        if not text:
+            return None
+        m = re.search(
+            r"(?:提取码|访问码|密\s*码|pwd|passcode|password|pass)"
+            r"\s*[:：=]?\s*([A-Za-z0-9]{2,16})",
+            text, re.I)
+        return m.group(1) if m else None
+
     def _queue_trust_ask(self, url, host, category, purpose):
         """把待用户确认的网址投递给主窗口（可见则弹窗，隐藏则挂起）。"""
         try:
@@ -907,6 +938,24 @@ class QRMonitor(threading.Thread):
                             "purpose": purpose})
         except Exception:
             pass
+
+    def _remember_auto_trust(self, cfg, host):
+        """auto_whitelist / auto_blacklist：把新公网域名写入对应名单并持久化。
+
+        此前「自动信任并打开 / 自动拒绝」只在 decide_host 里返回放行/拒绝，
+        从不落库，导致选自动信任后白名单始终为空；这里补上写入。"""
+        try:
+            ut2 = remember_auto_domain(cfg, host)
+        except Exception:
+            return
+        if ut2 is None:
+            return
+        try:
+            self.state.set("url_trust", ut2)
+            kind = "白名单" if ut2.get("new_domain_action") == "auto_whitelist" else "黑名单"
+            self.hub.log(f"已自动把新域名加入{kind}: {host}")
+        except Exception as e:
+            self.hub.log(f"自动信任名单保存失败: {e}")
 
     def _open_browser(self, url):
         """在默认浏览器打开网址（供信任放行后执行）。"""
@@ -1023,6 +1072,7 @@ class QRMonitor(threading.Thread):
         cfg = self.state.snapshot()
         host = _host_of(text)
         decision, cat = decide_host(cfg, host)
+        self._remember_auto_trust(cfg, host)
         if decision == "deny":
             self.hub.log(f"已阻止访问未信任的网址: {text[:60]}")
             return
@@ -1079,6 +1129,12 @@ class QRMonitor(threading.Thread):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 new_host = _host_of(newurl)
                 d, _ = decide_host(cfg, new_host)
+                try:
+                    ut2 = remember_auto_domain(cfg, new_host)
+                    if ut2 is not None and hub.state is not None:
+                        hub.state.set("url_trust", ut2)
+                except Exception:
+                    pass
                 if d == "deny":
                     try:
                         hub.log(f"已拦截重定向到未信任地址: {newurl[:80]}")

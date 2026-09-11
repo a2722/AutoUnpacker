@@ -14,6 +14,9 @@ DEFAULT_CONFIG = {
     "notify_success": True,
     "notify_failure": True,
     "notify_error": True,
+    "notify_trayed": True,            # 托盘提示：已最小化到托盘
+    "notify_already_running": True,   # 托盘提示：程序已在运行，已打开主界面
+    "notify_trust_pending": True,     # 托盘提示：有新的网址等待确认
     "qr_clipboard_action": "none",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
     "qr_url_redirect": True,
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
@@ -40,7 +43,7 @@ DEFAULT_CONFIG = {
     "close_action": "ask",   # 点右上角关闭时的行为：ask=每次询问 / tray=隐藏到托盘 / exit=关闭程序
     # 网址信任机制：控制二维码/剪贴板 URL 的自动访问与自动打开浏览器
     "url_trust": {
-        "new_domain_action": "ask",   # ask=弹窗询问 / auto_whitelist=自动信任并打开 / auto_blacklist=自动拒绝
+        "new_domain_action": "none",  # none=无操作(默认) / ask=弹窗询问 / auto_whitelist=自动信任并打开 / auto_blacklist=自动拒绝
         "whitelist": [],              # 信任域名（含全部子域），可覆盖内置黑名单类别
         "blacklist": [],              # 拒绝域名（含全部子域），最高优先级
         "builtin_blacklist": True,    # 内置类别黑名单（私网/回环/链路本地/元数据/保留地址）
@@ -92,6 +95,9 @@ def _sanitize_cfg(cfg):
         cfg["notify_success"] = bool(cfg.get("notify_success", True))
         cfg["notify_failure"] = bool(cfg.get("notify_failure", True))
         cfg["notify_error"] = bool(cfg.get("notify_error", True))
+        cfg["notify_trayed"] = bool(cfg.get("notify_trayed", True))
+        cfg["notify_already_running"] = bool(cfg.get("notify_already_running", True))
+        cfg["notify_trust_pending"] = bool(cfg.get("notify_trust_pending", True))
         action = str(cfg.get("qr_clipboard_action", "none"))
         cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "none"
         cfg["qr_url_redirect"] = bool(cfg.get("qr_url_redirect", True))
@@ -125,8 +131,8 @@ def _sanitize_cfg(cfg):
         ut = cfg.get("url_trust")
         if not isinstance(ut, dict):
             ut = {}
-        na = str(ut.get("new_domain_action", "ask"))
-        ut["new_domain_action"] = na if na in ("ask", "auto_whitelist", "auto_blacklist") else "ask"
+        na = str(ut.get("new_domain_action", "none"))
+        ut["new_domain_action"] = na if na in ("none", "ask", "auto_whitelist", "auto_blacklist") else "none"
         wl = ut.get("whitelist")
         if not isinstance(wl, list):
             wl = []

@@ -507,10 +507,29 @@ class SettingsDialog(QDialog):
         self.notify_failure_cb = self._cfg_cb("notify_failure", "解压失败", True)
         self.notify_error_cb = self._cfg_cb("notify_error", "解压出错", True)
         nl.addWidget(self.notify_cb)
-        self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
-                             self.notify_failure_cb, self.notify_error_cb)
-        for cb in self._notify_subs:
+        for cb in (self.notify_archive_cb, self.notify_success_cb,
+                   self.notify_failure_cb, self.notify_error_cb):
             nl.addWidget(cb)
+
+        # 托盘提示：主界面隐藏 / 已在运行 / 有待确认网址时弹出的托盘气泡，
+        # 同样受总开关约束，另可各自单独关闭。
+        tray_label = QLabel("托盘提示")
+        tray_label.setStyleSheet("color: #6b7688; font-size: 12px;")
+        nl.addSpacing(4)
+        nl.addWidget(tray_label)
+        self.notify_trayed_cb = self._cfg_cb("notify_trayed", "已最小化到托盘", True)
+        self.notify_running_cb = self._cfg_cb(
+            "notify_already_running", "程序已在运行，已打开主界面", True)
+        self.notify_trust_cb = self._cfg_cb(
+            "notify_trust_pending", "有新的网址等待确认", True)
+        for cb in (self.notify_trayed_cb, self.notify_running_cb,
+                   self.notify_trust_cb):
+            nl.addWidget(cb)
+
+        self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
+                             self.notify_failure_cb, self.notify_error_cb,
+                             self.notify_trayed_cb, self.notify_running_cb,
+                             self.notify_trust_cb)
 
         def _on_notify_master(s):
             on = bool(s)
@@ -602,8 +621,9 @@ class SettingsDialog(QDialog):
         self._na_grp = QButtonGroup(na_box)
         self._na_grp.setExclusive(True)
         self._na_buttons = {}
-        current_na = str(ut.get("new_domain_action", "ask"))
-        for val, label in (("ask", "弹窗询问（每次询问，默认推荐）"),
+        current_na = str(ut.get("new_domain_action", "none"))
+        for val, label in (("none", "无操作（不打开、不询问，也不记录；默认）"),
+                           ("ask", "弹窗询问（每次询问）"),
                            ("auto_whitelist", "自动信任并打开（公网新域名自动加入白名单）"),
                            ("auto_blacklist", "自动拒绝（公网新域名自动加入黑名单）")):
             rb = QRadioButton(label)

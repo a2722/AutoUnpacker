@@ -63,7 +63,8 @@ class PasswordBookDialog(QDialog):
         tool_row.addStretch(1)
         tool_row.addWidget(self.count_lbl)
 
-        self.auto_cb = QCheckBox("自动将剪贴板捕获的临时密码添加到长期密码本")
+        self.auto_cb = QCheckBox("自动收录剪贴板临时密码")
+        self.auto_cb.setToolTip("把剪贴板捕获的临时密码自动加入长期密码本。")
         self.auto_cb.setChecked(state.auto_add())
 
         # 长期密码区（编辑框 + 工具行 + 自动加入开关）
@@ -85,7 +86,7 @@ class PasswordBookDialog(QDialog):
         temp_lay.setContentsMargins(0, 0, 0, 0)
         temp_lay.setSpacing(8)
         temp_head = QHBoxLayout()
-        temp_head.addWidget(QLabel("临时密码（本次开机内，超有效期/上限自动清理）："))
+        temp_head.addWidget(QLabel("临时密码（超时/超量自动清理）："))
         temp_head.addStretch(1)
         clear_btn = QPushButton("清空临时密码")
         clear_btn.clicked.connect(self._clear_temp)

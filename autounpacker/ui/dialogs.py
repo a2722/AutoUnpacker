@@ -320,6 +320,11 @@ class SettingsDialog(QDialog):
         self._build_pages()
         self._cat_list.currentRowChanged.connect(self._stack.setCurrentIndex)
         self._cat_list.setCurrentRow(0)
+        # 设置项随版本增减会变高（如「网址信任」多一个单选项）；按内容自适应
+        # 初始尺寸并把最小高度抬到内容下限，否则长页首次打开会被压扁、文字被裁，
+        # 要拖动窗口才撑开。宽度维持 640，最小宽度仍允许横向压缩（长标签换行）。
+        self.setMinimumHeight(self.minimumSizeHint().height())
+        self.resize(640, max(520, self.sizeHint().height()))
 
     # ---------- 页面构建 ----------
     def _cfg_cb(self, key, text, default):
@@ -501,7 +506,8 @@ class SettingsDialog(QDialog):
         # ---------- 通知 ----------
         noti_box = QGroupBox("通知")
         nl = QVBoxLayout(noti_box)
-        self.notify_cb = self._cfg_cb("notify_enabled", "总开关（关闭后不弹任何通知）", True)
+        self.notify_cb = self._cfg_cb("notify_enabled", "通知总开关", True)
+        self.notify_cb.setToolTip("关闭后不弹出任何通知（运行日志仍会记录）。")
         self.notify_archive_cb = self._cfg_cb("notify_archive", "发现压缩包", True)
         self.notify_success_cb = self._cfg_cb("notify_success", "解压完成", True)
         self.notify_failure_cb = self._cfg_cb("notify_failure", "解压失败", True)
@@ -519,7 +525,8 @@ class SettingsDialog(QDialog):
         nl.addWidget(tray_label)
         self.notify_trayed_cb = self._cfg_cb("notify_trayed", "已最小化到托盘", True)
         self.notify_running_cb = self._cfg_cb(
-            "notify_already_running", "程序已在运行，已打开主界面", True)
+            "notify_already_running", "程序已在运行时提示", True)
+        self.notify_running_cb.setToolTip("再次启动程序时，提示已在运行并打开主界面。")
         self.notify_trust_cb = self._cfg_cb(
             "notify_trust_pending", "有新的网址等待确认", True)
         for cb in (self.notify_trayed_cb, self.notify_running_cb,
@@ -542,39 +549,46 @@ class SettingsDialog(QDialog):
         # ---------- 二维码与剪贴板 ----------
         self.qr_cb = self._cfg_cb("qr_enabled", "启用剪贴板二维码识别", True)
         self.redirect_cb = self._cfg_cb(
-            "qr_url_redirect", "二维码链接域名重定向（drive.uc.cn → fast.uc.cn）", True)
+            "qr_url_redirect", "二维码链接域名重定向", True)
+        self.redirect_cb.setToolTip(
+            "打开前重写链接域名，例如 drive.uc.cn → fast.uc.cn。")
         clip_box = QGroupBox("二维码打开网页后剪贴板联动")
         cl = QVBoxLayout(clip_box)
         self.clip_group = QButtonGroup(self)
         opts = [
-            ("none", "不处理（保持剪贴板原样）"),
-            ("code", "恢复「最近的非图片复制内容」（如提取码）到剪贴板"),
-            ("url", "把「二维码解码出来的内容」写回剪贴板"),
+            ("none", "不处理（保持原样）", "打开网页后不改动剪贴板。"),
+            ("code", "恢复最近复制的提取码",
+             "把最近一次复制的非图片内容（如提取码）写回剪贴板，方便直接粘贴。"),
+            ("url", "写回二维码内容",
+             "把二维码解码出来的整段内容写回剪贴板。"),
         ]
         current = str(self.state.snapshot().get("qr_clipboard_action", "none"))
-        for value, label in opts:
+        for value, label, tip in opts:
             rb = QRadioButton(label)
             rb.setChecked(value == current)
-            self.clip_group.addButton(rb, opts.index((value, label)))
+            rb.setToolTip(tip)
+            self.clip_group.addButton(rb, opts.index((value, label, tip)))
             cl.addWidget(rb)
         self.clip_group.buttonClicked.connect(
             lambda b: self.state.set("qr_clipboard_action",
                                      opts[self.clip_group.id(b)][0]))
         self.qr_url_cb = self._cfg_cb(
-            "qr_url_enabled", "复制 http(s) 网址时自动识别二维码图片并打开", True)
+            "qr_url_enabled", "复制网址时识别二维码图片并打开", True)
+        self.qr_url_cb.setToolTip(
+            "复制 http(s) 网址时自动访问；若返回的是二维码图片，则解码后按设置打开。")
 
         # 临时密码：父（宽松：网址排除）→ 子（更严格：智能过滤），以及有效期/上限
         tp_box = QGroupBox("临时密码")
         tp_lay = QVBoxLayout(tp_box)
         self.url_exclude_cb = self._cfg_cb(
-            "url_exclude_temp_password", "网址排除（不记 :// 链接）", True)
+            "url_exclude_temp_password", "网址排除", True)
         self.url_exclude_cb.setToolTip(
             "带 :// 的网址不记为临时密码；xxxx.com 这类无协议头的域名形式仍会记录。\n"
             "关闭则照单全收（连网址也收）。")
         tp_lay.addWidget(self.url_exclude_cb)
         # 子项：比父更严格，缩进显示，仅在父项开启时可用
         self.tempfilter_cb = self._cfg_cb(
-            "temp_password_filter", "智能过滤（再排路径/文件名/句子）", True)
+            "temp_password_filter", "智能过滤", True)
         self.tempfilter_cb.setToolTip(
             "在「网址排除」基础上更严格：再排除多行文本、文件路径/UNC、\n"
             "带常见扩展名的文件名、含句读标点的句子（且只收 <60 字符）。")
@@ -616,38 +630,48 @@ class SettingsDialog(QDialog):
 
         # ---------- 网址信任 ----------
         ut = self.state.snapshot().get("url_trust") or {}
-        na_box = QGroupBox("遇到未信任的新域名时（默认处理方式）")
+        na_box = QGroupBox("遇到未信任的新域名时")
+        na_box.setToolTip("未信任的新公网域名的默认处理方式。")
         na_lay = QVBoxLayout(na_box)
         self._na_grp = QButtonGroup(na_box)
         self._na_grp.setExclusive(True)
         self._na_buttons = {}
         current_na = str(ut.get("new_domain_action", "none"))
-        for val, label in (("none", "无操作（不打开、不询问，也不记录；默认）"),
-                           ("ask", "弹窗询问（每次询问）"),
-                           ("auto_whitelist", "自动信任并打开（公网新域名自动加入白名单）"),
-                           ("auto_blacklist", "自动拒绝（公网新域名自动加入黑名单）")):
+        for val, label, tip in (
+                ("none", "无操作（默认）",
+                 "不打开、不询问、也不记录，静默跳过。"),
+                ("ask", "弹窗询问",
+                 "每次遇到未信任的新域名都弹窗询问。"),
+                ("auto_whitelist", "自动信任并打开",
+                 "公网新域名自动放行并加入白名单。"),
+                ("auto_blacklist", "自动拒绝",
+                 "公网新域名自动拒绝并加入黑名单。")):
             rb = QRadioButton(label)
             rb.setChecked(val == current_na)
+            rb.setToolTip(tip)
             self._na_grp.addButton(rb)
             self._na_buttons[val] = rb
             na_lay.addWidget(rb)
         self._na_grp.buttonClicked.connect(self._on_trust_mode)
 
-        self.builtin_cb = QCheckBox(
-            "拦截内置敏感地址（私网 / 回环 / 链路本地 / 元数据 / 保留地址）")
+        self.builtin_cb = QCheckBox("拦截内置敏感地址")
+        self.builtin_cb.setToolTip(
+            "私网 / 回环 / 链路本地 / 元数据 / 保留地址默认拒绝（防 SSRF）。")
         self.builtin_cb.setChecked(bool((ut or {}).get("builtin_blacklist", True)))
         self.builtin_cb.stateChanged.connect(self._on_builtin_blacklist)
         self.tls_cb = self._cfg_cb(
-            "tls_skip_verify",
-            "允许不验证 HTTPS 证书（不推荐，仅证书有问题的站点才需要）", False)
+            "tls_skip_verify", "允许不验证 HTTPS 证书", False)
+        self.tls_cb.setToolTip(
+            "不推荐；仅当站点证书有问题时才需要，开启有中间人攻击风险。")
 
-        wl_label = QLabel("白名单（每行一个域名，自动包含其全部子域；"
-                          "可覆盖内置敏感地址拦截）")
+        wl_label = QLabel("白名单（每行一个域名，含全部子域）")
         wl_label.setWordWrap(True)
+        wl_label.setToolTip("命中即信任，可覆盖内置敏感地址拦截。")
         wl_label.setStyleSheet("color: #3d4756; font-size: 12px;")
         self.wl_edit = self._trust_list_editor("whitelist")
-        bl_label = QLabel("黑名单（每行一个域名，优先级最高；命中即静默拒绝）")
+        bl_label = QLabel("黑名单（每行一个域名，优先级最高）")
         bl_label.setWordWrap(True)
+        bl_label.setToolTip("命中即静默拒绝。")
         bl_label.setStyleSheet("color: #3d4756; font-size: 12px;")
         self.bl_edit = self._trust_list_editor("blacklist")
         note = QLabel("说明：私网 / 回环 / 链路本地 / 元数据等内置敏感地址默认拒绝，"
@@ -661,20 +685,24 @@ class SettingsDialog(QDialog):
 
         # ---------- 解压 ----------
         self.merge_cb = self._cfg_cb(
-            "promote_merge",
-            "提升时同名文件夹无文件冲突则合并（有同名文件仍重命名 (N)）", True)
+            "promote_merge", "同名文件夹无冲突则合并", True)
+        self.merge_cb.setToolTip(
+            "解压提升时，同名文件夹内无文件冲突则合并；有同名文件仍重命名为 (N)。")
         self.translate_cb = self._cfg_cb(
-            "translation_move_enabled",
-            "翻译 JSON 自动归位（<10MB 单 json 移入同名大文件夹，"
-            "小文件夹先出现时监控 5 分钟）", True)
+            "translation_move_enabled", "翻译 JSON 自动归位", True)
+        self.translate_cb.setToolTip(
+            "小于 10MB 的单 json 文件夹，若文件名命中某大文件夹名则移入该文件夹；\n"
+            "小文件夹先出现时监控 5 分钟等待目标。")
         pages.append(("解压", self._page_widget("解压", self.merge_cb, self.translate_cb)))
 
         # ---------- 全局快捷键 ----------
-        hot_box = QGroupBox("全局快捷键（唤起主界面）")
+        hot_box = QGroupBox("全局快捷键")
+        hot_box.setToolTip("用于唤起主界面。")
         hl = QVBoxLayout(hot_box)
         hl.setSpacing(6)
         self.hotkey_enable_cb = self._cfg_cb(
-            "hotkey_enabled", "启用（主界面隐藏到托盘时也能唤起）", True)
+            "hotkey_enabled", "启用全局快捷键", True)
+        self.hotkey_enable_cb.setToolTip("主界面隐藏到托盘时也能用它唤起。")
         self.hotkey_enable_cb.stateChanged.connect(
             lambda s: self._notify_hotkey_change())
         hl.addWidget(self.hotkey_enable_cb)
@@ -706,17 +734,21 @@ class SettingsDialog(QDialog):
             lambda v: self.state.set("poll_interval", int(v)))
         interval_row.addWidget(self.interval_spin)
         interval_row.addStretch(1)
-        self.logcolor_cb = self._cfg_cb("log_colors_enabled", "运行日志按事件类型着色", True)
+        self.logcolor_cb = self._cfg_cb("log_colors_enabled", "日志按事件着色", True)
+        self.logcolor_cb.setToolTip("运行日志按成功 / 失败 / 等待等类型着色。")
 
         # 关闭窗口行为（与 closeEvent 三选一弹窗联动，选择即同步到此设置）
-        close_box = QGroupBox("关闭窗口行为（点击右上角 × 时）")
+        close_box = QGroupBox("关闭窗口行为")
+        close_box.setToolTip("点击右上角 × 时的动作。")
         close_lay = QVBoxLayout(close_box)
         self._close_grp = QButtonGroup(close_box)
         self._close_rbs = {}
-        for val, label in (("ask", "每次询问（每次关闭都弹出选择）"),
-                           ("tray", "隐藏到托盘（程序继续后台运行）"),
-                           ("exit", "关闭程序（停止所有监听）")):
+        for val, label, tip in (
+                ("ask", "每次询问", "每次关闭都弹出选择。"),
+                ("tray", "隐藏到托盘", "程序继续在后台运行。"),
+                ("exit", "关闭程序", "停止所有监听与剪贴板监控。")):
             rb = QRadioButton(label)
+            rb.setToolTip(tip)
             self._close_grp.addButton(rb)
             self._close_rbs[val] = rb
             close_lay.addWidget(rb)

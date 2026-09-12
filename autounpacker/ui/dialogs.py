@@ -783,8 +783,19 @@ class SettingsDialog(QDialog):
         self._update_status.setWordWrap(True)
         self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
         ver_lay.addWidget(self._update_status)
+        # 实验性功能（默认关闭）
+        exp_box = QGroupBox("实验性功能")
+        exp_lay = QVBoxLayout(exp_box)
+        self.experimental_cb = self._cfg_cb(
+            "experimental_enabled", "开启实验性功能", False)
+        self.experimental_cb.setToolTip(
+            "实验性、默认关闭。当前用途：只读探测百度网盘客户端的本地任务库\n"
+            "（BaiduYunGuanjia.db），用于还原下载批次、目录结构与分卷。\n"
+            "只读打开、短连接、不写不锁，不影响正在运行的网盘客户端。")
+        exp_lay.addWidget(self.experimental_cb)
+
         pages.append(("常规", self._page_widget(
-            "常规", interval_row, self.logcolor_cb, close_box, ver_box)))
+            "常规", interval_row, self.logcolor_cb, close_box, ver_box, exp_box)))
 
         # 填充左侧分类列表与右侧页面栈
         for name, widget in pages:

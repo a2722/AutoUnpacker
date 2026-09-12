@@ -5,7 +5,7 @@ import queue
 import threading
 import types
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QPlainTextEdit, QSystemTrayIcon, QMenu, QSplitter, QProgressBar, QShortcut)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QPlainTextEdit, QSystemTrayIcon, QMenu, QSplitter, QProgressBar, QShortcut, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QKeySequence
 
@@ -87,7 +87,12 @@ class MainWindow(QMainWindow):
         settings_btn = QPushButton("设置")
         settings_btn.setObjectName("primary")
         settings_btn.clicked.connect(self._open_settings)
+        baidu_btn = QPushButton("网盘下载目录")
+        baidu_btn.setToolTip(
+            "从百度网盘本地任务库识别下载目录并加入监听（需先在设置开启实验性功能）")
+        baidu_btn.clicked.connect(self._add_baidu_download_dir)
         top.addWidget(self.add_btn)
+        top.addWidget(baidu_btn)
         top.addWidget(pw_btn)
         top.addWidget(trail_btn)
         top.addWidget(settings_btn)
@@ -384,6 +389,45 @@ class MainWindow(QMainWindow):
         cfg["watch_paths"].append(entry)
         self.state.set("watch_paths", cfg["watch_paths"])
         self.rebuild_cards()
+
+    def _add_baidu_download_dir(self):
+        """从百度网盘本地任务库识别下载目录并加入监听（实验性功能）。"""
+        if not self.state.snapshot().get("experimental_enabled", False):
+            QMessageBox.information(
+                self, "百度网盘下载目录",
+                "该功能依赖实验性功能，请先在「设置 → 常规」开启「实验性功能」。")
+            return
+        root = None
+        try:
+            from ..baidu_task import detect_download_root
+            root = detect_download_root(
+                self.state.snapshot().get("baidu_task_db") or None)
+        except Exception as e:
+            self.hub.log(f"识别百度网盘下载目录失败: {e}")
+        if root is None:
+            QMessageBox.information(
+                self, "百度网盘下载目录",
+                "未能从百度网盘任务库识别到下载目录。\n"
+                "（确认网盘客户端有下载历史，或该库路径未被改动）")
+            return
+        try:
+            from ..utils import _norm_path_for_cfg
+            norm = _norm_path_for_cfg(str(root))
+            entries = list(self.state.snapshot().get("watch_paths") or [])
+            if any(_norm_path_for_cfg(str(e.get("path", ""))) == norm for e in entries):
+                QMessageBox.information(self, "百度网盘下载目录",
+                                        f"该目录已在监听中：\n{root}")
+                return
+            entries.append({"path": str(root), "enabled": True,
+                            "output_dir": "", "delete_source": False})
+            self.state.set("watch_paths", entries)
+            self.rebuild_cards()
+            self.hub.log(f"已把百度网盘下载目录加入监听: {root}")
+            QMessageBox.information(self, "百度网盘下载目录",
+                                    f"已添加监听路径：\n{root}")
+        except Exception as e:
+            self.hub.log(f"添加百度网盘下载目录失败: {e}")
+            QMessageBox.warning(self, "百度网盘下载目录", f"添加失败：{e}")
 
     def _open_password_book(self):
         dlg = PasswordBookDialog(self.state, self)

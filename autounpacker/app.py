@@ -154,6 +154,15 @@ def main():
     watcher.start()
     qr.start()
 
+    # 实验性功能（默认关）：后台只读探测百度网盘本地任务库，写日志供验证；
+    # 并轮询活动下载任务（仅在开关打开时）。只读、短连接、异常全部吞掉。
+    try:
+        from .baidu_task import probe_and_log, start_active_watcher
+        probe_and_log(state, hub)
+        start_active_watcher(state, hub)
+    except Exception:
+        pass
+
     # PyQt 依赖统一在入口加载：缺失时写 crash.log 并报错（保持原崩溃日志行为）
     try:
         from PyQt5.QtWidgets import QApplication

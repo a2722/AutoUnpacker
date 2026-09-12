@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
         "builtin_blacklist": True,    # 内置类别黑名单（私网/回环/链路本地/元数据/保留地址）
     },
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）
+    "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
+    "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
 }
 
 
@@ -144,6 +146,8 @@ def _sanitize_cfg(cfg):
         ut["builtin_blacklist"] = bool(ut.get("builtin_blacklist", True))
         cfg["url_trust"] = ut
         cfg["tls_skip_verify"] = bool(cfg.get("tls_skip_verify", False))
+        cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
+        cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
     except Exception:
         pass
     return cfg

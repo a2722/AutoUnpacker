@@ -1834,6 +1834,31 @@ def is_volume_file(source_name, candidate, stem):
     return False
 
 
+def _recycle_paths(paths):
+    """把存在的路径移入回收站（不可用时回退永久删除）。
+
+    返回 (recycled, failed)：recycled=已移入回收站的路径，failed=回收站不可用后
+    已永久删除的路径（与 delete_source / delete_hook 的语义一致）。不存在的忽略。"""
+    targets = [str(p) for p in paths if Path(p).exists()]
+    if not targets:
+        return [], []
+    recycled, failed = [], []
+    try:
+        from . import trail as deletion_trail
+        ok, failed = deletion_trail.send_to_recycle_bin(targets)
+        recycled = [t for t in targets if t not in failed]
+        if not ok:
+            failed = [t for t in targets if t not in recycled]
+    except Exception:
+        recycled, failed = [], list(targets)
+    for p in failed:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return recycled, failed
+
+
 def delete_source(source, hook=None):
     """删除源文件（含分卷）。
 
@@ -1855,22 +1880,7 @@ def delete_source(source, hook=None):
         print("没有需要删除的源文件")
         return
 
-    recycled, failed = [], []
-    try:
-        from . import trail as deletion_trail
-        ok, failed = deletion_trail.send_to_recycle_bin([str(t) for t in targets])
-        recycled = [str(t) for t in targets if str(t) not in failed]
-        if not ok:
-            failed = [str(t) for t in targets if str(t) not in recycled]
-    except Exception:
-        recycled, failed = [], [str(t) for t in targets]
-
-    for p in failed:
-        try:
-            Path(p).unlink(missing_ok=True)
-        except OSError:
-            pass
-
+    recycled, failed = _recycle_paths(targets)
     if hook:
         hook(recycled, failed)
     print(f"已删除源文件及分卷，共 {len(recycled) + len(failed)} 个（移入回收站）")
@@ -1941,10 +1951,26 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
         same_place = False
 
     promoted = None
+    pre_recycled, pre_failed = [], []
+    occupies_source = False
     if not same_place:
         promote_to.mkdir(parents=True, exist_ok=True)
         dest = promote_to / src_dir.name
-        if dest.exists() and merge and not _dirs_conflict(src_dir, dest):
+        # 目标名被「本次即将回收的源文件/其分卷」占用：典型为无扩展名压缩包与其
+        # 内层同名文件夹撞名（源文件 E:\test\2022 与内层文件夹 2022）。此时既不能
+        # 合并进去、也不能直接 move 覆盖；先回收占位文件让出位置，提升后才能用回
+        # 原名（否则会退化成 2022(1)）。
+        if dest.is_file() and source.exists():
+            try:
+                occupies_source = os.path.samefile(dest, source)
+            except OSError:
+                occupies_source = False
+            if not occupies_source and is_volume_name(source.name):
+                occupies_source = is_volume_file(source.name, dest.name, source.stem)
+        if occupies_source:
+            pre_recycled, pre_failed = _recycle_paths([dest])
+
+        if dest.is_dir() and merge and not _dirs_conflict(src_dir, dest):
             # 目标同名文件夹存在但无文件冲突：直接并入，不建 (N)
             _merge_dir(src_dir, dest)
             try:
@@ -1963,13 +1989,19 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
                 shutil.move(str(src_dir), str(dest))
                 promoted = str(dest)
             except OSError as e:
-                return {"promoted": None, "recycled": [], "hook_called": False,
+                if hook:
+                    hook(pre_recycled, pre_failed)
+                return {"promoted": None, "recycled": pre_recycled,
+                        "hook_called": bool(pre_recycled or pre_failed),
                         "note": f"提升失败: {e}"}
     else:
         promoted = str(src_dir)
 
+    # 源文件路径已被提升后的文件夹复用（occupies_source）时，该路径此刻是成品
+    # 目录，不能再当源文件回收（否则会把刚提升出来的内容一起删掉）。
+    reused = {str(source)} if occupies_source else set()
     targets = []
-    if source.exists():
+    if source.exists() and str(source) not in reused:
         targets.append(str(source))
     # 分卷源文件（如 xxx.7z.001）连同其他分卷一起回收，否则只删主卷和
     # 输出目录，分卷兄弟（xxx.7z.002...）会残留（promote 成功时才走到这里）。
@@ -1978,27 +2010,17 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
         for entry in src_parent.iterdir():
             if (entry.is_file()
                     and is_volume_file(source.name, entry.name, source.stem)
-                    and str(entry) not in targets):
+                    and str(entry) not in targets
+                    and str(entry) not in reused):
                 targets.append(str(entry))
     if same_place:
         targets.extend(str(f) for f in top_files)
     elif output_dir.exists():
         targets.append(str(output_dir))
 
-    recycled, failed = [], []
-    try:
-        from . import trail as deletion_trail
-        ok, failed = deletion_trail.send_to_recycle_bin(targets)
-        recycled = [t for t in targets if t not in failed]
-        if not ok:
-            failed = [t for t in targets if t not in recycled]
-    except Exception:
-        recycled, failed = [], targets
-    for p in failed:
-        try:
-            Path(p).unlink(missing_ok=True)
-        except OSError:
-            pass
+    recycled2, failed2 = _recycle_paths(targets)
+    recycled = pre_recycled + recycled2
+    failed = pre_failed + failed2
 
     if hook:
         hook(recycled, failed)

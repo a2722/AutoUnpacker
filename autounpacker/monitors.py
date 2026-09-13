@@ -37,6 +37,14 @@ _CLIP_PROBED = False
 _clipboard_mod = None   # 探测成功后缓存的 win32clipboard 模块
 _imagegrab_mod = None   # 探测成功后缓存的 PIL.ImageGrab 模块
 
+# URL 允许的 ASCII 字符集（RFC 3986 组成字符），用于把「网址 + 中文说明/提取码」
+# 这类剪贴板文本截断成真正的网址。若把空格/中文一并交给 urllib，会抛
+# "URL can't contain control characters"（用户反馈的 drive.uc.cn 提取码场景）。
+_URL_CHARS = r"A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%"
+_URL_RE = re.compile(r"https?://[" + _URL_CHARS + r"]+", re.I)
+_WWW_URL_RE = re.compile(r"www\.[" + _URL_CHARS + r"]+", re.I)
+_URL_TRAILING_JUNK = ".,;:!?、。，；：！？）】》」"
+
 
 def _ensure_clipboard():
     """首次调用时探测剪贴板依赖；结果缓存到模块级标志。返回 (win32clipboard, ImageGrab)。"""
@@ -1276,13 +1284,19 @@ class QRMonitor(threading.Thread):
 
     @staticmethod
     def _extract_url(text):
-        import re
-        if re.match(r"^https?://\S+$", text, re.I):
-            return text
-        m = re.search(r"(https?://\S+|www\.\S+\.\S+)", text, re.I)
+        """从任意文本里截出第一个真正可用的网址（沿 ASCII URL 字符集切分）。
+
+        关键是**在首个非法字符处截断**：复制「链接 + 空格 + 码：XXXX」时，
+        空格与中文都不属于 URL 字符集，因此不会再把「码：XXXX」吞进网址。
+        只在此返回 None 表示没有网址。"""
+        if not text:
+            return None
+        m = _URL_RE.search(text)
         if m:
-            url = m.group(1)
-            return url if url.startswith(("http://", "https://")) else "http://" + url
+            return m.group(0).rstrip(_URL_TRAILING_JUNK)
+        m = _WWW_URL_RE.search(text)
+        if m:
+            return "http://" + m.group(0).rstrip(_URL_TRAILING_JUNK)
         return None
 
     # ---------- 网址形式的二维码图片识别 ----------
@@ -1293,8 +1307,15 @@ class QRMonitor(threading.Thread):
 
         检查点A：访问前先做信任判定——未信任的网址不发起任何请求，
         黑名单/内置敏感地址静默拒绝，公网新域名投递主窗口询问。"""
-        if not text.startswith(("http://", "https://")):
+        # 剪贴板里复制的往往是「链接 + 空格 + 码：XXXX」整段文本，先截出真正
+        # 的网址再访问，否则空格/中文会让 urllib 抛 "URL can't contain control
+        # characters"（用户反馈的 drive.uc.cn 提取码场景）。
+        if not (text or "").strip().lower().startswith(("http://", "https://")):
             return
+        url = self._extract_url(text)
+        if not url:
+            return
+        text = url
         if not force and text == self.last_url:
             return
         self.last_url = text

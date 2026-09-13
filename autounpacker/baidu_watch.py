@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from .baidu_db import _select, _as_text, select_task_db
+from .baidu_db import (_select, _as_text, select_task_db, detect_download_root)
 from .baidu_manifest import (observe_tasks, report_events, leftover_tasks,
                              summarize, format_summary, _TRACK)
 
@@ -40,6 +40,41 @@ _BACKOFF_AT = 5          # 连续失败达到该次数后开始指数退避
 _INTERVAL_IDLE = 12.0    # 空闲（无活动任务）间隔
 _INTERVAL_ACTIVE = 3.0   # 有活动任务时的间隔
 _INTERVAL_MAX = 60.0     # 退避上限（秒）
+
+# 「下载目录未加入监听」提示：按目录只提示一次
+_HINTED_UNWATCHED = set()
+
+
+def _norm_path(p):
+    return str(p or "").replace("/", "\\").rstrip("\\").lower()
+
+
+def _hint_if_download_dir_unwatched(cfg, db, log):
+    """实验性已开、但识别出的百度下载目录没被任何「已启用」的监听路径覆盖时，
+    多嘴提示一次：该目录**仅监控、不解压**。
+
+    避免用户误以为「开了实验性 = 来料会被自动处理」。只提示，不改任何配置
+    （监听范围始终是显式白名单）。任何失败静默。
+    """
+    try:
+        if not db:
+            return
+        root = detect_download_root(db)
+        if not root:
+            return
+        key = _norm_path(root)
+        if key in _HINTED_UNWATCHED:
+            return
+        enabled = [_norm_path(w.get("path"))
+                   for w in (cfg.get("watch_paths") or [])
+                   if isinstance(w, dict) and w.get("enabled") and w.get("path")]
+        covered = any(key == e or key.startswith(e + "\\") for e in enabled)
+        if not covered:
+            _HINTED_UNWATCHED.add(key)
+            log(f"下载目录 {root} 未加入监听：仅监控、不解压")
+            log("  如需自动解压，请在主界面点「网盘下载目录」，或启用对应的监听路径")
+    except Exception:
+        pass
 
 
 def _baidu_running():
@@ -154,6 +189,7 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                 if db and str(db) != (last_db or ""):
                     last_db = str(db)
                     _log(f"任务库选中：{db}（{reason}）")
+                    _hint_if_download_dir_unwatched(cfg, db, _log)
 
                 rows = None
                 hist = []

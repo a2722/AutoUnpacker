@@ -248,22 +248,41 @@ def observe_tasks(rows, hist_rows=None):
             if _hist_match(hist_rows, info["server_path"], info["size"]):
                 events["dups"].append(dict(info))
         else:
+            # 同一路径被**重新下载**：刷新 task_id 等字段。否则本条目还挂着旧
+            # task_id，新任务结束时就匹配不上，会被误判为「仍在下载中」，状态
+            # 永远停在 active → _baidu_poll（只处理 done）→ 永不解压。
+            reappeared = info.get("state") != "active"
+            info["task_id"] = tid
+            sp = _as_text(r.get("server_path"))
+            if sp:
+                info["server_path"] = sp
+            if r.get("file_size") is not None:
+                info["size"] = r.get("file_size")
+            if r.get("isdir") is not None:
+                info["isdir"] = r.get("isdir")
             info["state"] = "active"
+            if reappeared:
+                # 重新下载：当作一次新任务上报（便于日志/预登记）
+                events["started"].append(dict(info))
         try:
             if int(r.get("error_code") or 0) != 0:
                 events["failed"].append(dict(info))
         except Exception:
             pass
-    gone = _TRACK["active_ids"] - cur_ids
     _TRACK["active_ids"] = cur_ids
-    if gone:
-        for info in _TRACK["files"].values():
-            if (info.get("state") == "active"
-                    and _as_text(info.get("task_id")) in gone):
-                ok = _hist_match(hist_rows, info.get("server_path"),
-                                 info.get("size"))
-                info["state"] = "done" if ok else "gone"
-                (events["done"] if ok else events["gone"]).append(dict(info))
+    # 按「是否仍在当前 downloading 集合」判定完成 / 失联 —— 而不是只看相邻两拍
+    # 的差集。原因：同一路径被重新下载时任务 id 会变，用旧 task_id 去查差集必然
+    # 落空，状态会永远停在 active（→ _baidu_poll 只处理 done，于是永不解压）。
+    # 改为遍历所有 active 条目、只要其 task_id 不在当前活动集合里就判定完成/失联，
+    # 与 task_id 是否刷新无关，更稳。
+    for info in _TRACK["files"].values():
+        if info.get("state") != "active":
+            continue
+        if _as_text(info.get("task_id")) in cur_ids:
+            continue
+        ok = _hist_match(hist_rows, info.get("server_path"), info.get("size"))
+        info["state"] = "done" if ok else "gone"
+        (events["done"] if ok else events["gone"]).append(dict(info))
     return events
 
 

@@ -663,7 +663,10 @@ class FolderWatcher(threading.Thread):
                     return "done"
             passwords = self.state.all_passwords()
             out_dir = (wc.get("output_dir") or "").strip() or None
-            promote_to = out_dir or (wc.get("path") or "").strip() or None
+            # 默认抬升到**源文件所在目录**（而不是监听根）。表层模式下源文件就在
+            # 根，二者等价；百度清单模式会处理下载到**子目录**里的包，若一律抬升到
+            # 监听根，就会破坏下载时的目录结构、并在原位留下空文件夹。
+            promote_to = out_dir or str(fp.parent)
             options = {
                 "enable_nested": True,
                 "max_depth": 10,

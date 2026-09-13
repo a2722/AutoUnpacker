@@ -276,15 +276,22 @@ def detect_download_root(db_path=None, history_limit=300):
     paths = [p for p in paths if re.match(r"^[A-Za-z]:[\\/]", p)]
     if not paths:
         return None
+    # 用「文件所在目录」求公共前缀：commonpath 对单条记录会直接返回该文件本身，
+    # 于是「下载根」被推成一个文件路径（加监听/提示都会出错）。改用父目录，
+    # 保证返回的一定是目录。
+    dirs = [os.path.dirname(p) for p in paths]
+    dirs = [d for d in dirs if d]
+    if not dirs:
+        return None
     common = None
     try:
-        common = Path(os.path.commonpath(paths))
+        common = Path(os.path.commonpath(dirs))
     except Exception:
         common = None
     # 共同根若退化成盘符根（E:\），改用最高频的父目录
     if common is None or str(common).rstrip("\\/") == common.anchor.rstrip("\\/"):
         from collections import Counter
-        top = Counter(os.path.dirname(p) for p in paths).most_common(1)
+        top = Counter(dirs).most_common(1)
         if top:
             common = Path(top[0][0])
     return common

@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-"""网址信任机制：控制剪贴板 URL 自动访问 / 二维码 URL 自动打开浏览器。
+"""网址信任机制：控制剪贴板/二维码 URL 的自动访问与自动打开浏览器。
 
-判定优先级：用户黑名单 > 用户白名单(可覆盖内置) > 内置敏感类别(默认拒绝) > 公网新域名(按配置)。
+职责：- classify_host() 对 IP 字面量/域名做内置敏感类别分类（私网/回环/链路本地/保留）
+- decide_host() 核心判定：用户黑名单 > 用户白名单(可覆盖内置) > 内置类别 > 公网新域名按配置
+- remember_auto_domain() 把自动信任/拒绝命中的新域名落库到用户名单
+关键入口：decide_host() / classify_host() / remember_auto_domain()
+依赖：socket、ipaddress（getaddrinfo 为阻塞调用，仅后台线程用 resolve=True）
+注意：内置敏感地址（含云元数据 169.254.169.254）默认拒绝，仅用户显式加白可覆盖
 """
 import socket
 import ipaddress

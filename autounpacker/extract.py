@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""解压核心：格式探测（含伪装/分卷/未完成下载）、密码候选生成、7-Zip/Python 双引擎与多层解压服务。
+
+职责：- detect_archive_format() 等：魔数/尾部/前部扫描识别真实压缩格式与「多段伪装」文件
+- 分卷识别与到齐判断、文件名提取密码、按层生成候选密码列表
+- 7-Zip 与 Python zipfile 两套解压引擎（密码经 stdin 传递，绝不进命令行）
+- ExtractService 驱动多层嵌套解压（含 RAR 分卷规范化、伪装 ZIP 剥离兜底、暂停/进度回调）
+关键入口：analyze_file() / create_engine() / PauseController / ExtractService.extract()
+依赖：sevenzip、db（密码字典）、标准库（subprocess/zipfile/ctypes）
+注意：7z 命令绝不能带 -p（裸 -p 走控制台读密码，stdin 管道读不到，密码永远不生效）
+"""
 import argparse
 import ctypes
 import os

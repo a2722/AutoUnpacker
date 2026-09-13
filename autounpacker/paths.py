@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""路径常量：代码位于 autounpacker/ 包，数据文件统一放在项目根目录。
+"""路径常量：数据文件统一放在项目根目录，各模块经 `paths.X` 引用。
 
-测试可重定向 DATA_DIR（或直接改 CONFIG_FILE 等），各模块统一经
-``from . import paths`` 后以 ``paths.X`` 引用，保证重定向全局生效。"""
+职责：- 定义 PROJECT_ROOT / DATA_DIR / CONFIG_FILE / TEMP_PW_FILE / CRASH_LOG / LOGS_DIR 等常量
+- 测试可重定向 DATA_DIR（或直接改 CONFIG_FILE 等），各模块统一引用保证全局生效
+关键入口：无（纯常量模块）
+依赖：仅 pathlib
+注意：各模块统一 `from . import paths` 后以 `paths.X` 引用，保证重定向全局生效
+"""
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent

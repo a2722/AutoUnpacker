@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""剪贴板写入子进程：主程序把要写入的文本通过 stdin 传入。
+"""剪贴板写入子进程：把 stdin 传入的文本写入系统剪贴板。
 
-win32clipboard 的 SetClipboardData 在并发/特殊输入下可能触发原生堆损坏
-（0xc0000374），在独立子进程执行可确保崩溃只影响本进程，不拖垮常驻主程序。
-文本经 stdin(UTF-8) 传输，避免命令行参数编码/长度问题。
-用法:  pythonw clipboard_worker.py < 文本
-退出码 0=成功, 1=写入失败, 2=解码失败。
+职责：- 从 stdin(UTF-8) 读取文本，经 win32clipboard 写入剪贴板
+- 隔离 SetClipboardData 的原生堆损坏（0xc0000374）风险
+关键入口：main()
+依赖：win32clipboard
+注意：退出码 0=成功，1=写入失败，2=解码失败；由 QRMonitor._set_clipboard 以子进程方式调用
 """
 import sys
 

@@ -1,13 +1,25 @@
 # -*- coding: utf-8 -*-
-"""通用控件：HotkeyEdit（快捷键捕获）、托盘图标、监听卡片 WatchCard、
-全局热键过滤器、彩虹引导按钮。"""
+"""通用控件：HotkeyEdit（快捷键捕获）、托盘图标、监听卡片 WatchCard、全局热键过滤器、彩虹引导按钮。
+
+职责：- HotkeyEdit 捕获「修饰键 + 普通键」组合并发出 comboChanged 信号
+- make_tray_icon() 程序化绘制托盘图标；_HotkeyFilter 捕获 WM_HOTKEY 全局热键
+- WatchCard 单个监听路径的编辑卡片（路径/输出目录/删除源文件/监听模式）
+- RainbowBorderButton 无监听路径时的高亮彩虹边框引导按钮
+关键入口：HotkeyEdit / WatchCard / RainbowBorderButton / make_tray_icon() / _HotkeyFilter
+依赖：PyQt5、win32gui（可选）、config（快捷键常量）
+注意：RainbowBorderButton 仅在 set_rainbow(True) 时启动约 30fps 定时重绘，平时零后台开销
+"""
 import ctypes
 
-from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QFileDialog, QFrame)
+from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QFileDialog, QFrame, QComboBox)
 from PyQt5.QtCore import (Qt, QTimer, QRectF, pyqtSignal, QAbstractNativeEventFilter)
 from PyQt5.QtGui import (QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QConicalGradient, QPainterPath)
 
 from ..config import _HK_NAME_BY_VK, HOTKEY_ID, WM_HOTKEY
+from .style import PALETTE
+
+# 系统主题变化广播：WM_SETTINGCHANGE 的 lParam 为 "ImmersiveColorSet" 时表示深浅色变了
+WM_SETTINGCHANGE = 0x001A
 
 try:
     import win32gui
@@ -41,7 +53,7 @@ class HotkeyEdit(QLineEdit):
         if event.button() == Qt.LeftButton:
             self._capturing = True
             self.setText("按下组合键...")
-            self.setStyleSheet("color: #1f6feb;")
+            self.setStyleSheet(f"color: {PALETTE['accent_text']};")
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
@@ -80,7 +92,7 @@ def make_tray_icon():
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
     p.setPen(Qt.NoPen)
-    p.setBrush(QColor(31, 111, 235))
+    p.setBrush(QColor(PALETTE["tray_icon"]))
     p.drawRoundedRect(4, 10, 56, 48, 7, 7)
     p.setBrush(QColor(255, 255, 255))
     p.drawRect(26, 3, 12, 9)
@@ -154,8 +166,24 @@ class WatchCard(QFrame):
         self.del_cb.setChecked(bool(entry.get("delete_source", False)))
         self.del_cb.stateChanged.connect(self._on_delete)
         row3.addWidget(self.del_cb)
-        row3.addStretch(1)
+        self.mode_cb = QComboBox()
+        self.mode_cb.addItem("表层（安全）", "surface")
+        self.mode_cb.addItem("百度清单（含子目录）", "baidu")
+        self.mode_cb.setCurrentIndex(
+            1 if str(entry.get("mode") or "") == "baidu" else 0)
+        self.mode_cb.setToolTip(
+            "表层（安全）：只处理监听目录表面一层的文件（原有行为）。\n"
+            "百度清单（含子目录）：额外按百度网盘任务清单，处理下载到子目录里的\n"
+            "压缩包/分卷；清单不可用（未开实验性 / 历史被清）时自动退回表层。")
+        self.mode_cb.currentIndexChanged.connect(self._on_mode)
+        row3.addStretch(1)              # 勾选框靠左、「模式」靠右，避免挤在一起
+        row3.addSpacing(16)
+        row3.addWidget(QLabel("模式"))
+        row3.addWidget(self.mode_cb)
         lay.addLayout(row3)
+
+    def _on_mode(self, _i):
+        self.state.update_path(self.idx, "mode", self.mode_cb.currentData())
 
     def _on_enable(self, s):
         self.state.update_path(self.idx, "enabled", bool(s))
@@ -187,23 +215,18 @@ TRAIL_STATUS_TEXT = {
     "failed": "解压失败",
 }
 
-TRAIL_STATUS_COLORS = {
-    "recorded": "#8a94a6",
-    "kept": "#2e7d32",
-    "deleted": "#c0392b",
-    "restored": "#1f6feb",
-    "failed": "#ad1457",
-}
+TRAIL_STATUS_COLORS = PALETTE["trail"]   # 与 style.PALETTE 同一对象，随主题就地更新
 
 TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 
 
 class _HotkeyFilter(QAbstractNativeEventFilter):
-    """Win32 消息过滤器：捕获 WM_HOTKEY（全局快捷键）并回调。"""
+    """Win32 消息过滤器：捕获 WM_HOTKEY（全局快捷键）与 WM_SETTINGCHANGE（主题变化）。"""
 
-    def __init__(self, on_hotkey):
+    def __init__(self, on_hotkey, on_settings_change=None):
         super().__init__()
         self._on_hotkey = on_hotkey
+        self._on_settings_change = on_settings_change
 
     def nativeEventFilter(self, eventType, message):
         if eventType == b"windows_generic_MSG":
@@ -217,6 +240,15 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
                 except Exception:
                     pass
                 return True, 0
+            if (msg.message == WM_SETTINGCHANGE
+                    and self._on_settings_change is not None):
+                # lParam 指向宽字符串：含 "ImmersiveColorSet" 即系统深浅色切换
+                try:
+                    lp = ctypes.cast(msg.lParam, ctypes.c_wchar_p)
+                    if lp and lp.value and "ImmersiveColorSet" in lp.value:
+                        self._on_settings_change()
+                except Exception:
+                    pass
         return False, 0
 
 

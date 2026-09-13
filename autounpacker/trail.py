@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-删除回溯模块
-- 统一标记最初始源文件（多层解压产生的次级中间文件不标记）
-- 删除源文件时移入回收站（可撤销），而不是永久删除
-- 提供从回收站还原已删除源文件的功能（回收站被清空/永久删除的无法还原）
+"""删除回溯：记录解压源文件、删除到回收站（可撤销）并从回收站还原。
+
+职责：- 为最初始源文件建档（多层解压产生的中间文件不标记）
+- send_to_recycle_bin() 用 SHFileOperation(FOF_ALLOWUNDO) 移入回收站而非永久删除
+- restore_record() 经 Shell.Application 从回收站一键还原
+- 回溯窗口期 = 本次开机，启动时 prune_records() 丢弃旧记录防累积
+关键入口：new_record() / already_handled() / send_to_recycle_bin() / restore_record()
+依赖：ctypes（SHFileOperation）、win32com（还原）、DATA_DIR/deletion_trail.json
+注意：回收站被清空或永久删除的文件无法还原
 """
 import os
 import time

@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
-"""AutoUnpacker - 兼容启动入口（推荐使用 `python -m autounpacker`）。
+"""兼容启动入口：把控制权交给包内的 app.main()（推荐使用 `python -m autounpacker`）。
 
-本文件仅负责把控制权交给包内的 app.main()。"""
+职责：- 把项目根目录插入 sys.path，使 main.py 可直接运行
+关键入口：autounpacker.app 的 main()（本文件仅转发）
+依赖：autounpacker.app
+注意：本文件不含业务逻辑；真正的入口流程在 autounpacker/app.py 的 main()
+"""
 import sys
 from pathlib import Path
 

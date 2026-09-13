@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
-"""各类对话框：删除回溯、7-Zip 管理、设置、关闭行为、网址信任确认。"""
+"""各类对话框：删除回溯、7-Zip 管理、设置、关闭行为确认、网址信任确认。
+
+职责：- DeleteTrailDialog 展示删除回溯记录并一键还原
+- SevenZipSetupDialog 检测/安装/卸载 7-Zip（隔离版与全局版）
+- SettingsDialog 全部配置项编辑（监听路径、通知、信任名单、快捷键等）
+- CloseActionDialog 关闭行为询问；TrustAskDialog 新网址信任确认
+关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog
+依赖：PyQt5、trail、sevenzip、trust、widgets
+注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
+"""
 import threading
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import (QColor, QBrush)
 
 from .. import trail as deletion_trail   # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
-from .widgets import HotkeyEdit
+from .widgets import HotkeyEdit, TRAIL_STATUS_COLORS
+from .style import PALETTE
+from . import style as ui_style
 from ..trust import trust_entry_categories
 
 TRAIL_STATUS_TEXT = {
@@ -19,13 +30,8 @@ TRAIL_STATUS_TEXT = {
     "failed": "解压失败",
 }
 
-TRAIL_STATUS_COLORS = {
-    "recorded": "#8a94a6",
-    "kept": "#2e7d32",
-    "deleted": "#c0392b",
-    "restored": "#1f6feb",
-    "failed": "#ad1457",
-}
+# 状态颜色统一由 widgets/style 提供（TRAIL_STATUS_COLORS = PALETTE["trail"]，
+# 与主题同一对象，切换主题后就地更新），此处不再重复定义。
 
 TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 
@@ -60,7 +66,7 @@ class DeleteTrailDialog(QDialog):
             "回收站被清空后则无法还原。"
         )
         guide.setWordWrap(True)
-        guide.setStyleSheet("color: #6b7688; font-size: 12px;")
+        guide.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         lay.addWidget(guide)
 
         self.table = QTableWidget(0, 4)
@@ -206,7 +212,7 @@ class SevenZipSetupDialog(QDialog):
 
         self.progress_lbl = QLabel("")
         self.progress_lbl.setWordWrap(True)
-        self.progress_lbl.setStyleSheet("color: #1f6feb;")
+        self.progress_lbl.setStyleSheet(f"color: {PALETTE['accent_text']};")
         lay.addWidget(self.progress_lbl)
 
         row = QHBoxLayout()
@@ -229,7 +235,7 @@ class SevenZipSetupDialog(QDialog):
             "注：7-Zip 官方安装器要求管理员授权，隔离版安装时也会弹出一次 UAC，"
             "确认后仍只写入 %APPDATA%（不写入 Program Files）。")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #6b7688; font-size: 12px;")
+        note.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         lay.addWidget(note)
 
     def _build_message(self, info):
@@ -285,11 +291,13 @@ class SevenZipSetupDialog(QDialog):
 class SettingsDialog(QDialog):
     """设置：通知开关、剪贴板联动、二维码识别、轮询间隔等，改动即时生效并保存。"""
 
-    def __init__(self, state, hub, parent=None, on_hotkey_change=None):
+    def __init__(self, state, hub, parent=None, on_hotkey_change=None,
+                 on_theme_change=None):
         super().__init__(parent)
         self.state = state
         self.hub = hub
         self._hotkey_cb = on_hotkey_change
+        self._theme_cb = on_theme_change
         self.setWindowTitle("设置")
         self.setModal(True)
         self.resize(640, 520)
@@ -320,11 +328,32 @@ class SettingsDialog(QDialog):
         self._build_pages()
         self._cat_list.currentRowChanged.connect(self._stack.setCurrentIndex)
         self._cat_list.setCurrentRow(0)
-        # 设置项随版本增减会变高（如「网址信任」多一个单选项）；按内容自适应
-        # 初始尺寸并把最小高度抬到内容下限，否则长页首次打开会被压扁、文字被裁，
-        # 要拖动窗口才撑开。宽度维持 640，最小宽度仍允许横向压缩（长标签换行）。
-        self.setMinimumHeight(self.minimumSizeHint().height())
-        self.resize(640, max(520, self.sizeHint().height()))
+        # 高度按「最高的一页」自适应，并**延后到布局稳定后再算**：立刻算时，
+        # 切换过主题/风格后 sizeHint 可能还没刷新，首开会又矮又出滚动条。
+        # 宽度维持 640，最小宽度仍允许横向压缩（长标签换行）。
+        self.resize(640, 560)
+        QTimer.singleShot(0, self._fit_to_content)
+
+    def _fit_to_content(self):
+        """按最高的一页 + 非页面部分 计算窗口高度（与当前主题/风格无关）。"""
+        try:
+            page_h = 0
+            for i in range(self._stack.count()):
+                w = self._stack.widget(i)
+                if w is not None:
+                    page_h = max(page_h, w.sizeHint().height())
+            chrome = max(0, self.sizeHint().height()
+                         - self._stack.sizeHint().height())
+            target = min(max(520, page_h + chrome + 24), 900)
+            self.setMinimumHeight(min(target, 700))
+            self.resize(640, target)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 显示后再算一次：切换主题/风格后 sizeHint 可能滞后，延后一点更稳
+        QTimer.singleShot(30, self._fit_to_content)
 
     # ---------- 页面构建 ----------
     def _cfg_cb(self, key, text, default):
@@ -369,7 +398,7 @@ class SettingsDialog(QDialog):
         self._check_btn.setEnabled(False)
         self._update_btn.setEnabled(False)
         self._update_status.setText("正在检查更新…")
-        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+        self._update_status.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
 
         def _worker():
             status, latest = updater.check_latest_version()
@@ -394,21 +423,21 @@ class SettingsDialog(QDialog):
         if status != updater.STATUS_OK or not latest:
             # 网络失败 / 解析失败：不弹窗，提示行告知无法连接
             self._update_status.setText("无法连接 GitHub，请检查网络后重试")
-            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
             return
         cmp = updater.compare_versions(_ver, latest)
         if cmp == 1:
             self._update_status.setText(
                 f"发现新版本 {latest}（当前 {_ver}）")
-            self._update_status.setStyleSheet("color: #2e86c1; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['info']}; font-size: 12px;")
             self._latest_version = latest            # 供「前往下载更新」使用
             self._update_btn.setEnabled(True)   # 有更新才允许点击
         elif cmp == 0:
             self._update_status.setText(f"当前已是最新版本（{_ver}）")
-            self._update_status.setStyleSheet("color: #27ae60; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['success']}; font-size: 12px;")
         else:
             self._update_status.setText(f"当前版本（{_ver}）高于远端最新版")
-            self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
 
     def _open_update_page(self):
         """点击「前往下载更新」：执行自动更新（下载→校验→更新脚本→重启）。
@@ -419,16 +448,16 @@ class SettingsDialog(QDialog):
         latest = getattr(self, "_latest_version", None)
         if not latest:
             self._update_status.setText("请先点击「检查更新」")
-            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
             return
         self._update_btn.setEnabled(False)
         self._check_btn.setEnabled(False)
         self._update_status.setText("正在准备更新…")
-        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+        self._update_status.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
 
         def _progress(text):
             self._update_status.setText(text)
-            self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
 
         def _worker():
             status, msg = updater.apply_update(latest, progress_cb=_progress)
@@ -443,12 +472,12 @@ class SettingsDialog(QDialog):
         status, msg = self._update_result_cache
         if status == "ok":
             self._update_status.setText(msg)
-            self._update_status.setStyleSheet("color: #27ae60; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['success']}; font-size: 12px;")
             # 更新脚本已启动，程序即将被重启；给用户一点阅读时间
             QTimer.singleShot(1500, self.close)
         else:
             self._update_status.setText(msg)
-            self._update_status.setStyleSheet("color: #c0392b; font-size: 12px;")
+            self._update_status.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
             self._check_btn.setEnabled(True)
             self._update_btn.setEnabled(True)
 
@@ -520,7 +549,7 @@ class SettingsDialog(QDialog):
         # 托盘提示：主界面隐藏 / 已在运行 / 有待确认网址时弹出的托盘气泡，
         # 同样受总开关约束，另可各自单独关闭。
         tray_label = QLabel("托盘提示")
-        tray_label.setStyleSheet("color: #6b7688; font-size: 12px;")
+        tray_label.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         nl.addSpacing(4)
         nl.addWidget(tray_label)
         self.notify_trayed_cb = self._cfg_cb("notify_trayed", "已最小化到托盘", True)
@@ -533,10 +562,34 @@ class SettingsDialog(QDialog):
                    self.notify_trust_cb):
             nl.addWidget(cb)
 
+        # 网盘任务（实验性：百度网盘任务库）
+        baidu_label = QLabel("网盘任务（实验性）")
+        baidu_label.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
+        nl.addSpacing(4)
+        nl.addWidget(baidu_label)
+        self.notify_baidu_done_cb = self._cfg_cb(
+            "notify_baidu_done", "网盘下载批次完成", True)
+        self.notify_baidu_done_cb.setToolTip(
+            "实验性功能开启时：一个下载批次全部任务完成时通知。")
+        self.notify_baidu_leftover_cb = self._cfg_cb(
+            "notify_baidu_leftover", "启动时有未完成的网盘任务", True)
+        self.notify_baidu_leftover_cb.setToolTip(
+            "实验性功能开启时：启动发现仍有未完成的网盘任务时通知。")
+        self.notify_baidu_dup_cb = self._cfg_cb(
+            "notify_baidu_dup", "新任务与历史下载重复", False)
+        self.notify_baidu_dup_cb.setToolTip(
+            "实验性功能开启时：新任务在下载历史里已存在（同名同大小）时通知。")
+        for cb in (self.notify_baidu_done_cb, self.notify_baidu_leftover_cb,
+                   self.notify_baidu_dup_cb):
+            nl.addWidget(cb)
+
         self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
                              self.notify_failure_cb, self.notify_error_cb,
                              self.notify_trayed_cb, self.notify_running_cb,
-                             self.notify_trust_cb)
+                             self.notify_trust_cb,
+                             self.notify_baidu_done_cb,
+                             self.notify_baidu_leftover_cb,
+                             self.notify_baidu_dup_cb)
 
         def _on_notify_master(s):
             on = bool(s)
@@ -667,17 +720,17 @@ class SettingsDialog(QDialog):
         wl_label = QLabel("白名单（每行一个域名，含全部子域）")
         wl_label.setWordWrap(True)
         wl_label.setToolTip("命中即信任，可覆盖内置敏感地址拦截。")
-        wl_label.setStyleSheet("color: #3d4756; font-size: 12px;")
+        wl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
         self.wl_edit = self._trust_list_editor("whitelist")
         bl_label = QLabel("黑名单（每行一个域名，优先级最高）")
         bl_label.setWordWrap(True)
         bl_label.setToolTip("命中即静默拒绝。")
-        bl_label.setStyleSheet("color: #3d4756; font-size: 12px;")
+        bl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
         self.bl_edit = self._trust_list_editor("blacklist")
         note = QLabel("说明：私网 / 回环 / 链路本地 / 元数据等内置敏感地址默认拒绝，"
                       "即使选择「自动信任」也不会放行，只有手动加入白名单才会信任。")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #c0392b; font-size: 12px;")
+        note.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
         pages.append(("网址信任",
                       self._page_widget("网址信任", na_box, self.builtin_cb,
                                         self.tls_cb, wl_label, self.wl_edit,
@@ -695,7 +748,7 @@ class SettingsDialog(QDialog):
             "小文件夹先出现时监控 5 分钟等待目标。")
         pages.append(("解压", self._page_widget("解压", self.merge_cb, self.translate_cb)))
 
-        # ---------- 全局快捷键 ----------
+    # ---------- 全局快捷键 ----------
         hot_box = QGroupBox("全局快捷键")
         hot_box.setToolTip("用于唤起主界面。")
         hl = QVBoxLayout(hot_box)
@@ -725,6 +778,25 @@ class SettingsDialog(QDialog):
                       self._page_widget("7-Zip 管理", self._build_sevenzip_group())))
 
         # ---------- 常规 ----------
+        # 主题：跟随系统 / 浅色 / 深色（切换即时生效并记住偏好）
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("主题"))
+        self.theme_cb = QComboBox()
+        self.theme_cb.addItem("跟随系统", "auto")
+        self.theme_cb.addItem("浅色", "fluent")
+        self.theme_cb.addItem("深色", "devtool")
+        _cur = str(self.state.snapshot().get("ui_theme", "auto") or "auto").lower()
+        self.theme_cb.setCurrentIndex(
+            0 if _cur == "auto" else (1 if _cur == "fluent" else 2))
+        self.theme_cb.setToolTip(
+            "跟随系统：按 Windows 的「应用」深浅色自动选择\n"
+            "（启动不做检测、显示后再纠正，不影响启动速度）。\n"
+            "浅色 = Fluent 方案；深色 = DevTool 方案。切换即时生效。")
+        self.theme_cb.currentIndexChanged.connect(self._on_theme_changed)
+        self.theme_cb.setMinimumWidth(150)
+        theme_row.addWidget(self.theme_cb)
+        theme_row.addStretch(1)
+
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("轮询间隔(s)"))
         self.interval_spin = QSpinBox()
@@ -781,7 +853,7 @@ class SettingsDialog(QDialog):
         # 检查结果文本行（状态提示 / 新版本提示 / 网络失败提示）
         self._update_status = QLabel("")
         self._update_status.setWordWrap(True)
-        self._update_status.setStyleSheet("color: #3d4756; font-size: 12px;")
+        self._update_status.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
         ver_lay.addWidget(self._update_status)
         # 实验性功能（默认关闭）
         exp_box = QGroupBox("实验性功能")
@@ -793,14 +865,119 @@ class SettingsDialog(QDialog):
             "（BaiduYunGuanjia.db），用于还原下载批次、目录结构与分卷。\n"
             "只读打开、短连接、不写不锁，不影响正在运行的网盘客户端。")
         exp_lay.addWidget(self.experimental_cb)
+        # 手动诊断按钮：显式、只读、一次性，不受实验开关限制（始终可用）
+        diag_row = QHBoxLayout()
+        self.netdisk_diag_btn = QPushButton("立即读取网盘任务库")
+        self.netdisk_diag_btn.setToolTip(
+            "手动执行一次只读诊断：读取网盘客户端本地任务库\n"
+            "（BaiduYunGuanjia.db）并展示行数、轮询状态与活动任务。")
+        self.netdisk_diag_btn.clicked.connect(self._diagnose_netdisk_db)
+        diag_row.addWidget(self.netdisk_diag_btn)
+        diag_row.addStretch(1)
+        exp_lay.addLayout(diag_row)
 
         pages.append(("常规", self._page_widget(
-            "常规", interval_row, self.logcolor_cb, close_box, ver_box, exp_box)))
+            "常规", theme_row, interval_row, self.logcolor_cb, close_box,
+            ver_box, exp_box)))
+
+        # 「常规」提到最前：一打开设置页就是常规
+        for i, (name, _w) in enumerate(pages):
+            if name == "常规":
+                pages.insert(0, pages.pop(i))
+                break
 
         # 填充左侧分类列表与右侧页面栈
         for name, widget in pages:
             self._cat_list.addItem(name)
             self._stack.addWidget(widget)
+
+    # ---------- 主题 ----------
+    def _on_theme_changed(self, _idx=0):
+        """切换界面主题：记住偏好 + 即时应用（auto 时才读注册表）+ 通知主窗口。"""
+        try:
+            val = self.theme_cb.currentData() or "auto"
+            self.state.set("ui_theme", val)
+            from PyQt5.QtWidgets import QApplication
+            want = ui_style.resolve_theme(val)
+            ui_style.apply_theme(QApplication.instance(), want)
+            self.state.set("ui_theme_cached", want)
+            if self._theme_cb is not None:
+                self._theme_cb(want)
+        except Exception as e:
+            try:
+                self.hub.log(f"切换主题失败: {e}")
+            except Exception:
+                pass
+
+    # ---------- 网盘任务库诊断 ----------
+    @staticmethod
+    def _netdisk_diag_text(info):
+        """把 diagnose() 的 dict 结果整理成中文可读文本。"""
+        lines = [
+            f"数据库路径：{info.get('db_path') or '未找到'}",
+            f"选择原因：{info.get('db_source') or '—'}",
+        ]
+        dl = info.get("download_file_rows")
+        lines.append("download_file 行数："
+                     + ("读取失败" if dl is None else str(dl)))
+        hl = info.get("history_rows")
+        lines.append("历史行数：" + ("读取失败" if hl is None else str(hl)))
+        ival = info.get("interval")
+        ival_txt = f"{float(ival):g}" if isinstance(ival, (int, float)) else "未知"
+        degraded = bool(info.get("degraded"))
+        lines.append(f"当前轮询状态：{'降级' if degraded else '正常'}"
+                     f"（间隔 {ival_txt} 秒）")
+        lines.append(f"最近一次读失败原因：{info.get('error') or '无'}")
+        lines.append("活动任务清单：")
+        tasks = info.get("active") or []
+        if not tasks:
+            lines.append("  当前无活动下载任务")
+        else:
+            for t in tasks[:30]:
+                if isinstance(t, dict):
+                    path = t.get("local_path")
+                    size = t.get("file_size")
+                else:
+                    path, size = None, None
+                size_txt = f"（{size} 字节）" if size is not None else ""
+                lines.append(f"  · {path or '(无路径)'}{size_txt}")
+            if len(tasks) > 30:
+                lines.append(f"  …等共 {len(tasks)} 个")
+        if not info.get("found"):
+            lines.append("\n未找到网盘任务库：实验性功能或百度网盘客户端可能不可用。")
+        return "\n".join(lines)
+
+    def _diagnose_netdisk_db(self):
+        """「立即读取网盘任务库」：手动执行一次只读诊断并以只读弹窗展示。
+
+        懒加载 baidu_task 模块，绝不因模块缺失/损坏影响设置对话框；
+        整个流程包在 try/except 里，任何失败只以弹窗报告、绝不抛出。"""
+        try:
+            from ..baidu_task import diagnose
+            info = diagnose()
+            text = self._netdisk_diag_text(info)
+            dlg = QDialog(self)
+            dlg.setWindowTitle("网盘任务库诊断")
+            dlg.setModal(True)
+            dlg.setMinimumSize(480, 320)
+            dlg.resize(560, 420)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(14, 12, 14, 12)
+            lay.setSpacing(10)
+            edit = QPlainTextEdit(text)
+            edit.setReadOnly(True)   # 只读，长路径可滚动、可选中复制
+            lay.addWidget(edit, 1)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            close_btn = QPushButton("关闭")
+            close_btn.clicked.connect(dlg.accept)
+            row.addWidget(close_btn)
+            lay.addLayout(row)
+            dlg.exec_()
+        except Exception as e:
+            QMessageBox.warning(
+                self, "网盘任务库诊断",
+                f"诊断失败：{e}\n\n实验性功能模块或百度网盘客户端可能不可用。")
 
     # ---------- 全局快捷键 ----------
     def _notify_hotkey_change(self):
@@ -860,7 +1037,7 @@ class SettingsDialog(QDialog):
                       "密码经 stdin 管道传给 7z，不会出现在命令行（任务管理器/WMI 看不到）。\n"
                       "隔离版安装会弹一次 UAC（官方安装器要求），但仍只写入 %APPDATA%。")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #6b7688; font-size: 12px;")
+        note.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         gl.addWidget(note)
 
         self._7z_refresh_status()
@@ -992,7 +1169,7 @@ class CloseActionDialog(QDialog):
             "不勾选则仅本次生效，下次关闭仍会询问。\n"
             "如误触关闭，按 Esc 或点标题栏 × 即可取消。")
         info.setWordWrap(True)
-        info.setStyleSheet("color: #3d4756; font-size: 13px;")
+        info.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 13px;")
         lay.addWidget(info)
 
         self.remember_cb = QCheckBox("不再提示（保存本次选择为默认行为）")
@@ -1073,7 +1250,8 @@ class TrustAskDialog(QDialog):
                 "自动访问或打开可能带来安全风险。请确认是否真的信任它。")
             warn.setWordWrap(True)
             warn.setStyleSheet(
-                "color: #c0392b; background: #ffe4e4; border: 1px solid #f2c2c2;"
+                f"color: {PALETTE['warn_text']}; background: {PALETTE['warn_bg']}; "
+                f"border: 1px solid {PALETTE['warn_border']};"
                 " border-radius: 6px; padding: 8px;")
             lay.addWidget(warn)
 
@@ -1087,7 +1265,7 @@ class TrustAskDialog(QDialog):
             "· 永久拒绝 —— 加入黑名单（含其全部子域），此后静默拒绝。\n\n"
             "如不确定，建议选择「拒绝打开」。按 Esc / 标题栏 × 等同于拒绝。")
         info.setWordWrap(True)
-        info.setStyleSheet("color: #3d4756; font-size: 13px;")
+        info.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 13px;")
         lay.addWidget(info)
 
         row1 = QHBoxLayout()

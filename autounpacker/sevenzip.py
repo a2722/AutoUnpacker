@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-7-Zip 管理模块：版本发现/检测、隔离版与全局版安装、卸载。
+"""7-Zip 管理：版本发现/检测、隔离版与全局版的下载安装、卸载。
 
-设计要点：
-- 隔离版存放在 %APPDATA%\\AutoUnpacker\\7z，不污染项目目录，也不影响全局环境。
-- 下载只发生在用户明确同意之后（首次启动检测弹窗 / 设置里的按钮），不捆绑任何二进制。
-- 版本门槛：低于 MIN_VERSION 的 7-Zip 无法通过 stdin 传密码（密码只能拼在命令行，
-  会被任务管理器/WMI 窥探），一律视为「低版本」，需升级后才能使用。
-- 版本检测结果按 exe 路径缓存；安装/卸载后调用 invalidate_cache() 使缓存失效。
+职责：- get_version()/check_version_ok() 读取 7z 版本并判断是否达 stdin 传密码门槛（18.00+），结果按路径缓存
+- install_isolated()/install_global() 从官网下载并静默安装（免提权走 Windows 自带 tar 解 extra 包，否则 UAC）
+- uninstall_isolated()/uninstall_system() 卸载（隔离版绝不被系统版卸载误伤）
+关键入口：check_environment() / install_isolated() / install_global() / uninstall_isolated()
+依赖：urllib.request、ctypes（UAC 提权）、Windows 自带 tar.exe
+注意：隔离版装在 %APPDATA%\\AutoUnpacker\\7z，不污染项目与全局；低于 MIN_VERSION 的 7-Zip 无法经 stdin 传密码，一律需升级
 """
 import ctypes
 import os

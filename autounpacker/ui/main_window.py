@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""主窗口 MainWindow：监听卡片管理、托盘、日志、暂停、快捷键、网址信任。"""
+"""主窗口 MainWindow：监听卡片管理、托盘、日志、暂停/恢复、全局快捷键、网址信任、拖放临时解压。
+
+职责：- 组装主界面（监听路径卡片、日志区、进度条）并定时消费 Hub 队列
+- 托盘图标与最小化到托盘、单实例事件响应、Esc/Ctrl+W 关闭行为
+- 全局热键注册（RegisterHotKey + 原生事件过滤）、网址信任确认弹窗调度
+- 拖入文件临时解压、首次启动 7-Zip 检测
+关键入口：MainWindow / _first_run_7z_check()
+依赖：PyQt5、hub、state、extract、dialogs、widgets、password_book、trust
+注意：stdout 捕获与 Qt 插件路径由 app.main 统一处理，本模块不重复安装
+"""
 import html
 import queue
 import threading
@@ -17,6 +26,8 @@ from ..trust import _host_matches
 from ..password_book import PasswordBookDialog
 from .widgets import (WatchCard, RainbowBorderButton, make_tray_icon,
                       _HotkeyFilter)
+from . import style as ui_style
+from .style import PALETTE
 from .dialogs import (SettingsDialog, DeleteTrailDialog, SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog)
 
@@ -51,9 +62,13 @@ class MainWindow(QMainWindow):
             self._show_check.start(400)
         app = QApplication.instance()
         if app is not None:
-            self._hotkey_filter = _HotkeyFilter(self._show_window)
+            self._hotkey_filter = _HotkeyFilter(
+                self._show_window, self._on_system_theme_changed)
             app.installNativeEventFilter(self._hotkey_filter)
-        self._register_hotkey()
+        # 全局快捷键：**等窗口显示后再注册**。在 __init__ 里立刻注册时，winId()
+        # 拿到的原生窗口句柄可能尚未“坐实”，偶发 RegisterHotKey 失败(1400 无效句柄)；
+        # 延后注册 + 失败重试可彻底消除这个启动偶发。
+        QTimer.singleShot(600, self._register_hotkey)
         # 主界面快捷键：Esc / Ctrl+W 触发关闭（走 close_action 逻辑：
         # 询问弹窗 / 隐藏到托盘 / 关闭程序）。仅主界面激活时生效，
         # 模态对话框（设置/密码本等）打开时不干扰。
@@ -379,13 +394,14 @@ class MainWindow(QMainWindow):
     # ---------- 控制 ----------
     def _open_settings(self):
         dlg = SettingsDialog(self.state, self.hub, self,
-                             on_hotkey_change=self._register_hotkey)
+                             on_hotkey_change=self._register_hotkey,
+                             on_theme_change=self.on_theme_changed)
         dlg.exec_()
 
     def _add_path(self):
         cfg = self.state.snapshot()
         entry = {"path": "", "enabled": True, "output_dir": "",
-                 "delete_source": False}
+                 "delete_source": False, "mode": "surface"}
         cfg["watch_paths"].append(entry)
         self.state.set("watch_paths", cfg["watch_paths"])
         self.rebuild_cards()
@@ -419,7 +435,8 @@ class MainWindow(QMainWindow):
                                         f"该目录已在监听中：\n{root}")
                 return
             entries.append({"path": str(root), "enabled": True,
-                            "output_dir": "", "delete_source": False})
+                            "output_dir": "", "delete_source": False,
+                            "mode": "baidu"})
             self.state.set("watch_paths", entries)
             self.rebuild_cards()
             self.hub.log(f"已把百度网盘下载目录加入监听: {root}")
@@ -479,19 +496,78 @@ class MainWindow(QMainWindow):
             return
         m = msg
         if "失败" in m or "出错" in m or "错误" in m:
-            color = "#ff8080"      # 错误：红
+            color = PALETTE["log_error"]      # 错误：红
         elif "完成" in m or "成功" in m or "开始监听" in m:
-            color = "#8be28b"      # 成功：绿
+            color = PALETTE["log_success"]    # 成功：绿
         elif ("发现压缩包" in m or "开始智能解压" in m or "已捕获临时密码" in m
               or "识别到二维码" in m or "正在打开" in m or "归位" in m
               or "翻译" in m or "网址" in m):
-            color = "#7fb6ff"      # 信息：蓝
+            color = PALETTE["log_info"]       # 信息：蓝
         elif ("分卷" in m or "下载未完成" in m or "密码" in m
               or "超时" in m or "监控" in m or "等待" in m):
-            color = "#f2c97d"      # 等待/提示：黄
+            color = PALETTE["log_wait"]       # 等待/提示：黄
         else:
-            color = "#d8e0ea"      # 默认：灰白
+            color = PALETTE["log_default"]    # 默认
         self.log_box.appendHtml(f'<span style="color:{color}">{html.escape(msg)}</span>')
+
+    # ---------- 主题（深浅色）----------
+    def _on_system_theme_changed(self):
+        """系统深浅色切换（WM_SETTINGCHANGE）→ 仅当偏好为 auto 时跟随。"""
+        try:
+            pref = str(self.state.snapshot().get("ui_theme", "auto")).lower()
+            if pref != "auto":
+                return
+            want = ui_style.detect_system_theme()
+            if want == ui_style.current_theme():
+                return
+            ui_style.apply_theme(QApplication.instance(), want)
+            self.on_theme_changed(want)
+            self.state.set("ui_theme_cached", want)
+        except Exception:
+            pass
+
+    def on_theme_changed(self, theme):
+        """主题已切换：重建卡片 + 重设标题栏 + 记一条日志（内联色取自 PALETTE）。"""
+        try:
+            self.rebuild_cards()
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(0, self._apply_titlebar)
+        except Exception:
+            pass
+        try:
+            self.hub.log(f"界面主题已切换: {theme}")
+        except Exception:
+            pass
+
+    def _apply_titlebar(self):
+        """深色主题时把 Windows 原生标题栏也变深。
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE：新系统属性号 20，旧版 Win10 用 19（两个都试）。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+            dark = 1 if ui_style.current_theme() == "devtool" else 0
+            hwnd = wintypes.HWND(int(self.winId()))
+            v = ctypes.c_int(dark)
+            dwm = ctypes.windll.dwmapi
+            for attr in (20, 19):
+                try:
+                    if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v),
+                                                 ctypes.sizeof(v)) == 0:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_titlebar_done", False):
+            self._titlebar_done = True
+            QTimer.singleShot(0, self._apply_titlebar)
 
     def _drain(self):
         while True:
@@ -607,7 +683,9 @@ class MainWindow(QMainWindow):
         self.pause_btn.style().polish(self.pause_btn)
 
     # ---------- 全局快捷键 ----------
-    def _register_hotkey(self):
+    def _register_hotkey(self, _retry=0):
+        if not isinstance(_retry, int):
+            _retry = 0
         self._unregister_hotkey()
         if win32gui is None:
             return
@@ -630,7 +708,13 @@ class MainWindow(QMainWindow):
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk)
             self.hub.log(f"全局快捷键已注册: {combo}")
         except Exception as e:
-            self.hub.log(f"全局快捷键注册失败: {e}")
+            # 启动瞬间偶发失败（例如窗口句柄尚未就绪，error 1400 "无效的窗口句柄"）。
+            # 稍后重试：最多 3 次，避免「偶发注册不上」让热键长期失效。
+            if _retry < 3:
+                self.hub.log(f"全局快捷键注册失败，稍后重试({_retry + 1}/3): {e}")
+                QTimer.singleShot(1200, lambda: self._register_hotkey(_retry + 1))
+            else:
+                self.hub.log(f"全局快捷键注册失败: {e}")
 
     def _unregister_hotkey(self):
         if win32gui is None:

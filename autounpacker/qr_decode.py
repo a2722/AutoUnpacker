@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """二维码图片解码（多引擎），独立模块供子进程隔离调用。
 
-cv2 / pyzbar / PIL 等原生库在极端输入下可能段错误或写坏堆（0xc0000374），
-把解码放到独立子进程执行可避免拖垮常驻主程序。
+职责：- decode_qr_image() 依次用 cv2.QRCodeDetector（多尺度放大）、pyzbar、锐化二值化兜底三个引擎解码
+- 返回去重后的文本列表
+关键入口：decode_qr_image()
+依赖：numpy、cv2、pyzbar、PIL（惰性导入）
+注意：cv2 / pyzbar / PIL 在极端输入下可能段错误或写坏堆（0xc0000374），本模块应在独立子进程执行，避免拖垮常驻主程序
 """
 import numpy as np
 

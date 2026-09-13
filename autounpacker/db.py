@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-统一 SQLite 小数据库（toolbox.db）
-- 共享密码本（原存 config.json）
-- 密码字典（原存 ~/.smart_extract_password_dict.json）
-- 未来查表功能在此追加新表即可
+"""统一 SQLite 小数据库（toolbox.db）：共享密码本、密码字典、百度粘性记忆、旧数据迁移。
+
+职责：- 维护 passwords / password_dict / baidu_sticky 三张表（连接时自动建表，WAL 模式）
+- 共享密码本与密码字典的增删查（原存 config.json 与 ~/.smart_extract_password_dict.json）
+- 百度清单模式的粘性记忆（sticky_remember/sticky_known/sticky_list/sticky_prune）
+- migrate_legacy() 把旧 config 密码列表 / 旧字典 json 一次性迁入数据库
+关键入口：init_db() / get_passwords() / add_password() / load_password_dict() / sticky_remember() / migrate_legacy()
+依赖：sqlite3、paths.DATA_DIR
+注意：所有操作持模块级线程锁且 check_same_thread=False；未来查表功能在此追加新表即可
 """
 import json
 import sqlite3
@@ -28,6 +32,13 @@ CREATE TABLE IF NOT EXISTS password_dict (
     password TEXT PRIMARY KEY,
     used_count INTEGER NOT NULL DEFAULT 0,
     last_used_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS baidu_sticky (
+    path TEXT PRIMARY KEY,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'file',
+    note TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -148,6 +159,44 @@ def add_dict_password(password):
             conn.commit()
         finally:
             conn.close()
+
+
+# ---------- 百度清单模式：粘性记忆 ----------
+def sticky_remember(path, kind="file", note=""):
+    """记住一个「属于本次网盘下载」的路径（跨重启 / 客户端清历史后仍认得）。"""
+    p = str(path or "").strip()
+    if not p:
+        return
+    now = int(time.time())
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT INTO baidu_sticky (path, first_seen, last_seen, kind, note) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET last_seen = ?, kind = ?, note = ?",
+                (p, now, now, str(kind), str(note), now, str(kind), str(note)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def sticky_known(path):
+    rows = _execute("SELECT 1 FROM baidu_sticky WHERE path = ? LIMIT 1",
+                    (str(path or ""),), fetch=True)
+    return bool(rows)
+
+
+def sticky_list(limit=1000):
+    return _execute(
+        "SELECT path, first_seen, last_seen, kind, note FROM baidu_sticky "
+        "ORDER BY last_seen DESC LIMIT ?", (int(limit),), fetch=True)
+
+
+def sticky_prune(keep_days=7):
+    """清理长期未再出现的记录（默认保留 7 天）。"""
+    cutoff = int(time.time()) - int(keep_days) * 86400
+    _execute("DELETE FROM baidu_sticky WHERE last_seen < ?", (cutoff,))
 
 
 # ---------- 旧数据迁移 ----------

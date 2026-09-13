@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""共享配置状态（AppState）：GUI 写、后台线程读；临时密码本机生命周期管理。"""
+"""共享应用状态 AppState：GUI 写、后台线程读；临时密码本机生命周期管理。
+
+职责：- 线程安全的配置读写（snapshot/set/update_path/set_path）
+- 长期密码本代理到 toolbox.db（passwords/set_passwords/all_passwords）
+- 临时密码的捕获、过期裁剪、条数上限、开机内持久化（temp_passwords.json）
+关键入口：AppState
+依赖：db、config.save_config、utils（_boot_time/_boot_tick）
+注意：临时密码生命周期 = 本次系统启动（程序重启不丢，系统重启自动失效）
+"""
 import json
 import os
 import threading

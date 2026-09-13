@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""程序入口：单实例检测、依赖探测、后台线程启动、GUI 组装。"""
+"""程序入口：单实例检测、Qt 插件路径注入、后台线程启动、GUI 组装。
+
+职责：- 在导入 PyQt5 前注入 Qt 平台插件路径（修复 venv 下 no Qt platform plugin）
+- 单实例检测（命名事件 + --force 强制新开）、crash.log 与 faulthandler 安装
+- 初始化日志/数据库/配置，启动 FolderWatcher 与 QRMonitor 后台线程
+- 组装 QApplication 与 MainWindow，处理首次启动的 7-Zip 检测
+关键入口：main()
+依赖：paths / extract / trail / db / config / state / hub / monitors / ui（PyQt5）
+注意：仅支持 Windows；PyQt5 必须在 Qt 插件路径注入之后才可导入
+"""
 import os
 import sys
 
@@ -167,7 +176,7 @@ def main():
     try:
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QTimer
-        from .ui.style import STYLE
+        from .ui import style as ui_style
         from .ui.main_window import MainWindow, _first_run_7z_check
     except Exception:
         try:
@@ -182,10 +191,35 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(STYLE)
+
+    # 主题：启动**不做任何系统检测**（零启动开销），先用「上次记住的主题」出首屏；
+    # 窗口显示后再检测纠正一次；之后靠 WM_SETTINGCHANGE 跟随系统切换（零轮询）。
+    _pref = str(cfg.get("ui_theme", "auto") or "auto").lower()
+    _cached = str(cfg.get("ui_theme_cached") or "").lower()
+    if _pref in ui_style.THEMES:
+        _theme0 = _pref
+    else:
+        _theme0 = _cached if _cached in ui_style.THEMES else ui_style.DEFAULT_THEME
+    ui_style.apply_theme(app, _theme0)
+
     win = MainWindow(state, hub, show_event, pauser)
     if not autostart:
         win.show()
+
+    def _sync_theme_after_show():
+        """显示后再纠正主题：仅当解析结果与当前不同才切；结果记进配置供下次零检测启动。"""
+        try:
+            pref = str(state.snapshot().get("ui_theme", "auto") or "auto").lower()
+            want = ui_style.resolve_theme(pref)
+            if want != ui_style.current_theme():
+                ui_style.apply_theme(app, want)
+                win.on_theme_changed(want)
+            if (state.snapshot().get("ui_theme_cached") or "") != want:
+                state.set("ui_theme_cached", want)
+        except Exception:
+            pass
+
+    QTimer.singleShot(900, _sync_theme_after_show)
 
     # 首次启动：后台检测 7-Zip（仅首次或手动「立即检查」，其他时间不检查以免阻塞）
     if not cfg.get("sevenzip_check_done", False):

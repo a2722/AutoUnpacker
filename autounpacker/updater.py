@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
-"""版本检查与自动更新模块：向 GitHub Releases API 查询最新版本、下载新版。
+"""版本检查与自动更新：查询 GitHub Releases、下载新版并生成 update.bat 自更新。
 
-设计约束：
-- 绝不主动拉取：只有用户点击「检查更新」按钮才发起网络请求；
-- 网络失败不弹窗：返回结果由调用方在 UI 里以文本行展示（"无法连接 GitHub"）；
-- 版本比较按语义化版本（major.minor.patch，忽略 v 前缀）；
-- 自动更新流程：下载新版 zip → 校验 → 解压到临时目录 → 生成 update.bat
-  （结束当前进程 → 备份旧代码 → 覆盖新代码 → 重启程序）。数据文件
-  （config.json / toolbox.db / temp_passwords.json / deletion_trail.json /
-  logs / backup）绝不覆盖。
+职责：- check_latest_version() 查询最新 tag；compare_versions() 语义化版本比较
+- download_release_zip()/verify_release_zip() 下载并校验更新包（防 zip slip）
+- apply_update() 生成 update.bat：结束进程 → 备份旧代码 → 覆盖新代码 → 重启程序
+关键入口：check_latest_version() / apply_update() / compare_versions()
+依赖：urllib.request、zipfile、GitHub API（a2722/AutoUnpacker，无认证 60 次/小时）
+注意：绝不主动拉取（仅用户点击按钮触发）；config.json/toolbox.db/logs/backup 等数据文件绝不覆盖
 """
 import json
 import os

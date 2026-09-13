@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""二维码解码子进程：主程序把图片/原始字节存到临时文件后调用本脚本。
+"""二维码解码子进程：加载图片并调用 qr_decode 解码，隔离原生库崩溃。
 
-原生库（cv2/pyzbar/PIL）崩溃只影响本进程，不影响常驻主程序。
-用法:
-    pythonw qr_worker.py <文件路径>
-解码结果逐行输出到 stdout（每行一个文本）；非零退出码表示失败/崩溃。
+职责：- 从命令行参数读图片路径，PIL 加载后交 decode_qr_image() 解码
+- 结果逐行输出到 stdout；强制 stdout/stderr 为 UTF-8 与父进程对齐
+关键入口：main()
+依赖：PIL、qr_decode
+注意：退出码 0=成功，2=缺参数，3=图片打开失败，4=解码失败；崩溃只影响本进程
 """
 import os
 import sys

@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Hub：后台线程 → GUI 的消息队列 + 日志落盘；StdoutCapture 把 print 转发到 Hub。"""
+"""Hub 消息中枢：后台线程 → GUI 的队列 + 日志落盘；StdoutCapture 把 print 转发进 GUI。
+
+职责：- Hub.log()/notify() 投递日志与通知到队列并写 logs\\YYYY-MM-DD.log
+- 单日日志防爆（200MB 上限 / 单行截断）+ 14 天旧日志清理
+- notify 按类型开关过滤（NOTIFY_KEYS 映射配置项）
+- StdoutCapture 幂等包装 sys.stdout，把 pythonw 下的 print 转发为 Hub 日志
+关键入口：Hub / install_stdout_capture() / restore_stdout_capture()
+依赖：paths.LOGS_DIR、queue/threading
+注意：stdout 捕获只在进程入口（app.main）安装一次，勿在工作线程里重复安装
+"""
 import io
 import queue
 import sys
@@ -26,6 +35,10 @@ class Hub:
         "智能解压完成": "notify_success",
         "智能解压失败": "notify_failure",
         "智能解压出错": "notify_error",
+        # 实验性：百度网盘任务库（A/B/C/D）
+        "网盘下载完成": "notify_baidu_done",
+        "网盘任务未完成": "notify_baidu_leftover",
+        "网盘重复下载": "notify_baidu_dup",
     }
 
     def __init__(self, state=None):

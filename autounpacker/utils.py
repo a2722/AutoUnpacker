@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""通用工具：开机时间点、配置路径规范化、文件占用检测、崩溃日志。"""
+"""通用工具：开机时间点、配置路径规范化、文件占用检测、崩溃日志。
+
+职责：- _boot_tick()/_boot_time() 识别「同一次系统启动」（GetTickCount64）
+- _norm_path_for_cfg() 配置路径去重规范化
+- _can_open_append() 检测文件是否被其他进程独占（下载器写入中）
+- _install_crash_log() 把未捕获异常追加进 crash.log（不吞掉原有 excepthook）
+关键入口：_boot_time() / _boot_tick() / _can_open_append() / _install_crash_log()
+依赖：ctypes、sys、threading、paths
+注意：_can_open_append 绝不用 "ab" 模式打开（会凭空重建 0 字节幽灵文件）
+"""
 import ctypes
 import os
 import sys

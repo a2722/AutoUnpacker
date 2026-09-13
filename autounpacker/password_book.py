@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""共享密码本模块：所有监听目录共用一个长期密码本 + 运行期临时密码"""
+"""共享密码本对话框：长期密码编辑 + 临时密码查看，所有监听目录共用。
+
+职责：- PasswordBookDialog 提供长期密码（每行一个）编辑、排序、查重
+- 只读展示运行期临时密码，QTimer 轮询实时同步（不打断用户选中/滚动）
+- 保存时写入 state（长期密码存 toolbox.db）
+关键入口：PasswordBookDialog / parse_password_text()
+依赖：PyQt5、state.AppState
+注意：密码按换行分隔（不再用逗号）；临时密码由后台剪贴板线程写入 state，此处只展示
+"""
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
@@ -7,6 +15,8 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QCheckBox, QPushButton, QMessageBox,
     QSplitter, QWidget,
 )
+
+from .ui.style import PALETTE
 
 def parse_password_text(text):
     """按行解析密码文本（换行分隔），去掉空行并去重，保持顺序"""
@@ -57,7 +67,7 @@ class PasswordBookDialog(QDialog):
         dedup_btn = QPushButton("查重清理")
         dedup_btn.clicked.connect(self._dedup)
         self.count_lbl = QLabel()
-        self.count_lbl.setStyleSheet("color: #6b7688;")
+        self.count_lbl.setStyleSheet(f"color: {PALETTE['muted']};")
         tool_row.addWidget(sort_btn)
         tool_row.addWidget(dedup_btn)
         tool_row.addStretch(1)

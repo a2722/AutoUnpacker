@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""配置：默认值、净化、读取、原子保存、全局快捷键解析。"""
+"""配置中心：默认值、净化、读取、原子保存、全局快捷键解析。
+
+职责：- 维护 DEFAULT_CONFIG 全部配置项（通知/二维码/信任/实验性等开关）
+- _sanitize_cfg() 净化与迁移旧版配置（旧路径密码并入全局密码本、补默认值）
+- load_config() 读取合并、损坏时备份回退默认；save_config() 原子写入
+- parse_hotkey() 把 'Ctrl+Alt+W' 解析为 (mods, vk)，供全局快捷键注册
+关键入口：load_config() / save_config() / parse_hotkey() / _sanitize_cfg()
+依赖：paths（配置文件路径）、utils._norm_path_for_cfg
+注意：保存必须走 save_config()（先写 .tmp 再 os.replace），半截 JSON 会导致下次启动整个配置被静默重置
+"""
 import json
 import os
 import time
@@ -17,6 +26,9 @@ DEFAULT_CONFIG = {
     "notify_trayed": True,            # 托盘提示：已最小化到托盘
     "notify_already_running": True,   # 托盘提示：程序已在运行，已打开主界面
     "notify_trust_pending": True,     # 托盘提示：有新的网址等待确认
+    "notify_baidu_done": True,        # 实验性：网盘下载批次完成
+    "notify_baidu_leftover": True,    # 实验性：启动时有未完成的网盘任务
+    "notify_baidu_dup": False,        # 实验性：新任务与历史下载重复（默认关，避免打扰）
     "qr_clipboard_action": "none",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
     "qr_url_redirect": True,
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
@@ -51,6 +63,8 @@ DEFAULT_CONFIG = {
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
+    "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
+    "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
 
 
@@ -84,6 +98,10 @@ def _sanitize_cfg(cfg):
                 "enabled": bool(p.get("enabled", True)),
                 "output_dir": str(p.get("output_dir") or ""),
                 "delete_source": bool(p.get("delete_source", False)),
+                # 监听模式：surface=只扫表层（原有，安全）
+                #          baidu  =额外按百度网盘任务清单处理子目录里的压缩包/分卷
+                "mode": ("baidu" if str(p.get("mode") or "").lower() == "baidu"
+                         else "surface"),
             })
         cfg["watch_paths"] = clean
         cfg["passwords"] = global_passwords
@@ -100,6 +118,9 @@ def _sanitize_cfg(cfg):
         cfg["notify_trayed"] = bool(cfg.get("notify_trayed", True))
         cfg["notify_already_running"] = bool(cfg.get("notify_already_running", True))
         cfg["notify_trust_pending"] = bool(cfg.get("notify_trust_pending", True))
+        cfg["notify_baidu_done"] = bool(cfg.get("notify_baidu_done", True))
+        cfg["notify_baidu_leftover"] = bool(cfg.get("notify_baidu_leftover", True))
+        cfg["notify_baidu_dup"] = bool(cfg.get("notify_baidu_dup", False))
         action = str(cfg.get("qr_clipboard_action", "none"))
         cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "none"
         cfg["qr_url_redirect"] = bool(cfg.get("qr_url_redirect", True))
@@ -148,6 +169,10 @@ def _sanitize_cfg(cfg):
         cfg["tls_skip_verify"] = bool(cfg.get("tls_skip_verify", False))
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
+        _ut = str(cfg.get("ui_theme", "auto") or "auto").strip().lower()
+        cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
+        _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()
+        cfg["ui_theme_cached"] = _utc if _utc in ("fluent", "devtool") else ""
     except Exception:
         pass
     return cfg

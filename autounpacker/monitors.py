@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-"""后台监控线程：
-- FolderWatcher：监听目录轮询，智能解压（嵌套/密码/分卷/伪装/隐写/删除回溯）
-- QRMonitor：剪贴板监控（二维码识别 + 短文本临时密码捕获 + 网址信任门卫）
+"""后台监控线程：目录轮询智能解压 + 剪贴板/二维码监控。
+
+职责：- FolderWatcher：轮询监听目录表层，识别压缩包并触发智能解压（嵌套/密码/分卷/伪装/删除回溯）
+- 分卷到齐判断、翻译 JSON 归位、百度清单模式（Tier-2 子目录处理，只增强不阻断）
+- QRMonitor：剪贴板二维码识别 + 短文本临时密码捕获 + 网址信任门卫（黑白名单判定）
+关键入口：FolderWatcher / QRMonitor
+依赖：extract、trail、db、trust、baidu_task（实验性，惰性导入）
+注意：剪贴板/二维码依赖（win32clipboard/PIL）为惰性探测，缺失时自动禁用相关功能
 """
 import os
 import queue
@@ -74,6 +79,9 @@ class FolderWatcher(threading.Thread):
     TRANSLATION_MAX_SIZE = 10 * 1024 * 1024  # 翻译 json 最大 10MB
     TRANSLATION_WINDOW = 5 * 60              # 小文件夹先出现时的监控窗口（秒）
     VOL_MAX_WAIT = 300   # 首卷分卷"只有满卷"时最长等待(秒)：之后兜底按现状尝试解压
+    BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
+    BT_PROGRAM_EXT = {".exe", ".dll", ".bat", ".cmd", ".lnk", ".msi", ".sys",
+                      ".scr", ".com", ".ocx"}
 
     def __init__(self, state, hub, pauser=None):
         super().__init__(daemon=True)
@@ -91,6 +99,12 @@ class FolderWatcher(threading.Thread):
         self._vol_wait = {}
         # 输出文件被占用的重试计数 {abs_path: 次数}（上限 3 次，防死循环）
         self._lock_retry = {}
+        # 百度清单模式（Tier-2）：已处理集合 / 稳定观察 / 已告警 / 粘性记忆缓存
+        self._bt_seen = {}      # {watch_key: set(norm_abs_path)}
+        self._bt_probe = {}     # {watch_key: {norm_abs_path: (size, 稳定起始时间)}}
+        self._bt_warned = set()
+        self._bt_sticky = None  # set(norm_abs_path)，来自 toolbox.db 的粘性记忆
+        self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
 
     @staticmethod
     def _file_identity(path):
@@ -144,8 +158,29 @@ class FolderWatcher(threading.Thread):
         # 只监听文件夹表面的一层文件，不递归子孙文件夹
         if not watch.is_dir():
             return
+        # 输出目录与监听根重叠（等于 / 在其内部）→ 可能「自己吃自己」，提示一次
+        try:
+            od = str(wc.get("output_dir") or "").strip()
+            if od:
+                okey = self._norm_path(od)
+                wkey = self._norm_path(watch)
+                if (okey == wkey or okey.startswith(wkey + os.sep)):
+                    if wkey not in self._out_warned:
+                        self._out_warned.add(wkey)
+                        self.hub.log(
+                            f"提示：监听路径与解压输出目录重叠，可能自我循环: "
+                            f"{watch} ↔ {od}")
+        except Exception:
+            pass
         # 翻译 JSON 归位检查（基于根目录下的文件夹，与文件监听相互独立）
         self._translation_check(watch)
+        # 百度清单模式（Tier-2）：额外处理下载到子目录里的压缩包/分卷。
+        # 只增强、不阻断：清单不可用就什么都不做，等于退回表层模式。
+        if str(wc.get("mode") or "") == "baidu":
+            try:
+                self._baidu_poll(watch, wc)
+            except Exception as e:
+                self.hub.log(f"百度清单模式处理出错 ({watch}): {e}")
         key = self._norm_path(watch)
         if key not in self.seen:
             try:
@@ -197,6 +232,113 @@ class FolderWatcher(threading.Thread):
                 probe[name] = self.PROBE_CYCLES
         # 分卷未到齐被推迟的文件不记入 seen，下轮会重新检查
         self.seen[key] = current - deferred
+
+    # ---------- 百度清单模式（Tier-2，实验性；只增强不阻断）----------
+    def _bt_sticky_set(self):
+        """粘性记忆（toolbox.db），懒加载一次；存放归一化后的路径。"""
+        if self._bt_sticky is None:
+            s = set()
+            try:
+                from . import db as _db
+                for row in _db.sticky_list(5000):
+                    path, _first, _last, kind, _note = row
+                    if str(kind) != "program":   # 程序目录单独标记，不算「我们的文件」
+                        s.add(self._norm_path(path))
+            except Exception:
+                s = set()
+            self._bt_sticky = s
+        return self._bt_sticky
+
+    def _looks_like_program_dir(self, d):
+        """目录内是否有可执行/程序文件（避免把程序自带的压缩包解开）。"""
+        try:
+            for e in d.iterdir():
+                if e.is_file() and e.suffix.lower() in self.BT_PROGRAM_EXT:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _baidu_poll(self, watch, wc):
+        """按百度网盘任务清单，处理下载到子目录里的压缩包/分卷。
+
+        只在监听路径 mode=='baidu' 时调用。安全铁律：
+        - **清单外的路径一律不碰**（这是"只扫表层"之外的唯一扩展，白名单语义）；
+        - 只处理「任务已完成(state=done)」或「我们之前确实处理过(粘性记忆)」的路径；
+        - 大小需连续稳定 BT_STABLE_SEC 秒、且不是 `.baiduyun.p.downloading`；
+        - 疑似程序目录（含 exe/dll/...）只记一条日志、不自动解压；
+        - 任何异常都吞掉并回退到表层模式，绝不阻断。
+        """
+        from . import baidu_task as bt
+        if not bt.is_enabled(self.state):
+            return
+        try:
+            manifest = bt.expected_files()
+        except Exception:
+            return
+        if not manifest:
+            return
+        root = self._norm_path(watch)
+        seen = self._bt_seen.setdefault(root, set())
+        probe = self._bt_probe.setdefault(root, {})
+        sticky = self._bt_sticky_set()
+        now = time.time()
+        for _batch, items in manifest.items():
+            for it in items:
+                lp = str(it.get("local_path") or "")
+                if not lp or it.get("isdir"):
+                    continue
+                key = self._norm_path(lp)
+                if key in seen:
+                    continue
+                # 只处理本监听目录内的路径（清单可能含其它监听目录的批次）
+                if not key.startswith(root + os.sep):
+                    continue
+                # 只认「已下载完成」，或「我们之前处理过」的（清历史/重启后的兜底）
+                if it.get("state") != "done" and key not in sticky:
+                    continue
+                p = Path(lp)
+                try:
+                    if not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                try:
+                    if smart_extract.is_incomplete_download(p):
+                        probe.pop(key, None)
+                        continue
+                except Exception:
+                    pass
+                # 大小连续稳定一段时间才动，避免半截文件
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                prev = probe.get(key)
+                if prev is None or prev[0] != size:
+                    probe[key] = (size, now)
+                    continue
+                if now - prev[1] < self.BT_STABLE_SEC:
+                    continue
+                probe.pop(key, None)
+                # 程序目录保护：疑似程序 → 只提示，不自动解压
+                if self._looks_like_program_dir(p.parent):
+                    if key not in self._bt_warned:
+                        self._bt_warned.add(key)
+                        self.hub.log(f"疑似程序目录，跳过自动解压（百度清单）: {p}")
+                        bt.remember_sticky(p, kind="program")
+                    seen.add(key)
+                    continue
+                # 交给原有处理管线（含「等分卷齐全」与「归档内部穿透」）
+                res = self._handle(p, wc, initial_scan=True)
+                if res == "defer":
+                    # 分卷未到齐：不记 seen，但保持「已稳定」状态，
+                    # 下一轮直接重试（否则会退化成隔轮才试一次）。
+                    probe[key] = (size, 0.0)
+                    continue
+                seen.add(key)
+                sticky.add(key)
+                bt.remember_sticky(p)
 
     # ---------- 翻译 JSON 归位 ----------
     def _translation_check(self, watch):
@@ -356,6 +498,19 @@ class FolderWatcher(threading.Thread):
             if state.get("last_log") != key:
                 state["last_log"] = key
                 self.hub.log(msg)
+
+        # 实验性：网盘任务库辅助判断——**只加速、不阻断**。当任务清单显示该分卷组
+        # 已全部「下载完成」且文件都在磁盘上时，直接判定到齐，做到「下载完成即触发
+        # 解压」；拿不到信息（未开启实验性/未被跟踪）就回退下面的磁盘启发式。
+        try:
+            from . import baidu_task as _baidu_task
+            if _baidu_task.volume_hint(str(fp)) is True:
+                state["last_sig"] = None
+                _wlog(("db-ready", name),
+                      f"分卷已到齐（依据网盘任务清单）: {name}")
+                return True
+        except Exception:
+            pass
 
         if has_downloading:
             # 仍有分卷在下载：未到齐

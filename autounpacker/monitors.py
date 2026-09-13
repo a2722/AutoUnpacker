@@ -1090,8 +1090,8 @@ class QRMonitor(threading.Thread):
                         url = new_url
                 # 检查点B：打开浏览器前的信任判定
                 host = _host_of(url)
-                decision, cat = decide_host(cfg, host)
-                self._remember_auto_trust(cfg, host)
+                decision, cat = decide_host(cfg, host, "open")
+                self._remember_auto_trust(cfg, host, "open")
                 if decision == "deny":
                     self.hub.log(f"已阻止打开未信任的网址: {url[:80]}")
                     # 链接被阻止不代表内容无用：非纯链接仍把全部内容写剪贴板
@@ -1166,21 +1166,23 @@ class QRMonitor(threading.Thread):
         except Exception:
             pass
 
-    def _remember_auto_trust(self, cfg, host):
-        """auto_whitelist / auto_blacklist：把新公网域名写入对应名单并持久化。
+    def _remember_auto_trust(self, cfg, host, purpose="open"):
+        """auto_whitelist / auto_blacklist：把新公网域名写入**该用途**的名单并持久化。
 
-        此前「自动信任并打开 / 自动拒绝」只在 decide_host 里返回放行/拒绝，
-        从不落库，导致选自动信任后白名单始终为空；这里补上写入。"""
+        purpose="open" 写「自动打开」的白/黑名单；purpose="fetch" 写「下载识别」的。"""
         try:
-            ut2 = remember_auto_domain(cfg, host)
+            ut2 = remember_auto_domain(cfg, host, purpose)
         except Exception:
             return
         if ut2 is None:
             return
         try:
             self.state.set("url_trust", ut2)
-            kind = "白名单" if ut2.get("new_domain_action") == "auto_whitelist" else "黑名单"
-            self.hub.log(f"已自动把新域名加入{kind}: {host}")
+            sub = ut2.get(purpose)
+            mode = sub.get("new_domain_action") if isinstance(sub, dict) else None
+            kind = "白名单" if mode == "auto_whitelist" else "黑名单"
+            label = "自动打开" if purpose == "open" else "下载识别"
+            self.hub.log(f"已自动把新域名加入[{label}]的{kind}: {host}")
         except Exception as e:
             self.hub.log(f"自动信任名单保存失败: {e}")
 
@@ -1298,8 +1300,8 @@ class QRMonitor(threading.Thread):
         self.last_url = text
         cfg = self.state.snapshot()
         host = _host_of(text)
-        decision, cat = decide_host(cfg, host)
-        self._remember_auto_trust(cfg, host)
+        decision, cat = decide_host(cfg, host, "fetch")
+        self._remember_auto_trust(cfg, host, "fetch")
         if decision == "deny":
             self.hub.log(f"已阻止访问未信任的网址: {text[:60]}")
             return
@@ -1355,9 +1357,9 @@ class QRMonitor(threading.Thread):
         class _RedirectGuard(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 new_host = _host_of(newurl)
-                d, _ = decide_host(cfg, new_host)
+                d, _ = decide_host(cfg, new_host, "fetch")
                 try:
-                    ut2 = remember_auto_domain(cfg, new_host)
+                    ut2 = remember_auto_domain(cfg, new_host, "fetch")
                     if ut2 is not None and hub.state is not None:
                         hub.state.set("url_trust", ut2)
                 except Exception:

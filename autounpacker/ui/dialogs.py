@@ -370,12 +370,14 @@ class SettingsDialog(QDialog):
                 self.state.set("close_action", val)
                 break
 
-    def _on_trust_mode(self, btn):
-        """「网址信任」页新域名默认行为单选：选择即写回 url_trust 配置。"""
-        for val, rb in self._na_buttons.items():
+    def _on_trust_mode(self, purpose, btn):
+        """「网址信任」页某用途的新域名默认行为单选：选择即写回该用途配置。"""
+        for val, rb in (self._na_buttons.get(purpose) or {}).items():
             if rb is btn:
                 ut = dict(self.state.snapshot().get("url_trust") or {})
-                ut["new_domain_action"] = val
+                sub = dict(ut.get(purpose) or {}) if isinstance(ut.get(purpose), dict) else {}
+                sub["new_domain_action"] = val
+                ut[purpose] = sub
                 self.state.set("url_trust", ut)
                 break
 
@@ -481,11 +483,12 @@ class SettingsDialog(QDialog):
             self._check_btn.setEnabled(True)
             self._update_btn.setEnabled(True)
 
-    def _trust_list_editor(self, key):
-        """黑白名单编辑框：每行一个域名，停止输入 400ms 后自动保存。"""
+    def _trust_list_editor(self, key, purpose):
+        """某用途的白/黑名单编辑框：每行一个域名，停止输入 400ms 后自动保存。"""
         ut = self.state.snapshot().get("url_trust") or {}
-        edit = QPlainTextEdit("\n".join(str(x) for x in (ut.get(key) or [])))
-        edit.setMaximumHeight(120)
+        sub = ut.get(purpose) if isinstance(ut.get(purpose), dict) else {}
+        edit = QPlainTextEdit("\n".join(str(x) for x in ((sub or {}).get(key) or [])))
+        edit.setMaximumHeight(110)
         timer = QTimer(edit)
         timer.setSingleShot(True)
         timer.setInterval(400)
@@ -498,7 +501,9 @@ class SettingsDialog(QDialog):
                     lines.append(ln)
             try:
                 cur = dict(self.state.snapshot().get("url_trust") or {})
-                cur[key] = lines
+                sub2 = dict(cur.get(purpose) or {}) if isinstance(cur.get(purpose), dict) else {}
+                sub2[key] = lines
+                cur[purpose] = sub2
                 self.state.set("url_trust", cur)
             except Exception:
                 pass
@@ -506,6 +511,53 @@ class SettingsDialog(QDialog):
         timer.timeout.connect(_save)
         edit.textChanged.connect(lambda: timer.start())
         return edit
+
+    def _trust_section(self, purpose, title, tip):
+        """构建某用途（open/fetch）的信任配置分区：默认行为单选 + 白/黑名单。"""
+        ut = self.state.snapshot().get("url_trust") or {}
+        sub = ut.get(purpose) if isinstance(ut.get(purpose), dict) else {}
+        box = QGroupBox(title)
+        box.setToolTip(tip)
+        lay = QVBoxLayout(box)
+        lay.setSpacing(6)
+
+        cap = QLabel("遇到未信任的新域名时")
+        cap.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
+        lay.addWidget(cap)
+        grp = QButtonGroup(box)
+        grp.setExclusive(True)
+        self._na_buttons[purpose] = {}
+        current = str((sub or {}).get("new_domain_action", "none"))
+        for val, label, t in (
+                ("none", "无操作（默认）",
+                 "不打开、不询问、也不记录，静默跳过。"),
+                ("ask", "弹窗询问",
+                 "每次遇到本用途下未信任的新域名都弹窗询问。"),
+                ("auto_whitelist", "自动信任",
+                 "公网新域名自动放行并加入本用途白名单。"),
+                ("auto_blacklist", "自动拒绝",
+                 "公网新域名自动拒绝并加入本用途黑名单。")):
+            rb = QRadioButton(label)
+            rb.setChecked(val == current)
+            rb.setToolTip(t)
+            grp.addButton(rb)
+            self._na_buttons[purpose][val] = rb
+            lay.addWidget(rb)
+        grp.buttonClicked.connect(lambda btn, p=purpose: self._on_trust_mode(p, btn))
+
+        wl_label = QLabel("白名单（每行一个域名，含全部子域）")
+        wl_label.setWordWrap(True)
+        wl_label.setToolTip("命中即信任，可覆盖内置敏感地址拦截。")
+        wl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
+        lay.addWidget(wl_label)
+        lay.addWidget(self._trust_list_editor("whitelist", purpose))
+        bl_label = QLabel("黑名单（每行一个域名，优先级最高）")
+        bl_label.setWordWrap(True)
+        bl_label.setToolTip("命中即静默拒绝。")
+        bl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
+        lay.addWidget(bl_label)
+        lay.addWidget(self._trust_list_editor("blacklist", purpose))
+        return box
 
     @staticmethod
     def _page_title(text):
@@ -681,35 +733,12 @@ class SettingsDialog(QDialog):
                                         self.redirect_cb, clip_box,
                                         self.qr_url_cb, tp_box)))
 
-        # ---------- 网址信任 ----------
+        # ---------- 网址信任（按用途拆两套：open=自动打开浏览器 / fetch=下载识别二维码）----------
         ut = self.state.snapshot().get("url_trust") or {}
-        na_box = QGroupBox("遇到未信任的新域名时")
-        na_box.setToolTip("未信任的新公网域名的默认处理方式。")
-        na_lay = QVBoxLayout(na_box)
-        self._na_grp = QButtonGroup(na_box)
-        self._na_grp.setExclusive(True)
         self._na_buttons = {}
-        current_na = str(ut.get("new_domain_action", "none"))
-        for val, label, tip in (
-                ("none", "无操作（默认）",
-                 "不打开、不询问、也不记录，静默跳过。"),
-                ("ask", "弹窗询问",
-                 "每次遇到未信任的新域名都弹窗询问。"),
-                ("auto_whitelist", "自动信任并打开",
-                 "公网新域名自动放行并加入白名单。"),
-                ("auto_blacklist", "自动拒绝",
-                 "公网新域名自动拒绝并加入黑名单。")):
-            rb = QRadioButton(label)
-            rb.setChecked(val == current_na)
-            rb.setToolTip(tip)
-            self._na_grp.addButton(rb)
-            self._na_buttons[val] = rb
-            na_lay.addWidget(rb)
-        self._na_grp.buttonClicked.connect(self._on_trust_mode)
-
         self.builtin_cb = QCheckBox("拦截内置敏感地址")
         self.builtin_cb.setToolTip(
-            "私网 / 回环 / 链路本地 / 元数据 / 保留地址默认拒绝（防 SSRF）。")
+            "私网 / 回环 / 链路本地 / 元数据 / 保留地址默认拒绝（防 SSRF）。两用途共享。")
         self.builtin_cb.setChecked(bool((ut or {}).get("builtin_blacklist", True)))
         self.builtin_cb.stateChanged.connect(self._on_builtin_blacklist)
         self.tls_cb = self._cfg_cb(
@@ -717,24 +746,21 @@ class SettingsDialog(QDialog):
         self.tls_cb.setToolTip(
             "不推荐；仅当站点证书有问题时才需要，开启有中间人攻击风险。")
 
-        wl_label = QLabel("白名单（每行一个域名，含全部子域）")
-        wl_label.setWordWrap(True)
-        wl_label.setToolTip("命中即信任，可覆盖内置敏感地址拦截。")
-        wl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
-        self.wl_edit = self._trust_list_editor("whitelist")
-        bl_label = QLabel("黑名单（每行一个域名，优先级最高）")
-        bl_label.setWordWrap(True)
-        bl_label.setToolTip("命中即静默拒绝。")
-        bl_label.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
-        self.bl_edit = self._trust_list_editor("blacklist")
+        open_box = self._trust_section(
+            "open", "自动在浏览器打开（二维码解出的链接）",
+            "程序识别到二维码、要自动在浏览器打开其链接时的信任判定。")
+        fetch_box = self._trust_section(
+            "fetch", "下载识别二维码（复制的网址）",
+            "程序拉取你复制的网址、判断它是不是二维码图片时的信任判定。\n"
+            "例如网盘分享链接不可能是二维码，可在此加入黑名单以免多余访问。")
         note = QLabel("说明：私网 / 回环 / 链路本地 / 元数据等内置敏感地址默认拒绝，"
-                      "即使选择「自动信任」也不会放行，只有手动加入白名单才会信任。")
+                      "即使选择「自动信任」也不会放行，只有手动加入白名单才会信任。\n"
+                      "两套名单互不影响：同一域名可「自动打开」放行、同时「下载识别」拒绝。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
         pages.append(("网址信任",
-                      self._page_widget("网址信任", na_box, self.builtin_cb,
-                                        self.tls_cb, wl_label, self.wl_edit,
-                                        bl_label, self.bl_edit, note)))
+                      self._page_widget("网址信任", self.builtin_cb,
+                                        self.tls_cb, open_box, fetch_box, note)))
 
         # ---------- 解压 ----------
         self.merge_cb = self._cfg_cb(

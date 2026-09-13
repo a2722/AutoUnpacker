@@ -53,12 +53,22 @@ DEFAULT_CONFIG = {
          "delete_source": False},
     ],
     "close_action": "ask",   # 点右上角关闭时的行为：ask=每次询问 / tray=隐藏到托盘 / exit=关闭程序
-    # 网址信任机制：控制二维码/剪贴板 URL 的自动访问与自动打开浏览器
+    # 网址信任机制：按用途拆两套，各自独立的新域名默认行为 + 白/黑名单
+    #   open  —— 二维码解出的链接「自动在浏览器打开」
+    #   fetch —— 复制的网址「下载以识别是否二维码图片」
+    # builtin_blacklist 两用途共享（内置敏感地址拦截）。
     "url_trust": {
-        "new_domain_action": "none",  # none=无操作(默认) / ask=弹窗询问 / auto_whitelist=自动信任并打开 / auto_blacklist=自动拒绝
-        "whitelist": [],              # 信任域名（含全部子域），可覆盖内置黑名单类别
-        "blacklist": [],              # 拒绝域名（含全部子域），最高优先级
         "builtin_blacklist": True,    # 内置类别黑名单（私网/回环/链路本地/元数据/保留地址）
+        "open": {
+            "new_domain_action": "none",  # none=无操作 / ask=弹窗询问 / auto_whitelist=自动信任 / auto_blacklist=自动拒绝
+            "whitelist": [],              # 信任域名（含全部子域），可覆盖内置黑名单类别
+            "blacklist": [],              # 拒绝域名（含全部子域），最高优先级
+        },
+        "fetch": {
+            "new_domain_action": "none",  # 同上；两用途互不影响
+            "whitelist": [],
+            "blacklist": [],
+        },
     },
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
@@ -150,21 +160,34 @@ def _sanitize_cfg(cfg):
         cfg["sevenzip_check_done"] = bool(cfg.get("sevenzip_check_done", False))
         close_action = str(cfg.get("close_action", "ask")).strip()
         cfg["close_action"] = close_action if close_action in ("ask", "tray", "exit") else "ask"
-        # 网址信任机制
+        # 网址信任机制（按用途 open/fetch 拆两套：默认行为 + 白/黑名单）
         ut = cfg.get("url_trust")
         if not isinstance(ut, dict):
             ut = {}
-        na = str(ut.get("new_domain_action", "none"))
-        ut["new_domain_action"] = na if na in ("none", "ask", "auto_whitelist", "auto_blacklist") else "none"
-        wl = ut.get("whitelist")
-        if not isinstance(wl, list):
-            wl = []
-        ut["whitelist"] = [str(x).strip().lower() for x in wl if str(x).strip()]
-        bl = ut.get("blacklist")
-        if not isinstance(bl, list):
-            bl = []
-        ut["blacklist"] = [str(x).strip().lower() for x in bl if str(x).strip()]
+        # 旧版扁平结构（浮动在顶层、无 open/fetch 子字典）→ 迁移到两个用途，
+        # 行为不变；迁移后清理扁平键，确保只有 open/fetch 两处真源。
+        legacy = {k: ut.get(k) for k in
+                  ("new_domain_action", "whitelist", "blacklist") if k in ut}
+
+        def _norm_trust_sub(sub, fallback):
+            d = dict(sub) if isinstance(sub, dict) else {}
+            fb = fallback if isinstance(fallback, dict) else {}
+            na = str(d.get("new_domain_action", fb.get("new_domain_action", "none")))
+            d["new_domain_action"] = (
+                na if na in ("none", "ask", "auto_whitelist", "auto_blacklist") else "none")
+            for k in ("whitelist", "blacklist"):
+                v = d.get(k, fb.get(k))
+                if not isinstance(v, list):
+                    v = []
+                d[k] = [str(x).strip().lower() for x in v if str(x).strip()]
+            return d
+
+        for _p in ("open", "fetch"):
+            _fallback = legacy if not isinstance(ut.get(_p), dict) else None
+            ut[_p] = _norm_trust_sub(ut.get(_p), _fallback)
         ut["builtin_blacklist"] = bool(ut.get("builtin_blacklist", True))
+        for _k in ("new_domain_action", "whitelist", "blacklist"):
+            ut.pop(_k, None)
         cfg["url_trust"] = ut
         cfg["tls_skip_verify"] = bool(cfg.get("tls_skip_verify", False))
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))

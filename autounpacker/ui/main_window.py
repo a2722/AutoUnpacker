@@ -22,7 +22,7 @@ from .. import extract as smart_extract    # noqa: F401
 from .. import trail as deletion_trail     # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
 from ..config import parse_hotkey, HOTKEY_ID, MOD_NOREPEAT
-from ..trust import _host_matches
+from ..trust import add_trust_entry
 from ..password_book import PasswordBookDialog
 from .widgets import (WatchCard, RainbowBorderButton, make_tray_icon,
                       _HotkeyFilter)
@@ -644,17 +644,15 @@ class MainWindow(QMainWindow):
         """用户对信任询问做出选择：持久化黑白名单 + 放行或跳过。"""
         self._trust_dlg = None
         host = req.get("host") or ""
+        purpose = req.get("purpose", "open") or "open"
         if decision in ("trust", "block") and host:
             try:
-                ut = dict(self.state.snapshot().get("url_trust") or {})
                 key = "whitelist" if decision == "trust" else "blacklist"
-                lst = [str(x).strip().lower() for x in (ut.get(key) or [])]
-                if not any(_host_matches(e, host) for e in lst):
-                    lst.append(host)
-                ut[key] = lst
+                ut = add_trust_entry(self.state.snapshot(), host, key, purpose)
                 self.state.set("url_trust", ut)
                 kind = "已永久信任" if decision == "trust" else "已永久拒绝"
-                self.hub.log(f"{kind}域名: {host}")
+                label = "自动打开" if purpose == "open" else "下载识别"
+                self.hub.log(f"{kind}[{label}]域名: {host}")
             except Exception as e:
                 self.hub.log(f"信任名单保存失败: {e}")
         if decision in ("open_once", "trust"):

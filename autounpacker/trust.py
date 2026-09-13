@@ -2,9 +2,11 @@
 """网址信任机制：控制剪贴板/二维码 URL 的自动访问与自动打开浏览器。
 
 职责：- classify_host() 对 IP 字面量/域名做内置敏感类别分类（私网/回环/链路本地/保留）
-- decide_host() 核心判定：用户黑名单 > 用户白名单(可覆盖内置) > 内置类别 > 公网新域名按配置
-- remember_auto_domain() 把自动信任/拒绝命中的新域名落库到用户名单
-关键入口：decide_host() / classify_host() / remember_auto_domain()
+- decide_host() 核心判定，按 purpose 分两套独立名单：
+  「open」= 二维码链接自动开浏览器 / 「fetch」= 复制网址下载识别二维码。
+  优先级：本用途黑名单 > 本用途白名单(可覆盖内置) > 内置类别 > 本用途新域名默认行为
+- remember_auto_domain() / add_trust_entry() 维护某用途下的用户黑白名单
+关键入口：decide_host(cfg, host, purpose) / classify_host() / remember_auto_domain()
 依赖：socket、ipaddress（getaddrinfo 为阻塞调用，仅后台线程用 resolve=True）
 注意：内置敏感地址（含云元数据 169.254.169.254）默认拒绝，仅用户显式加白可覆盖
 """
@@ -110,15 +112,37 @@ def classify_host(host, resolve=True):
     return _host_resolve_cache.get(host)
 
 
-def decide_host(cfg, host):
-    """核心信任判定。返回 (decision, category)：
+# 各用途独立：open=二维码链接自动开浏览器 / fetch=复制网址下载识别二维码
+PURPOSES = ("open", "fetch")
+_NA_MODES = ("none", "ask", "auto_whitelist", "auto_blacklist")
+
+
+def _purpose_cfg(ut, purpose):
+    """取某用途的信任子配置（new_domain_action/whitelist/blacklist）。
+
+    兼容旧版扁平结构：若该用途子字典缺失，回退到顶层同名键
+    （配置加载时已自动迁移；此处兜底以防外部改写或旧内存态）。"""
+    sub = ut.get(purpose)
+    if isinstance(sub, dict):
+        return sub
+    legacy = {}
+    for k in ("new_domain_action", "whitelist", "blacklist"):
+        if k in ut:
+            legacy[k] = ut.get(k)
+    return legacy
+
+
+def decide_host(cfg, host, purpose="open"):
+    """核心信任判定（按用途取名单）。返回 (decision, category)：
+    - purpose: "open" 自动开浏览器 / "fetch" 下载识别二维码
     - decision: "allow" 静默放行 / "deny" 静默拒绝 / "ask" 需用户询问
     - category: classify_host 的类别（供弹窗风险标注）"""
     ut = cfg.get("url_trust") or {}
     if not isinstance(ut, dict):
         ut = {}
-    whitelist = ut.get("whitelist") or []
-    blacklist = ut.get("blacklist") or []
+    sub = _purpose_cfg(ut, purpose)
+    whitelist = sub.get("whitelist") or []
+    blacklist = sub.get("blacklist") or []
     if not host:
         return "deny", None
     # 1) 用户黑名单（最高优先级，即使在内置白名单也拒绝）
@@ -129,12 +153,12 @@ def decide_host(cfg, host):
     for entry in whitelist:
         if _host_matches(entry, host):
             return "allow", None
-    # 3) 内置类别黑名单（默认拒绝，仅用户显式加白可覆盖）
+    # 3) 内置类别黑名单（默认拒绝，仅用户显式加白可覆盖；两用途共享）
     cat = classify_host(host)
     if ut.get("builtin_blacklist", True) and cat and cat != "public":
         return "deny", cat
-    # 4) 公网新域名：按默认策略处理
-    mode = ut.get("new_domain_action", "none")
+    # 4) 公网新域名：按该用途的默认策略处理
+    mode = sub.get("new_domain_action", "none")
     if mode == "auto_whitelist":
         return "allow", cat
     if mode == "auto_blacklist":
@@ -144,38 +168,59 @@ def decide_host(cfg, host):
     return "ask", cat
 
 
-def remember_auto_domain(cfg, host):
-    """auto_whitelist / auto_blacklist：把命中的「新公网域名」写入对应用户名单。
+def remember_auto_domain(cfg, host, purpose="open"):
+    """auto_whitelist / auto_blacklist：把命中的「新公网域名」写入**该用途**的名单。
 
     返回更新后的 url_trust 字典（调用方据此持久化），无需变更时返回 None。
     仅当以下全部成立才写入：
-    - new_domain_action 为 auto_whitelist / auto_blacklist；
-    - host 非空，且不在现有黑白名单中（已记录过则跳过）；
-    - 不属于内置敏感类别（除非 builtin_blacklist 已关闭）。
-
-    背景：「自动信任并打开 / 自动拒绝」此前只在 decide_host 里返回放行/拒绝，
-    从不落库，导致设置里选自动信任后白名单始终为空。"""
+    - 该用途的 new_domain_action 为 auto_whitelist / auto_blacklist；
+    - host 非空，且不在该用途现有黑白名单中（已记录过则跳过）；
+    - 不属于内置敏感类别（除非 builtin_blacklist 已关闭）。"""
     ut = cfg.get("url_trust") or {}
     if not isinstance(ut, dict):
         return None
-    mode = str(ut.get("new_domain_action", "none"))
+    sub = _purpose_cfg(ut, purpose)
+    mode = str(sub.get("new_domain_action", "none"))
     if mode not in ("auto_whitelist", "auto_blacklist"):
         return None
     if not host:
         return None
-    whitelist = [str(x).strip().lower() for x in (ut.get("whitelist") or [])]
-    blacklist = [str(x).strip().lower() for x in (ut.get("blacklist") or [])]
+    whitelist = [str(x).strip().lower() for x in (sub.get("whitelist") or [])]
+    blacklist = [str(x).strip().lower() for x in (sub.get("blacklist") or [])]
     if any(_host_matches(e, host) for e in whitelist + blacklist):
         return None
     if ut.get("builtin_blacklist", True):
         cat = classify_host(host)
         if cat and cat != "public":
             return None         # 内置敏感地址：auto 信任也不能覆盖，不写白名单
-    ut2 = dict(ut)
+    sub2 = dict(sub)
     if mode == "auto_whitelist":
-        ut2["whitelist"] = whitelist + [host]
+        sub2["whitelist"] = whitelist + [host]
     else:
-        ut2["blacklist"] = blacklist + [host]
+        sub2["blacklist"] = blacklist + [host]
+    ut2 = dict(ut)
+    ut2[purpose] = sub2
+    return ut2
+
+
+def add_trust_entry(cfg, host, kind, purpose="open"):
+    """把 host 加入某用途的 whitelist / blacklist（用户手动「永久信任/拒绝」）。
+
+    kind ∈ {"whitelist","blacklist"}。返回更新后的 url_trust 字典（调用方持久化）；
+    host 为空或已在名单中则原样返回（无变化）。"""
+    ut = cfg.get("url_trust") or {}
+    if not isinstance(ut, dict):
+        ut = {}
+    h = str(host or "").strip().lower()
+    if not h:
+        return ut
+    sub = dict(_purpose_cfg(ut, purpose))
+    lst = [str(x).strip().lower() for x in (sub.get(kind) or [])]
+    if not any(_host_matches(e, h) for e in lst):
+        lst.append(h)
+    sub[kind] = lst
+    ut2 = dict(ut)
+    ut2[purpose] = sub
     return ut2
 
 

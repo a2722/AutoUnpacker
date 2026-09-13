@@ -87,6 +87,8 @@ class FolderWatcher(threading.Thread):
     TRANSLATION_MAX_SIZE = 10 * 1024 * 1024  # 翻译 json 最大 10MB
     TRANSLATION_WINDOW = 5 * 60              # 小文件夹先出现时的监控窗口（秒）
     VOL_MAX_WAIT = 300   # 首卷分卷"只有满卷"时最长等待(秒)：之后兜底按现状尝试解压
+    SPLIT_MAX_WAIT = 1800        # 跨目录分卷等待兄弟卷的最长时间(秒)：超时放弃（仅保留不删）
+    SPLIT_RECHECK_INTERVAL = 10  # 跨目录分卷复查间隔(秒)：节流「全监听根 rglob」
     BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
     BT_PROGRAM_EXT = {".exe", ".dll", ".bat", ".cmd", ".lnk", ".msi", ".sys",
                       ".scr", ".com", ".ocx"}
@@ -114,6 +116,8 @@ class FolderWatcher(threading.Thread):
         self._bt_sticky = None  # set(norm_abs_path)，来自 toolbox.db 的粘性记忆
         self._bt_consolidated = set()  # 已归拢（或已放弃）的跨目录分卷首卷：不再重复归拢
         self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
+        # 跨目录分卷等待期 {norm_source_path: {anchor, ident, since, last_check, last_sig}}
+        self._split_pending = {}
 
     @staticmethod
     def _file_identity(path):
@@ -668,7 +672,7 @@ class FolderWatcher(threading.Thread):
             return True
         return False
 
-    def _handle(self, fp, wc, traced=False, initial_scan=False):
+    def _handle(self, fp, wc, traced=False, initial_scan=False, out=None):
         """返回: "done"=已处理/已定型, "skip"=当前不是压缩包(可复查), "defer"=稍后重试"""
         name = fp.name
         # 用户暂停：延后所有解压（静默 defer，不刷日志），恢复后下轮自然继续。
@@ -719,6 +723,13 @@ class FolderWatcher(threading.Thread):
         # 用「大小+时间」识别身份：同名新文件（内容不同）不会被跳过
         abs_fp = self._norm_path(fp)
         ident = self._file_identity(fp)
+        # 跨目录分卷等待期：该源文件上一轮已解过（原因是缺兄弟卷），不重复解压，
+        # 只复查兄弟卷是否已出现在监听范围内的其他目录（省去每次重解 GB 级伪装包）。
+        st = self._split_pending.get(abs_fp)
+        if st is not None:
+            if self._is_same_traced(st.get("ident"), ident):
+                return self._split_recheck(fp, wc)
+            self._split_pending.pop(abs_fp, None)   # 文件变了（重新下载等）：走正常流程
         if self._is_same_traced(self.traced.get(abs_fp), ident):
             return "done"
         self.traced[abs_fp] = ident
@@ -770,6 +781,8 @@ class FolderWatcher(threading.Thread):
                     progress_cb=self._progress_cb, pauser=self.pauser)
             finally:
                 self.hub.q.put({"type": "progress_done"})
+            if out is not None:
+                out["result"] = result     # 供 _split_recheck 读锚点重试的结果
             if result and result["success"]:
                 self._lock_retry.pop(abs_fp, None)
                 msg = f"{name} 完成，穿透 {result['depth_reached']} 层，共 {len(result['extracted_files'])} 个文件"
@@ -790,10 +803,33 @@ class FolderWatcher(threading.Thread):
                 if (not smart_extract.is_fake_volume_name(fp)
                         and smart_extract.is_volume_name(name)
                         and smart_extract.is_first_volume(name)
+                        and not (result or {}).get("split_gap_archive")
                         and ("Unexpected end of archive" in err
                              or "Missing volume" in err
                              or not self._volume_ready(fp))):
                     self.hub.log(f"{name} 分卷可能未到齐，稍后重试: {err}")
+                    self.traced.pop(abs_fp, None)
+                    if record is not None:
+                        try:
+                            deletion_trail.save_records(
+                                [r for r in deletion_trail.load_records()
+                                 if r.get("id") != record["id"]])
+                        except Exception:
+                            pass
+                    return "defer"
+                # 跨目录分卷：解压到一半缺兄弟卷（该兄弟卷来自**另一个源文件**、落在
+                # 别的输出目录，如两个伪装 mp4 各装一半）。登记等待，由 _split_recheck
+                # 在监听范围内寻找并归拢，凑齐后重试锚点；超时则放弃（分卷与源文件都
+                # 保留，不删——源文件可重新下载，分卷留待手动处理）。
+                if (result or {}).get("split_gap_archive"):
+                    anchor = Path(result["split_gap_archive"])
+                    self.hub.log(
+                        f"{name} 分卷缺兄弟卷（{err[:80]}），等待跨目录归拢: {anchor.name}")
+                    self._split_pending[abs_fp] = {
+                        "anchor": str(anchor), "ident": ident,
+                        "since": time.time(), "last_check": 0.0,
+                        "last_sig": self._split_signature(anchor),
+                    }
                     self.traced.pop(abs_fp, None)
                     if record is not None:
                         try:
@@ -834,6 +870,115 @@ class FolderWatcher(threading.Thread):
             if record is not None:
                 deletion_trail.mark_failed(record["id"], str(e))
         return "done"
+
+    def _split_signature(self, anchor):
+        """锚点旁同系列分卷的（名, 大小）集合签名：出现新兄弟卷/大小变化 → 值得重试。"""
+        try:
+            return tuple(sorted(
+                (e.name, e.stat().st_size)
+                for e in anchor.parent.iterdir()
+                if e.is_file()
+                and smart_extract.is_volume_file(anchor.name, e.name, anchor.stem)))
+        except OSError:
+            return ()
+
+    def _gather_and_consolidate(self, anchor, wc):
+        """在监听根（与输出目录，若配置）范围内寻找锚点的跨目录分卷兄弟并移到锚点旁。
+
+        同名冲突 / 被占用 / 移动失败者跳过（不回滚：凑齐多少算多少，下轮再找）。
+        返回本轮移动的个数。只在监听白名单范围内搜索，绝不到监听根之外。"""
+        anchor = Path(anchor)
+        roots = []
+        for p in (wc.get("path"), (wc.get("output_dir") or "").strip() or None):
+            if p:
+                roots.append(Path(p))
+        moved = 0
+        for root in roots:
+            if not root.exists():
+                continue
+            try:
+                for cand in root.rglob("*"):
+                    try:
+                        if (cand.is_file()
+                                and cand.parent != anchor.parent
+                                and not smart_extract.is_incomplete_download(cand)
+                                and smart_extract.is_volume_file(
+                                    anchor.name, cand.name, anchor.stem)
+                                and _can_open_append(cand)):
+                            dest = anchor.parent / cand.name
+                            if dest.exists():
+                                continue
+                            shutil.move(str(cand), str(dest))
+                            moved += 1
+                            self.hub.log(f"跨目录分卷归拢: {cand} -> {dest}")
+                            try:
+                                cand.parent.rmdir()   # 搬空则清掉来源目录
+                            except OSError:
+                                pass
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return moved
+
+    def _split_recheck(self, fp, wc):
+        """跨目录分卷等待期复查（由 _handle 的等待捷径调用，每 SPLIT_RECHECK_INTERVAL
+        秒一次）：找兄弟卷 → 归拢 → 重试锚点；无进展超 SPLIT_MAX_WAIT 则放弃。
+
+        返回 "defer"=继续等待 / "done"=了结。"""
+        abs_fp = self._norm_path(fp)
+        st = self._split_pending.get(abs_fp)
+        if not st:
+            return "done"
+        now = time.time()
+        if now - st.get("last_check", 0.0) < self.SPLIT_RECHECK_INTERVAL:
+            return "defer"
+        st["last_check"] = now
+        anchor = Path(st["anchor"])
+        if not fp.exists() or not anchor.exists():
+            self._split_pending.pop(abs_fp, None)
+            return "done"
+        moved = self._gather_and_consolidate(anchor, wc)
+        sig = self._split_signature(anchor)
+        if moved or sig != st.get("last_sig") or st.pop("retry_pending", False):
+            st["last_sig"] = sig
+            st["since"] = now            # 有进展：重置超时计时
+            if moved:
+                self.hub.log(f"跨目录分卷已归拢 {moved} 个到 {anchor.parent}: {anchor.name}")
+            self.hub.log(f"分卷兄弟有更新/归拢，重试: {anchor.name}")
+            out = {}
+            self._handle(anchor, wc, traced=True, out=out)
+            result = out.get("result")
+            if result is not None and result.get("success"):
+                self._split_pending.pop(abs_fp, None)
+                self._recover_finish(fp, wc)
+                return "done"
+            if result is None:
+                st["retry_pending"] = True   # 锚点被占用/暂停等：下轮再试
+            return "defer"
+        if now - st.get("since", now) >= self.SPLIT_MAX_WAIT:
+            self.hub.log(f"跨目录分卷 {self.SPLIT_MAX_WAIT}s 内未到齐，放弃自动归拢"
+                         f"（分卷已保留: {anchor}；源文件保留: {fp.name}）")
+            self._split_pending.pop(abs_fp, None)
+            try:
+                rec = deletion_trail.new_record(fp, wc.get("path"))
+                deletion_trail.add_record(rec)
+                deletion_trail.mark_failed(rec["id"], "分卷兄弟卷未到齐（跨目录归拢超时）")
+            except Exception:
+                pass
+            return "done"
+        return "defer"
+
+    def _recover_finish(self, fp, wc):
+        """跨目录分卷恢复成功：源文件的载荷已由锚点解出，回收已消费的源文件并记档。"""
+        try:
+            rec = deletion_trail.new_record(fp, wc.get("path"))
+            deletion_trail.add_record(rec)
+            recycled, failed = smart_extract._recycle_paths([str(fp)])
+            deletion_trail.mark_deleted(rec["id"], recycled, failed)
+            self.hub.log(f"跨目录分卷恢复成功，已回收源文件: {fp.name}")
+        except Exception as e:
+            self.hub.log(f"回收源文件出错（保留原文件）: {fp.name}: {e}")
 
     def _progress_cb(self, ratio, layer, name):
         """解压引擎进度回调 → GUI 队列（_drain 更新进度条）。ratio=None=忙碌。"""

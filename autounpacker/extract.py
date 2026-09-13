@@ -378,6 +378,22 @@ def is_volume_name(name):
     return False
 
 
+def is_split_gap_error(archive_name, err_text):
+    """嵌套层解压失败是否属于「分卷缺兄弟卷」——应整体判失败并等待补齐/跨目录归拢，
+    而不是当成「损坏但可跳过」从而误报成功（假成功）。
+
+    - 分卷名（.001/.zNN/.partN.rar…）+ 三种典型缺卷报错 → 是；
+    - 末卷 base.zip / base.rar 不带编号，不在 is_volume_name 内，但 7-Zip 报
+      "Missing volume" 说明归档自身元数据已声明是多卷（缺 .z01/.r00 兄弟）→ 是；
+    - 截断的独立 zip 只报 Unexpected end of archive，不算（避免误判成缺卷死等）。
+    """
+    err = err_text or ""
+    gap_tokens = ("Unexpected end of archive" in err
+                  or "Missing volume" in err
+                  or "Cannot open the file as" in err)
+    return gap_tokens and (is_volume_name(archive_name) or "Missing volume" in err)
+
+
 def volume_download_pending(path):
     """分卷是否未到齐：是否还有正在下载中的分卷兄弟文件。
 
@@ -1346,10 +1362,11 @@ class ExtractService:
                 # 不应当作"已完成"吞掉失败——整体标记为失败，让监听层 defer
                 # 重试（等分卷到齐 / 修复归拢后再解），避免把半成品当成品。
                 err_text = result.get("error") or ""
-                is_split_gap = (is_volume_name(item["archive"].name)
-                                and ("Unexpected end of archive" in err_text
-                                     or "Missing volume" in err_text
-                                     or "Cannot open the file as" in err_text))
+                # 末卷 base.zip / base.rar 不带编号，不在 is_volume_name 内；但 7-Zip
+                # 报 "Missing volume" 说明归档自身元数据已声明是多卷（缺 .z01/.r00
+                # 兄弟卷）。因此把 "Missing volume" 作为独立的判定依据。截断的独立
+                # zip 只报 Unexpected end of archive，不会误入此分支。
+                is_split_gap = is_split_gap_error(item["archive"].name, err_text)
                 if is_split_gap:
                     self.emit(f"[第{depth}层] 嵌套分卷缺卷（{err_text[:80]}），整体判失败待重试")
                     self.layer_records.append({
@@ -1359,17 +1376,38 @@ class ExtractService:
                         "success": False,
                         "error": result["error"],
                     })
+                    # 保留缺兄弟卷的锚点（该分卷），供监听层跨目录归拢后重试：锚点
+                    # 若已在输出目录（直接模式）就原地不动；若在临时目录则搬到输出
+                    # 目录，避免 _cleanup / 失败回退把它删掉。
+                    anchor = item["archive"]
+                    try:
+                        if (anchor.exists()
+                                and anchor.parent != output_dir
+                                and output_dir not in anchor.parents):
+                            dest = output_dir / anchor.name
+                            if dest.exists():
+                                dest = output_dir / f"{anchor.stem}_failed{anchor.suffix}"
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(anchor), str(dest))
+                            anchor = dest
+                    except OSError as e:
+                        self.emit(f"[第{depth}层] 保留缺卷锚点失败: {e}")
                     return {
                         "task_id": task_id, "success": False,
                         "depth_reached": len(self.layer_records),
                         "extracted_files": [], "used_password": None,
                         "layer_records": self.layer_records,
                         "logs": self.logs, "error": result["error"],
+                        "split_gap_archive": str(anchor),   # 缺卷锚点：供跨目录归拢
+                        "keep_output_dir": True,            # 失败回退时保留输出目录
                     }
                 self.emit(f"[第{depth}层] 嵌套解压失败: {result['error']}（已跳过，保留原文件）")
                 try:
                     failed_archive = item["archive"]
-                    if failed_archive.exists():
+                    # 已在输出目录里的就地保留；只有仍留在临时目录的才搬过去。
+                    # 否则 dest 恰好就是它自己 → dest.exists() 为真 → 会被误改成
+                    # 「_failed」后缀，破坏分卷系列名（后续无法按系列名归拢）。
+                    if failed_archive.exists() and failed_archive.parent != output_dir:
                         dest = output_dir / failed_archive.name
                         if dest.exists():
                             dest = output_dir / f"{failed_archive.stem}_failed{failed_archive.suffix}"
@@ -2146,7 +2184,7 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
         # 之后可重试。仅当输出目录"解压前为空"(即本次新建)才整体清理，
         # 避免误删用户预先放入自定义输出目录的内容。
         try:
-            if out_dir.exists() and was_empty:
+            if out_dir.exists() and was_empty and not result.get("keep_output_dir"):
                 shutil.rmtree(out_dir, ignore_errors=True)
                 print(f"已回退并清理输出目录: {out_dir}")
         except Exception:

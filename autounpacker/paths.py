@@ -16,5 +16,6 @@ CONFIG_FILE = DATA_DIR / "config.json"
 TEMP_PW_FILE = DATA_DIR / "temp_passwords.json"
 CRASH_LOG = DATA_DIR / "crash.log"
 LOGS_DIR = DATA_DIR / "logs"
+CACHE_DIR = DATA_DIR / "cache"        # 运行时生成的缓存（如主题图标），可随时重建
 WORKERS_DIR = PACKAGE_DIR / "workers"
 SINGLE_INSTANCE_EVENT = "Local\\AutoUnpacker_ShowEvent"

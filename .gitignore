@@ -36,10 +36,8 @@ __pycache__/
 .stage_*/
 ExtractTemp/
 *.tmp
-# 主题图标（运行时按主题生成：下拉箭头 / 选中对勾 / 单选圆点）
-.combo_arrow_*.png
-.check_*.png
-.dot_*.png
+# 运行时生成的缓存（如主题图标：下拉箭头 / 选中对勾 / 单选圆点）
+cache/
 
 # ===== 编辑器/系统文件 =====
 .DS_Store

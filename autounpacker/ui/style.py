@@ -385,10 +385,11 @@ def _theme_extra_qss(theme):
                                  QPolygon, QPolygonF)
         from .. import paths
         tk = _TOKENS.get(theme, _FLUENT)
-        base = paths.DATA_DIR
+        base = paths.CACHE_DIR
+        base.mkdir(parents=True, exist_ok=True)
 
         def _url(pm, name):
-            path = base / f".{name}_{theme}.png"
+            path = base / f"{name}_{theme}.png"
             if pm.save(str(path), "PNG"):
                 return str(path).replace("\\", "/")
             return ""

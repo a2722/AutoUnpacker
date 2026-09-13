@@ -20,7 +20,8 @@
 import time
 from pathlib import Path
 
-from .extract import is_volume_name, _volume_base, _volume_number
+from .extract import (is_volume_name, _volume_base, _volume_number,
+                      is_volume_file, is_first_volume, is_incomplete_download)
 from .baidu_db import (_select, _as_text, select_task_db, get_active_tasks,
                        read_tasks, find_task_db)
 
@@ -375,6 +376,67 @@ def volume_hint(local_path):
             except OSError:
                 return None
         return True
+    except Exception:
+        return None
+
+
+def gather_volume_set(local_path, root=None):
+    """跨目录分卷集合：同一批次 + 与首卷同系列（`is_volume_file` 口径）的全部成员。
+
+    用途：有些分享把同一套分卷分散在不同子目录（同一次下载批次），而 7-Zip 只会
+    在同一目录里找兄弟卷。发现这种情况时，上层可把成员**归拢**到首卷目录后再走
+    既有的目录局部管线（`monitors._consolidate_cross_dir_volumes`）。
+
+    返回：
+    - None —— 不适用：未跟踪 / 非首卷 / 同目录（交由原逻辑）/ 成员不足 2 /
+      卷号重复（歧义）/ 有成员不在 root 下 / 任何异常；
+    - dict —— {"members": [info, ...]（含首卷自身）,
+               "ready": bool（全部 state=="done"、在盘、非未完成下载、编号连续无重复）}。
+
+    注意：完整性只判「清单层面」（客户端是否下完）；压缩包层面的末卷/EOCD/尾卷
+    判定交给归拢后的 `_volume_ready`，两侧各用各自权威的信号，不重复实现。
+    本函数不抛异常（模块铁律）。
+    """
+    try:
+        info = _TRACK["files"].get(_norm_path(local_path))
+        if not info or info.get("isdir"):
+            return None
+        name = Path(str(local_path)).name
+        if not is_volume_name(name) or not is_first_volume(name):
+            return None
+        batch = info.get("batch")
+        stem = Path(name).stem
+        # 成员判定一律走 is_volume_file：它覆盖 .NNN / .zNN / .rNN / .partN.rar，
+        # 以及「不带编号的末卷」（test.zip.001 系列的 test.zip）。
+        members = [info]
+        for v in _TRACK["files"].values():
+            if v is info or v.get("isdir") or v.get("batch") != batch:
+                continue
+            vname = Path(str(v.get("local_path") or "")).name
+            if vname and is_volume_file(name, vname, stem):
+                members.append(v)
+        if len(members) < 2:
+            return None
+        dirs = {_norm_path(Path(str(m.get("local_path"))).parent)
+                for m in members}
+        if len(dirs) < 2:
+            return None                    # 同目录：交还原目录局部逻辑
+        if root is not None:
+            r = _norm_path(root)
+            for m in members:
+                if not _norm_path(str(m.get("local_path") or "")).startswith(r + "\\"):
+                    return None            # 跨监听根（可能跨盘）：不动
+        nums = [n for n in (_volume_number(Path(str(m.get("local_path"))).name)
+                            for m in members) if n is not None]
+        if len(nums) != len(set(nums)):
+            return None                    # 卷号重复 → 两套同名分卷，无法区分，放弃
+        ready = (sorted(nums) == list(range(1, len(nums) + 1))
+                 and all(m.get("state") == "done"
+                         and Path(str(m.get("local_path"))).is_file()
+                         and not is_incomplete_download(
+                             Path(str(m.get("local_path"))))
+                         for m in members))
+        return {"members": members, "ready": ready}
     except Exception:
         return None
 

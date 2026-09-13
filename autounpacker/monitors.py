@@ -104,6 +104,7 @@ class FolderWatcher(threading.Thread):
         self._bt_probe = {}     # {watch_key: {norm_abs_path: (size, 稳定起始时间)}}
         self._bt_warned = set()
         self._bt_sticky = None  # set(norm_abs_path)，来自 toolbox.db 的粘性记忆
+        self._bt_consolidated = set()  # 已归拢（或已放弃）的跨目录分卷首卷：不再重复归拢
         self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
 
     @staticmethod
@@ -259,6 +260,56 @@ class FolderWatcher(threading.Thread):
             return False
         return False
 
+    def _consolidate_cross_dir_volumes(self, first_fp, gathered):
+        """把散落在不同目录的分卷兄弟**移动**到首卷所在目录，拼成一套。
+
+        背景：7-Zip 只在同一目录里找兄弟卷；有的分享把同一套分卷放在不同子目录。
+        归拢后交回既有 `_handle`，由 `_volume_ready`（目录局部）/`promote_extracted_
+        content` 正常判定与回收——分卷源文件会连同首卷一起进回收站，删除回溯记录
+        也准确。同盘时 `shutil.move` 即瞬间改名，几乎零成本。
+
+        先预检全部目标（源存在、目标无同名冲突），再逐个移动；中途失败则**回滚**
+        已移动的文件，避免半套。返回 True=已归拢（或无需归拢），False=放弃本套。
+        """
+        members = gathered.get("members") or []
+        anchor_dir = first_fp.parent
+        plan = []
+        for m in members:
+            src = Path(str(m.get("local_path") or ""))
+            if not src.name or src.parent == anchor_dir:
+                continue
+            dest = anchor_dir / src.name
+            if dest.exists():
+                self.hub.log(f"跨目录分卷归拢放弃（目标已存在同名）: {dest}")
+                return False
+            if not src.is_file():
+                self.hub.log(f"跨目录分卷归拢放弃（源不存在）: {src}")
+                return False
+            plan.append((src, dest))
+        if not plan:
+            return True
+        done = []
+        for src, dest in plan:
+            try:
+                shutil.move(str(src), str(dest))
+                done.append((src, dest))
+            except OSError as e:
+                self.hub.log(f"跨目录分卷归拢失败: {src} -> {dest}: {e}")
+                for s, d in reversed(done):   # 回滚，避免半套
+                    try:
+                        shutil.move(str(d), str(s))
+                    except OSError:
+                        pass
+                return False
+        self.hub.log(
+            f"跨目录分卷已归拢到 {anchor_dir}（{len(done)} 个）: {first_fp.name}")
+        for d in {s.parent for s, _ in done}:   # 清掉被搬空的来源目录（best-effort）
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        return True
+
     def _baidu_poll(self, watch, wc):
         """按百度网盘任务清单，处理下载到子目录里的压缩包/分卷。
 
@@ -329,6 +380,24 @@ class FolderWatcher(threading.Thread):
                         bt.remember_sticky(p, kind="program")
                     seen.add(key)
                     continue
+                # 跨目录分卷：同批次同系列的分卷散落在不同子目录时，7-Zip 在单个
+                # 目录里找不到兄弟卷。先把它们**归拢**到首卷目录（同盘=瞬间改名），
+                # 再交给下面的原目录局部管线；归拢后不再重复（_bt_consolidated）。
+                if (key not in self._bt_consolidated
+                        and smart_extract.is_volume_name(p.name)
+                        and smart_extract.is_first_volume(p.name)):
+                    gathered = bt.gather_volume_set(lp, root)
+                    if gathered is not None:
+                        if not gathered.get("ready"):
+                            # 同套分卷还有没下完的：保持稳定态，下轮直查
+                            probe[key] = (size, 0.0)
+                            continue
+                        if not self._consolidate_cross_dir_volumes(p, gathered):
+                            # 归拢失败（目标同名冲突等）：放弃本套，避免死循环
+                            self._bt_consolidated.add(key)
+                            seen.add(key)
+                            continue
+                        self._bt_consolidated.add(key)
                 # 交给原有处理管线（含「等分卷齐全」与「归档内部穿透」）
                 res = self._handle(p, wc, initial_scan=True)
                 if res == "defer":

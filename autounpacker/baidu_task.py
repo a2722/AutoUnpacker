@@ -49,6 +49,7 @@ from .baidu_manifest import (  # noqa: F401
     expected_files,
     leftover_tasks,
     volume_hint,
+    gather_volume_set,
     report_events,
 )
 from .baidu_watch import (  # noqa: F401

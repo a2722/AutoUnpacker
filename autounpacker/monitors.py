@@ -1483,6 +1483,33 @@ class QRMonitor(threading.Thread):
         if not data:
             self.hub.log(f"网址内容过大或为空（跳过）: {text[:60]}")
             return
+        # 2.F 全链路：百度分享链接顺手记下（公开分享页**无需登录**即含
+        # shareid/share_uk），供「客户端下载任务 ↔ 分享链接」关联。失败静默。
+        try:
+            from . import baidu_task as _bt
+            if _bt.parse_share_url(text):
+                rec = _bt.remember_share_link(text, data.decode("utf-8", "replace"))
+                if rec:
+                    self.hub.log(
+                        f"已记录分享链接: surl={rec.get('surl')} "
+                        f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
+                    try:
+                        self.hub.q.put({"type": "share_link",
+                                        "url": rec.get("url"),
+                                        "surl": rec.get("surl"),
+                                        "pwd": rec.get("pwd")})
+                    except Exception:
+                        pass
+                    sid = str(rec.get("shareid") or "")
+                    if sid:
+                        for info in (_bt._TRACK.get("files") or {}).values():
+                            if str((info.get("share") or {}).get("shareid")
+                                   or "") == sid:
+                                self.hub.log(
+                                    f"  ↳ 该分享对应正在下载: {info.get('local_path')}")
+                                break
+        except Exception:
+            pass
         if not self._is_image_bytes(data):
             self.hub.log(f"网址内容不是图片（跳过）: {text[:60]}")
             return

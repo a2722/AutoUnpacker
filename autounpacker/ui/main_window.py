@@ -300,6 +300,8 @@ class MainWindow(QMainWindow):
         show.triggered.connect(self._show_window)
         hide = menu.addAction("隐藏到托盘")
         hide.triggered.connect(self._hide_window)
+        open_share = menu.addAction("用客户端打开最近分享")
+        open_share.triggered.connect(self._open_recent_share)
         menu.addSeparator()
         quit_ = menu.addAction("退出")
         quit_.triggered.connect(self._quit)
@@ -601,6 +603,35 @@ class MainWindow(QMainWindow):
                 self.progress.hide()
             elif item["type"] == "url_trust_ask":
                 self._handle_trust_ask(item)
+            elif item["type"] == "share_link":
+                self._append_log(
+                    f"[分享] 已记录: {item.get('url')}"
+                    f"（托盘菜单「用客户端打开最近分享」可拉起客户端）")
+
+    def _open_recent_share(self):
+        """托盘动作：用百度网盘客户端打开最近捕获的分享链接（2.F『拉起』）。
+
+        不下载、不登录、不开网页——只把 `baiduyunguanjia://…` 交给系统协议处理器。"""
+        try:
+            from .. import baidu_task as bt
+            rec = bt.last_share()
+            if not rec:
+                self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
+                return
+            ok, detail = bt.open_share_in_client(
+                rec.get("surl"), pwd=rec.get("pwd") or "",
+                shareid=rec.get("shareid") or "",
+                share_uk=rec.get("share_uk") or "")
+            if ok:
+                self._append_log(f"已请求客户端打开分享: {rec.get('url')}")
+                if hasattr(self, "tray"):
+                    self.tray.showMessage(
+                        "用客户端打开分享", str(rec.get("url")),
+                        QSystemTrayIcon.Information, 3000)
+            else:
+                self._append_log(f"拉起客户端失败: {detail}")
+        except Exception as e:
+            self._append_log(f"拉起客户端出错: {e}")
 
     # ---------- 网址信任：挂起队列 / 非置顶询问弹窗 / 决策回写 ----------
     def _handle_trust_ask(self, req):

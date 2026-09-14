@@ -930,6 +930,10 @@ class SettingsDialog(QDialog):
             "网盘客户端下载（整包，分享里的文件全下）。注意：会自动触发下载，请确认\n"
             "分享链接来源可信；也可随时改用托盘菜单「用客户端打开最近分享」手动触发。")
         exp_lay.addWidget(self.baidu_auto_invoke_cb)
+        # 2.F 整条链路都在实验开关下：总开关没开时子选项灰掉（避免误以为能生效）
+        self.baidu_auto_invoke_cb.setEnabled(self.experimental_cb.isChecked())
+        self.experimental_cb.stateChanged.connect(
+            lambda s: self.baidu_auto_invoke_cb.setEnabled(bool(s)))
         # 手动诊断按钮：显式、只读、一次性，不受实验开关限制（始终可用）
         diag_row = QHBoxLayout()
         self.netdisk_diag_btn = QPushButton("立即读取网盘任务库")

@@ -304,8 +304,11 @@ class MainWindow(QMainWindow):
         show.triggered.connect(self._show_window)
         hide = menu.addAction("隐藏到托盘")
         hide.triggered.connect(self._hide_window)
-        open_share = menu.addAction("用客户端打开最近分享")
-        open_share.triggered.connect(self._open_recent_share)
+        # 2.F「用客户端下载最近分享」：整条链路属实验性功能，未开启时整项隐藏。
+        self._open_share_action = menu.addAction("用客户端打开最近分享")
+        self._open_share_action.triggered.connect(self._open_recent_share)
+        # 菜单每次展开前刷新一次可见性（配置可能刚被改过，无需额外的变更通知）
+        menu.aboutToShow.connect(self._refresh_share_menu)
         menu.addSeparator()
         quit_ = menu.addAction("退出")
         quit_.triggered.connect(self._quit)
@@ -613,9 +616,19 @@ class MainWindow(QMainWindow):
                     f"（托盘菜单「用客户端打开最近分享」可拉起客户端）")
                 # 实验性：开启「自动拉起」时才处理（默认关）。
                 # invoke_download 会轮询约 20s，禁止阻塞 Qt 事件循环 → 后台线程。
-                if self.state.snapshot().get("baidu_auto_invoke"):
+                if (self.state.snapshot().get("experimental_enabled")
+                        and self.state.snapshot().get("baidu_auto_invoke")):
                     self._start_share_invoke(item.get("url"), item.get("pwd") or "",
                                              manual=False)
+
+    def _refresh_share_menu(self):
+        """按「实验性功能」总开关刷新分享菜单项可见性（整条 2.F 属实验性）。"""
+        try:
+            if hasattr(self, "_open_share_action"):
+                self._open_share_action.setVisible(
+                    bool(self.state.snapshot().get("experimental_enabled")))
+        except Exception:
+            pass
 
     def _open_recent_share(self):
         """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
@@ -624,6 +637,10 @@ class MainWindow(QMainWindow):
         客户端，由客户端自己完成下载（不下载、不登录、不开网页）。
         链路约 20s（含轮询），必须后台执行，否则会冻住整个界面。"""
         try:
+            # 整条 2.F 属实验性功能：全局热键也可能被按下，这里必须再校验一次。
+            if not self.state.snapshot().get("experimental_enabled"):
+                self._append_log("实验性功能未开启，「用客户端下载分享」不可用")
+                return
             from .. import baidu_task as bt
             rec = bt.last_share()
             if not rec:

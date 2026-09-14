@@ -1504,12 +1504,13 @@ class QRMonitor(threading.Thread):
         if not force and text == self.last_url:
             return
         self.last_url = text
-        # 2.F：百度分享链接走**独立**链路，先于网址信任判定处理（不受其限制）。
-        # 分享链接的用途是「记录并把整包交给网盘客户端下载」，不是「下载来识别
-        # 是否二维码图片」，因此不该被 url_trust.fetch 的默认拒绝策略挡住。
-        if self._handle_baidu_share(text):
-            return
         cfg = self.state.snapshot()
+        # 2.F（实验性）：百度分享链接走**独立**链路，先于网址信任判定处理（不受其
+        # 限制）。分享链接的用途是「记录并把整包交给网盘客户端下载」，不是「下载来
+        # 识别是否二维码图片」，因此不该被 url_trust.fetch 的默认拒绝策略挡住。
+        # 整条 2.F 都藏在「实验性功能」总开关之后：没开就完全不捕获分享链接。
+        if cfg.get("experimental_enabled") and self._handle_baidu_share(text):
+            return
         host = _host_of(text)
         decision, cat = decide_host(cfg, host, "fetch")
         self._remember_auto_trust(cfg, host, "fetch")

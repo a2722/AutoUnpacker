@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "log_colors_enabled": True,         # 运行日志按事件类型着色
     "hotkey_enabled": True,             # 全局快捷键唤起主界面
     "hotkey": "Ctrl+Alt+W",             # 快捷键组合（空/无 表示禁用）
+    "hotkey_share": "",                 # 「用客户端下载最近分享」全局快捷键（空=不设置）
     "url_redirect_rules": [
         {"from": "drive.uc.cn", "to": "fast.uc.cn"},
     ],
@@ -152,6 +153,7 @@ def _sanitize_cfg(cfg):
         cfg["log_colors_enabled"] = bool(cfg.get("log_colors_enabled", True))
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))
         cfg["hotkey"] = str(cfg.get("hotkey", "Ctrl+Alt+W")).strip()
+        cfg["hotkey_share"] = str(cfg.get("hotkey_share", "")).strip()
         rules = []
         for r in cfg.get("url_redirect_rules") or []:
             if isinstance(r, dict) and r.get("from") and r.get("to"):
@@ -227,6 +229,7 @@ def load_config():
 
 # ---------- 全局快捷键（Win32 RegisterHotKey + WM_HOTKEY） ----------
 HOTKEY_ID = 0x5354          # 自定义 id（WM_HOTKEY 的 wParam）
+HOTKEY_ID_SHARE = 0x5355   # 「用客户端下载最近分享」的全局热键 id（第二个）
 WM_HOTKEY = 0x0312
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
 MOD_NOREPEAT = 0x4000

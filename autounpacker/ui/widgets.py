@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushB
 from PyQt5.QtCore import (Qt, QTimer, QRectF, pyqtSignal, QAbstractNativeEventFilter)
 from PyQt5.QtGui import (QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QConicalGradient, QPainterPath)
 
-from ..config import _HK_NAME_BY_VK, HOTKEY_ID, WM_HOTKEY
+from ..config import _HK_NAME_BY_VK, HOTKEY_ID, HOTKEY_ID_SHARE, WM_HOTKEY
 from .style import PALETTE
 
 # 系统主题变化广播：WM_SETTINGCHANGE 的 lParam 为 "ImmersiveColorSet" 时表示深浅色变了
@@ -223,10 +223,11 @@ TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 class _HotkeyFilter(QAbstractNativeEventFilter):
     """Win32 消息过滤器：捕获 WM_HOTKEY（全局快捷键）与 WM_SETTINGCHANGE（主题变化）。"""
 
-    def __init__(self, on_hotkey, on_settings_change=None):
+    def __init__(self, on_hotkey, on_settings_change=None, on_hotkey_share=None):
         super().__init__()
         self._on_hotkey = on_hotkey
         self._on_settings_change = on_settings_change
+        self._on_hotkey_share = on_hotkey_share
 
     def nativeEventFilter(self, eventType, message):
         if eventType == b"windows_generic_MSG":
@@ -237,6 +238,13 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
             if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID:
                 try:
                     self._on_hotkey()
+                except Exception:
+                    pass
+                return True, 0
+            if (msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID_SHARE
+                    and self._on_hotkey_share is not None):
+                try:
+                    self._on_hotkey_share()
                 except Exception:
                     pass
                 return True, 0

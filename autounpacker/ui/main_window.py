@@ -21,7 +21,7 @@ from PyQt5.QtGui import QKeySequence
 from .. import extract as smart_extract    # noqa: F401
 from .. import trail as deletion_trail     # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
-from ..config import parse_hotkey, HOTKEY_ID, MOD_NOREPEAT
+from ..config import parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE, MOD_NOREPEAT
 from ..trust import add_trust_entry
 from ..password_book import PasswordBookDialog
 from .widgets import (WatchCard, RainbowBorderButton, make_tray_icon,
@@ -63,7 +63,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             self._hotkey_filter = _HotkeyFilter(
-                self._show_window, self._on_system_theme_changed)
+                self._show_window, self._on_system_theme_changed,
+                self._on_share_hotkey)
             app.installNativeEventFilter(self._hotkey_filter)
         # 全局快捷键：**等窗口显示后再注册**。在 __init__ 里立刻注册时，winId()
         # 拿到的原生窗口句柄可能尚未“坐实”，偶发 RegisterHotKey 失败(1400 无效句柄)；
@@ -79,8 +80,9 @@ class MainWindow(QMainWindow):
         # 网址信任：挂起的询问请求 + 当前打开的确认弹窗（防叠加）
         self._pending_trust = []
         self._trust_dlg = None
-        # 实验性「自动拉起」：同一时刻只允许一个后台自动拉起任务（防重复）
-        self._auto_invoke_busy = False
+        # 分享「拉起」：同一时刻只允许一个后台拉起任务（防重复），
+        # 自动/手动两条路径共用该忙标志
+        self._share_invoke_busy = False
 
     def _build_ui(self):
         central = QWidget()
@@ -612,59 +614,63 @@ class MainWindow(QMainWindow):
                 # 实验性：开启「自动拉起」时才处理（默认关）。
                 # invoke_download 会轮询约 20s，禁止阻塞 Qt 事件循环 → 后台线程。
                 if self.state.snapshot().get("baidu_auto_invoke"):
-                    if self._auto_invoke_busy:
-                        self._append_log("[分享] 上一个自动拉起尚未结束，已跳过")
-                    else:
-                        self._auto_invoke_busy = True
-                        threading.Thread(
-                            target=self._auto_invoke_share,
-                            args=(item.get("url"), item.get("pwd") or ""),
-                            daemon=True).start()
+                    self._start_share_invoke(item.get("url"), item.get("pwd") or "",
+                                             manual=False)
 
     def _open_recent_share(self):
         """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
 
         走完整分享下载令牌链路后，用 `baiduyunguanjia://evoked-download/…` 唤起
-        客户端，由客户端自己完成下载（不下载、不登录、不开网页）。"""
+        客户端，由客户端自己完成下载（不下载、不登录、不开网页）。
+        链路约 20s（含轮询），必须后台执行，否则会冻住整个界面。"""
         try:
             from .. import baidu_task as bt
             rec = bt.last_share()
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
-            ok, detail = bt.invoke_download(
-                rec.get("url"), pwd=rec.get("pwd") or "")
-            if ok:
-                self._append_log(
-                    f"已请求客户端下载分享: {rec.get('url')}（{detail}）")
-                if hasattr(self, "tray"):
-                    self.tray.showMessage(
-                        "用客户端下载分享", str(rec.get("url")),
-                        QSystemTrayIcon.Information, 3000)
-            else:
-                self._append_log(f"拉起客户端失败: {detail}")
+            self._start_share_invoke(rec.get("url"), rec.get("pwd") or "", manual=True)
         except Exception as e:
             self._append_log(f"拉起客户端出错: {e}")
 
-    def _auto_invoke_share(self, url, pwd):
-        """后台线程：自动把分享链接交给网盘客户端下载（实验性，默认关）。
+    def _on_share_hotkey(self):
+        """全局热键：用客户端下载最近分享（等价托盘菜单那项）。"""
+        self._open_recent_share()
 
-        由 `_drain()` 在开启 `baidu_auto_invoke` 时以 daemon 线程启动，避免
-        `invoke_download` 的约 20s 轮询阻塞 Qt 事件循环。线程内**不碰 UI**，
-        日志一律走线程安全的 `hub.log`；无论成败都在 `finally` 复位忙标志，
-        且所有异常都在此吞掉、绝不逃逸到线程外。"""
+    def _start_share_invoke(self, url, pwd, manual=False):
+        """统一的分享拉起入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
+
+        `invoke_download` 含约 20s 轮询，**绝不能**在 UI 线程调用。"""
+        if self._share_invoke_busy:
+            self._append_log("[分享] 上一个拉起尚未结束，已跳过"
+                             if not manual else "[分享] 上一个拉起尚未结束，请稍候")
+            return
+        self._share_invoke_busy = True
+        threading.Thread(target=self._invoke_share_worker,
+                         args=(url, pwd, manual), daemon=True).start()
+
+    def _invoke_share_worker(self, url, pwd, manual):
+        """后台线程：跑完整拉起链路（约 20s 轮询）。
+
+        线程内**不碰 UI**：日志走线程安全的 `self.hub.log`，托盘提示走 `hub.q`
+        队列（由 `_drain()` 在主线程消费）。异常一律吞掉，忙标志在 finally 复位。"""
         try:
-            self.hub.log(f"[分享] 自动拉起客户端下载…: {url}")
+            self.hub.log(f"[分享] {'手动' if manual else '自动'}拉起客户端下载…: {url}")
             from .. import baidu_task as bt
             ok, detail = bt.invoke_download(url, pwd=pwd)
             if ok:
-                self.hub.log(f"[分享] 自动拉起成功: 已请求客户端下载（{detail}）")
+                self.hub.log(f"[分享] 拉起成功: 已请求客户端下载（{detail}）")
+                try:
+                    self.hub.q.put({"type": "notify", "title": "用客户端下载分享",
+                                    "msg": str(url)})
+                except Exception:
+                    pass
             else:
-                self.hub.log(f"[分享] 自动拉起失败: {detail}")
+                self.hub.log(f"[分享] 拉起失败: {detail}")
         except Exception as e:
-            self.hub.log(f"[分享] 自动拉取出错: {e}")
+            self.hub.log(f"[分享] 拉取出错: {e}")
         finally:
-            self._auto_invoke_busy = False
+            self._share_invoke_busy = False
 
     # ---------- 网址信任：挂起队列 / 非置顶询问弹窗 / 决策回写 ----------
     def _handle_trust_ask(self, req):
@@ -777,6 +783,35 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(1200, lambda: self._register_hotkey(_retry + 1))
             else:
                 self.hub.log(f"全局快捷键注册失败: {e}")
+        finally:
+            # 主热键无论走哪条分支（含上面的提前 return），都顺带注册分享热键
+            self._register_share_hotkey()
+
+    def _register_share_hotkey(self):
+        """注册「用客户端下载最近分享」的全局热键（可选，默认不设置）。
+
+        与主热键不同：分享热键是可选功能，注册失败不重试、不打扰；未启用
+        全局热键、未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
+        if win32gui is None:
+            return
+        try:
+            if not self.state.snapshot().get("hotkey_enabled", True):
+                return
+            combo = str(self.state.snapshot().get("hotkey_share", "")).strip()
+            if not combo or combo.lower() in ("无", "none", "null"):
+                return
+            parsed = parse_hotkey(combo)
+            if parsed is None:
+                self.hub.log(f"分享快捷键配置无效，未注册: {combo}")
+                return
+            mods, vk = parsed
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE, mods | MOD_NOREPEAT, vk)
+            self.hub.log(f"分享快捷键已注册: {combo}")
+        except Exception as e:
+            self.hub.log(f"分享快捷键注册失败: {e}")
 
     def _unregister_hotkey(self):
         if win32gui is None:
@@ -784,6 +819,11 @@ class MainWindow(QMainWindow):
         try:
             hwnd = int(self.winId())
             win32gui.UnregisterHotKey(hwnd, HOTKEY_ID)
+        except Exception:
+            pass
+        try:
+            hwnd = int(self.winId())
+            win32gui.UnregisterHotKey(hwnd, HOTKEY_ID_SHARE)
         except Exception:
             pass
 

@@ -11,7 +11,7 @@
 """
 import threading
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import (QColor, QBrush)
 
@@ -331,11 +331,16 @@ class SettingsDialog(QDialog):
         # 高度按「最高的一页」自适应，并**延后到布局稳定后再算**：立刻算时，
         # 切换过主题/风格后 sizeHint 可能还没刷新，首开会又矮又出滚动条。
         # 宽度维持 640，最小宽度仍允许横向压缩（长标签换行）。
+        self._fitted = False   # 只自适应一次，之后用户拖动窗口高度不再回弹
         self.resize(640, 560)
         QTimer.singleShot(0, self._fit_to_content)
 
     def _fit_to_content(self):
-        """按最高的一页 + 非页面部分 计算窗口高度（与当前主题/风格无关）。"""
+        """按最高的一页 + 非页面部分 计算窗口高度（与当前主题/风格无关）。
+
+        只在首次成功时自适应一次；此后用户拖动改变高度不再被强制回弹。"""
+        if self._fitted:
+            return
         try:
             page_h = 0
             for i in range(self._stack.count()):
@@ -344,9 +349,10 @@ class SettingsDialog(QDialog):
                     page_h = max(page_h, w.sizeHint().height())
             chrome = max(0, self.sizeHint().height()
                          - self._stack.sizeHint().height())
-            target = min(max(520, page_h + chrome + 24), 900)
-            self.setMinimumHeight(min(target, 700))
+            target = min(max(480, page_h + chrome + 24), 640)
+            self.setMinimumHeight(420)
             self.resize(640, target)
+            self._fitted = True
         except Exception:
             pass
 
@@ -566,9 +572,9 @@ class SettingsDialog(QDialog):
         return lbl
 
     def _page_widget(self, title, *items):
-        """构建一个设置页：标题 + 若干控件/布局（布局铺满，控件靠上）。"""
-        w = QWidget()
-        lay = QVBoxLayout(w)
+        """构建一个设置页：标题 + 若干控件/布局（内容装入滚动区，过高可滚动）。"""
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
         lay.setContentsMargins(4, 0, 4, 0)
         lay.setSpacing(10)
         lay.addWidget(self._page_title(title))
@@ -578,7 +584,16 @@ class SettingsDialog(QDialog):
             else:
                 lay.addWidget(it)
         lay.addStretch(1)
-        return w
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer = QWidget()
+        olay = QVBoxLayout(outer)
+        olay.setContentsMargins(0, 0, 0, 0)
+        olay.addWidget(scroll)
+        return outer
 
     def _build_pages(self):
         """按分类构建页面：每页 = (分类名, 页面控件)。"""
@@ -776,7 +791,7 @@ class SettingsDialog(QDialog):
 
     # ---------- 全局快捷键 ----------
         hot_box = QGroupBox("全局快捷键")
-        hot_box.setToolTip("用于唤起主界面。")
+        hot_box.setToolTip("用于唤起主界面；还可另设一个快捷键用客户端下载最近分享。")
         hl = QVBoxLayout(hot_box)
         hl.setSpacing(6)
         self.hotkey_enable_cb = self._cfg_cb(
@@ -797,6 +812,22 @@ class SettingsDialog(QDialog):
         clear_btn.clicked.connect(self._clear_hotkey)
         hrow.addWidget(clear_btn)
         hl.addLayout(hrow)
+        # 第二个可选快捷键：用客户端下载最近分享（默认留空 = 不设置）
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("用客户端下载分享"))
+        self.hotkey_share_edit = HotkeyEdit()
+        share_current = str(self.state.snapshot().get("hotkey_share", "")).strip()
+        if share_current:
+            self.hotkey_share_edit.setText(share_current)
+        self.hotkey_share_edit.comboChanged.connect(self._on_share_hotkey_changed)
+        srow.addWidget(self.hotkey_share_edit, 1)
+        share_clear_btn = QPushButton("清除")
+        share_clear_btn.clicked.connect(self._clear_share_hotkey)
+        srow.addWidget(share_clear_btn)
+        hl.addLayout(srow)
+        share_hint = QLabel("留空 = 不设置（默认）。")
+        share_hint.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
+        hl.addWidget(share_hint)
         pages.append(("全局快捷键", self._page_widget("全局快捷键", hot_box)))
 
         # ---------- 7-Zip 管理 ----------
@@ -1028,6 +1059,15 @@ class SettingsDialog(QDialog):
     def _clear_hotkey(self):
         self.hotkey_edit.setText("")
         self.state.set("hotkey", "")
+        self._notify_hotkey_change()
+
+    def _on_share_hotkey_changed(self, combo):
+        self.state.set("hotkey_share", combo)
+        self._notify_hotkey_change()
+
+    def _clear_share_hotkey(self):
+        self.hotkey_share_edit.setText("")
+        self.state.set("hotkey_share", "")
         self._notify_hotkey_change()
 
     # ---------- 7-Zip 管理 ----------

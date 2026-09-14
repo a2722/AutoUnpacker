@@ -111,7 +111,7 @@ def invoke_download(share_url, pwd=""):
     1. 解析链接 → surl_full / surl / pwd；
     2. `/share/tplconfig` 取 sign / timestamp；
     3. `/share/verify` 校验提取码 → randsk（sekey）；
-    4. `/share/list` 取首个条目的 fs_id / path；
+    4. `/share/list` 分页取**分享根目录下全部**条目的 fs_id / path（去重、保序）；
     5. `/api/sharedownload` 转存下载 → `list` 字段（字符串令牌 = filelist）；
     6. `/api/invoker/get` → browserId；
     7. `/api/invoker/online` 上报在线；
@@ -149,14 +149,40 @@ def invoke_download(share_url, pwd=""):
             {"pwd": pwd, "vcode": "", "vcode_str": ""},
             referer_share))["randsk"]
 
-        # 3. list：取首个条目的 fs_id / path。
-        fl0 = json.loads(_get(
-            op,
-            f"{_S}/share/list?web=5&app_id=250528&desc=1&showempty=0&page=1"
-            f"&num=20&order=time&shorturl={surl}&root=1&view_mode=1&{_Q}",
-            referer_share))["list"][0]
-        if not fl0 or fl0.get("fs_id") is None:
-            return False, "分享列表为空或结构异常"
+        # 3. list：分页收齐分享根目录下的**全部**条目（整包 / 全选下载）。
+        #    每页 50 条，按 fs_id 去重、保持服务端返回顺序；停止条件：
+        #    无 list / errno≠0 / 本页不足 50 条 / 页数达到硬上限 20（防死循环）。
+        fids, paths = [], []
+        seen_fs = set()
+        for p in range(1, 21):
+            try:
+                resp = json.loads(_get(
+                    op,
+                    f"{_S}/share/list?web=5&app_id=250528&desc=1&showempty=0"
+                    f"&page={p}&num=50&order=time&shorturl={surl}&root=1"
+                    f"&view_mode=1&{_Q}",
+                    referer_share))
+            except Exception:
+                break
+            if resp.get("errno"):
+                break
+            lst = resp.get("list")
+            if not isinstance(lst, list):
+                break
+            for it in lst:
+                if not isinstance(it, dict):
+                    continue
+                fs = it.get("fs_id")
+                path = it.get("path")
+                if fs is None or path is None or fs in seen_fs:
+                    continue
+                seen_fs.add(fs)
+                fids.append(fs)
+                paths.append(path)
+            if len(lst) < 50:
+                break
+        if not fids:
+            return False, "分享列表为空"
 
         # 4. 分享页取 share_uk / shareid（不在 URL 里，只能从 HTML 解析）。
         try:
@@ -168,6 +194,10 @@ def invoke_download(share_url, pwd=""):
             return False, "分享页未解析到 share_uk / shareid（链接可能失效或需提取码）"
 
         # 5. sharedownload：转存下载 → list 字段（字符串令牌 = filelist）。
+        #    把**全部** fs_id / path 一次性提交（整包）：服务端只回一个不透明的
+        #    `list` 令牌，该令牌已覆盖 fid_list 里的每一个条目，客户端据此全部下载。
+        #    百度单次上限约 999 个（超了会返回 31075），此处不拆分、原样提交；
+        #    失败时照实返回错误，不静默丢弃任何条目。
         sd = json.loads(_post(
             op,
             f"{_S}/api/sharedownload?{_Q}"
@@ -179,8 +209,8 @@ def invoke_download(share_url, pwd=""):
              "timestamp": str(ts),
              "uk": share_uk,
              "primaryid": shareid,
-             "fid_list": json.dumps([fl0["fs_id"]]),
-             "path_list": json.dumps([fl0["path"]])},
+             "fid_list": json.dumps(fids),
+             "path_list": json.dumps(paths)},
             referer_share))
         blob = sd.get("list")
         if not isinstance(blob, str):

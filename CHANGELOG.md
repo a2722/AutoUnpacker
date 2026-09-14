@@ -38,6 +38,22 @@
   写入对应名单。**旧版扁平配置启动时自动迁移到两边**，行为不变。
   （例：网盘分享链接不可能是二维码，可把 `drive.uc.cn` 放入 `fetch` 黑名单、
   同时留在 `open` 白名单里自动打开。）
+- **实验性（2.F）：分享「链接 ↔ 客户端下载任务」关联打通（链接→提取码→下载→解压）**。
+  客户端分享下载时，本地库活动表 `download_file.download_url` / `param2` 里带
+  `shareid` / `share_uk` / `fs_id` / `md5` / `sekey`（只在**下载进行中**才有值，完成进
+  历史表就没了）；而分享页 `https://pan.baidu.com/s/<surl>` **公开可读、无需登录**，
+  `window.yunData` 里有同组 `shareid` / `share_uk`。现在：
+  - `baidu_db` 活动任务查询新增读 `download_url` / `param2` / `error_code` / `status_changetime`；
+  - `baidu_manifest` 新增纯解析 `parse_share_download()`（从 download_url/param2 取
+    shareid/share_uk/fs_id/md5/sekey）、`extract_share_ids_from_html()`（从分享页 HTML 取
+    shareid/share_uk）、`parse_share_url()`、`remember_share_link()`、`share_link_for()`；
+  - 剪贴板出现百度分享链接时（`qr_url_enabled`）顺手抓页并记住 `surl → shareid`；
+  - `observe_tasks` 给活动任务挂 `share` 关联键，新任务日志据此输出
+    「分享 shareid=… uk=… fs_id=…，链接 …」。
+  于是「链接 ↔ 下载任务」可用 `shareid` 精确对齐（兜底：`server_path`+`size`+`md5`）。
+  - 另新增 `build_client_invoke_url()` / `open_share_in_client()`：按分享页调端 SDK 同款
+    格式构造 `baiduyunguanjia://preview-share-file/?param=<JSON>` 交给系统协议处理器，
+    即可**用客户端打开分享（"拉起"下载）**——不下载、不登录、不碰网页，绕开 IDM。
 
 ### 修复
 

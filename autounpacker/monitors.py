@@ -1445,6 +1445,46 @@ class QRMonitor(threading.Thread):
         return None
 
     # ---------- 网址形式的二维码图片识别 ----------
+    def _handle_baidu_share(self, text):
+        """2.F：百度分享链接的独立处理入口（**不受**「网址信任」限制）。
+
+        分享链接的用途是「记录 + 把整包交给网盘客户端下载」，而不是「下载该网址
+        识别是否二维码图片」，因此**先于**网址信任判定执行：命中即返回 True，
+        由本函数负责抓公开分享页（无需登录，含 shareid/share_uk）、记录链接、
+        并向主窗口投递 `share_link` 事件（主窗口据 `baidu_auto_invoke` 决定是否
+        自动拉起）。非分享链接返回 False，交回原有二维码链路。
+        """
+        try:
+            from . import baidu_task as _bt
+            if not _bt.parse_share_url(text):
+                return False
+            html = ""
+            try:
+                data = self._fetch_url(text)
+                if data:
+                    html = data.decode("utf-8", "replace")
+            except Exception:
+                html = ""      # 抓页失败也继续：拉起本身不需要 shareid/share_uk
+            rec = _bt.remember_share_link(text, html)
+            if not rec:
+                return True    # 已确认是分享链接：按分享处理，不再走二维码
+            self.hub.log(f"已记录分享链接: surl={rec.get('surl')} "
+                         f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
+            try:
+                self.hub.q.put({"type": "share_link", "url": rec.get("url"),
+                                "surl": rec.get("surl"), "pwd": rec.get("pwd")})
+            except Exception:
+                pass
+            sid = str(rec.get("shareid") or "")
+            if sid:
+                for info in (_bt._TRACK.get("files") or {}).values():
+                    if str((info.get("share") or {}).get("shareid") or "") == sid:
+                        self.hub.log(f"  ↳ 该分享对应正在下载: {info.get('local_path')}")
+                        break
+            return True
+        except Exception:
+            return False
+
     def _maybe_process_url(self, text, force=False):
         """复制的是 http(s) 网址时，尝试访问：若返回的是二维码图片则下载解码并打开
         （效果等同直接复制二维码图片）。同一网址只尝试一次（force=True 跳过
@@ -1464,6 +1504,11 @@ class QRMonitor(threading.Thread):
         if not force and text == self.last_url:
             return
         self.last_url = text
+        # 2.F：百度分享链接走**独立**链路，先于网址信任判定处理（不受其限制）。
+        # 分享链接的用途是「记录并把整包交给网盘客户端下载」，不是「下载来识别
+        # 是否二维码图片」，因此不该被 url_trust.fetch 的默认拒绝策略挡住。
+        if self._handle_baidu_share(text):
+            return
         cfg = self.state.snapshot()
         host = _host_of(text)
         decision, cat = decide_host(cfg, host, "fetch")
@@ -1483,33 +1528,6 @@ class QRMonitor(threading.Thread):
         if not data:
             self.hub.log(f"网址内容过大或为空（跳过）: {text[:60]}")
             return
-        # 2.F 全链路：百度分享链接顺手记下（公开分享页**无需登录**即含
-        # shareid/share_uk），供「客户端下载任务 ↔ 分享链接」关联。失败静默。
-        try:
-            from . import baidu_task as _bt
-            if _bt.parse_share_url(text):
-                rec = _bt.remember_share_link(text, data.decode("utf-8", "replace"))
-                if rec:
-                    self.hub.log(
-                        f"已记录分享链接: surl={rec.get('surl')} "
-                        f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
-                    try:
-                        self.hub.q.put({"type": "share_link",
-                                        "url": rec.get("url"),
-                                        "surl": rec.get("surl"),
-                                        "pwd": rec.get("pwd")})
-                    except Exception:
-                        pass
-                    sid = str(rec.get("shareid") or "")
-                    if sid:
-                        for info in (_bt._TRACK.get("files") or {}).values():
-                            if str((info.get("share") or {}).get("shareid")
-                                   or "") == sid:
-                                self.hub.log(
-                                    f"  ↳ 该分享对应正在下载: {info.get('local_path')}")
-                                break
-        except Exception:
-            pass
         if not self._is_image_bytes(data):
             self.hub.log(f"网址内容不是图片（跳过）: {text[:60]}")
             return

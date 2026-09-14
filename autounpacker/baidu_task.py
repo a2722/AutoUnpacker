@@ -51,6 +51,14 @@ from .baidu_manifest import (  # noqa: F401
     volume_hint,
     gather_volume_set,
     report_events,
+    # 2.F 全链路：分享链接 ↔ 下载任务 关联
+    parse_share_url,
+    extract_share_ids_from_html,
+    parse_share_download,
+    remember_share_link,
+    share_link_for,
+    build_client_invoke_url,
+    last_share,
 )
 from .baidu_watch import (  # noqa: F401
     _STATE,
@@ -62,6 +70,7 @@ from .baidu_watch import (  # noqa: F401
     start_active_watcher,
     diagnose,
     probe_and_log,
+    open_share_in_client,
 )
 
 # 子模块本身也一并暴露，便于按职责直接引用（如 bt.manifest.observe_tasks）

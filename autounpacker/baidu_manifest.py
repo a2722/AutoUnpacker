@@ -17,8 +17,11 @@
 注意：本模块全是纯函数/内存状态，**不做任何 DB 轮询、不启线程**（轮询在 baidu_watch）。
 所有函数都不得抛异常给调用方（失败一律降级为 None/空）。
 """
+import json
+import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qs, quote
 
 from .extract import (is_volume_name, _volume_base, _volume_number,
                       is_volume_file, is_first_volume, is_incomplete_download)
@@ -119,11 +122,206 @@ _TRACK = {
     "files": {},          # 归一化 local_path -> 任务信息（含 state / batch）
     "active_ids": set(),  # 上一拍的 active task_id 集合（用于检测「消失=完成」）
     "boot": None,         # 本进程启动墙钟（用于「遗留任务」提示）
+    # 2.F 全链路：已记住的分享链接。surl -> 记录；shareid -> 同一条记录（用于关联）
+    "shares": {},
+    "shares_by_id": {},
 }
 
 
 def _norm_path(p):
     return str(p or "").replace("/", "\\").rstrip("\\").lower()
+
+
+# ---------- 2.F 全链路：分享「链接 ↔ 下载任务」的关联键（纯解析，无网络） ----------
+_SHARE_URL_RE = re.compile(r"https?://pan\.baidu\.com/s/1([A-Za-z0-9_-]+)", re.I)
+_SURL_RE = re.compile(r"[?&]surl=([A-Za-z0-9_-]+)")
+
+
+def parse_share_url(url):
+    """把剪贴板里的百度分享链接解析成 {"surl","pwd","url"}；不是分享链接返回 None。"""
+    try:
+        s = str(url or "")
+        m = _SHARE_URL_RE.search(s)
+        if m:
+            surl = m.group(1)
+        else:
+            m2 = _SURL_RE.search(s)
+            if not m2:
+                return None
+            surl = m2.group(1)
+        pwd = ""
+        try:
+            pwd = (parse_qs(urlsplit(s).query).get("pwd") or [""])[0]
+        except Exception:
+            pass
+        return {"surl": surl, "pwd": pwd, "url": s}
+    except Exception:
+        return None
+
+
+def extract_share_ids_from_html(html):
+    """从公开分享页 HTML 的 window.yunData 取 share_uk / shareid（**无需登录**）。
+
+    页面里形如：window.yunData={…, share_uk:"3567282991", shareid:"11286763343"};
+    取不到 shareid 返回 None。"""
+    try:
+        t = html or ""
+        m = re.search(r"window\.yunData\s*=\s*\{.*?\};", t, re.S)
+        seg = m.group(0) if m else t
+        sid = re.search(r'shareid\s*:\s*["\']?(\d+)', seg) or \
+            re.search(r'"shareid"\s*:\s*"?(\d+)', t)
+        if not sid:
+            return None
+        uk = re.search(r'share_uk\s*:\s*["\']?(\d+)', seg)
+        return {"shareid": sid.group(1), "share_uk": uk.group(1) if uk else None}
+    except Exception:
+        return None
+
+
+def parse_share_download(info):
+    """从活动任务的 download_url / param2 解析「分享下载」的关联键（纯函数）。
+
+    download_url（客户端分享下载）形如::
+        https://d.pcs.baidu.com/file/<md5>?fid=<share_uk>-250528-<fs_id>&rt=sh
+            &shareid=<shareid>&vuk=<下载者uk>&…
+    param2 形如::
+        uk=<share_uk>&primaryid=<shareid>&fid_list=[<fs_id>]&product=share
+            &extra={"sekey":"…"}&token=<token>
+
+    返回 {shareid, share_uk, fs_id, md5, sekey, token, vuk, dlink}；
+    无法确认为「分享下载」时返回 None。本函数不抛异常。
+    """
+    try:
+        info = info or {}
+        url = str(info.get("download_url") or "").strip()
+        param2 = str(info.get("param2") or "").strip()
+        if not url and not param2:
+            return None
+        out = {}
+        if url:
+            parts = urlsplit(url)
+            q = parse_qs(parts.query)
+            m = re.match(r"^(\d+)-250528-(\d+)$", (q.get("fid") or [""])[0])
+            if m:
+                out["share_uk"] = m.group(1)
+                out["fs_id"] = m.group(2)
+            for src, dst in (("shareid", "shareid"), ("vuk", "vuk")):
+                v = (q.get(src) or [""])[0]
+                if v:
+                    out[dst] = v
+            seg = [x for x in parts.path.split("/") if x]
+            if seg:
+                out["md5"] = seg[-1]
+            out["dlink"] = url
+        if param2:
+            q2 = parse_qs(param2)
+            for src, dst in (("uk", "share_uk"), ("primaryid", "shareid"),
+                             ("token", "token")):
+                v = (q2.get(src) or [""])[0]
+                if v:
+                    out.setdefault(dst, v)
+            fm = re.search(r"(\d{6,})", (q2.get("fid_list") or [""])[0])
+            if fm:
+                out.setdefault("fs_id", fm.group(1))
+            try:
+                sekey = (json.loads((q2.get("extra") or [""])[0]) or {}).get("sekey")
+                if sekey:
+                    out["sekey"] = sekey
+            except Exception:
+                pass
+        if not (out.get("shareid") or out.get("share_uk")):
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def remember_share_link(url, html=None):
+    """记住一条分享链接（剪贴板捕获时调用），并按 shareid 建索引。
+
+    html 给出时顺带解析 shareid/share_uk（公开分享页无需登录即可解析）。
+    返回记录 dict 或 None；写入 _TRACK["shares"] / _TRACK["shares_by_id"]。"""
+    try:
+        p = parse_share_url(url)
+        if not p:
+            return None
+        rec = {"surl": p["surl"], "pwd": p["pwd"], "url": p["url"],
+               "ts": time.time()}
+        ids = extract_share_ids_from_html(html) if html else None
+        if ids:
+            rec.update(ids)
+        _TRACK["shares"][p["surl"]] = rec
+        if rec.get("shareid"):
+            _TRACK["shares_by_id"][str(rec["shareid"])] = rec
+        return rec
+    except Exception:
+        return None
+
+
+def share_link_for(share):
+    """给定 parse_share_download 的结果，找回已记住的分享链接（没有返回 None）。"""
+    try:
+        sid = str((share or {}).get("shareid") or "")
+        rec = _TRACK["shares_by_id"].get(sid) if sid else None
+        if rec:
+            return rec.get("url")
+    except Exception:
+        pass
+    return None
+
+
+# ---------- 2.F 拉起：构造「用客户端打开分享」的自定义协议 URL（纯函数，无 IO） ----------
+CLIENT_SCHEMA = "baiduyunguanjia"
+
+
+def build_client_invoke_url(surl, pwd="", shareid="", share_uk="", uk="",
+                            is_public=0, view_limit=0, view_visited=0,
+                            method="preview-share-file", page="file_list",
+                            extra=None):
+    """构造页面 SDK 同款调端 URL（用它可让系统唤起百度网盘客户端打开该分享）：
+
+        baiduyunguanjia://<method>/?param=<encodeURIComponent(JSON)>
+
+    param 结构与服务页 `pcCallClient/service/start.js` 一致：
+    `share_info{url,pwd,is_public,share_id,share_uk,view_limit,view_visited}`
+    + `preview_dir` / `open_dir` + `ext`。SDK 上限 2048 字符（超了客户端不认）。
+    纯函数，失败返回 None。
+    """
+    try:
+        payload = {
+            "checkUserInfo": bool(uk),
+            "uk": int(uk) if str(uk or "").isdigit() else "",
+            "share_info": {
+                "url": str(surl or ""),
+                "pwd": str(pwd or ""),
+                "is_public": int(is_public or 0),
+                "share_id": str(shareid or ""),
+                "share_uk": str(share_uk or ""),
+                "view_limit": int(view_limit or 0),
+                "view_visited": int(view_visited or 0),
+            },
+            "preview_dir": {"sharePath": "/", "path": "/"},
+            "open_dir": {"path": "/"},
+            "ext": {"type": "share_link", "page": page, "btn": "pc_open"},
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        param = quote(json.dumps(payload, ensure_ascii=False,
+                                 separators=(",", ":")), safe="")
+        if len(param) > 2048:
+            return None          # SDK 的 SCHEMA_TOO_LONG：客户端不认
+        return f"{CLIENT_SCHEMA}://{method}/?param={param}"
+    except Exception:
+        return None
+
+
+def last_share():
+    """最近记住的一条分享链接记录（按时间），没有返回 None。"""
+    try:
+        recs = list(_TRACK["shares"].values())
+        return max(recs, key=lambda r: r.get("ts") or 0) if recs else None
+    except Exception:
+        return None
 
 
 def is_enabled(state=None, cfg=None):
@@ -243,6 +441,7 @@ def observe_tasks(rows, hist_rows=None):
                 "task_id": tid,
                 "add_time": r.get("add_time"),
                 "state": "active",
+                "share": parse_share_download(r),   # 分享下载的关联键（2.F）
             }
             _TRACK["files"][key] = info
             events["started"].append(dict(info))
@@ -261,6 +460,9 @@ def observe_tasks(rows, hist_rows=None):
                 info["size"] = r.get("file_size")
             if r.get("isdir") is not None:
                 info["isdir"] = r.get("isdir")
+            sh = parse_share_download(r)
+            if sh:
+                info["share"] = sh
             info["state"] = "active"
             if reappeared:
                 # 重新下载：当作一次新任务上报（便于日志/预登记）
@@ -450,8 +652,18 @@ def report_events(events, hub, notify=True, max_lines=12):
             pass
 
     for it in (events.get("started") or [])[:max_lines]:
+        extra = ""
+        sh = it.get("share") or {}
+        if sh:
+            extra = (f"，分享 shareid={sh.get('shareid')} uk={sh.get('share_uk')}"
+                     f" fs_id={sh.get('fs_id')}")
+            link = share_link_for(sh)
+            if link:
+                extra += f"，链接 {link}"
+            elif sh.get("sekey"):
+                extra += "，已含提取码校验(sekey)"
         _log(f"网盘新任务：{it.get('local_path')}（{it.get('size')} B，"
-             f"批次 {it.get('batch')}）")
+             f"批次 {it.get('batch')}{extra}）")
     # B：新出现文件的批次，输出「预登记」清单（结构摘要，便于提前建目录/等分卷）
     for b in {it.get("batch") for it in (events.get("started") or [])}:
         fs = batch_files(b)

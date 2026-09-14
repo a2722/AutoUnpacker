@@ -196,7 +196,8 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                 if db:
                     rows = _select(db, "download_file",
                                    ("task_id", "server_path", "local_path",
-                                    "file_size", "isdir", "error_code"))
+                                    "file_size", "isdir", "error_code",
+                                    "download_url", "param2"))
                     if rows is not None:
                         hist = _select(db, "download_history_file",
                                        ("server_path", "size"), limit=1000) or []
@@ -345,6 +346,26 @@ def probe_and_log(state, hub):
                 pass
 
     threading.Thread(target=_worker, daemon=True).start()
+
+
+def open_share_in_client(surl, pwd="", shareid="", share_uk="", uk=""):
+    """用系统协议唤起百度网盘客户端打开该分享（"下载拉起"的第一步）。
+
+    只把 `baiduyunguanjia://preview-share-file/?param=…` 交给系统协议处理器
+    （os.startfile）——**不下载、不登录、不碰网页**，由客户端自己完成下载。
+    非阻塞；返回 (ok: bool, detail: str)（detail 为 URL 或错误原因）。
+    """
+    try:
+        from .baidu_manifest import build_client_invoke_url
+        url = build_client_invoke_url(surl, pwd=pwd, shareid=shareid,
+                                      share_uk=share_uk, uk=uk)
+        if not url:
+            return False, "构造调端 URL 失败（参数非法或超过 2048 字符）"
+        import os
+        os.startfile(url)          # Windows：交给协议处理器 → YunDetectService.exe
+        return True, url
+    except Exception as e:
+        return False, str(e)
 
 
 if __name__ == "__main__":

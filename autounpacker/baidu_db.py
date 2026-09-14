@@ -233,9 +233,12 @@ def read_tasks(db_path, history_limit=500):
     列存在性容错：缺列时该键不出现，消费方一律用 .get()。读失败给出空列表
     （保持旧行为；需要区分失败请用 _select / diagnose）。
     """
+    # download_url / param2 只在**活动表**存在（历史表没有），且只在下载进行中有值；
+    # 分享下载时它们带 shareid / share_uk / fs_id / md5 / sekey，是「链接↔下载」关联键。
     active = _select(db_path, "download_file",
                      ("task_id", "server_path", "local_path", "status", "file_size",
-                      "isdir", "download_type", "add_time"))
+                      "isdir", "download_type", "add_time", "error_code",
+                      "status_changetime", "download_url", "param2"))
     history = _select(db_path, "download_history_file",
                       ("id", "server_path", "local_path", "isdir", "size",
                        "op_starttime", "op_endtime", "download_type"),
@@ -253,7 +256,8 @@ def get_active_tasks(db_path=None):
         return []
     return _select(db, "download_file",
                    ("task_id", "server_path", "local_path", "status", "file_size",
-                    "isdir", "download_type", "add_time")) or []
+                    "isdir", "download_type", "add_time", "error_code",
+                    "status_changetime", "download_url", "param2")) or []
 
 
 def detect_download_root(db_path=None, history_limit=300):

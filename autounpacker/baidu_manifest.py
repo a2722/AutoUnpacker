@@ -21,7 +21,7 @@ import json
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlsplit, parse_qs, quote
+from urllib.parse import urlsplit, parse_qs
 
 from .extract import (is_volume_name, _volume_base, _volume_number,
                       is_volume_file, is_first_volume, is_incomplete_download)
@@ -268,51 +268,6 @@ def share_link_for(share):
     except Exception:
         pass
     return None
-
-
-# ---------- 2.F 拉起：构造「用客户端打开分享」的自定义协议 URL（纯函数，无 IO） ----------
-CLIENT_SCHEMA = "baiduyunguanjia"
-
-
-def build_client_invoke_url(surl, pwd="", shareid="", share_uk="", uk="",
-                            is_public=0, view_limit=0, view_visited=0,
-                            method="preview-share-file", page="file_list",
-                            extra=None):
-    """构造页面 SDK 同款调端 URL（用它可让系统唤起百度网盘客户端打开该分享）：
-
-        baiduyunguanjia://<method>/?param=<encodeURIComponent(JSON)>
-
-    param 结构与服务页 `pcCallClient/service/start.js` 一致：
-    `share_info{url,pwd,is_public,share_id,share_uk,view_limit,view_visited}`
-    + `preview_dir` / `open_dir` + `ext`。SDK 上限 2048 字符（超了客户端不认）。
-    纯函数，失败返回 None。
-    """
-    try:
-        payload = {
-            "checkUserInfo": bool(uk),
-            "uk": int(uk) if str(uk or "").isdigit() else "",
-            "share_info": {
-                "url": str(surl or ""),
-                "pwd": str(pwd or ""),
-                "is_public": int(is_public or 0),
-                "share_id": str(shareid or ""),
-                "share_uk": str(share_uk or ""),
-                "view_limit": int(view_limit or 0),
-                "view_visited": int(view_visited or 0),
-            },
-            "preview_dir": {"sharePath": "/", "path": "/"},
-            "open_dir": {"path": "/"},
-            "ext": {"type": "share_link", "page": page, "btn": "pc_open"},
-        }
-        if isinstance(extra, dict):
-            payload.update(extra)
-        param = quote(json.dumps(payload, ensure_ascii=False,
-                                 separators=(",", ":")), safe="")
-        if len(param) > 2048:
-            return None          # SDK 的 SCHEMA_TOO_LONG：客户端不认
-        return f"{CLIENT_SCHEMA}://{method}/?param={param}"
-    except Exception:
-        return None
 
 
 def last_share():

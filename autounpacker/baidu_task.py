@@ -6,6 +6,7 @@
 - `baidu_db.py`      ：只读访问层（定位/选择库、短连接只读查询、列容错、读活动/历史）
 - `baidu_manifest.py`：批次/分卷还原 + 任务跟踪事件（纯逻辑、无线程）
 - `baidu_watch.py`   ：后台轮询线程 + 一次性诊断 + 启动探测
+- `baidu_share.py`   ：分享链接「拉起客户端下载」全链路（invoke_download）
 
 外部只需 `from . import baidu_task as bt`（或 `from .baidu_task import xxx`），
 所有原有名字在此继续可用（含以 `_` 开头的内部名，供测试与 monitors 使用）。
@@ -57,9 +58,9 @@ from .baidu_manifest import (  # noqa: F401
     parse_share_download,
     remember_share_link,
     share_link_for,
-    build_client_invoke_url,
     last_share,
 )
+from .baidu_share import invoke_download  # noqa: F401
 from .baidu_watch import (  # noqa: F401
     _STATE,
     _BACKOFF_AT,
@@ -70,11 +71,10 @@ from .baidu_watch import (  # noqa: F401
     start_active_watcher,
     diagnose,
     probe_and_log,
-    open_share_in_client,
 )
 
 # 子模块本身也一并暴露，便于按职责直接引用（如 bt.manifest.observe_tasks）
-from . import baidu_db, baidu_manifest, baidu_watch  # noqa: F401
+from . import baidu_db, baidu_manifest, baidu_watch, baidu_share  # noqa: F401
 
 
 if __name__ == "__main__":

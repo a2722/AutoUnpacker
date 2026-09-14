@@ -79,6 +79,8 @@ class MainWindow(QMainWindow):
         # 网址信任：挂起的询问请求 + 当前打开的确认弹窗（防叠加）
         self._pending_trust = []
         self._trust_dlg = None
+        # 实验性「自动拉起」：同一时刻只允许一个后台自动拉起任务（防重复）
+        self._auto_invoke_busy = False
 
     def _build_ui(self):
         central = QWidget()
@@ -607,6 +609,17 @@ class MainWindow(QMainWindow):
                 self._append_log(
                     f"[分享] 已记录: {item.get('url')}"
                     f"（托盘菜单「用客户端打开最近分享」可拉起客户端）")
+                # 实验性：开启「自动拉起」时才处理（默认关）。
+                # invoke_download 会轮询约 20s，禁止阻塞 Qt 事件循环 → 后台线程。
+                if self.state.snapshot().get("baidu_auto_invoke"):
+                    if self._auto_invoke_busy:
+                        self._append_log("[分享] 上一个自动拉起尚未结束，已跳过")
+                    else:
+                        self._auto_invoke_busy = True
+                        threading.Thread(
+                            target=self._auto_invoke_share,
+                            args=(item.get("url"), item.get("pwd") or ""),
+                            daemon=True).start()
 
     def _open_recent_share(self):
         """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
@@ -632,6 +645,26 @@ class MainWindow(QMainWindow):
                 self._append_log(f"拉起客户端失败: {detail}")
         except Exception as e:
             self._append_log(f"拉起客户端出错: {e}")
+
+    def _auto_invoke_share(self, url, pwd):
+        """后台线程：自动把分享链接交给网盘客户端下载（实验性，默认关）。
+
+        由 `_drain()` 在开启 `baidu_auto_invoke` 时以 daemon 线程启动，避免
+        `invoke_download` 的约 20s 轮询阻塞 Qt 事件循环。线程内**不碰 UI**，
+        日志一律走线程安全的 `hub.log`；无论成败都在 `finally` 复位忙标志，
+        且所有异常都在此吞掉、绝不逃逸到线程外。"""
+        try:
+            self.hub.log(f"[分享] 自动拉起客户端下载…: {url}")
+            from .. import baidu_task as bt
+            ok, detail = bt.invoke_download(url, pwd=pwd)
+            if ok:
+                self.hub.log(f"[分享] 自动拉起成功: 已请求客户端下载（{detail}）")
+            else:
+                self.hub.log(f"[分享] 自动拉起失败: {detail}")
+        except Exception as e:
+            self.hub.log(f"[分享] 自动拉取出错: {e}")
+        finally:
+            self._auto_invoke_busy = False
 
     # ---------- 网址信任：挂起队列 / 非置顶询问弹窗 / 决策回写 ----------
     def _handle_trust_ask(self, req):

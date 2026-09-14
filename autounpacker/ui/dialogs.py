@@ -891,6 +891,14 @@ class SettingsDialog(QDialog):
             "（BaiduYunGuanjia.db），用于还原下载批次、目录结构与分卷。\n"
             "只读打开、短连接、不写不锁，不影响正在运行的网盘客户端。")
         exp_lay.addWidget(self.experimental_cb)
+        # 检测到分享链接时自动拉起客户端下载（实验性，默认关）
+        self.baidu_auto_invoke_cb = self._cfg_cb(
+            "baidu_auto_invoke", "检测到分享链接时自动拉起客户端下载", False)
+        self.baidu_auto_invoke_cb.setToolTip(
+            "实验性、默认关闭。开启后：复制到百度网盘分享链接时，程序会自动把它交给\n"
+            "网盘客户端下载（整包，分享里的文件全下）。注意：会自动触发下载，请确认\n"
+            "分享链接来源可信；也可随时改用托盘菜单「用客户端打开最近分享」手动触发。")
+        exp_lay.addWidget(self.baidu_auto_invoke_cb)
         # 手动诊断按钮：显式、只读、一次性，不受实验开关限制（始终可用）
         diag_row = QHBoxLayout()
         self.netdisk_diag_btn = QPushButton("立即读取网盘任务库")

@@ -73,6 +73,7 @@ DEFAULT_CONFIG = {
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
+    "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
@@ -192,6 +193,7 @@ def _sanitize_cfg(cfg):
         cfg["tls_skip_verify"] = bool(cfg.get("tls_skip_verify", False))
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
+        cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
         _ut = str(cfg.get("ui_theme", "auto") or "auto").strip().lower()
         cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
         _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()

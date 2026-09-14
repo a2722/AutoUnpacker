@@ -609,24 +609,24 @@ class MainWindow(QMainWindow):
                     f"（托盘菜单「用客户端打开最近分享」可拉起客户端）")
 
     def _open_recent_share(self):
-        """托盘动作：用百度网盘客户端打开最近捕获的分享链接（2.F『拉起』）。
+        """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
 
-        不下载、不登录、不开网页——只把 `baiduyunguanjia://…` 交给系统协议处理器。"""
+        走完整分享下载令牌链路后，用 `baiduyunguanjia://evoked-download/…` 唤起
+        客户端，由客户端自己完成下载（不下载、不登录、不开网页）。"""
         try:
             from .. import baidu_task as bt
             rec = bt.last_share()
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
-            ok, detail = bt.open_share_in_client(
-                rec.get("surl"), pwd=rec.get("pwd") or "",
-                shareid=rec.get("shareid") or "",
-                share_uk=rec.get("share_uk") or "")
+            ok, detail = bt.invoke_download(
+                rec.get("url"), pwd=rec.get("pwd") or "")
             if ok:
-                self._append_log(f"已请求客户端打开分享: {rec.get('url')}")
+                self._append_log(
+                    f"已请求客户端下载分享: {rec.get('url')}（{detail}）")
                 if hasattr(self, "tray"):
                     self.tray.showMessage(
-                        "用客户端打开分享", str(rec.get("url")),
+                        "用客户端下载分享", str(rec.get("url")),
                         QSystemTrayIcon.Information, 3000)
             else:
                 self._append_log(f"拉起客户端失败: {detail}")

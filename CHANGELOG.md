@@ -51,9 +51,12 @@
   - `observe_tasks` 给活动任务挂 `share` 关联键，新任务日志据此输出
     「分享 shareid=… uk=… fs_id=…，链接 …」。
   于是「链接 ↔ 下载任务」可用 `shareid` 精确对齐（兜底：`server_path`+`size`+`md5`）。
-  - 另新增 `build_client_invoke_url()` / `open_share_in_client()`：按分享页调端 SDK 同款
-    格式构造 `baiduyunguanjia://preview-share-file/?param=<JSON>` 交给系统协议处理器，
-    即可**用客户端打开分享（"拉起"下载）**——不下载、不登录、不碰网页，绕开 IDM。
+  - 另新增 `baidu_share.invoke_download()`：完整复刻「分享链接 → tplconfig 取 sign →
+    verify 校验提取码得 sekey → share/list 列文件 → sharedownload 转存（拿到不透明的
+    `filelist` 字符串令牌）→ invoker/get + online + send 投递 → 用
+    `baiduyunguanjia://evoked-download/?browserId=…&seq=…` 唤起客户端 → invoker/check
+    轮询确认」这条链路，即可**用客户端下载该分享（"拉起"下载）**——不下载、不登录、
+    不碰网页，绕开 IDM。
 
 ### 修复
 

@@ -5,10 +5,12 @@
 - SevenZipSetupDialog 检测/安装/卸载 7-Zip（隔离版与全局版）
 - SettingsDialog 全部配置项编辑（监听路径、通知、信任名单、快捷键等）
 - CloseActionDialog 关闭行为询问；TrustAskDialog 新网址信任确认
-关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog
+- ShareCodeAskDialog 分享缺提取码时的非阻塞询问（超时自动忽略）
+关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog / ShareCodeAskDialog
 依赖：PyQt5、trail、sevenzip、trust、widgets
 注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
 """
+import re
 import threading
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame)
@@ -34,6 +36,10 @@ TRAIL_STATUS_TEXT = {
 # 与主题同一对象，切换主题后就地更新），此处不再重复定义。
 
 TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
+
+# 分享缺提取码询问面板的超时（秒）：到点自动按「忽略」处理。
+# 3 分钟为初始值，后续可统一调整；所有此类非阻塞提示都复用这一常量。
+SHARE_ASK_TIMEOUT_SEC = 180
 
 
 class DeleteTrailDialog(QDialog):
@@ -825,6 +831,23 @@ class SettingsDialog(QDialog):
         share_clear_btn.clicked.connect(self._clear_share_hotkey)
         srow.addWidget(share_clear_btn)
         hl.addLayout(srow)
+        # 第三个可选快捷键：用映射里的固定提取码下载最近分享（默认留空 = 不设置）
+        code_row = QHBoxLayout()
+        code_row.addWidget(QLabel("固定提取码手势"))
+        self.hotkey_share_code_edit = HotkeyEdit()
+        code_current = str(
+            self.state.snapshot().get("hotkey_share_code", "")).strip()
+        if code_current:
+            self.hotkey_share_code_edit.setText(code_current)
+        self.hotkey_share_code_edit.setToolTip(
+            "用映射里的固定提取码下载最近分享；留空 = 不设置（默认）。")
+        self.hotkey_share_code_edit.comboChanged.connect(
+            self._on_share_code_hotkey_changed)
+        code_row.addWidget(self.hotkey_share_code_edit, 1)
+        code_clear_btn = QPushButton("清除")
+        code_clear_btn.clicked.connect(self._clear_share_code_hotkey)
+        code_row.addWidget(code_clear_btn)
+        hl.addLayout(code_row)
         share_hint = QLabel("留空 = 不设置（默认）。")
         share_hint.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         hl.addWidget(share_hint)
@@ -934,6 +957,30 @@ class SettingsDialog(QDialog):
         self.baidu_auto_invoke_cb.setEnabled(self.experimental_cb.isChecked())
         self.experimental_cb.stateChanged.connect(
             lambda s: self.baidu_auto_invoke_cb.setEnabled(bool(s)))
+        # 分享下载前先让我挑选文件（实验性，默认关；同受实验总开关约束）
+        self.baidu_pick_cb = self._cfg_cb(
+            "baidu_pick_before_download", "分享下载前先让我挑选文件（实验性）", False)
+        self.baidu_pick_cb.setToolTip(
+            "实验性、默认关闭。开启后：网盘分享下载前先弹出文件清单，勾选后再下载\n"
+            "（适合分享里文件很多、只想下载其中一部分的场景）。")
+        exp_lay.addWidget(self.baidu_pick_cb)
+        self.baidu_pick_cb.setEnabled(self.experimental_cb.isChecked())
+        self.experimental_cb.stateChanged.connect(
+            lambda s: self.baidu_pick_cb.setEnabled(bool(s)))
+        # 无登录态提示：实验链路不携带浏览器登录态、不用浏览器 cookie；客户端未运行
+        # 时唤起可能让它进入未登录状态。仅一行说明文字（不可编辑、不弹窗）。
+        # 与上面两个子开关同样受实验总开关约束（关时一并灰掉），不引入新逻辑。
+        self.share_nologin_hint = QLabel(
+            "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用你的浏览器 cookie。"
+            "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态，届时需要重新登录。"
+            "为避免这一点，自动拉起前会先检查客户端进程，未运行时将跳过并提示你。")
+        self.share_nologin_hint.setWordWrap(True)
+        self.share_nologin_hint.setStyleSheet(
+            f"color: {PALETTE['warn_text']}; font-size: 12px;")
+        exp_lay.addWidget(self.share_nologin_hint)
+        self.share_nologin_hint.setEnabled(self.experimental_cb.isChecked())
+        self.experimental_cb.stateChanged.connect(
+            lambda s: self.share_nologin_hint.setEnabled(bool(s)))
         # 手动诊断按钮：显式、只读、一次性，不受实验开关限制（始终可用）
         diag_row = QHBoxLayout()
         self.netdisk_diag_btn = QPushButton("立即读取网盘任务库")
@@ -1072,6 +1119,15 @@ class SettingsDialog(QDialog):
     def _clear_share_hotkey(self):
         self.hotkey_share_edit.setText("")
         self.state.set("hotkey_share", "")
+        self._notify_hotkey_change()
+
+    def _on_share_code_hotkey_changed(self, combo):
+        self.state.set("hotkey_share_code", combo)
+        self._notify_hotkey_change()
+
+    def _clear_share_code_hotkey(self):
+        self.hotkey_share_code_edit.setText("")
+        self.state.set("hotkey_share_code", "")
         self._notify_hotkey_change()
 
     # ---------- 7-Zip 管理 ----------
@@ -1383,4 +1439,202 @@ class TrustAskDialog(QDialog):
             except Exception:
                 pass
 
+
+class ShareCodeAskDialog(QDialog):
+    """分享缺提取码时的非阻塞询问面板（超时自动忽略）。
+
+    识别到分享链接、但剪贴板附近没有有效提取码时，由调用方用 show() 展示；
+    非模态、不置顶、不抢焦点，默认 3 分钟后自动按「忽略」处理。点标题栏 ×
+    或按 Esc 关闭同样等价「忽略」，保证 on_decision 恰好被回调一次、
+    调用方不会永远等待。任何回调都不向外抛异常。
+
+    on_decision(kind, code)：
+      kind == "mapped"  -> 用户选择「加入固定提取码映射」，code 为文本框内容
+      kind == "once"    -> 用户选择「只用本次」，code 为文本框内容
+      kind == "ignore"  -> 用户选择忽略，或面板超时 / 关闭时自动忽略
+    """
+
+    def __init__(self, parent, surl, url, share_uk, mapped_code="",
+                 timeout_sec=SHARE_ASK_TIMEOUT_SEC, on_decision=None,
+                 state=None, hub=None):
+        super().__init__(parent)
+        self.surl = str(surl or "").strip()
+        self.url = str(url or "").strip()
+        self.share_uk = str(share_uk or "").strip()
+        self.on_decision = on_decision   # 由调用方注入：def (kind, code)
+        self._state = state
+        self._hub = hub
+        self._done = False
+        try:
+            self._timeout_sec = max(1, int(timeout_sec))
+        except Exception:
+            self._timeout_sec = SHARE_ASK_TIMEOUT_SEC
+
+        self.setWindowTitle("分享缺提取码")
+        # 非模态、不置顶：绝不 setModal(True) / exec_() / raise_
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint
+                            | Qt.WindowSystemMenuHint | Qt.WindowCloseButtonHint)
+        self.setModal(False)
+        self.resize(560, 400)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        title = QLabel("识别到分享链接，但剪贴板附近没有有效提取码")
+        title.setObjectName("appTitle")
+        title.setWordWrap(True)
+        lay.addWidget(title)
+
+        meta = QLabel(
+            f"surl：{self.surl or '未知'}\n分享者：{self.share_uk or '未知'}")
+        meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(meta)
+
+        # 链接太长时中间截断，完整链接放 tooltip（可选中复制）
+        url_label = QLabel()
+        url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        url_label.setText("链接：" + self.fontMetrics().elidedText(
+            self.url, Qt.ElideMiddle, 440))
+        url_label.setToolTip(self.url)
+        lay.addWidget(url_label)
+
+        box = QGroupBox("提取码处理方式")
+        bl = QVBoxLayout(box)
+        bl.setSpacing(6)
+        self._group = QButtonGroup(box)
+
+        row_a = QHBoxLayout()
+        self.mapped_rb = QRadioButton("加入该分享者的固定提取码映射")
+        self._group.addButton(self.mapped_rb)
+        row_a.addWidget(self.mapped_rb)
+        self.mapped_edit = QLineEdit()
+        self.mapped_edit.setPlaceholderText("请输入 4 位提取码")
+        if str(mapped_code or "").strip():
+            self.mapped_edit.setText(str(mapped_code).strip())
+        self.mapped_edit.setFixedWidth(150)
+        row_a.addWidget(self.mapped_edit)
+        row_a.addStretch(1)
+        bl.addLayout(row_a)
+
+        row_b = QHBoxLayout()
+        self.once_rb = QRadioButton("只用本次")
+        self._group.addButton(self.once_rb)
+        row_b.addWidget(self.once_rb)
+        self.once_edit = QLineEdit()
+        self.once_edit.setPlaceholderText("请输入 4 位提取码")
+        self.once_edit.setFixedWidth(150)
+        row_b.addWidget(self.once_edit)
+        row_b.addStretch(1)
+        bl.addLayout(row_b)
+
+        self.ignore_rb = QRadioButton("忽略本次")
+        self._group.addButton(self.ignore_rb)
+        bl.addWidget(self.ignore_rb)
+        lay.addWidget(box)
+
+        # 有预填映射时默认选中 a，否则默认「只用本次」（最快的一次性动作）
+        if self.mapped_edit.text().strip():
+            self.mapped_rb.setChecked(True)
+        else:
+            self.once_rb.setChecked(True)
+
+        self.err_label = QLabel("")   # 行内校验提示，不用任何模态弹窗
+        self.err_label.setWordWrap(True)
+        self.err_label.setStyleSheet(
+            f"color: {PALETTE['danger']}; font-size: 12px;")
+        lay.addWidget(self.err_label)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ignore_btn = QPushButton("忽略")
+        ignore_btn.clicked.connect(self._on_ignore_clicked)
+        ok_btn = QPushButton("确定")
+        ok_btn.setObjectName("primary")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_ok_clicked)
+        btns.addWidget(ignore_btn)
+        btns.addWidget(ok_btn)
+        lay.addLayout(btns)
+
+        self.timeout_label = QLabel(self._timeout_text())
+        self.timeout_label.setStyleSheet(
+            f"color: {PALETTE['muted']}; font-size: 12px;")
+        lay.addWidget(self.timeout_label)
+
+        # 单次计时器：到点记录一行日志后按「忽略」处理
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._on_timeout)
+        self._timer.start(self._timeout_sec * 1000)
+
+    def _timeout_text(self):
+        if self._timeout_sec >= 60:
+            return f"本窗口 {self._timeout_sec // 60} 分钟后自动忽略"
+        return f"本窗口 {self._timeout_sec} 秒后自动忽略"
+
+    def _selected(self):
+        """当前选中项 -> (kind, 对应输入框)；kind 为 ignore 时输入框为 None。"""
+        if self.mapped_rb.isChecked():
+            return "mapped", self.mapped_edit
+        if self.once_rb.isChecked():
+            return "once", self.once_edit
+        return "ignore", None
+
+    def _on_ok_clicked(self):
+        kind, edit = self._selected()
+        if kind == "ignore":
+            self._finish("ignore", "")
+            self.accept()
+            return
+        code = edit.text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9]{4}", code):
+            self.err_label.setText(
+                "提取码需为 4 位字母或数字（例：ab12），请检查后重试。")
+            return
+        self.err_label.setText("")
+        self._finish(kind, code)
+        self.accept()
+
+    def _on_ignore_clicked(self):
+        self._finish("ignore", "")
+        self.accept()
+
+    def _on_timeout(self):
+        # 超时：只记一行日志，然后关闭并按「忽略」处理（closeEvent 走同一出口）
+        try:
+            if self._hub is not None:
+                self._hub.log(
+                    f"分享询问超时({self._timeout_sec}s)，已忽略: {self.surl}")
+        except Exception:
+            pass
+        self.close()
+        self._finish("ignore", "")
+
+    def _finish(self, kind, code):
+        """统一出口：on_decision 只回调一次，并停掉超时计时器。"""
+        if self._done:
+            return
+        self._done = True
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        cb = self.on_decision
+        self.on_decision = None
+        if cb is not None:
+            try:
+                cb(kind, code)
+            except Exception:
+                pass
+
+    def reject(self):
+        # Esc 关闭：等价「忽略」
+        self._finish("ignore", "")
+        super().reject()
+
+    def closeEvent(self, event):
+        # 点标题栏 ×：等价「忽略」（已作答时 _finish 内部自行跳过）
+        self._finish("ignore", "")
+        super().closeEvent(event)
 

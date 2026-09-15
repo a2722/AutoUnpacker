@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "hotkey_enabled": True,             # 全局快捷键唤起主界面
     "hotkey": "Ctrl+Alt+W",             # 快捷键组合（空/无 表示禁用）
     "hotkey_share": "",                 # 「用客户端下载最近分享」全局快捷键（空=不设置）
+    "hotkey_share_code": "",            # 「用固定提取码下载最近分享」全局快捷键（空=不设置）
     "url_redirect_rules": [
         {"from": "drive.uc.cn", "to": "fast.uc.cn"},
     ],
@@ -75,6 +76,7 @@ DEFAULT_CONFIG = {
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
+    "baidu_pick_before_download": False,  # 实验性：分享下载前总是先让我挑选文件（默认关）
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
@@ -154,6 +156,7 @@ def _sanitize_cfg(cfg):
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))
         cfg["hotkey"] = str(cfg.get("hotkey", "Ctrl+Alt+W")).strip()
         cfg["hotkey_share"] = str(cfg.get("hotkey_share", "")).strip()
+        cfg["hotkey_share_code"] = str(cfg.get("hotkey_share_code", "")).strip()
         rules = []
         for r in cfg.get("url_redirect_rules") or []:
             if isinstance(r, dict) and r.get("from") and r.get("to"):
@@ -196,6 +199,7 @@ def _sanitize_cfg(cfg):
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
+        cfg["baidu_pick_before_download"] = bool(cfg.get("baidu_pick_before_download", False))
         _ut = str(cfg.get("ui_theme", "auto") or "auto").strip().lower()
         cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
         _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()
@@ -230,6 +234,7 @@ def load_config():
 # ---------- 全局快捷键（Win32 RegisterHotKey + WM_HOTKEY） ----------
 HOTKEY_ID = 0x5354          # 自定义 id（WM_HOTKEY 的 wParam）
 HOTKEY_ID_SHARE = 0x5355   # 「用客户端下载最近分享」的全局热键 id（第二个）
+HOTKEY_ID_SHARE_CODE = 0x5356  # 「用固定提取码下载最近分享」的全局热键 id（第三个）
 WM_HOTKEY = 0x0312
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
 MOD_NOREPEAT = 0x4000

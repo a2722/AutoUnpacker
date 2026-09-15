@@ -3,7 +3,8 @@
 
 职责：- FolderWatcher：轮询监听目录表层，识别压缩包并触发智能解压（嵌套/密码/分卷/伪装/删除回溯）
 - 分卷到齐判断、翻译 JSON 归位、百度清单模式（Tier-2 子目录处理，只增强不阻断）
-- QRMonitor：剪贴板二维码识别 + 短文本临时密码捕获 + 网址信任门卫（黑白名单判定）
+- QRMonitor：剪贴板二维码识别 + 短文本临时密码捕获 + 网址信任门卫（黑白名单判定）；
+  轮询线程只负责「检测 + 入队」，单独的守护工作线程串行执行网络/子进程/浏览器等阻塞 I/O
 关键入口：FolderWatcher / QRMonitor
 依赖：extract、trail、db、trust、baidu_task（实验性，惰性导入）
 注意：剪贴板/二维码依赖（win32clipboard/PIL）为惰性探测，缺失时自动禁用相关功能
@@ -1064,7 +1065,22 @@ def _should_capture_temp_password(text, cfg):
 
 
 class QRMonitor(threading.Thread):
-    """剪贴板监控线程：二维码识别（可选） + 短文本临时密码捕获"""
+    """剪贴板监控：轮询线程只「检测 + 入队」，单独工作线程串行执行阻塞 I/O。
+
+    两线程模型（D8 option C）：
+    - 轮询线程（run/_poll_once，每 0.5s 一次）：快照配置、排空信任放行队列、
+      捕获剪贴板文本、按 md5 去重检测剪贴板图片，全部只做轻量操作并转为工作项
+      入队；不发起任何网络/子进程/浏览器调用。这样检测循环始终快速返回，
+      _recent_texts 得以连续喂入（依赖它的「最近提取码回退」功能才不会被卡住）。
+    - 工作线程（_worker_loop，单个守护线程）：从 task_q 串行取任务，执行
+      _maybe_process_url/_decode_qr/_set_clipboard/_open_browser 等阻塞 I/O。
+      工作项严格 FIFO，处理顺序与旧单线程实现一致。
+
+    task_q 工作项格式：
+      ("text", text)            -> _maybe_process_url(text)
+      ("image", image)          -> _decode_qr(image) + _handle_decoded_texts(texts)
+      ("grant", url, purpose)   -> purpose=="fetch" 时强制拉取，否则打开浏览器
+    """
     def __init__(self, state, hub, pauser=None):
         super().__init__(daemon=True)
         self.state = state
@@ -1077,40 +1093,107 @@ class QRMonitor(threading.Thread):
         self.clipboard_worker_path = paths.WORKERS_DIR / "clipboard_worker.py"  # 剪贴板写入子进程脚本
         # 最近捕获的非图片剪贴板内容（如用户复制二维码前复制的提取码）
         self._recent_texts = deque(maxlen=20)
+        # 工作队列：轮询线程只负责「检测 + 入队」，工作线程串行执行阻塞 I/O。
+        # maxsize=8 用于限制内存；满队列由 _enqueue 淘汰最旧一项处理，绝不阻塞/抛异常。
+        self.task_q = queue.Queue(maxsize=8)
+        self._hist_lock = threading.Lock()   # 保护 last_text/_recent_texts（轮询线程与工作线程共享）
+        self._queue_full_logged = False      # 满队列日志节流标志（每段溢出只记一次）
 
     def run(self):
+        # 工作线程只启动一次：所有阻塞 I/O（网络/子进程/浏览器）都在它里面串行
+        # 执行，保证本轮询循环每 0.5s 都能持续检测剪贴板变化。
+        threading.Thread(target=self._worker_loop, daemon=True).start()
         while True:
             cfg = self.state.snapshot()
-            # 处理用户信任确认后的放行请求（主窗口决策回调写入 url_grant_q）
-            while True:
-                try:
-                    gurl, gpurpose = self.hub.url_grant_q.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    if gpurpose == "fetch":
-                        self._maybe_process_url(gurl, force=True)
-                    else:
-                        self._open_browser(gurl)
-                except Exception as e:
-                    self.hub.log(f"信任放行执行失败: {e}")
-            # 暂停 = 原「停止监听」：剪贴板/二维码监控一并停止
-            if self.state.running and not (self.pauser is not None
-                                           and self.pauser.is_paused()):
-                try:
-                    new_text = self._capture_text_password()
-                    if cfg.get("qr_url_enabled") and QR_AVAILABLE and new_text:
-                        self._maybe_process_url(new_text)
-                    if cfg.get("qr_enabled") and QR_AVAILABLE and CLIPBOARD_AVAILABLE:
-                        wc, ig = _ensure_clipboard()
-                        if wc is not None and ig is not None:
-                            if wc.IsClipboardFormatAvailable(wc.CF_DIB):
-                                image = ig.grabclipboard()
-                                if image is not None:
-                                    self._process(image)
-                except Exception as e:
-                    self.hub.log(f"剪贴板监控出错: {e}")
+            self._poll_once(cfg)
             time.sleep(0.5)
+
+    def _poll_once(self, cfg):
+        """执行一轮轮询：只做「检测 + 入队」，绝不发起网络/子进程/浏览器 I/O。
+
+        轮询线程职责：
+        - 排空 url_grant_q，把用户的信任放行请求转为工作项入队（不受暂停影响）
+        - 暂停门控下：捕获剪贴板文本、按 md5 去重检测剪贴板图片，命中即入队
+        真正的耗时操作交给 _worker_loop 串行执行，因此本方法始终快速返回，
+        _recent_texts 得以连续喂入（最近提取码回退功能依赖它）。"""
+        # 处理用户信任确认后的放行请求（主窗口决策回调写入 url_grant_q）
+        while True:
+            try:
+                gurl, gpurpose = self.hub.url_grant_q.get_nowait()
+            except queue.Empty:
+                break
+            self._enqueue(("grant", gurl, gpurpose))
+        # 暂停 = 原「停止监听」：剪贴板/二维码监控一并停止
+        if self.state.running and not (self.pauser is not None
+                                       and self.pauser.is_paused()):
+            try:
+                new_text = self._capture_text_password()
+                if cfg.get("qr_url_enabled") and QR_AVAILABLE and new_text:
+                    self._enqueue(("text", new_text))
+                if cfg.get("qr_enabled") and QR_AVAILABLE and CLIPBOARD_AVAILABLE:
+                    wc, ig = _ensure_clipboard()
+                    if wc is not None and ig is not None:
+                        if wc.IsClipboardFormatAvailable(wc.CF_DIB):
+                            image = ig.grabclipboard()
+                            if image is not None:
+                                self._process(image)
+            except Exception as e:
+                self.hub.log(f"剪贴板监控出错: {e}")
+
+    def _worker_loop(self):
+        """工作线程：串行消费 task_q，执行所有阻塞 I/O。
+
+        与轮询线程分离的原因见类文档。broad try/except 保证任何单个任务失败都
+        不会让工作线程退出（否则后续任务将永远无人处理）。工作项严格 FIFO。"""
+        while True:
+            item = self.task_q.get()
+            try:
+                kind = item[0]
+                if kind == "text":
+                    self._maybe_process_url(item[1])
+                elif kind == "image":
+                    texts = self._decode_qr(item[1])
+                    self._handle_decoded_texts(texts)
+                elif kind == "grant":
+                    try:
+                        if item[2] == "fetch":
+                            self._maybe_process_url(item[1], force=True)
+                        else:
+                            self._open_browser(item[1])
+                    except Exception as e:
+                        self.hub.log(f"信任放行执行失败: {e}")
+            except Exception as e:
+                self.hub.log(f"剪贴板监控出错: {e}")
+            finally:
+                self.task_q.task_done()
+
+    def _enqueue(self, item):
+        """把工作项放入 task_q；队列满时淘汰**最旧**的一项，绝不抛异常给调用者。
+
+        队列满时必须在「丢最旧」与「丢最新」之间选。丢最新会掐死用户刚触发的
+        操作（刚复制的分享链接、刚确认的信任放行）；而且 last_text/last_hash 是
+        在入队之前就推进的，被丢掉之后「再复制一遍」也会被去重跳过、无法补救。
+        因此这里淘汰最旧的一项，保证最新的用户操作一定被处理。
+
+        满队列日志只在一次「溢出连续段」里记一条，恢复正常入队后复位标志。"""
+        try:
+            self.task_q.put_nowait(item)
+            self._queue_full_logged = False
+            return
+        except queue.Full:
+            pass
+        evicted = False
+        try:
+            self.task_q.get_nowait()       # 淘汰最旧的一项
+            self.task_q.task_done()        # 与被淘汰项配平 unfinished_tasks
+            self.task_q.put_nowait(item)   # 单消费者只出不进，此处不会再 Full
+            evicted = True
+        except (queue.Empty, queue.Full):
+            pass
+        if not self._queue_full_logged:
+            self._queue_full_logged = True
+            self.hub.log("剪贴板处理队列已满，已淘汰最旧的一项" if evicted
+                         else "剪贴板处理队列已满，本次任务已丢弃")
 
     def _capture_text_password(self):
         """监控剪贴板文本：短文本(<60)存入临时密码；同时记录最近的非图片内容
@@ -1144,10 +1227,14 @@ class QRMonitor(threading.Thread):
             if not text:
                 return None
             text = text.strip()
-            if not text or text == self.last_text:
-                return None
-            self.last_text = text
-            self._recent_texts.append(text[:200])
+            # last_text / _recent_texts 由轮询线程（此处）与工作线程
+            # （_restore_last_text）共享，统一用 _hist_lock 保护；临界区内不做任何
+            # 耗时操作，避免卡住另一线程。
+            with self._hist_lock:
+                if not text or text == self.last_text:
+                    return None
+                self.last_text = text
+                self._recent_texts.append((time.time(), text[:200]))
             cfg = self.state.snapshot()
             # 是否记录为临时密码：受「智能过滤」「网址排除」两个开关控制
             if _should_capture_temp_password(text, cfg):
@@ -1182,19 +1269,43 @@ class QRMonitor(threading.Thread):
             return False
 
     def _restore_last_text(self):
-        """把最近捕获的非图片剪贴板内容（如提取码）写回剪贴板，方便直接 Ctrl+V。"""
-        while self._recent_texts:
-            text = self._recent_texts[-1]
-            self._recent_texts.pop()
+        """把最近捕获的非图片剪贴板内容（如提取码）写回剪贴板，方便直接 Ctrl+V。
+
+        _recent_texts / last_text 与轮询线程共享，用 _hist_lock 保护；锁只包住
+        「取队尾 + 出队」这一步，_set_clipboard 的阻塞调用留在锁外，避免轮询
+        线程被卡住。
+
+        迭代次数以进入时的条数为上限：轮询线程在循环期间仍会持续 append，不设
+        上限时（旧实现同线程读写，不会发生）写剪贴板持续失败 + 持续复制会让这里
+        迟迟不退出，饿死队列里的其它任务。"""
+        with self._hist_lock:
+            pending = len(self._recent_texts)
+        while pending > 0:
+            pending -= 1
+            with self._hist_lock:
+                if not self._recent_texts:
+                    break
+                _, text = self._recent_texts[-1]
+                self._recent_texts.pop()
+                if text:
+                    self.last_text = text  # 避免下一轮把它当新内容重复记录
             if not text:
                 continue
-            self.last_text = text  # 避免下一轮把它当新内容重复记录
             if self._set_clipboard(text):
                 self.hub.log(f"已把最近的非图片复制内容写回剪贴板: {text[:40]}")
                 return
         self.hub.log("没有可恢复的最近文本")
 
+    def _history(self):
+        """返回最近的非图片剪贴板文本快照 [(t, text), ...]（临时密码回退用，需持锁取副本）。"""
+        with self._hist_lock:
+            return list(self._recent_texts)
+
     def _process(self, image):
+        """轮询线程侧：剪贴板图片按 md5 去重后入队，解码交给工作线程。
+
+        去重必须留在轮询线程：否则未变化的剪贴板图片会每 0.5s 重复入队，很快
+        淹没 task_q。仅在图片确实变化（哈希不同）时入队一次。"""
         import hashlib
         from io import BytesIO
         buf = BytesIO()
@@ -1203,8 +1314,7 @@ class QRMonitor(threading.Thread):
         if h == self.last_hash:
             return
         self.last_hash = h
-        texts = self._decode_qr(image)
-        self._handle_decoded_texts(texts)
+        self._enqueue(("image", image))
 
     def _handle_decoded_texts(self, texts):
         """对解码出的文本做统一处理。
@@ -1227,6 +1337,12 @@ class QRMonitor(threading.Thread):
             rules = cfg.get("url_redirect_rules") or []
             action = cfg.get("qr_clipboard_action", "none")
             for text in texts:
+                # d1/d2：二维码内容若解析为百度分享链接，只走「分享」链路
+                # （记录 + 投递 share_link，由主窗口按 experimental_enabled 与
+                # baidu_auto_invoke 决定是否拉起客户端），绝不打开浏览器；分享
+                # 链接是给网盘客户端下载整包用的，不是给浏览器看的网页。
+                if cfg.get("experimental_enabled") and self._handle_baidu_share(text):
+                    continue
                 url = self._extract_url(text)
                 if not url:
                     # 情况A：无链接（普通内容 / 多链接）。内容里若含提取码，
@@ -1468,11 +1584,44 @@ class QRMonitor(threading.Thread):
             rec = _bt.remember_share_link(text, html)
             if not rec:
                 return True    # 已确认是分享链接：按分享处理，不再走二维码
+            # d3（收紧）：URL 未带 ?pwd= 时按顺序自动回退解析提取码，命中即原地写
+            # 回 rec["pwd"]（remember_share_link 存的正是同一个 dict，其它消费者立即
+            # 可见）：1) 文本内嵌（如「…链接 提取码：Zdjn」）→ 2) **仅**最近复制的文本。
+            # **绝不**在此自动套用分享者的固定映射：使用固定码必须由用户显式手势
+            # 触发（面板/托盘/热键）。本处只通过 has_map 告知 UI「该分享者配有固定
+            # 码」，由 UI 去征询；recent_code_from_history 缺失或异常时按无码处理。
+            # 此处只做快速只读查询，绝不发起网络请求。
+            code_source = "url" if rec.get("pwd") else ""
+            if not rec.get("pwd"):
+                code = self._extract_pwd_code(text)
+                if code:
+                    rec["pwd"] = code
+                    code_source = "text"
+                    self.hub.log(f"分享缺提取码：已按文本内嵌提取码补上 -> {code}")
+                else:
+                    code = None
+                    try:
+                        code, _ = _bt.recent_code_from_history(self._history())
+                    except Exception:
+                        code = None
+                    if code:
+                        rec["pwd"] = code
+                        code_source = "recent"
+                        self.hub.log(f"分享缺提取码：已按最近复制的文本补上 -> {code}")
+                    else:
+                        self.hub.log("分享缺提取码：未找到可用候选，按无码尝试")
             self.hub.log(f"已记录分享链接: surl={rec.get('surl')} "
                          f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
             try:
+                has_map = bool(_bt.mapped_code(rec.get("share_uk")))
+            except Exception:
+                has_map = False
+            try:
                 self.hub.q.put({"type": "share_link", "url": rec.get("url"),
-                                "surl": rec.get("surl"), "pwd": rec.get("pwd")})
+                                "surl": rec.get("surl"), "pwd": rec.get("pwd"),
+                                "share_uk": rec.get("share_uk"),
+                                "has_map": has_map,
+                                "code_source": code_source})
             except Exception:
                 pass
             sid = str(rec.get("shareid") or "")

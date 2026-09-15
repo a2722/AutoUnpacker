@@ -2,9 +2,10 @@
 """共享密码本对话框：长期密码编辑 + 临时密码查看，所有监听目录共用。
 
 职责：- PasswordBookDialog 提供长期密码（每行一个）编辑、排序、查重
+- 编辑特殊用户固定提取码（share_uk → 提取码 + 是否「需要挑选」，每行一条）
 - 只读展示运行期临时密码，QTimer 轮询实时同步（不打断用户选中/滚动）
-- 保存时写入 state（长期密码存 toolbox.db）
-关键入口：PasswordBookDialog / parse_password_text()
+- 保存时写入 state（长期密码/固定提取码存 toolbox.db）
+关键入口：PasswordBookDialog / parse_password_text() / parse_share_code_text() / format_share_code_text()
 依赖：PyQt5、state.AppState
 注意：密码按换行分隔（不再用逗号）；临时密码由后台剪贴板线程写入 state，此处只展示
 """
@@ -30,6 +31,73 @@ def parse_password_text(text):
     return result
 
 
+def parse_share_code_text(text):
+    """把「分享者UK 提取码 [pick] [#备注]」多行文本解析为
+    [{"share_uk","code","note","pick"}, ...]，pick 为 0/1。
+
+    空行/注释行/格式不合法的行一律跳过；同一 UK 重复出现时以最后一行为准。
+    接受格式：以空白（空格/制表符）分隔，「#」之后为备注（可省略）；UK 必须是
+    纯数字，「提取码」必须是 1~16 位 ASCII 字母或数字。第三列若为 pick/挑选/1
+    （pick 不分大小写）则标记「需要挑选」（pick=1），否则该列并入备注文本。
+    任何输入都不抛异常。
+    """
+    result = []
+    index = {}
+    for line in str(text or "").splitlines():
+        p = line.strip()
+        if not p or p.startswith("#"):
+            continue
+        body, _, note = p.partition("#")
+        parts = body.split()
+        if len(parts) < 2:
+            continue
+        uk, code = parts[0], parts[1]
+        if not (uk.isascii() and uk.isdigit()):
+            continue
+        if not (1 <= len(code) <= 16) or not (code.isascii() and code.isalnum()):
+            continue
+        rest = parts[2:]
+        pick = 0
+        if rest and rest[0].lower() in ("pick", "挑选", "1"):
+            pick = 1
+            rest = rest[1:]
+        note = note.strip() or " ".join(rest)
+        item = {"share_uk": uk, "code": code, "note": note, "pick": pick}
+        if uk in index:
+            # 同一 UK 重复：最后一行的提取码/备注/pick 生效，位置沿用首次出现（与 db 一致）
+            index[uk].update(item)
+        else:
+            index[uk] = item
+            result.append(item)
+    return result
+
+
+def format_share_code_text(items):
+    """把固定提取码列表格式化为编辑框文本：每行「分享者UK 提取码 [pick] [#备注]」。
+
+    与 parse_share_code_text 互为往返：pick=1 写成 pick 标记，再解析回来仍为 1；
+    pick=0 不写标记。非法条目跳过，任何输入都不抛异常。
+    """
+    lines = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        uk = str(it.get("share_uk") or "").strip()
+        code = str(it.get("code") or "").strip()
+        if not uk or not code:
+            continue
+        try:
+            pick = 1 if int(it.get("pick") or 0) else 0
+        except Exception:
+            pick = 1 if it.get("pick") else 0
+        note = str(it.get("note") or "").strip()
+        line = f"{uk} {code} pick" if pick else f"{uk} {code}"
+        if note:
+            line += f" #{note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class PasswordBookDialog(QDialog):
     """共享密码本子窗口：长期密码（换行分隔）+ 临时密码管理"""
 
@@ -37,7 +105,7 @@ class PasswordBookDialog(QDialog):
         super().__init__(parent)
         self.state = state
         self.setWindowTitle("共享密码本")
-        self.resize(520, 540)
+        self.resize(520, 660)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 14)
@@ -113,7 +181,38 @@ class PasswordBookDialog(QDialog):
         split.setSizes([340, 140])
         lay.addWidget(split, 1)
 
+        # 特殊用户固定提取码区（标题行 + 编辑框）：预填 state 中的数据（与解析器可往返）
+        try:
+            share_text = format_share_code_text(state.share_code_map() or [])
+        except Exception:
+            share_text = ""
+
+        self.share_edit = QPlainTextEdit()
+        self.share_edit.setMinimumHeight(60)
+        self.share_edit.setPlaceholderText(
+            "每行一条：分享者UK 提取码 [pick] [#备注]，例如：\n"
+            "3567282991 ab12 #老王\n"
+            "3567282991 ab12 pick #老王\n"
+            "第三列写 pick / 挑选 / 1 表示该分享者需要挑选下载文件（不写则整包下载）；\n"
+            "分享者UK 是分享页上传者的数字 uid（share_uk）；提取码为 4 位字符。")
+        self.share_edit.setPlainText(share_text)
+        share_box = QWidget()
+        share_lay = QVBoxLayout(share_box)
+        share_lay.setContentsMargins(0, 0, 0, 0)
+        share_lay.setSpacing(8)
+        share_head = QHBoxLayout()
+        share_head.addWidget(QLabel("特殊用户固定提取码（每行：分享者UK 提取码 [pick] [#备注]）："))
+        share_head.addStretch(1)
+        self.share_count_lbl = QLabel()
+        self.share_count_lbl.setStyleSheet(f"color: {PALETTE['muted']};")
+        share_head.addWidget(self.share_count_lbl)
+        share_lay.addLayout(share_head)
+        share_lay.addWidget(self.share_edit)
+        lay.addWidget(share_box)
+
         self._update_count()
+        self.share_edit.textChanged.connect(self._update_share_count)
+        self._update_share_count()
 
         btns = QHBoxLayout()
         btns.addStretch(1)
@@ -188,6 +287,10 @@ class PasswordBookDialog(QDialog):
     def _update_count(self):
         self.count_lbl.setText(f"共 {len(self._lines())} 条")
 
+    def _update_share_count(self):
+        n = len(parse_share_code_text(self.share_edit.toPlainText()))
+        self.share_count_lbl.setText(f"共 {n} 条")
+
     def _sort(self):
         """按字母升序排序（忽略大小写），不修改密码内容"""
         lines = self._lines()
@@ -216,4 +319,9 @@ class PasswordBookDialog(QDialog):
     def accept(self):
         self.state.set_passwords(parse_password_text(self.edit.toPlainText()))
         self.state.set_auto_add(self.auto_cb.isChecked())
+        try:
+            self.state.set_share_code_map(
+                parse_share_code_text(self.share_edit.toPlainText()))
+        except Exception:
+            pass
         super().accept()

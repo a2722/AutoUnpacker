@@ -128,6 +128,42 @@ _TRACK = {
 }
 
 
+# D7：会话级「本次进程内已拉起次数」计数。刻意**放在 _TRACK 之外**，免得干扰
+# 现有对 _TRACK 的迭代；也刻意**只存内存不落盘**——去重窗口就是「一次进程生命周期」。
+_LAUNCHES = {}      # surl -> 本次进程内已拉起次数（D7：会话内去重，重启即忘）
+
+
+def share_launch_count(surl):
+    """返回本进程内该 surl 已拉起的次数（未知/空串返回 0）。
+
+    D7：只做内存计数、不持久化——去重窗口＝「一次进程生命周期」，重启即忘。
+    绝不抛异常，开销极小。
+    """
+    try:
+        key = str(surl or "").strip()
+        if not key:
+            return 0
+        return int(_LAUNCHES.get(key) or 0)
+    except Exception:
+        return 0
+
+
+def bump_share_launch(surl):
+    """把该 surl 的拉起次数 +1 并返回新值（空 surl 忽略，返回 0）。
+
+    D7：仅内存、不持久化。绝不抛异常。
+    """
+    try:
+        key = str(surl or "").strip()
+        if not key:
+            return 0
+        n = int(_LAUNCHES.get(key) or 0) + 1
+        _LAUNCHES[key] = n
+        return n
+    except Exception:
+        return 0
+
+
 def _norm_path(p):
     return str(p or "").replace("/", "\\").rstrip("\\").lower()
 
@@ -141,6 +177,10 @@ def parse_share_url(url):
     """把剪贴板里的百度分享链接解析成 {"surl","pwd","url"}；不是分享链接返回 None。"""
     try:
         s = str(url or "")
+        # D6：只认 pan.baidu.com 域名的分享链接。此前 `surl=` 兜底匹配不限域名，
+        # 任何带 surl 参数的第三方站点都会被误当成百度分享；这里先做域名守卫。
+        if "pan.baidu.com" not in s.lower():
+            return None
         m = _SHARE_URL_RE.search(s)
         if m:
             surl = m.group(1)
@@ -157,6 +197,99 @@ def parse_share_url(url):
         return {"surl": surl, "pwd": pwd, "url": s}
     except Exception:
         return None
+
+
+def looks_like_share_code(text):
+    """判断文本是否像百度网盘提取码：4 位字母数字（大小写均可）。"""
+    try:
+        s = str(text or "").strip()
+        if not s:
+            return False
+        # 用 fullmatch 而非 search：长文本不应被误判为提取码。
+        return bool(re.fullmatch(r"[A-Za-z0-9]{4}", s))
+    except Exception:
+        return False
+
+
+def mapped_code(share_uk):
+    """该分享者是否配置了固定提取码；返回 code 或 None（薄封装 db.find_share_code，**不做应用**）。
+
+    d3 收紧后的口径：固定映射不再自动套用——monitor 用本函数只判断「有没有」，
+    是否使用必须由用户显式手势决定。绝不抛异常。
+    """
+    try:
+        if not share_uk:
+            return None
+        from . import db as _db
+        code = _db.find_share_code(str(share_uk))
+        if code:
+            c = str(code).strip()
+            if c:
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def recent_code_from_history(history):
+    """只在「运行时剪贴板历史」里选一个候选提取码，返回 (code|None, source)。
+
+    history 元素通常是 (t, text)（t 为墙钟 float），也容忍纯字符串（时间未知）
+    与畸形条目：取 t 最大且像提取码的那条；若都没有可用时间戳但有条目像提取码，
+    回退到「最后一个」像提取码的条目。source："recent" 命中，"" 无候选。
+    绝不抛异常。
+    """
+    try:
+        best_ts = None
+        best_text = None
+        fallback_text = None
+        for ent in (history or []):
+            if isinstance(ent, str):
+                text = ent
+                ts = None
+            else:
+                try:
+                    text = ent[1]
+                except Exception:
+                    continue          # 畸形条目直接跳过
+                try:
+                    ts = float(ent[0])
+                except Exception:
+                    ts = None
+            if not looks_like_share_code(text):
+                continue
+            fallback_text = text
+            if ts is not None and (best_ts is None or ts > best_ts):
+                best_ts = ts
+                best_text = text
+        if best_text is not None:
+            return (best_text, "recent")
+        if fallback_text is not None:
+            return (fallback_text, "recent")
+    except Exception:
+        pass
+    return (None, "")
+
+
+def pick_share_code(share_uk, history):
+    """按 d3/d4/d5 选一个候选提取码，返回 (code, source)。
+
+    source 取值："map" = 特殊用户（share_uk）固定提取码映射命中；
+                  "recent" = 运行时剪贴板历史里「绝对最近」且像提取码的那条；
+                  "" = 没有候选。
+    优先级：特殊用户映射 > 最近复制（d5 要求映射优先）。
+    只返回一个候选（d4：默认只试最近 1 个）。绝不抛异常。
+    实现＝ mapped_code + recent_code_from_history 的组合（行为与旧版逐字一致）。
+    """
+    # d3/d5：特殊用户固定映射优先于「最近复制」。
+    code = mapped_code(share_uk)
+    if code:
+        return (code, "map")
+    # d5：否则取剪贴板历史里「绝对最近」且像提取码的那条。
+    c, src = recent_code_from_history(history)
+    if c is not None:
+        return (c, src)
+    return (None, "")
 
 
 def extract_share_ids_from_html(html):

@@ -738,6 +738,41 @@ def _dir_size(path):
     return total
 
 
+def _detect_7z_only_format(path):
+    """嗅探文件头部魔数：若格式只有 7-Zip 能解、内置 zipfile 引擎解不了，
+    返回格式名（rar/7z/tar/gz/bz2/xz），否则返回 None（ZIP 或无法判断）。
+
+    纯函数、零依赖、最多读 300 字节（tar 的 "ustar" 魔数在偏移 257）。文件
+    缺失、为空、过短、不可读一律返回 None，绝不抛异常。ZIP 签名明确返回
+    None，保证「损坏的 ZIP 仍报不是有效的 ZIP 文件」的旧行为不变。
+
+    用途：7-Zip 缺失时程序会降级到 PythonZipEngine，此时对 rar/7z 等格式
+    必须给出"需要 7-Zip"的准确提示，而不是让 zipfile 抛 BadZipFile 后误报
+    "不是有效的 ZIP 文件"。"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(300)
+    except OSError:
+        return None
+    if not data:
+        return None
+    if data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x06\x06", b"PK\x07\x08"):
+        return None
+    if data[:7] == b"Rar!\x1a\x07\x00" or data[:8] == b"Rar!\x1a\x07\x01\x00":
+        return "rar"  # rar4 / rar5
+    if data[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    if data[:2] == b"\x1f\x8b":
+        return "gz"
+    if data[:3] == b"BZh":
+        return "bz2"
+    if data[:6] == b"\xfd7zXZ\x00":
+        return "xz"
+    if data[257:262] == b"ustar":
+        return "tar"
+    return None
+
+
 class PythonZipEngine:
     name = "Python zipfile"
 
@@ -757,6 +792,13 @@ class PythonZipEngine:
 
     def extract(self, task, options, layer):
         archive = Path(task["source_path"])
+        fmt = _detect_7z_only_format(archive)
+        if fmt:
+            # 非 ZIP 格式（rar/7z/tar…）：内置引擎无能为力，必须明确提示需要
+            # 7-Zip，而不是让 zipfile 抛 BadZipFile 后误报"不是有效的 ZIP 文件"。
+            return {"success": False, "used_password": None,
+                    "error": f"该格式需要 7-Zip（当前不可用）：{fmt} 无法用内置引擎解压",
+                    "logs": [f"检测到 {fmt} 格式，内置 zipfile 引擎无法解压，需要 7-Zip"]}
         out = Path(task["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         pauser = task.get("pauser")

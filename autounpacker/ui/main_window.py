@@ -740,6 +740,30 @@ class MainWindow(QMainWindow):
         """全局热键：用固定提取码下载最近分享（等价托盘菜单那项）。"""
         self._open_recent_share_with_code()
 
+    def _share_gate_blocked(self, manual, where=""):
+        """后台线程预检：百度网盘客户端未在运行时，立即中断本次分享下载。
+
+        只读检查 `baidu_share.client_ready()`（`tasklist` 进程检查约数百毫秒，**只能在
+        后台线程**调用）；不碰任何 Qt 控件，日志走线程安全的 `self.hub.log`，托盘提醒
+        走 `_share_notify`（hub 队列）。客户端未运行 → 记日志 + 提醒后返回 True，调用方
+        据此直接结束，后续网络请求与弹窗一概不再发生。预检自身任何异常都按「放行」
+        处理（返回 False），绝不因预检逻辑打断流程——提交时 `commit_download` 内
+        仍有最终安全网兜底。"""
+        try:
+            from .. import baidu_share as bs
+            if bs.client_ready():
+                return False
+        except Exception as e:
+            tag = ("手动" if manual else "自动") + (f"·{where}" if where else "")
+            self.hub.log(f"[分享] 客户端预检异常（{tag}），继续按原流程尝试: {e}")
+            return False
+        self.hub.log("[分享] 客户端未在运行，已中断本次分享下载（先打开百度网盘客户端再重试）")
+        self._share_notify(
+            "分享下载已中断",
+            "百度网盘客户端未在运行，已中断本次分享下载：客户端未运行时拉起会进入"
+            "未登录态、可能需重新登录。请先打开客户端后重试。")
+        return True
+
     def _start_share_invoke(self, url, pwd, manual=False):
         """统一的分享拉起入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
 
@@ -758,6 +782,8 @@ class MainWindow(QMainWindow):
         线程内**不碰 UI**：日志走线程安全的 `self.hub.log`，托盘提示走 `hub.q`
         队列（由 `_drain()` 在主线程消费）。异常一律吞掉，忙标志在 finally 复位。"""
         try:
+            if self._share_gate_blocked(manual, where="拉起客户端"):
+                return
             self.hub.log(f"[分享] {'手动' if manual else '自动'}拉起客户端下载…: {url}")
             from .. import baidu_task as bt
             ok, detail = bt.invoke_download(url, pwd=pwd)
@@ -816,6 +842,8 @@ class MainWindow(QMainWindow):
         等待用户在 Qt 线程做出的选择。空提取码时先探测该分享是否根本不需要提取码，
         确需提取码才把「询问」请求投回 Qt 线程。异常一律吞掉，忙标志在 finally 复位。"""
         try:
+            if self._share_gate_blocked(manual, where="准备管线"):
+                return
             from .. import baidu_share as bs
             if not pwd:
                 # 空提取码：先在后台线程探测是否根本不需要提取码（网络 IO）。

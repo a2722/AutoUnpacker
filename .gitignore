@@ -5,12 +5,19 @@ config.json
 temp_passwords.json
 # 长期密码本数据库
 toolbox.db
+# SQLite 随身文件：WAL/SHM/journal 里是同样的明文数据，运行时随时出现
+toolbox.db-*
+*.db-wal
+*.db-shm
+*.db-journal
 # 删除回溯记录（含真实文件路径）
 deletion_trail.json
 # 运行日志（含明文密码和文件路径）
 logs/
-# 崩溃日志（含用户路径）
-crash.log
+# 崩溃日志（含用户路径，含轮转出来的 crash.log.1 等）
+crash.log*
+# 其他散落日志（含轮转文件）
+*.log
 
 # ===== 历史备份（含敏感数据副本） =====
 backup/
@@ -27,6 +34,16 @@ ui-proposals/
 __pycache__/
 *.pyc
 *.pyo
+# 工具缓存目录（ruff 会自建 .ruff_cache/.gitignore，这里再兜一层）
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 打包 / 虚拟环境产物（源码仓库不收录）=====
+build/
+dist/
+venv/
+.venv/
 
 # ===== 第三方二进制 =====
 *.dll

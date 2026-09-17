@@ -1572,28 +1572,53 @@ class QRMonitor(threading.Thread):
         """
         try:
             from . import baidu_task as _bt
-            if not _bt.parse_share_url(text):
+            # 剪贴板/二维码里常见「链接 + 空格 + 提取码：XXXX」整段文本。必须**先把
+            # 真 URL 截出来**再抓页与记录，原因有二：
+            #   1) 直接拿整段去 fetch 会因空格/中文失败 → 拿不到 shareid/share_uk；
+            #   2) 整段会被写进 rec["url"]，后续拉起时 prepare_share 把它当 Referer，
+            #      请求头里带中文会直接炸。
+            # 而提取码必须仍从**整段原文**里找（见下方 _extract_pwd_code(raw)）。
+            raw = text or ""
+            url = self._extract_url(raw) or raw
+            if not _bt.parse_share_url(url):
                 return False
             html = ""
             try:
-                data = self._fetch_url(text)
+                data = self._fetch_url(url)
                 if data:
                     html = data.decode("utf-8", "replace")
             except Exception:
                 html = ""      # 抓页失败也继续：拉起本身不需要 shareid/share_uk
-            rec = _bt.remember_share_link(text, html)
+            rec = _bt.remember_share_link(url, html)
             if not rec:
                 return True    # 已确认是分享链接：按分享处理，不再走二维码
+            # 2.F：抓页即判定「链接已失效」——最早的判定点，**零额外请求**。命中即
+            # 按分享处理（return True，不再走二维码），但**不**投递 `share_link`
+            # 事件：既然已判定失效，就不该再让自动路径去 prepare_share 白白请求一次。
+            # 用户手势那条路由 main_window 的失效短路负责（弹 Windows 通知）。
+            # 探测器缺失/异常一律按「未失效」处理，绝不打断主流程。
+            try:
+                dead = _bt.detect_dead_share_page(html)
+            except Exception:
+                dead = None
+            if dead:
+                try:
+                    _bt.mark_share_dead(rec.get("surl") or url, dead)
+                except Exception:
+                    pass      # 标记失败只丢失缓存，绝不打断主流程
+                self.hub.log(f"{dead}，已跳过：{url}")
+                return True
             # d3（收紧）：URL 未带 ?pwd= 时按顺序自动回退解析提取码，命中即原地写
             # 回 rec["pwd"]（remember_share_link 存的正是同一个 dict，其它消费者立即
-            # 可见）：1) 文本内嵌（如「…链接 提取码：Zdjn」）→ 2) **仅**最近复制的文本。
+            # 可见）：1) 文本内嵌（如「…链接 提取码：Zdjn」）→ 2) 仅采用**最近 120 秒内**
+            # 复制过的文本（严格时效；拿旧码去 verify 只会白烧唯一一次配额）。
             # **绝不**在此自动套用分享者的固定映射：使用固定码必须由用户显式手势
             # 触发（面板/托盘/热键）。本处只通过 has_map 告知 UI「该分享者配有固定
-            # 码」，由 UI 去征询；recent_code_from_history 缺失或异常时按无码处理。
+            # 码」，由 UI 去征询；fresh_code_from_history 缺失或异常时按无码处理。
             # 此处只做快速只读查询，绝不发起网络请求。
             code_source = "url" if rec.get("pwd") else ""
             if not rec.get("pwd"):
-                code = self._extract_pwd_code(text)
+                code = self._extract_pwd_code(raw)
                 if code:
                     rec["pwd"] = code
                     code_source = "text"
@@ -1601,7 +1626,7 @@ class QRMonitor(threading.Thread):
                 else:
                     code = None
                     try:
-                        code, _ = _bt.recent_code_from_history(self._history())
+                        code, _ = _bt.fresh_code_from_history(self._history())
                     except Exception:
                         code = None
                     if code:
@@ -1646,6 +1671,7 @@ class QRMonitor(threading.Thread):
         # characters"（用户反馈的 drive.uc.cn 提取码场景）。
         if not (text or "").strip().lower().startswith(("http://", "https://")):
             return
+        raw = text            # 整段原文（可能含「提取码：XXXX」，分享链路要用）
         url = self._extract_url(text)
         if not url:
             return
@@ -1658,7 +1684,10 @@ class QRMonitor(threading.Thread):
         # 限制）。分享链接的用途是「记录并把整包交给网盘客户端下载」，不是「下载来
         # 识别是否二维码图片」，因此不该被 url_trust.fetch 的默认拒绝策略挡住。
         # 整条 2.F 都藏在「实验性功能」总开关之后：没开就完全不捕获分享链接。
-        if cfg.get("experimental_enabled") and self._handle_baidu_share(text):
+        # 传**整段原文**（raw）而非截断后的 url：分享链路要从整段里提取
+        # 「提取码：XXXX」，其内部会再自行截出干净 URL 用于抓页与记录
+        # （见 _handle_baidu_share）。原先传 text=url 会把提取码整段丢掉。
+        if cfg.get("experimental_enabled") and self._handle_baidu_share(raw):
             return
         host = _host_of(text)
         decision, cat = decide_host(cfg, host, "fetch")

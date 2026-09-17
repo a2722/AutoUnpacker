@@ -47,6 +47,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from .baidu_manifest import detect_dead_share_page
+
 
 # 公共查询串：chunlei Web 端固定参数，末尾的 `=` 不能省。
 _Q = "channel=chunlei&web=1&app_id=250528&clienttype=0&bdstoken="
@@ -55,6 +57,10 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # 分享链接路径段（/s/<surl_full>）；提取码从查询串取。
 _SURL_RE = re.compile(r"/s/([A-Za-z0-9_-]+)")
+
+# 新版分享的提取码是强制必填项：空码去提交必然失败。`prepare_share` 在死链判定之后、
+# 任何 tplconfig/verify 请求之前就此短路，把原因交回上层去询问用户（供测试/上层引用）。
+NEED_CODE_REASON = "该分享需要提取码"
 
 # 调 tasklist 时的无窗口标志（与 extract.py 一致；老版本 Python 无此常量时退化 0）。
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -152,10 +158,17 @@ def _parse_share(share_url, pwd):
 
 
 def _html_ids(html):
-    """从分享页 HTML 取 (share_uk, shareid)（`window.yunData` / locals.get 都能命中）。"""
+    """从分享页 HTML 取 (share_uk, shareid)（`window.yunData` / locals 都能命中）。
+
+    真实页面里数字写成 `"share_uk":"1102408115653","shareid":21895586648`
+    （**键带引号**），而 window.yunData 里是 `share_uk: data.share_uk`（变量引用）。
+    旧正则要求 `share_uk` 后紧跟 `=`/`:`，对带引号键两种都命中不了 → 第 4 步会误判
+    「未解析到 share_uk / shareid」而整条准备流程失败。两种写法都要认。"""
     t = html or ""
-    uk = re.search(r'share_uk\s*[=:]\s*["\']?(\d+)', t)
-    sid = re.search(r'shareid\s*[=:]\s*["\']?(\d+)', t)
+    uk = re.search(r'"share_uk"\s*:\s*"?(\d+)', t) or \
+        re.search(r'share_uk\s*[=:]\s*["\']?(\d+)', t)
+    sid = re.search(r'"shareid"\s*:\s*"?(\d+)', t) or \
+        re.search(r'shareid\s*[=:]\s*["\']?(\d+)', t)
     return (uk.group(1) if uk else None, sid.group(1) if sid else None)
 
 
@@ -169,6 +182,12 @@ def prepare_share(share_url, pwd=""):
        失败即停，两次 verify 之间至少间隔 `_VERIFY_MIN_GAP` 秒；
     3. `/share/list` 分页收齐分享根目录下的**全部**条目（按 fs_id 去重、保序）；
     4. 分享页取 share_uk / shareid（不在 URL 里，只能从 HTML 解析）。
+
+    `pwd` 为空时**不再发起任何 tplconfig/verify 请求**：新版分享的提取码是强制
+    必填项，空码提交只会白烧本次调用唯一的一次、且间隔受限的 verify 配额，多发
+    一次注定失败的请求，还可能被风控视为非人类。此时直接返回
+    `(False, NEED_CODE_REASON)`，把原因交回上层去询问用户；step0 的那一次页面
+    GET 仍会发生（用于死链判定，死链结论优先于缺码）。
 
     返回 (ok: bool, data)：
     - 成功：data 为 dict，公开键：
@@ -187,17 +206,38 @@ def prepare_share(share_url, pwd=""):
         op = _build_opener()
 
         # 0. 预热：先访问分享页（可能 404），吞掉异常只为拿 cookie。
+        #    （2.F）顺手留住页面 HTML 做「失效分享」探测：命中即在 verify 之前短路
+        #    返回——绝不消耗本流程唯一一次、且间隔受限的 verify 配额。
         try:
-            _get(op, f"{_S}/s/{surl_full}?pwd={pwd}", referer_share)
+            page0 = _get(op, f"{_S}/s/{surl_full}?pwd={pwd}", referer_share)
         except Exception:
-            pass
+            page0 = ""
+        dead = detect_dead_share_page(page0)
+        if dead:
+            return False, dead
 
-        # 1. tplconfig：取 sign / timestamp。
-        d = json.loads(_get(
+        # 空码闸门：新版分享的提取码是强制必填项，拿空 pwd 去 verify 必然失败
+        # （只会白烧本次调用唯一的一次配额、多发一次注定失败的请求）。
+        # 没有码就到此为止，交回上层去询问用户。位置刻意排在死链判定之后：
+        # 这样「裸链接」也能先拿到准确的「链接已失效」结论，而不是误报成缺码。
+        if not str(pwd or "").strip():
+            return False, NEED_CODE_REASON
+
+        # 1. tplconfig：取 sign / timestamp。字段未齐时给出明确中文原因，
+        #    不再让裸 ["data"] 取值抛 KeyError 被外层兜成英文 "'data'"。
+        tpl = json.loads(_get(
             op,
             f"{_S}/share/tplconfig?surl={surl_full}&fields=sign,timestamp"
             f"&view_mode=1&{_Q}",
-            referer_share))["data"]
+            referer_share))
+        if not isinstance(tpl, dict):
+            return False, "分享信息获取失败（返回结构异常）"
+        errno = tpl.get("errno")
+        if errno not in (None, 0):
+            return False, f"分享信息获取失败（errno={errno}）"
+        d = tpl.get("data")
+        if not isinstance(d, dict) or "sign" not in d or "timestamp" not in d:
+            return False, "分享信息获取失败（未返回 sign/timestamp）"
         sign, ts = d["sign"], d["timestamp"]
 
         # 2. verify：校验提取码 → randsk（即 sekey），后面 extra 要用。

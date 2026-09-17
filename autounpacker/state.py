@@ -206,6 +206,20 @@ class AppState:
             self._prune_temp()
             return list(self._temp_passwords)
 
+    def temp_password_entries(self):
+        """本次运行的临时密码带时间戳列表 [(ts, p)]（读取时顺带按有效期裁剪）。
+
+        与 temp_passwords() 同源、同锁：先 _prune_temp() 保证时间戳字典与密码
+        列表已对齐（缺时间戳的条目会被补成当前时间），再返回 (捕获时间戳, 密码)。
+        供「手动拉起分享时按最近 N 秒内的提取码补码」按时效筛选。绝不抛异常。"""
+        try:
+            with self.lock:
+                self._prune_temp()
+                return [(self._temp_ts.get(p, 0.0), p)
+                        for p in self._temp_passwords]
+        except Exception:
+            return []
+
     def add_temp_password(self, p):
         """往临时密码表添加（本次开机内有效，程序重启不丢；叠加有效期/上限）。
 

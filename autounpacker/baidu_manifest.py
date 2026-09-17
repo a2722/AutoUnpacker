@@ -108,6 +108,21 @@ def format_summary(s, max_batches=8, max_vols=10):
     return lines
 
 
+def format_summary_brief(s):
+    """启动期极简摘要：**恰好 1 行**（明细见手动「立即读取网盘任务库」诊断按钮）。
+
+    与 format_summary 首行同款口径：不可用时给出原因；异常时降级为固定文案。
+    供启动探测日志使用——不再逐行输出库路径/批次/分卷/本地路径明细。
+    """
+    try:
+        if not s or not s.get("ok"):
+            return [f"百度任务库：未启用或不可用（{(s or {}).get('reason', '')}）"]
+        return [f"活动任务 {s['active']} 条，历史 {s['history']} 条；"
+                f"批次 {len(s['batches'])} 个，分卷组 {len(s['volumes'])} 组"]
+    except Exception:
+        return ["百度任务库摘要不可用"]
+
+
 def format_active(tasks):
     if not tasks:
         return ["百度网盘：当前无活动下载任务"]
@@ -125,6 +140,8 @@ _TRACK = {
     # 2.F 全链路：已记住的分享链接。surl -> 记录；shareid -> 同一条记录（用于关联）
     "shares": {},
     "shares_by_id": {},
+    # 2.F：已判定「链接已失效」的分享。surl -> 原因（进程内记忆，供之后的手势短路）
+    "dead": {},
 }
 
 
@@ -271,6 +288,72 @@ def recent_code_from_history(history):
     return (None, "")
 
 
+# 手动拉起时「最近提取码」的有效期（秒），用户定的 120
+CODE_CANDIDATE_TTL = 120.0
+
+
+def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None):
+    """只在「时间戳可解析且仍在时效内」的历史条目里选一个候选提取码。
+
+    与 recent_code_from_history 的差别：本函数**严格要求时间戳**——
+    只有满足 `0 <= now - ts <= ttl` 的条目才参与，无时间戳的条目一律忽略
+    （手动拉起是事后补码，必须严格按时效，不能拿陈年旧码充数）。
+
+    返回 (code|None, source)：在时效内、时间戳最大且 looks_like_share_code 的
+    那条命中时返回 (code, "recent")；否则 (None, "")。
+    `now` 缺省 time.time()。history 可能是 None/数字/畸形条目，绝不抛异常。
+    """
+    try:
+        if now is None:
+            now = time.time()
+        best_ts = None
+        best_text = None
+        for ent in (history or []):
+            if isinstance(ent, str):
+                continue              # 无时间戳：严格时效，忽略
+            try:
+                text = ent[1]
+            except Exception:
+                continue              # 畸形条目直接跳过
+            try:
+                ts = float(ent[0])
+            except Exception:
+                continue              # 时间戳不可解析：忽略
+            age = now - ts
+            if age < 0 or age > ttl:
+                continue              # 未生效 / 已过期
+            if not looks_like_share_code(text):
+                continue
+            if best_ts is None or ts > best_ts:
+                best_ts = ts
+                best_text = text
+        if best_text is not None:
+            return (best_text, "recent")
+    except Exception:
+        pass
+    return (None, "")
+
+
+def resolve_invoke_code(share_uk, entries, ttl=CODE_CANDIDATE_TTL):
+    """手动拉起分享、记录本身无提取码时，决定要不要补码。返回 (code|None, source)。
+
+    三态语义：
+    - ("mapped")：该分享者配有**固定提取码映射** → 返回 (None, "mapped")，
+      即**不**静默套用固定码（固定码是「固定提取码手势」/Alt+3 的显式手势，
+      这里只提示用户改用那个手势）；
+    - ("recent")：无固定映射，但在时效内找到最近捕获的提取码 → (code, "recent")；
+    - ("")：无固定映射、时效内也无候选 → (None, "")。
+
+    `entries` 形如 [(ts, text)]（见 AppState.temp_password_entries）。
+    绝不抛异常。"""
+    try:
+        if mapped_code(share_uk):
+            return (None, "mapped")
+        return fresh_code_from_history(entries, ttl)
+    except Exception:
+        return (None, "")
+
+
 def pick_share_code(share_uk, history):
     """按 d3/d4/d5 选一个候选提取码，返回 (code, source)。
 
@@ -293,22 +376,112 @@ def pick_share_code(share_uk, history):
 
 
 def extract_share_ids_from_html(html):
-    """从公开分享页 HTML 的 window.yunData 取 share_uk / shareid（**无需登录**）。
+    """从公开分享页 HTML 取 share_uk / shareid（**无需登录**）。
 
-    页面里形如：window.yunData={…, share_uk:"3567282991", shareid:"11286763343"};
+    真实页面里同一份数据有两种写法（取证：备份目录里的分享页快照）：
+      ① JSON 片段：      …, "share_uk":"1102408115653", "shareid":21895586648, …
+                        （**键带引号**：这是唯一能取到数字的地方）
+      ② window.yunData： share_uk: data.share_uk, shareid: data.shareid
+                        （值是对变量的引用，取不到数字）
+    因此两种写法都要认：先按①在全文找（带引号键），取不到再退回②在 yunData 段内找。
     取不到 shareid 返回 None。"""
     try:
         t = html or ""
         m = re.search(r"window\.yunData\s*=\s*\{.*?\};", t, re.S)
         seg = m.group(0) if m else t
-        sid = re.search(r'shareid\s*:\s*["\']?(\d+)', seg) or \
-            re.search(r'"shareid"\s*:\s*"?(\d+)', t)
+        sid = re.search(r'"shareid"\s*:\s*"?(\d+)', t) or \
+            re.search(r'shareid\s*:\s*["\']?(\d+)', seg)
         if not sid:
             return None
-        uk = re.search(r'share_uk\s*:\s*["\']?(\d+)', seg)
+        uk = re.search(r'"share_uk"\s*:\s*"?(\d+)', t) or \
+            re.search(r'share_uk\s*:\s*["\']?(\d+)', seg)
         return {"shareid": sid.group(1), "share_uk": uk.group(1) if uk else None}
     except Exception:
         return None
+
+
+# ---------- 2.F：失效分享页（分享被取消/过期/违规无法访问）的识别与进程内标记 ----------
+# 死页由服务器直接渲染、不依赖 JS（取证：真实死页 vs 活页快照逐项对比）：
+#   - 死页 <title> = 「百度网盘-链接不存在」，正文有 "share_page_type":"error"；
+#   - 活页 <title> = 「百度网盘-分享文件」，无 "share_page_type":"error"
+#     （活页该字段取值是 "multi" 等，故必须精确匹配 "error" 这一取值）。
+# 判据只用服务器直出的 HTML 信号；**不**用 neglect / error-reason / errno 数字——
+# neglect 活页也有；error-reason 在死页只是空模板残留（文案由 JS 拿到 errno 后回填）；
+# errno 在多处 JSON 里出现、含义不唯一。
+DEAD_SHARE_PREFIX = "链接已失效"
+
+# <title> 里的失效文案族（取消/过期/侵权/违规共用同一套错误页骨架）。
+_DEAD_TITLE_WORDS = ("链接不存在", "链接已失效", "分享已取消", "分享已过期")
+
+
+def detect_dead_share_page(html):
+    """识别「分享已失效」页：命中返回以 DEAD_SHARE_PREFIX 开头的中文原因，否则 None。
+
+    绝不抛异常（None/空/数字/畸形一律 None）。
+    判据（服务器直接渲染，不依赖 JS）：
+      A) <title> 命中失效文案族：链接不存在 / 链接已失效 / 分享已取消 / 分享已过期；
+      B) 正文出现 "share_page_type":"error"（允许冒号两侧空白）。
+    命中 A 时原因带命中文字，如 "链接已失效（链接不存在）"；
+    仅命中 B 时用 "链接已失效（分享页异常，可能已被取消或过期）"。
+    禁止使用 neglect / error-reason / errno 数字作为判据（neglect 活页也有；error-reason
+    在死页是空模板残留；errno 在多处 JSON 里出现、含义不唯一）。
+    """
+    try:
+        t = html if isinstance(html, str) else ""
+        if not t:
+            return None
+        m = re.search(r"<title[^>]*>(.*?)</title>", t, re.I | re.S)
+        title = m.group(1) if m else ""
+        for w in _DEAD_TITLE_WORDS:
+            if w in title:
+                return f"{DEAD_SHARE_PREFIX}（{w}）"
+        if re.search(r'"share_page_type"\s*:\s*"error"', t):
+            return f"{DEAD_SHARE_PREFIX}（分享页异常，可能已被取消或过期）"
+        return None
+    except Exception:
+        return None
+
+
+def is_dead_share_reason(reason):
+    """失败原因是否属于「链接已失效」：str(reason or "").startswith(DEAD_SHARE_PREFIX)。"""
+    try:
+        return str(reason or "").startswith(DEAD_SHARE_PREFIX)
+    except Exception:
+        return False
+
+
+def mark_share_dead(surl, reason=""):
+    """把某分享标记为已失效（进程内记忆，供之后的手势短路）。绝不抛异常。
+
+    - 记入 _TRACK 的新键 "dead"（surl -> 原因）。
+    - 若 _TRACK["shares"] 里已有该 surl 的记录，就地把同一 dict 打上
+      rec["dead"]=原因、rec["dead_reason"]=原因（该 dict 是共享对象，见
+      remember_share_link）。
+    """
+    try:
+        key = str(surl or "").strip()
+        if not key:
+            return
+        r = str(reason or "")
+        _TRACK["dead"][key] = r
+        rec = _TRACK["shares"].get(key)
+        if isinstance(rec, dict):
+            rec["dead"] = r
+            rec["dead_reason"] = r
+    except Exception:
+        pass
+
+
+def share_dead(surl):
+    """返回失效原因字符串；未标记/未知/异常一律返回 ""（空串）。绝不抛异常。"""
+    try:
+        key = str(surl or "").strip()
+        if not key:
+            return ""
+        v = _TRACK["dead"].get(key)
+        return v if isinstance(v, str) else ""
+    except Exception:
+        return ""
 
 
 def parse_share_download(info):

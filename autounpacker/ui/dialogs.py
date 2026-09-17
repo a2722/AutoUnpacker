@@ -779,9 +779,25 @@ class SettingsDialog(QDialog):
                       "两套名单互不影响：同一域名可「自动打开」放行、同时「下载识别」拒绝。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {PALETTE['danger']}; font-size: 12px;")
+        # 分享链路的「例外」必须说明清楚：实验性开启时，抓取公开分享页发生在
+        # 网址信任判定之前（monitors.py:1661 与 1344 先于 decide_host），因此**不受**
+        # 上面两套名单限制；否则用户会以为把 pan.baidu.com 加进黑名单就能拦住它。
+        # 纯只读说明文字，不引入任何逻辑（不改名单、不改判定）。
+        # 前缀刻意用「⚠ 分享链路例外」而**不用**「⚠ 实验性提示」：实验分组里已有一条
+        # 「⚠ 实验性提示…」，既有测试按该前缀断言"恰有一个"，沿用会撞车。
+        self.trust_share_note = QLabel(
+            "⚠ 分享链路例外：开启「实验性功能」后，分享链路抓取公开分享页时"
+            "不受上述两套名单限制（必须先抓一次分享页才能拿到 shareid/share_uk，"
+            "否则无法交给网盘客户端下载）。所以把 pan.baidu.com 加进"
+            "「下载识别二维码」的黑名单，拦不住分享链路的这次抓取；"
+            "其他网址的打开/抓取仍照常按名单判定。")
+        self.trust_share_note.setWordWrap(True)
+        self.trust_share_note.setStyleSheet(
+            f"color: {PALETTE['warn_text']}; font-size: 12px;")
         pages.append(("网址信任",
                       self._page_widget("网址信任", self.builtin_cb,
-                                        self.tls_cb, open_box, fetch_box, note)))
+                                        self.tls_cb, open_box, fetch_box, note,
+                                        self.trust_share_note)))
 
         # ---------- 解压 ----------
         self.merge_cb = self._cfg_cb(
@@ -797,7 +813,7 @@ class SettingsDialog(QDialog):
 
     # ---------- 全局快捷键 ----------
         hot_box = QGroupBox("全局快捷键")
-        hot_box.setToolTip("用于唤起主界面；还可另设一个快捷键用客户端下载最近分享。")
+        hot_box.setToolTip("用于唤起主界面。")
         hl = QVBoxLayout(hot_box)
         hl.setSpacing(6)
         self.hotkey_enable_cb = self._cfg_cb(
@@ -818,6 +834,13 @@ class SettingsDialog(QDialog):
         clear_btn.clicked.connect(self._clear_hotkey)
         hrow.addWidget(clear_btn)
         hl.addLayout(hrow)
+        pages.append(("全局快捷键", self._page_widget("全局快捷键", hot_box)))
+
+        # 实验性 2.F 分享快捷键：单独成组，归入「实验性」页（属性/回调/配置键不变）
+        share_hot_box = QGroupBox("分享快捷键（实验性）")
+        share_hot_box.setToolTip("实验性 2.F：用客户端下载最近分享 / 固定提取码手势。")
+        shl = QVBoxLayout(share_hot_box)
+        shl.setSpacing(6)
         # 第二个可选快捷键：用客户端下载最近分享（默认留空 = 不设置）
         srow = QHBoxLayout()
         srow.addWidget(QLabel("用客户端下载分享"))
@@ -830,7 +853,7 @@ class SettingsDialog(QDialog):
         share_clear_btn = QPushButton("清除")
         share_clear_btn.clicked.connect(self._clear_share_hotkey)
         srow.addWidget(share_clear_btn)
-        hl.addLayout(srow)
+        shl.addLayout(srow)
         # 第三个可选快捷键：用映射里的固定提取码下载最近分享（默认留空 = 不设置）
         code_row = QHBoxLayout()
         code_row.addWidget(QLabel("固定提取码手势"))
@@ -847,11 +870,10 @@ class SettingsDialog(QDialog):
         code_clear_btn = QPushButton("清除")
         code_clear_btn.clicked.connect(self._clear_share_code_hotkey)
         code_row.addWidget(code_clear_btn)
-        hl.addLayout(code_row)
+        shl.addLayout(code_row)
         share_hint = QLabel("留空 = 不设置（默认）。")
         share_hint.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
-        hl.addWidget(share_hint)
-        pages.append(("全局快捷键", self._page_widget("全局快捷键", hot_box)))
+        shl.addWidget(share_hint)
 
         # ---------- 7-Zip 管理 ----------
         pages.append(("7-Zip 管理",
@@ -994,12 +1016,20 @@ class SettingsDialog(QDialog):
 
         pages.append(("常规", self._page_widget(
             "常规", theme_row, interval_row, self.logcolor_cb, close_box,
-            ver_box, exp_box)))
+            ver_box)))
+        # 实验性相关 UI（实验开关分组 + 分享快捷键分组）统一归入独立的「实验性」页
+        pages.append(("实验性", self._page_widget(
+            "实验性", exp_box, share_hot_box)))
 
         # 「常规」提到最前：一打开设置页就是常规
         for i, (name, _w) in enumerate(pages):
             if name == "常规":
                 pages.insert(0, pages.pop(i))
+                break
+        # 「实验性」紧随「常规」之后（索引 1），其余页面顺序保持不变
+        for i, (name, _w) in enumerate(pages):
+            if name == "实验性":
+                pages.insert(1, pages.pop(i))
                 break
 
         # 填充左侧分类列表与右侧页面栈
@@ -1072,6 +1102,14 @@ class SettingsDialog(QDialog):
             from ..baidu_task import diagnose
             info = diagnose()
             text = self._netdisk_diag_text(info)
+            try:
+                # 启动日志已瘦身为一行摘要，批次/分卷/条目明细挪到这里（手动、只读）
+                from ..baidu_manifest import summarize, format_summary
+                s = summarize(info.get("db_path"))
+                text += "\n\n" + "\n".join(
+                    format_summary(s, max_batches=50, max_vols=50))
+            except Exception as e:
+                text += f"\n\n（批次明细读取失败：{e}）"
             dlg = QDialog(self)
             dlg.setWindowTitle("网盘任务库诊断")
             dlg.setModal(True)

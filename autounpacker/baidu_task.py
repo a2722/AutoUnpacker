@@ -59,6 +59,18 @@ from .baidu_manifest import (  # noqa: F401
     remember_share_link,
     share_link_for,
     last_share,
+    # 2.F：失效分享页识别 + 进程内标记（monitors 抓取即判定、手势短路用）
+    DEAD_SHARE_PREFIX,
+    detect_dead_share_page,
+    is_dead_share_reason,
+    mark_share_dead,
+    share_dead,
+    # 2.F：提取码候选（**时效版**）——monitors 捕获路径回捞用。
+    # 刻意**不**转发无时效的 recent_code_from_history：捕获路径必须严格按时效，
+    # 拿陈年旧码去 verify 只会白烧唯一一次、且间隔受限的配额。
+    mapped_code,
+    fresh_code_from_history,
+    CODE_CANDIDATE_TTL,
 )
 from .baidu_share import invoke_download  # noqa: F401
 from .baidu_watch import (  # noqa: F401

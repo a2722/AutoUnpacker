@@ -25,7 +25,8 @@ from pathlib import Path
 
 from .baidu_db import (_select, _as_text, select_task_db, detect_download_root)
 from .baidu_manifest import (observe_tasks, report_events, leftover_tasks,
-                             summarize, format_summary, _TRACK)
+                             summarize, format_summary, format_summary_brief,
+                             _TRACK)
 
 # 轮询状态（模块级，供 diagnose() 展示；只读、无副作用）
 _STATE = {
@@ -133,6 +134,29 @@ def _baidu_running():
         return True
 
 
+# 「任务库选中」只打一次：启动期探测线程与轮询线程共用最近一次已打印的库路径。
+# 用锁包住 check-and-set，避免两线程几乎同时完成选库时各打一行。
+_DB_LOG_LOCK = threading.Lock()
+
+
+def _should_log_db(db):
+    """探测线程与轮询线程共用：同一库「任务库选中」只打印一次，避免启动期重复。
+
+    读 _STATE["db_logged"]（最近一次已打印的库路径，字符串化比较）：
+    与传入 db 不同 → 记录当前 db 并返回 True（库变化时仍各打一次）；相同 → False。
+    绝不抛异常——任何异常一律返回 True（宁多打一行，不可漏打）。
+    """
+    try:
+        key = str(db)
+        with _DB_LOG_LOCK:
+            if _STATE.get("db_logged") != key:
+                _STATE["db_logged"] = key
+                return True
+            return False
+    except Exception:
+        return True
+
+
 def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                          active_interval=_INTERVAL_ACTIVE):
     """实验性：后台轮询 download_file（活动任务），任务集合变化时写日志。
@@ -188,7 +212,10 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                 _STATE["db_source"] = reason
                 if db and str(db) != (last_db or ""):
                     last_db = str(db)
-                    _log(f"任务库选中：{db}（{reason}）")
+                    # 启动期探测线程可能已打过同一个库 → 这里只做去重打印；
+                    # hint 维持原语义（自身按目录去重），不随后者一起吞掉。
+                    if _should_log_db(db):
+                        _log(f"任务库选中：{db}（{reason}）")
                     _hint_if_download_dir_unwatched(cfg, db, _log)
 
                 rows = None
@@ -313,7 +340,8 @@ def probe_and_log(state, hub):
             _STATE["db_path"] = str(db) if db else None
             _STATE["db_source"] = reason
             try:
-                hub.log(f"[实验性] 任务库选中：{db if db else '未找到'}（{reason}）")
+                if _should_log_db(db):
+                    hub.log(f"[实验性] 任务库选中：{db if db else '未找到'}（{reason}）")
             except Exception:
                 pass
         except Exception:
@@ -337,7 +365,8 @@ def probe_and_log(state, hub):
             pass
         try:
             s = summarize(str(db) if db else None)
-            for line in format_summary(s):
+            # 启动只留 1 行摘要；批次/分卷/条目明细见手动「立即读取网盘任务库」
+            for line in format_summary_brief(s):
                 hub.log(f"[实验性] {line}")
         except Exception as e:
             try:

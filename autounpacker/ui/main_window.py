@@ -183,6 +183,8 @@ class MainWindow(QMainWindow):
         log_head.addWidget(self.pause_btn)
         log_lay.addLayout(log_head)
         self.log_box = QPlainTextEdit()
+        # 界面日志只保留最近 3000 行，完整日志仍在 logs/ 文件
+        self.log_box.setMaximumBlockCount(3000)
         self.log_box.setReadOnly(True)
         self.log_box.setMinimumHeight(60)
         log_lay.addWidget(self.log_box, 1)
@@ -698,6 +700,36 @@ class MainWindow(QMainWindow):
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
+            # 失效短路：该分享已在本进程被标记失效（抓页/探测/提交任一环节命中）→
+            # 零网络请求、**绝不**唤起客户端，直接日志 + 托盘通知。用户手势唤起时
+            # 最需要这条：不盯着日志的人也立刻知道链接已失效。
+            try:
+                dead = bm.share_dead(rec.get("surl") or rec.get("url"))
+            except Exception:
+                dead = ""
+            if dead:
+                self._append_log(f"[分享] 该分享链接已失效，已跳过拉起：{dead}")
+                self._share_notify("分享链接已失效", f"{rec.get('url')}\n{dead}")
+                return
+            # 记录时刻没有提取码时，才尝试「按最近捕获的提取码补上」：
+            # 提取码常常在链接记录之后几秒才被复制到剪贴板，记录时刻的候选搜索
+            # 只跑一次、拿不到 → 手动拉起会发空码。这里在拉起前再补一次，
+            # 但严格限时效（CODE_CANDIDATE_TTL 秒）；固定映射用户不静默套用。
+            if not (rec.get("pwd") or "").strip():
+                try:
+                    _code, _src = bm.resolve_invoke_code(
+                        rec.get("share_uk"), self.state.temp_password_entries())
+                    if _src == "recent" and _code:
+                        rec["pwd"] = _code
+                        self._append_log(
+                            f"分享缺提取码：按最近 {int(bm.CODE_CANDIDATE_TTL)} 秒内"
+                            f"捕获的提取码补上 -> {_code}")
+                    elif _src == "mapped":
+                        self._append_log(
+                            "该分享者配有固定提取码：请用「固定提取码手势」"
+                            "（托盘菜单/快捷键）下载")
+                except Exception:
+                    pass          # 补码只是增强，绝不打断拉起
             # 手动路径即用户明确同意：直接拉起，同时计数（与自动路径共用 d7 计数）
             self._bump_share_launch(rec.get("surl") or rec.get("url"))
             self._start_share_invoke(rec.get("url"), rec.get("pwd") or "", manual=True)
@@ -722,6 +754,19 @@ class MainWindow(QMainWindow):
             rec = bt.last_share()
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
+                return
+            # 失效短路：固定提取码也救不活失效链接 → 零网络请求、绝不唤起客户端，
+            # 日志 + 托盘通知并说明固定提取码也无效。
+            try:
+                dead = bm.share_dead(rec.get("surl") or rec.get("url"))
+            except Exception:
+                dead = ""
+            if dead:
+                self._append_log(
+                    f"[分享] 该分享链接已失效，固定提取码也无法下载，已跳过：{dead}")
+                self._share_notify(
+                    "分享链接已失效",
+                    f"{rec.get('url')}\n{dead}（固定提取码也无法下载）")
                 return
             code = None
             try:
@@ -796,6 +841,21 @@ class MainWindow(QMainWindow):
                     pass
             else:
                 self.hub.log(f"[分享] 拉起失败: {detail}")
+                # 失效判定优先：标记 + 「已失效」通知（用户手势后不该一片安静）。
+                try:
+                    dead = bm.is_dead_share_reason(detail)
+                except Exception:
+                    dead = False
+                if dead:
+                    try:
+                        bm.mark_share_dead(url, detail)
+                    except Exception:
+                        pass
+                    self._share_notify("分享链接已失效", f"{url}\n{detail}")
+                elif manual:
+                    # 用户明确按了手势却毫无反馈是最糟的体验：手动失败必须通知。
+                    # 自动路径（manual=False）保持只有日志，避免噪音。
+                    self._share_notify("分享拉起失败", f"{url}\n{detail}")
         except Exception as e:
             self.hub.log(f"[分享] 拉取出错: {e}")
         finally:
@@ -850,6 +910,20 @@ class MainWindow(QMainWindow):
                 self.hub.log(f"[分享] 自动探测分享是否需要提取码…: {url}")
                 ok, prep = bs.prepare_share(url, "")
                 if not ok:
+                    # 失效分流：探测失败若是「链接已失效」，问提取码毫无意义 →
+                    # 标记 + 通知 + 直接结束，绝不投递 share_ask 去询问提取码。
+                    try:
+                        dead = bm.is_dead_share_reason(prep)
+                    except Exception:
+                        dead = False
+                    if dead:
+                        self.hub.log(f"[分享] {prep}")
+                        try:
+                            bm.mark_share_dead(surl, prep)
+                        except Exception:
+                            pass      # 标记失败绝不影响本次分流
+                        self._share_notify("分享链接已失效", f"{url}\n{prep}")
+                        return
                     self.hub.log("[分享] 该分享需要提取码，改为询问用户")
                     try:
                         self.hub.q.put({"type": "share_ask", "item": item or {},
@@ -862,6 +936,20 @@ class MainWindow(QMainWindow):
                 self.hub.log(f"[分享] {'手动' if manual else '自动'}准备分享下载…: {url}")
                 ok, prep = bs.prepare_share(url, pwd)
                 if not ok:
+                    # 失效链接即便带了提取码也失败：标记后以「分享链接已失效」通知，
+                    # 与普通「准备失败」区分开（用户一眼知道不是码的问题）。
+                    try:
+                        dead = bm.is_dead_share_reason(prep)
+                    except Exception:
+                        dead = False
+                    if dead:
+                        self.hub.log(f"[分享] {prep}")
+                        try:
+                            bm.mark_share_dead(surl, prep)
+                        except Exception:
+                            pass
+                        self._share_notify("分享链接已失效", f"{url}\n{prep}")
+                        return
                     self.hub.log(f"[分享] 准备失败: {prep}")
                     self._share_notify("分享下载失败", f"{url}\n{prep}")
                     return

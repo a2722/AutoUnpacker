@@ -1030,7 +1030,8 @@ _FILE_EXT_RE = re.compile(
 def _looks_like_non_password(text):
     """严格过滤（对应「智能过滤」子项）：多行/路径/文件名/句子等明显不是提取码。
 
-    不含网址判断——网址由更宽松的父项「网址排除」负责。"""
+    不含网址判断——网址由更宽松的父项「网址排除」负责。
+    另：含版本号样式 / ≥4 个空白分词 also 视为非密码（标题/版本串）。"""
     t = text.strip().strip('"').strip("'").strip()
     if not t:
         return True
@@ -1045,6 +1046,13 @@ def _looks_like_non_password(text):
         return True                                       # 含反斜杠的路径样文本
     if _FILE_EXT_RE.search(t):
         return True                                       # 带常见扩展名的文件名
+    # 标题/版本样式（如「PIXEL CALL GIRLS -REI- 1.30」）：多词 + 版本号一眼不是提取码。
+    # 只挡这两类窄形态，普通多词口令（「my pass」）与 4 位提取码不受影响；
+    # 用户若真要捕获这类串，可在设置里关掉「智能过滤」子项。
+    if re.search(r"\d+\.\d+", t):
+        return True                                       # 含版本号样式 x.y
+    if len([w for w in re.split(r"\s+", t) if w]) >= 4:
+        return True                                       # 4 个及以上空白分词 → 标题/句子
     return False
 
 

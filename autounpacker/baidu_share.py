@@ -157,6 +157,14 @@ def _parse_share(share_url, pwd):
     return surl_full, surl, str(pwd or "")
 
 
+def is_need_code_reason(reason):
+    """失败原因是否属于「空码闸门」给出的「该分享需要提取码」。绝不抛异常。"""
+    try:
+        return str(reason or "").strip() == NEED_CODE_REASON
+    except Exception:
+        return False
+
+
 def _html_ids(html):
     """从分享页 HTML 取 (share_uk, shareid)（`window.yunData` / locals 都能命中）。
 
@@ -263,9 +271,9 @@ def prepare_share(share_url, pwd=""):
             return False, "需要图形验证码：本次已放弃（不再重试，避免触发风控）"
         verr = vj.get("errno")
         if verr not in (None, 0):
-            if pwd:
-                return False, f"提取码校验失败（errno={verr}）：提取码可能不正确"
-            return False, f"提取码校验失败（errno={verr}）：未提供提取码"
+            # 空码闸门（见本文件 step 0.5）已保证走到这里 pwd 必非空，
+            # 因此原「未提供提取码」分支不可达，已删除。
+            return False, f"提取码校验失败（errno={verr}）：提取码可能不正确"
         randsk = vj.get("randsk")
         if not randsk:
             return False, f"share/verify 未返回 randsk（errno={vj.get('errno')}）"

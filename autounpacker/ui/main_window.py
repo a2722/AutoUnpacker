@@ -715,6 +715,7 @@ class MainWindow(QMainWindow):
             # 提取码常常在链接记录之后几秒才被复制到剪贴板，记录时刻的候选搜索
             # 只跑一次、拿不到 → 手动拉起会发空码。这里在拉起前再补一次，
             # 但严格限时效（CODE_CANDIDATE_TTL 秒）；固定映射用户不静默套用。
+            _src_mapped = False
             if not (rec.get("pwd") or "").strip():
                 try:
                     _code, _src = bm.resolve_invoke_code(
@@ -725,11 +726,26 @@ class MainWindow(QMainWindow):
                             f"分享缺提取码：按最近 {int(bm.CODE_CANDIDATE_TTL)} 秒内"
                             f"捕获的提取码补上 -> {_code}")
                     elif _src == "mapped":
-                        self._append_log(
-                            "该分享者配有固定提取码：请用「固定提取码手势」"
-                            "（托盘菜单/快捷键）下载")
+                        _src_mapped = True
                 except Exception:
                     pass          # 补码只是增强，绝不打断拉起
+            # 补码后仍无提取码：新版分享提取码必填，空码提交必然失败 —— 直接给出
+            # 可操作提示并返回：零网络请求、绝不唤起客户端、也不累加 d7 拉起计数
+            # （否则之后真正成功的那次会被"重复拉起需确认"误挡）。
+            if not (rec.get("pwd") or "").strip():
+                if _src_mapped:
+                    self._append_log("[分享] 该分享者配有固定提取码，需用「固定提取码」手势")
+                    self._share_notify(
+                        "分享缺少提取码",
+                        f"{rec.get('url')}\n该分享者配有固定提取码：请用「固定提取码」"
+                        f"手势（托盘菜单 / Alt+3）下载。")
+                else:
+                    self._append_log("[分享] 该分享缺少提取码，已跳过拉起")
+                    self._share_notify(
+                        "分享缺少提取码",
+                        f"{rec.get('url')}\n该分享需要提取码：把「链接 + 提取码」整段"
+                        f"复制到剪贴板后再试。")
+                return
             # 手动路径即用户明确同意：直接拉起，同时计数（与自动路径共用 d7 计数）
             self._bump_share_launch(rec.get("surl") or rec.get("url"))
             self._start_share_invoke(rec.get("url"), rec.get("pwd") or "", manual=True)
@@ -852,10 +868,25 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                     self._share_notify("分享链接已失效", f"{url}\n{detail}")
-                elif manual:
-                    # 用户明确按了手势却毫无反馈是最糟的体验：手动失败必须通知。
-                    # 自动路径（manual=False）保持只有日志，避免噪音。
-                    self._share_notify("分享拉起失败", f"{url}\n{detail}")
+                else:
+                    # 缺码判定：原因可能是「该分享需要提取码」（空码闸门）。
+                    # 本函数已 import baidu_task as bt，但 bt 未转发该助手，
+                    # 故直接引用 baidu_share（异常一律按「非缺码」处理）。
+                    try:
+                        from .. import baidu_share as bs
+                        need_code = bs.is_need_code_reason(detail)
+                    except Exception:
+                        need_code = False
+                    if need_code:
+                        # 空码闸门：不是"拉起失败"，而是"缺提取码"——给可操作的提示。
+                        self._share_notify(
+                            "分享缺少提取码",
+                            f"{url}\n该分享需要提取码：把「链接 + 提取码」整段复制到剪贴板后"
+                            f"再试，或用「固定提取码」手势（托盘菜单 / Alt+3）。")
+                    elif manual:
+                        # 用户明确按了手势却毫无反馈是最糟的体验：手动失败必须通知。
+                        # 自动路径（manual=False）保持只有日志，避免噪音。
+                        self._share_notify("分享拉起失败", f"{url}\n{detail}")
         except Exception as e:
             self.hub.log(f"[分享] 拉取出错: {e}")
         finally:

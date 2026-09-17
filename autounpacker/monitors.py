@@ -85,6 +85,13 @@ class FolderWatcher(threading.Thread):
     """多路径监听线程（只监听目录表面，不递归子孙文件夹）"""
 
     PROBE_CYCLES = 4  # 新文件未被识别为压缩包时的复查轮数
+    # seen 文件中「连续 skip + 大小变化」重走（含观察期重置）的硬上限：持续增长
+    # 但根本不是压缩包的文件（监听目录里正在写的 .log/.db 等）达到本上限后不再
+    # 逐轮重走 _handle（含 analyze_file）。默认 poll_interval=2s，60 次 ≈ 2 分钟：
+    # 足够覆盖绝大多数正常下载（下载中每轮大小都在变，直到尾部落盘后变完整），
+    # 又不会让非压缩包文件永久 churn。达到上限后仅当大小**稳定下来**（可能是
+    # 下载已完成）时才给一次复查机会；仍非压缩包则继续保持上限。
+    REWALK_MAX_STREAK = 60
     TRANSLATION_MAX_SIZE = 10 * 1024 * 1024  # 翻译 json 最大 10MB
     TRANSLATION_WINDOW = 5 * 60              # 小文件夹先出现时的监控窗口（秒）
     VOL_MAX_WAIT = 300   # 首卷分卷"只有满卷"时最长等待(秒)：之后兜底按现状尝试解压
@@ -93,6 +100,9 @@ class FolderWatcher(threading.Thread):
     BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
     BT_PROGRAM_EXT = {".exe", ".dll", ".bat", ".cmd", ".lnk", ".msi", ".sys",
                       ".scr", ".com", ".ocx"}
+    # 百度清单模式：目录内程序文件至少这么多才判「疑似程序目录」（单个 .exe 不判，
+    # 保守：宁可偶尔多解一次，也不把整个监听根禁掉）。见 _looks_like_program_dir。
+    BT_PROGRAM_DIR_MIN = 2
 
     def __init__(self, state, hub, pauser=None):
         super().__init__(daemon=True)
@@ -100,12 +110,25 @@ class FolderWatcher(threading.Thread):
         self.hub = hub
         self.pauser = pauser
         self.seen = {}
+        # seen 的身份镜像 {watch_key: {name: (size, mtime)}}：与 seen 一一对应。
+        # seen 本身只记名字（=「已定型」），本结构让 seen 也「身份感知」：每轮对
+        # seen 中的文件做一次 stat，身份变化的同名文件（下载完成/重新下载/替换）
+        # 会被静默重走 _handle；身份不变者绝不重走（零额外 churn）。
+        self._seen_ident = {}
+        # 身份重走的 churn 上限状态：{(watch_key, name): {"streak": 连续「skip +
+        # 大小变化」重走次数, "blocked": 是否已达上限, "pending": 达上限后是否出现过
+        # 大小变化（等大小稳定后再给一次机会）}}。随「大小稳定 / 成功处理 / 文件
+        # 消失」复位，避免长期占内存。
+        self._rewalk = {}
         # 已处理过的文件身份 {norm_path: (size, mtime)}：同名但内容不同的
         # 新文件（重新下载/替换）不会被误当成已处理而跳过
         self.traced = {}
         self.probing = {}  # {watch_key: {name: 剩余复查轮数}}
         # 翻译文件监控窗口 {小文件夹路径: (json_stem, 首次发现时间)}
         self._pending_trans = {}
+        # 超时放弃的翻译文件夹 {小文件夹路径 str: json 身份(size, mtime)}：
+        # 身份不变则不再重开监控窗口（防「超时→删→立刻重登记」死循环）
+        self._trans_given_up = {}
         # 首卷分卷观察期 {abs_path: {seen, last_activity, stable_since}}
         self._vol_wait = {}
         # 输出文件被占用的重试计数 {abs_path: 次数}（上限 3 次，防死循环）
@@ -129,9 +152,42 @@ class FolderWatcher(threading.Thread):
         except OSError:
             return None
 
+    def _identity_safe(self, fp):
+        """_file_identity 的容错包装：stat 失败/异常一律记为 None（该轮不重走）。"""
+        try:
+            return self._file_identity(fp)
+        except OSError:
+            return None
+
     @staticmethod
     def _is_same_traced(old_ident, ident):
         return old_ident is not None and old_ident == ident
+
+    @staticmethod
+    def _size_changed(old_ident, ident):
+        """身份是否「值得重走」：只看大小变化（mtime 仅作辅助记录）。
+
+        `_file_identity` 是 (size, mtime)，索引器/杀软/`copy /b` 只碰 mtime 就会让
+        整包重新解压。故身份重走一律以 size 为准；size 未变而 mtime 变了，只更新
+        记录的 mtime、绝不重走。取不到身份（None）也不重走。"""
+        if old_ident is None or ident is None:
+            return False
+        return old_ident[0] != ident[0]
+
+    def _bump_rewalk(self, rk):
+        """记一次「skip + 大小变化」重走；达到上限返回 False（并置 blocked）。
+
+        `rk` = (watch_key, name)。未达上限返回 True，调用方可继续把该文件留在
+        probe 观察期（重置为 PROBE_CYCLES）。"""
+        st = self._rewalk.get(rk)
+        if st is None:
+            st = {"streak": 0, "blocked": False, "pending": False}
+            self._rewalk[rk] = st
+        st["streak"] += 1
+        if st["streak"] >= self.REWALK_MAX_STREAK:
+            st["blocked"] = True
+            return False
+        return True
 
     @staticmethod
     def _norm_path(path):
@@ -161,6 +217,9 @@ class FolderWatcher(threading.Thread):
             for key in list(self.seen):
                 if key not in enabled:
                     del self.seen[key]
+                    self._seen_ident.pop(key, None)  # 身份镜像随 seen 一起清理
+                    for rk in [k for k in self._rewalk if k[0] == key]:
+                        self._rewalk.pop(rk, None)   # churn 计数随监听路径移除清理
             for path, wc in enabled.items():
                 try:
                     self._poll(Path(path), wc)
@@ -211,6 +270,13 @@ class FolderWatcher(threading.Thread):
                 if self._handle(watch / name, wc, initial_scan=True) == "defer":
                     deferred.add(name)
             self.seen[key] = current - deferred
+            # 记录初次扫描后仍在 seen 中的文件身份，避免下一轮被误判为「身份变了」
+            ident_map = self._seen_ident.setdefault(key, {})
+            ident_map.clear()
+            for name in self.seen[key]:
+                ident = self._identity_safe(watch / name)
+                if ident is not None:
+                    ident_map[name] = ident
             return
         try:
             current = set(n for n in os.listdir(watch) if (watch / n).is_file())
@@ -219,22 +285,123 @@ class FolderWatcher(threading.Thread):
         new = current - self.seen[key]
         deferred = set()
         probe = self.probing.setdefault(key, {})
+        ident_map = self._seen_ident.setdefault(key, {})
+        done_now = set()   # 本轮已由复查轮处理为 done 的文件：避免下面重走同轮重复调用
         # 先复查上一轮进入观察期的文件（这些已在 seen 中）：写入完成后会被
         # 重新识别为压缩包并处理
         for name in list(probe):
+            rk = (key, name)
             if name not in current:
                 probe.pop(name, None)
+                self._rewalk.pop(rk, None)   # 文件消失：churn 计数复位
                 continue
-            res = self._handle(watch / name, wc)
+            fp = watch / name
+            ident = self._identity_safe(fp)
+            size_changed = self._size_changed(ident_map.get(name), ident)
+            st = self._rewalk.get(rk)
+            if st is not None and st.get("blocked"):
+                # 已达 churn 硬上限：大小仍在变（如持续写入的 .log）→ 不再重走，
+                # 让观察期自然过期；名额留在 _seen_ident 里继续观测大小变化。
+                if size_changed:
+                    st["pending"] = True
+                    probe[name] -= 1
+                    if probe[name] <= 0:
+                        probe.pop(name, None)
+                    if ident is not None:
+                        ident_map[name] = ident
+                    continue
+                if not st.get("pending"):
+                    # 上限后大小一直稳定：不复查，让观察期过期
+                    probe[name] -= 1
+                    if probe[name] <= 0:
+                        probe.pop(name, None)
+                    if ident is not None:
+                        ident_map[name] = ident
+                    continue
+                # pending：上限后出现过大小变化、现已稳定（可能下载完成）→
+                # 消耗一次「恢复机会」复查；若仍非压缩包则继续保持上限。
+                st["pending"] = False
+            res = self._handle(fp, wc)
             if res == "defer":
                 probe.pop(name, None)
+                self._rewalk.pop(rk, None)   # 交给下轮重查：churn 计数不复用
                 deferred.add(name)
             elif res == "done":
                 probe.pop(name, None)
+                done_now.add(name)
+                self._rewalk.pop(rk, None)   # 成功处理：churn 计数复位
             else:  # 仍不是压缩包
-                probe[name] -= 1
-                if probe[name] <= 0:
-                    probe.pop(name, None)  # 观察期结束，放弃（留在 seen）
+                # 身份相对上一轮发生变化 = 仍在写入/下载（尾部 zip 还没落盘）：
+                # 重置观察期继续盯着它（而不是递减）。否则长下载会在固定 4 轮后
+                # 被放弃、文件从此失联。身份不变才真正递减、按原语义过期。
+                # 但受 churn 硬上限约束：连续「skip + 大小变化」达到
+                # REWALK_MAX_STREAK 后不再重置，让非压缩包文件最终放弃。
+                if size_changed:
+                    if self._bump_rewalk(rk):
+                        probe[name] = self.PROBE_CYCLES
+                    else:
+                        probe[name] -= 1
+                        if probe[name] <= 0:
+                            probe.pop(name, None)
+                else:
+                    probe[name] -= 1
+                    if probe[name] <= 0:
+                        probe.pop(name, None)  # 观察期结束，放弃（留在 seen）
+            if ident is not None:
+                ident_map[name] = ident
+        # seen 中「身份变了」的文件重走 _handle：覆盖下载窗口早已关闭后文件才变
+        # 完整（或同名文件被重新下载/替换）的情况。静默重走，不做额外日志；
+        # 身份不变者绝不重走（避免逐轮 churn），身份取不到（stat 失败）也不重走
+        # （避免死循环）。观察期内的文件已由上面的复查轮负责，这里跳过以免同轮
+        # 重复调用。
+        for name in list(self.seen[key]):
+            if name in probe or name in done_now:
+                continue
+            fp = watch / name
+            ident = self._identity_safe(fp)
+            if ident is None:
+                continue
+            rk = (key, name)
+            prev = ident_map.get(name)
+            if prev is not None and not self._size_changed(prev, ident):
+                # size 未变（可能仅 mtime 变了）→ 绝不重走；仅更新记录的 mtime。
+                # churn 状态：出现过大小的文件若已稳定下来（可能下载完成），
+                # 消耗一次「恢复机会」复查；否则大小稳定即复位计数。
+                st = self._rewalk.get(rk)
+                if st is not None and st.get("pending"):
+                    st["pending"] = False
+                    res = self._handle(fp, wc)
+                    if res == "defer":
+                        deferred.add(name)
+                    elif res == "skip":
+                        st["streak"] = self.REWALK_MAX_STREAK
+                        st["blocked"] = True
+                    else:
+                        self._rewalk.pop(rk, None)   # 成功处理：计数复位
+                else:
+                    self._rewalk.pop(rk, None)       # 大小稳定 → churn 计数复位
+                if prev != ident:
+                    ident_map[name] = ident
+                continue
+            # size 变化（含身份首次可读）
+            st = self._rewalk.get(rk)
+            if st is not None and st.get("blocked"):
+                # 已达 churn 硬上限：连续增长不再重走，仅记待稳定；等大小稳定后
+                # 由上面的 stable 分支给一次恢复机会。
+                st["pending"] = True
+                ident_map[name] = ident
+                continue
+            res = self._handle(fp, wc)
+            if res == "defer":
+                deferred.add(name)
+                self._rewalk.pop(rk, None)           # 交给下轮重查：计数不复用
+            elif res == "skip":
+                probe[name] = self.PROBE_CYCLES
+                if not self._bump_rewalk(rk):
+                    probe.pop(name, None)            # 达上限：移出观察期，避免重走
+            else:
+                self._rewalk.pop(rk, None)           # 成功处理：计数复位
+            ident_map[name] = ident
         # 再处理新出现的文件
         for name in sorted(new):
             res = self._handle(watch / name, wc)
@@ -244,8 +411,21 @@ class FolderWatcher(threading.Thread):
                 # 暂未识别为压缩包：可能正被写入/复制（尾部还没写完），
                 # 进入观察期复查几轮，避免一次性吸收后永不处理。
                 probe[name] = self.PROBE_CYCLES
+                ident = self._identity_safe(watch / name)
+                if ident is not None:
+                    ident_map[name] = ident
         # 分卷未到齐被推迟的文件不记入 seen，下轮会重新检查
         self.seen[key] = current - deferred
+        # 同步身份镜像：补齐 seen 中缺身份的、清掉已离开 seen 的
+        for name in list(ident_map):
+            if name not in self.seen[key]:
+                ident_map.pop(name, None)
+                self._rewalk.pop((key, name), None)   # 文件离开 seen：churn 计数复位
+        for name in self.seen[key]:
+            if name not in ident_map:
+                ident = self._identity_safe(watch / name)
+                if ident is not None:
+                    ident_map[name] = ident
 
     # ---------- 百度清单模式（Tier-2，实验性；只增强不阻断）----------
     def _bt_sticky_set(self):
@@ -263,15 +443,42 @@ class FolderWatcher(threading.Thread):
             self._bt_sticky = s
         return self._bt_sticky
 
-    def _looks_like_program_dir(self, d):
-        """目录内是否有可执行/程序文件（避免把程序自带的压缩包解开）。"""
+    def _looks_like_program_dir(self, d, watch_roots=None):
+        """目录是否为「疑似程序目录」（避免把程序自带的压缩包解开）。
+
+        保守规则（此前把所有含单个 .exe 的目录都判成程序目录，导致监听根本身
+        ——通常混着安装包/脚本——被整个禁掉，凡直接落在监听根的包都被跳过）：
+        - **任何被监听目录自身永不算程序目录**：`d` 归一化后与 `watch_roots`
+          （各监听根的 norm 路径）任一相等即返回 False（监听根不是「下载子目录」）；
+        - 否则，目录内程序文件（`BT_PROGRAM_EXT`）数量达到 `BT_PROGRAM_DIR_MIN`
+          个，**且目录内没有正在下载的压缩包**（`.baiduyun.p.downloading` 等，
+          由 `is_incomplete_download` 判定）时，才判为程序目录；目录里还有正在下载
+          的文件说明这是一个下载目录，放行（宁可偶尔多解一次）。
+        绝不抛异常。
+        """
         try:
+            dn = self._norm_path(d)
+        except Exception:
+            return False
+        if watch_roots:
+            try:
+                for wr in watch_roots:
+                    if dn == wr:
+                        return False
+            except Exception:
+                pass
+        try:
+            count = 0
             for e in d.iterdir():
-                if e.is_file() and e.suffix.lower() in self.BT_PROGRAM_EXT:
-                    return True
+                if not e.is_file():
+                    continue
+                if smart_extract.is_incomplete_download(e):
+                    return False            # 有正在下载的压缩包 → 不是程序目录
+                if e.suffix.lower() in self.BT_PROGRAM_EXT:
+                    count += 1
+            return count >= self.BT_PROGRAM_DIR_MIN
         except OSError:
             return False
-        return False
 
     def _consolidate_cross_dir_volumes(self, first_fp, gathered):
         """把散落在不同目录的分卷兄弟**移动**到首卷所在目录，拼成一套。
@@ -343,6 +550,16 @@ class FolderWatcher(threading.Thread):
         if not manifest:
             return
         root = self._norm_path(watch)
+        # 监听根集合（含所有配置的监听路径）：用于「任何被监听目录自身都不算程序
+        # 目录」的豁免，避免根目录里的安装包/脚本把整个根禁掉。
+        watch_roots = {root}
+        try:
+            for _wcp in (self.state.snapshot().get("watch_paths") or []):
+                _wp = _wcp.get("path")
+                if _wp:
+                    watch_roots.add(self._norm_path(_wp))
+        except Exception:
+            pass
         seen = self._bt_seen.setdefault(root, set())
         probe = self._bt_probe.setdefault(root, {})
         sticky = self._bt_sticky_set()
@@ -385,12 +602,15 @@ class FolderWatcher(threading.Thread):
                 if now - prev[1] < self.BT_STABLE_SEC:
                     continue
                 probe.pop(key, None)
-                # 程序目录保护：疑似程序 → 只提示，不自动解压
-                if self._looks_like_program_dir(p.parent):
+                # 程序目录保护：疑似程序 → 只提示，不自动解压。监听根/被监听目录
+                # 自身由 _looks_like_program_dir 豁免；这里再加一道兜底，绝不对
+                # 监听根路径写 kind="program" 粘性记忆（避免污染）。
+                if self._looks_like_program_dir(p.parent, watch_roots):
                     if key not in self._bt_warned:
                         self._bt_warned.add(key)
                         self.hub.log(f"疑似程序目录，跳过自动解压（百度清单）: {p}")
-                        bt.remember_sticky(p, kind="program")
+                        if self._norm_path(p.parent) not in watch_roots:
+                            bt.remember_sticky(p, kind="program")
                     seen.add(key)
                     continue
                 # 跨目录分卷：同批次同系列的分卷散落在不同子目录时，7-Zip 在单个
@@ -429,7 +649,8 @@ class FolderWatcher(threading.Thread):
 
         两者出现顺序不定：
         - 大文件夹先到：小文件夹一出现就归位；
-        - 小文件夹先到：进入 5 分钟监控窗口，期间大文件夹出现即归位，超时放弃。"""
+        - 小文件夹先到：进入 5 分钟监控窗口，期间大文件夹出现即归位，超时放弃；
+          超时放弃后按 json 身份记住，文件变化前不再重试。"""
         cfg = self.state.snapshot()
         if not cfg.get("translation_move_enabled", True):
             return
@@ -448,24 +669,34 @@ class FolderWatcher(threading.Thread):
             p = Path(path)
             if not p.is_dir():
                 self._pending_trans.pop(path, None)
+                self._trans_given_up.pop(path, None)
                 continue
             if now - first_seen > self.TRANSLATION_WINDOW:
-                self.hub.log(f"翻译文件监控超时（5 分钟内未等到目标文件夹），放弃: {p.name}")
+                self.hub.log(f"翻译文件监控超时（5 分钟内未等到目标文件夹），放弃（该文件变化前不再重试）: {p.name}")
                 self._pending_trans.pop(path, None)
+                info = self._translation_candidate(p)
+                self._trans_given_up[path] = (
+                    self._file_identity(info[1]) if info else None)
                 continue
             target = self._find_translation_target(watch, stem, p)
             if target:
                 self._pending_trans.pop(path, None)
                 self._move_translation(p, stem, target)
         # 本轮出现的候选：能立刻找到目标就归位，否则进入监控窗口
-        for d, (stem, _) in candidates.items():
+        for d, (stem, json_file) in candidates.items():
             if not d.is_dir():
                 continue
+            key = str(d)
+            if key in self._trans_given_up:
+                old_ident = self._trans_given_up[key]
+                if old_ident is not None and self._file_identity(json_file) == old_ident:
+                    continue  # 已超时放弃且文件未变化：静默跳过，不重开窗口
+                self._trans_given_up.pop(key, None)
             target = self._find_translation_target(watch, stem, d)
             if target:
                 self._move_translation(d, stem, target)
-            elif str(d) not in self._pending_trans:
-                self._pending_trans[str(d)] = (stem, time.time())
+            elif key not in self._pending_trans:
+                self._pending_trans[key] = (stem, time.time())
                 self.hub.log(f"发现翻译文件（等待目标文件夹，5 分钟窗口）: {d.name}\\{stem}.json")
 
     @staticmethod
@@ -513,6 +744,7 @@ class FolderWatcher(threading.Thread):
                       if x.is_file() and x.suffix.lower() == ".json")
         except (OSError, StopIteration):
             self._pending_trans.pop(str(src_dir), None)
+            self._trans_given_up.pop(str(src_dir), None)
             return
         try:
             dest = target_dir / jf.name
@@ -528,6 +760,7 @@ class FolderWatcher(threading.Thread):
         except OSError:
             pass
         self._pending_trans.pop(str(src_dir), None)
+        self._trans_given_up.pop(str(src_dir), None)
 
     # ---------- 首卷分卷观察期 ----------
     def _volume_ready(self, fp):
@@ -1106,6 +1339,9 @@ class QRMonitor(threading.Thread):
         self.task_q = queue.Queue(maxsize=8)
         self._hist_lock = threading.Lock()   # 保护 last_text/_recent_texts（轮询线程与工作线程共享）
         self._queue_full_logged = False      # 满队列日志节流标志（每段溢出只记一次）
+        # 「静默复制」正在写入剪贴板的文本：写入成功前置位，防止自写内容被轮询
+        # 线程当成用户输入（详见 _copy_silently）。None=当前无静默写入。
+        self._silent_write = None
 
     def run(self):
         # 工作线程只启动一次：所有阻塞 I/O（网络/子进程/浏览器）都在它里面串行
@@ -1131,6 +1367,16 @@ class QRMonitor(threading.Thread):
             except queue.Empty:
                 break
             self._enqueue(("grant", gurl, gpurpose))
+        # 排空「静默复制」请求（主窗口点击日志链接后写入 hub.clip_echo_q）。写法与
+        # url_grant_q 同款；getattr 兼容没有该属性的测试桩 hub。
+        clip_q = getattr(self.hub, "clip_echo_q", None)
+        if clip_q is not None:
+            while True:
+                try:
+                    curl = clip_q.get_nowait()
+                except queue.Empty:
+                    break
+                self._enqueue(("clipcopy", curl))
         # 暂停 = 原「停止监听」：剪贴板/二维码监控一并停止
         if self.state.running and not (self.pauser is not None
                                        and self.pauser.is_paused()):
@@ -1170,6 +1416,9 @@ class QRMonitor(threading.Thread):
                             self._open_browser(item[1])
                     except Exception as e:
                         self.hub.log(f"信任放行执行失败: {e}")
+                elif kind == "clipcopy":
+                    # 日志链接的「静默复制」：写剪贴板但绝不被本程序当成新输入
+                    self._copy_silently(item[1])
             except Exception as e:
                 self.hub.log(f"剪贴板监控出错: {e}")
             finally:
@@ -1239,7 +1488,10 @@ class QRMonitor(threading.Thread):
             # （_restore_last_text）共享，统一用 _hist_lock 保护；临界区内不做任何
             # 耗时操作，避免卡住另一线程。
             with self._hist_lock:
-                if not text or text == self.last_text:
+                # text == _silent_write：这是本程序刚静默写入剪贴板的内容，绝不当
+                # 成用户输入（写剪贴板与置位 last_text 之间的瞬时窗口也由它兜住）。
+                if (not text or text == self.last_text
+                        or text == getattr(self, "_silent_write", None)):
                     return None
                 self.last_text = text
                 self._recent_texts.append((time.time(), text[:200]))
@@ -1275,6 +1527,41 @@ class QRMonitor(threading.Thread):
             return proc.returncode == 0
         except Exception:
             return False
+
+    def _copy_silently(self, text):
+        """日志链接点击的「静默复制」：写剪贴板但**绝不**被本程序当作新输入处理。
+
+        关键在本次自写期间 `_silent_write` 的置位（见下方失败语义）：轮询线程
+        _capture_text_password 读到同一内容时，`text == self.last_text` 或
+        `text == self._silent_write` 都会直接 return None —— 因此这次自写**不会**：
+          ① 被记录为临时密码；② append 进 _recent_texts（最近提取码候选）；
+          ③ 由 _poll_once 入队走 _maybe_process_url（网址信任询问/抓取/百度分享）。
+        不要把它 append 进 _recent_texts，也不要加其它副作用。
+
+        失败语义（本轮修复）：先写剪贴板，**成功才**推进 last_text/last_url；
+        失败则不推进——否则用户之后真的手动复制同一个 URL 会被静默忽略，旧剪贴板
+        内容也可能被重处理一次。自写内容不会被当成用户输入的保证：
+          - 写之前先在 _hist_lock 内把 text 放进 `_silent_write`；轮询线程的
+            `_capture_text_password` 在同一把锁内同时检查 last_text 与 `_silent_write`，
+            命中任一即 return None；
+          - 写成功后，在**同一次持锁**内先置 last_text/last_url、再把 `_silent_write`
+            清空。轮询线程要么在清空前看到 `_silent_write`、要么在清空后看到
+            last_text，两态都被同一把锁串起来，不存在「既未置位、又未标记」的窗口；
+          - 写失败时剪贴板内容未变（仍是旧内容），`_silent_write` 清空、last_text 保持
+            不变，旧内容仍由 last_text 去重抑制，且用户真的再复制该 URL 时不会被漏掉。
+        """
+        with self._hist_lock:
+            self._silent_write = text
+        ok = self._set_clipboard(text)
+        with self._hist_lock:
+            if ok:
+                self.last_text = text
+                self.last_url = text
+            self._silent_write = None
+        try:
+            self.hub.q.put({"type": "clip_done", "url": text, "ok": bool(ok)})
+        except Exception:
+            pass
 
     def _restore_last_text(self):
         """把最近捕获的非图片剪贴板内容（如提取码）写回剪贴板，方便直接 Ctrl+V。
@@ -1495,33 +1782,42 @@ class QRMonitor(threading.Thread):
     def _decode_qr_file(self, path):
         """把解码工作放到独立子进程执行：cv2/pyzbar/PIL 原生崩溃只杀子进程。"""
         import subprocess
+        # 解码期计数只覆盖「子进程运行期」：这里是「图片/路径 → 文本」唯一的公共
+        # 瓶颈，剪贴板图片链接与二维码分享两条路径都经此。放这一层而非调用方，是因为
+        # 解码完成的信号就在紧随其后的 _handle_decoded_texts/_handle_baidu_share，
+        # 把手势落空判定窗口与真正的解码窗口对齐，避免把「解码已结束、记录尚未入库」
+        # 误判为「还在解码」。begin/end 成对，finally 保证异常/超时/早退都归还计数。
+        self.hub.qr_begin_decode()
         try:
-            proc = subprocess.run(
-                [sys.executable, str(self.qr_worker_path), path],
-                timeout=20, capture_output=True,
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
-            )
-        except subprocess.TimeoutExpired:
-            self.hub.log("二维码解码超时（已终止）")
-            return []
-        except Exception as e:
-            self.hub.log(f"二维码解码子进程启动失败: {e}")
-            return []
-        if proc.returncode != 0:
             try:
-                err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+                proc = subprocess.run(
+                    [sys.executable, str(self.qr_worker_path), path],
+                    timeout=20, capture_output=True,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+            except subprocess.TimeoutExpired:
+                self.hub.log("二维码解码超时（已终止）")
+                return []
+            except Exception as e:
+                self.hub.log(f"二维码解码子进程启动失败: {e}")
+                return []
+            if proc.returncode != 0:
+                try:
+                    err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+                except Exception:
+                    err = []
+                detail = err[-1] if err else f"退出码 {proc.returncode}"
+                kind = ("解码失败" if b"__ERROR__" in (proc.stderr or b"")
+                        else "解码进程异常退出（已隔离）")
+                self.hub.log(f"二维码{kind}: {detail[:80]}")
+                return []
+            try:
+                out = proc.stdout.decode("utf-8", "replace")
             except Exception:
-                err = []
-            detail = err[-1] if err else f"退出码 {proc.returncode}"
-            kind = ("解码失败" if b"__ERROR__" in (proc.stderr or b"")
-                    else "解码进程异常退出（已隔离）")
-            self.hub.log(f"二维码{kind}: {detail[:80]}")
-            return []
-        try:
-            out = proc.stdout.decode("utf-8", "replace")
-        except Exception:
-            out = ""
-        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+                out = ""
+            return [ln.strip() for ln in out.splitlines() if ln.strip()]
+        finally:
+            self.hub.qr_end_decode()
 
     @staticmethod
     def _redirect_url(url, rules):
@@ -1643,6 +1939,11 @@ class QRMonitor(threading.Thread):
                         self.hub.log(f"分享缺提取码：已按最近复制的文本补上 -> {code}")
                     else:
                         self.hub.log("分享缺提取码：未找到可用候选，按无码尝试")
+            # 唯一取值 bug 修复（配合 main_window._effective_share_code）：把码的
+            # 「来源」落到记录上——"url"/"text" 是权威来源，"recent" 是抓取时按
+            # 120s 历史猜的。下游（手动拉起）据此判断是否需要在手势时重新取值，
+            # 避免猜测码被黏死后覆盖后来更准的剪贴板码。
+            rec["code_source"] = code_source
             self.hub.log(f"已记录分享链接: surl={rec.get('surl')} "
                          f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
             try:

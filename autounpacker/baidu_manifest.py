@@ -37,11 +37,94 @@ def _share_root(server_path):
     return seg or "(root)"
 
 
+# 百度客户端给「分享下载」用的通用根目录名：**不同分享者、不同分享**都会落在这个
+# 名字下面（真实样本见本次修复报告：/我的资源/<文件> 与 /我的资源/<分享目录>/...）。
+# 因此它**不能**作为批次身份，否则不相干的分享会被并进同一「批次」。仅用于
+# 「显示名」推导时跳过。
+_GENERIC_SHARE_ROOTS = {"我的资源"}
+
+
+def _share_key(share):
+    """分享下载的稳定批次键（纯 ASCII、不含中文），优先 `<shareid>.<share_uk>`。
+
+    没有分享信息（网页直链/普通下载）返回 None，由调用方退回 `_share_root`。
+    绝不抛异常。
+    """
+    try:
+        sid = str((share or {}).get("shareid") or "").strip()
+        uk = str((share or {}).get("share_uk") or "").strip()
+        if sid and uk:
+            return f"{sid}.{uk}"
+        return sid or uk or None
+    except Exception:
+        return None
+
+
+def _share_display_name(server_path, share=None):
+    """批次的人类可读显示名（日志/通知用）。绝不抛异常。
+
+    规则（依据真实 `server_path` 样本推导，样本原文见修复报告）：
+    - 根名**不是**通用根时直接用它（如 `某分享/1.7z.001` → `某分享`）；
+    - 根名是通用根（如「我的资源」）时，跳过它再看：若其下还有「分享层目录」
+      （至少两段），取紧邻的那一段。真实样本
+      `我的资源/<分享目录>/<文件>` -> `<分享目录>`；
+    - 分享层拿不到（文件直接落在通用根下，如 `我的资源/xxx.mp4`）时退化为
+      `分享 <shareid>`；连 shareid 也没有才退回根名。
+    """
+    try:
+        p = str(server_path or "").replace("\\", "/").strip("/")
+        segs = [s for s in p.split("/") if s]
+        root = segs[0] if segs else ""
+        if root and root not in _GENERIC_SHARE_ROOTS:
+            return root
+        rest = segs[1:] if root in _GENERIC_SHARE_ROOTS else segs
+        if len(rest) >= 2:
+            return rest[0]
+        sid = str((share or {}).get("shareid") or "").strip()
+        if sid:
+            return f"分享 {sid}"
+        return root or "(root)"
+    except Exception:
+        return "(root)"
+
+
+def _batch_identity(server_path, share=None):
+    """返回 (batch_key, display_name)。
+
+    分享下载按**分享**划分（键稳定且不含中文）；没有分享信息时才退回
+    `_share_root(server_path)`。所有 batch 消费点必须统一用本函数产出的 key。
+    """
+    key = _share_key(share)
+    if key:
+        return key, _share_display_name(server_path, share)
+    root = _share_root(server_path)
+    return root, root
+
+
+def _batch_label(info):
+    """事件的显示名（缺 batch_name 时退回 batch 键，再退回 "(root)"）。"""
+    return ((info or {}).get("batch_name") or (info or {}).get("batch")
+            or "(root)")
+
+
+def _batch_label_from(files, batch):
+    """从已登记文件里取该批次的显示名（取不到退回 batch 键）。"""
+    for v in files or []:
+        if v.get("batch_name"):
+            return v.get("batch_name")
+    return batch or "(root)"
+
+
 def group_batches(items):
-    """按分享根把条目归为批次，保持出现顺序。返回 {root: [item, ...]}。"""
+    """按「批次身份」（分享优先，否则分享根）把条目归批，保持出现顺序。
+
+    返回 {batch_key: [item, ...]}。历史行没有分享参数时自然退回 `_share_root`。
+    """
     groups = {}
     for it in items:
-        groups.setdefault(_share_root(it.get("server_path")), []).append(it)
+        key, _name = _batch_identity(it.get("server_path"),
+                                     parse_share_download(it))
+        groups.setdefault(key, []).append(it)
     return groups
 
 
@@ -693,16 +776,20 @@ def observe_tasks(rows, hist_rows=None):
         key = _norm_path(lp)
         info = _TRACK["files"].get(key)
         if info is None:
+            sp = _as_text(r.get("server_path"))
+            sh = parse_share_download(r)            # 分享下载的关联键（2.F）
+            bkey, bname = _batch_identity(sp, sh)
             info = {
                 "local_path": lp,
-                "server_path": _as_text(r.get("server_path")),
+                "server_path": sp,
                 "size": r.get("file_size"),
                 "isdir": r.get("isdir"),
-                "batch": _share_root(_as_text(r.get("server_path"))),
+                "batch": bkey,
+                "batch_name": bname,
                 "task_id": tid,
                 "add_time": r.get("add_time"),
                 "state": "active",
-                "share": parse_share_download(r),   # 分享下载的关联键（2.F）
+                "share": sh,
             }
             _TRACK["files"][key] = info
             events["started"].append(dict(info))
@@ -724,6 +811,12 @@ def observe_tasks(rows, hist_rows=None):
             sh = parse_share_download(r)
             if sh:
                 info["share"] = sh
+            # 批次身份随 server_path / 分享信息刷新，保证同一路径被重新下载（可能
+            # 来自另一个分享）时也归到正确的批次，不残留旧键。
+            bkey, bname = _batch_identity(info.get("server_path"),
+                                          info.get("share"))
+            info["batch"] = bkey
+            info["batch_name"] = bname
             info["state"] = "active"
             if reappeared:
                 # 重新下载：当作一次新任务上报（便于日志/预登记）
@@ -775,11 +868,15 @@ def expected_files(db_path=None):
     files = list(_TRACK["files"].values())
     if not files:
         for r in get_active_tasks(db_path):
+            sp = _as_text(r.get("server_path"))
+            sh = parse_share_download(r)
+            bkey, bname = _batch_identity(sp, sh)
             files.append({
                 "local_path": _as_text(r.get("local_path")),
                 "size": r.get("file_size"),
                 "isdir": r.get("isdir"),
-                "batch": _share_root(_as_text(r.get("server_path"))),
+                "batch": bkey,
+                "batch_name": bname,
                 "state": "active",
             })
     out = {}
@@ -924,12 +1021,12 @@ def report_events(events, hub, notify=True, max_lines=12):
             elif sh.get("sekey"):
                 extra += "，已含提取码校验(sekey)"
         _log(f"网盘新任务：{it.get('local_path')}（{it.get('size')} B，"
-             f"批次 {it.get('batch')}{extra}）")
+             f"批次 {_batch_label(it)}{extra}）")
     # B：新出现文件的批次，输出「预登记」清单（结构摘要，便于提前建目录/等分卷）
     for b in {it.get("batch") for it in (events.get("started") or [])}:
         fs = batch_files(b)
         ndir = sum(1 for v in fs if v.get("isdir"))
-        _log(f"批次预登记 {b}：共 {len(fs)} 项（目录 {ndir}）")
+        _log(f"批次预登记 {_batch_label_from(fs, b)}：共 {len(fs)} 项（目录 {ndir}）")
         for v in fs[:8]:
             _log(f"    {v.get('local_path')}")
         if len(fs) > 8:
@@ -952,12 +1049,16 @@ def report_events(events, hub, notify=True, max_lines=12):
     for it in done:
         _log(f"网盘任务完成：{it.get('local_path')}")
     for b in {it.get("batch") for it in done}:
+        fs = batch_files(b)
         n, a, d, g = batch_state(b)
         if a == 0 and d > 0 and g == 0:
-            _log(f"网盘下载批次完成：{b}（{d} 项全部完成）")
+            # 显示名按「分享层目录」推导；绝不用通用根（如「我的资源」）冒充批次名，
+            # 通知口径明确为「本批次」（只统计该分享键下的已登记项）。
+            name = _batch_label_from(fs, b)
+            _log(f"网盘下载批次完成：{name}（本批次 {d} 项全部完成）")
             if notify:
                 try:
-                    hub.notify("网盘下载完成", f"{b}：{d} 个文件已下载完成")
+                    hub.notify("网盘下载完成", f"{name}：{d} 个文件已下载完成")
                 except Exception:
                     pass
             notified.append(b)

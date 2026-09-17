@@ -46,9 +46,33 @@ class Hub:
         # 网址信任放行队列：主窗口用户决策「允许」后投递 (url, purpose)，
         # QRMonitor 循环读取并执行（与 self.q 分离，避免双读者竞态）
         self.url_grant_q = queue.Queue()
+        # 静默复制队列：主窗口点击日志里的链接后投递 url，QRMonitor 循环读取并
+        # 「先置位 last_text 再写剪贴板」，使这次自写不被本程序当成新输入处理
+        # （仿 url_grant_q：与 self.q 分离，避免双读者竞态）
+        self.clip_echo_q = queue.Queue()
+        # 二维码解码期计数：QRMonitor（工作线程）在解码子进程运行期间加一，
+        # GUI 手势可据此判断「当前确实正在解码」→ 登记一次性预定任务；
+        # 两侧只持有同一个 hub，跨线程共享状态挂在这里（不新增消息类型）。
+        self._qr_lock = threading.Lock()
+        self._qr_decoding = 0
         self.state = state
         self._log_lock = threading.Lock()
         self._cleanup_old_logs()
+
+    def qr_begin_decode(self):
+        """进入二维码解码期（子进程运行期）+1。"""
+        with self._qr_lock:
+            self._qr_decoding += 1
+
+    def qr_end_decode(self):
+        """退出二维码解码期 -1（最小钳到 0，防止异常路径把计数拉成负数）。"""
+        with self._qr_lock:
+            self._qr_decoding = max(0, self._qr_decoding - 1)
+
+    def qr_decoding_active(self):
+        """当前是否处于二维码解码期（有解码子进程正在运行）。"""
+        with self._qr_lock:
+            return self._qr_decoding > 0
 
     @staticmethod
     def _cleanup_old_logs():

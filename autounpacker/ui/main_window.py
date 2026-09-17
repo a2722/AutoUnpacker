@@ -11,13 +11,14 @@
 """
 import html
 import queue
+import re
 import threading
 import time
 import types
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QPlainTextEdit, QSystemTrayIcon, QMenu, QSplitter, QProgressBar, QShortcut, QMessageBox)
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtCore import Qt, QTimer, QEvent
+from PyQt5.QtGui import QKeySequence, QTextCursor, QTextCharFormat, QColor
 
 from .. import extract as smart_extract    # noqa: F401
 from .. import trail as deletion_trail     # noqa: F401
@@ -47,6 +48,384 @@ except ImportError:
 SHARE_PREP_STALE_SEC = 120
 # 挑选窗最长等待秒数：超时未选择按「取消」处理，避免忙标志被永久占用。
 SHARE_PICK_WAIT_SEC = 1800
+# 二维码解码「预定任务」时效：手势落空时登记，解码出百度分享链接后自动补按；
+# 超过该秒数未等到 share_link 事件即作废（避免几秒后的无关分享被误当成该次手势）。
+PENDING_SHARE_TTL_SEC = 60
+# 预定任务的 kind → 文案。(登记日志, 托盘通知正文)；托盘标题两路都用「二维码正在解析」。
+# Alt+2（share）文案已验收，逐字不动；Alt+3（share_code）为固定提取码那一路。
+# 将来把 Alt+2/Alt+3 合并成一个热键时，只需改这里的条目 + _dispatch_pending_share 的一行。
+PENDING_SHARE_TEXT = {
+    "share": (
+        "[分享] 二维码正在解析，已登记预定任务：解析出百度分享链接后自动拉起",
+        "解析完成后若是百度分享链接，将自动拉起客户端（无需再按）"),
+    "share_code": (
+        "[分享] 二维码正在解析，已登记预定任务：解析出百度分享链接后按固定提取码自动拉起",
+        "解析完成后若是百度分享链接，将按固定提取码自动拉起客户端（无需再按）"),
+}
+# kind → 手势标签（仅用于「已刷新」等需要说明是哪一路的日志）。
+PENDING_SHARE_TAG = {"share": "Alt+2", "share_code": "Alt+3"}
+
+# ---------------------------------------------------------------------------
+# 日志里的网址：渲染成可点 <a>，单击静默复制一次后降级为普通文本。
+# 渲染（_render_log_html）与点击定位（MainWindow._hit_log_link）共用同一套 URL
+# 识别逻辑，避免两处规则漂移。
+# ---------------------------------------------------------------------------
+# 从 http(s):// 起，吃到空白或 <>"' 为止；尾部标点再单独剔除（见 _LOG_URL_TRAIL）。
+_LOG_URL_RE = re.compile(r'https?://[^\s<>"\']+')
+# 中英文场景下链接常被这些标点紧跟（句号/逗号/括号/引号等），不属于 URL。
+_LOG_URL_TRAIL = '，。；、,.;:!?）】》」』)]}>'
+
+
+def _find_log_urls(text):
+    """返回 [(start, end, url)]：行内所有 http(s) 链接及其剔除尾部标点后的区间。
+
+    渲染与点击定位共用本函数，保证「能渲染成链接的」与「能点中的」完全一致。
+    剔除尾部标点后为空则不收录；一行内多个链接全部收录。
+    """
+    spans = []
+    for m in _LOG_URL_RE.finditer(text):
+        s, e = m.start(), m.end()
+        while e > s and text[e - 1] in _LOG_URL_TRAIL:
+            e -= 1
+        if e > s:
+            spans.append((s, e, text[s:e]))
+    return spans
+
+
+def _render_log_html(msg, color):
+    """把一行日志转成 HTML：整行着色 + http(s) 链接变成可点 <a>。
+
+    逐个文本片段做 html.escape（链接单独 escape），而不是先整体 escape 再替换——
+    后者会把被转义的引号 `&quot;` 误并进 URL。QPlainTextEdit 解析后 block 的纯
+    文本仍等于原始 msg，因此点击侧能对同一 msg 用 _find_log_urls 精确定位。
+    """
+    spans = _find_log_urls(msg)
+    if not spans:
+        return f'<span style="color:{color}">{html.escape(msg)}</span>'
+    parts = []
+    pos = 0
+    for s, e, url in spans:
+        parts.append(html.escape(msg[pos:s]))
+        esc = html.escape(url, quote=True)
+        parts.append(
+            f'<a href="{esc}" style="color:{PALETTE["log_link"]};'
+            f'text-decoration:underline">{esc}</a>')
+        pos = e
+    parts.append(html.escape(msg[pos:]))
+    return f'<span style="color:{color}">{"".join(parts)}</span>'
+
+
+# ---------------------------------------------------------------------------
+# 提取码取值 / 缺码小窗：module 级实现 + 类方法薄包装。
+#
+# 之所以放 module 级：既有大量测试用「非 QWidget 桩」直接调用
+# `mw.MainWindow._open_recent_share(stub)` / `_share_ask_code`，这些桩只绑定了
+# 它当时触达的方法名；若新逻辑改调 `self._effective_share_code(...)`，这些桩会
+# 因缺方法而 AttributeError。module 级函数让旧桩继续可用，同时类上仍暴露
+# `MainWindow._effective_share_code` / `_show_share_code_window` 作为正式助手。
+# ---------------------------------------------------------------------------
+
+def _share_log(win, msg):
+    """把一行日志写到主窗：优先 `_append_log`（Qt 线程），异常/缺失时退回 hub.log。"""
+    fn = getattr(win, "_append_log", None)
+    if callable(fn):
+        try:
+            fn(msg)
+            return
+        except Exception:
+            pass
+    try:
+        win.hub.log(msg)
+    except Exception:
+        pass
+
+
+def _persist_log(win, msg):
+    """固定提取码绑定的诊断日志（线程安全分流，module 级以免依赖实例绑定）。
+
+    Qt 主线程（面板/热键路径）直接 `_append_log` 落日志；后台 worker 线程
+    （Alt+3 提交成功后绑定）绝不能碰控件，改走 `hub.log` 由 `_drain` 消费。"""
+    try:
+        if threading.current_thread() is threading.main_thread():
+            _share_log(win, msg)
+            return
+    except Exception:
+        pass
+    try:
+        win.hub.log(msg)
+    except Exception:
+        pass
+
+
+def _share_dlg_target(dlg):
+    """读小窗归属的目标 (surl, share_uk)。
+
+    优先冻结访问器 `target_surl()` / `target_uk()`；尚未落地时回退旧属性
+    `surl` / `share_uk`。任何异常都返回 ("", "")，绝不向外抛。"""
+    if dlg is None:
+        return "", ""
+    out = []
+    for fn_name, attr in (("target_surl", "surl"), ("target_uk", "share_uk")):
+        val = ""
+        fn = getattr(dlg, fn_name, None)
+        if callable(fn):
+            try:
+                val = fn() or ""
+            except Exception:
+                val = ""
+        if not val:
+            try:
+                val = getattr(dlg, attr, "") or ""
+            except Exception:
+                val = ""
+        out.append(str(val).strip())
+    return out[0], out[1]
+
+
+def _share_window_alive(dlg):
+    """小窗是否仍可复用：已超时（`_timed_out`）或已关闭（isVisible 为假）即失效。
+
+    120s 到点只关闭、**不回调**，所以 `_share_ask_dlg` 引用可能仍指向已死窗口——
+    必须显式判活，否则会把超时窗当「同一个」复用，导致作废的码仍被读取。"""
+    if dlg is None:
+        return False
+    try:
+        if getattr(dlg, "_timed_out", False):
+            return False
+    except Exception:
+        pass
+    vis = getattr(dlg, "isVisible", None)
+    if callable(vis):
+        try:
+            return bool(vis())
+        except Exception:
+            return True
+    return True
+
+
+def _share_code_in_window(win, surl, share_uk):
+    """小窗里是否有一个「属于同一分享且通过校验」的码。
+
+    返回 (code, dlg)：code 为空串表示不可用。`current_code()`（冻结访问器）是
+    最高优先级取值来源；未落地时视同无码。归属判定：同 surl 或同 share_uk；
+    超时/已关闭的旧窗一律视为无码。"""
+    dlg = getattr(win, "_share_ask_dlg", None)
+    if dlg is None or not _share_window_alive(dlg):
+        return "", dlg
+    code = ""
+    fn = getattr(dlg, "current_code", None)
+    if callable(fn):
+        try:
+            code = str(fn() or "").strip()
+        except Exception:
+            code = ""
+    if not code:
+        return "", dlg
+    t_surl, t_uk = _share_dlg_target(dlg)
+    surl = str(surl or "").strip()
+    share_uk = str(share_uk or "").strip()
+    same = bool((t_surl and surl and t_surl == surl)
+                or (share_uk and t_uk and share_uk == t_uk))
+    if not same:
+        return "", dlg
+    return code, dlg
+
+
+def _effective_share_code(win, surl, share_uk, rec_pwd, code_source):
+    """唯一的分享提取码取值助手（优先级冻结），返回 `(code, source)`。
+
+    1. 小窗里填的码（且该窗属于同一 surl/share_uk、`current_code()` 非空）
+       → `("window")`（最高优先，用户手填即意图）
+    2. 记录自带码且来源权威（`code_source` 属 `url`/`text`/`window`/空）
+       → `(rec_pwd, code_source)`。`window` = 用户在小窗里亲手填过并写回记录的码，
+       与 `url`/`text` 同为权威（「以小窗填写的为准」）；`code_source` 缺失按权威
+       空来源处理，兼容旧记录。
+    3. 记录码为空、或 `code_source == "recent"`（抓取时的猜测）
+       → 用 `fresh_code_from_history`（严格 120s，取最新）**重新取值**：
+         取到 → `("recent")`；取不到 → 回退 `rec_pwd`（可能为空）
+    4. 全无 → `("", "")`
+
+    绝不抛异常。"""
+    try:
+        code, _dlg = _share_code_in_window(win, surl, share_uk)
+        if code:
+            return (code, "window")
+    except Exception:
+        pass
+    try:
+        pwd = str(rec_pwd or "").strip()
+    except Exception:
+        pwd = ""
+    src = "" if code_source is None else str(code_source)
+    # `window`：用户在小窗亲手填的码（写回记录时的来源标记），与 url/text 同为
+    # 权威来源——小窗关闭后也不该被更新的剪贴板候选覆盖。
+    if pwd and src in ("url", "text", "window", ""):
+        return (pwd, src)
+    # 记录码为空或来源是猜测 → 重新取 120s 内最新的码
+    fresh = None
+    try:
+        entries = win.state.temp_password_entries()
+        fresh, _ = bm.fresh_code_from_history(entries)
+    except Exception:
+        fresh = None
+    if fresh:
+        return (str(fresh).strip(), "recent")
+    if pwd:
+        return (pwd, src)
+    return ("", "")
+
+
+def _call_start_share_pick(win, url, surl, pwd, manual=False, item=None,
+                           bind_code_uk=None):
+    """调用 `win._start_share_pick` 并转发 `bind_code_uk`；兼容不接受该参数的旧桩。
+
+    真实实现接受 `bind_code_uk`；既有大量测试把 `_start_share_pick` 换成不含该形参
+    的桩。这里按签名判断：不接受时退回位置调用（绑定语义对桩不可观测，本就不会执行
+    worker），绝不因签名差异让调用抛错。module 级定义使旧桩（未绑定本方法）可用。"""
+    fn = win._start_share_pick
+    accepts = True
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        accepts = ("bind_code_uk" in params) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except Exception:
+        accepts = True
+    if accepts:
+        return fn(url, surl, pwd, manual=manual, item=item,
+                  bind_code_uk=bind_code_uk)
+    return fn(url, surl, pwd, manual=manual, item=item)
+
+
+def _prefill_share_code_window(dlg, code):
+    """复用小窗时预填「最新已知码」：只在框内当前码为空时填入，绝不覆盖用户输入。
+
+    优先冻结的可写方法（set_code / prefill_code / prefill，若将来落地）；
+    否则回退已知输入框属性（once_edit / code_edit / mapped_edit）。"""
+    code = str(code or "").strip()
+    if not code or dlg is None:
+        return
+    try:
+        fn = getattr(dlg, "current_code", None)
+        if callable(fn) and str(fn() or "").strip():
+            return                      # 用户已填：不覆盖
+    except Exception:
+        pass
+    for name in ("set_code", "prefill_code", "prefill"):
+        fn = getattr(dlg, name, None)
+        if callable(fn):
+            try:
+                fn(code)
+                return
+            except Exception:
+                pass
+    for attr in ("once_edit", "code_edit", "mapped_edit"):
+        ed = getattr(dlg, attr, None)
+        if ed is not None and hasattr(ed, "setText"):
+            try:
+                if not str(ed.text() or "").strip():
+                    ed.setText(code)
+                    return
+            except Exception:
+                pass
+
+
+def _show_share_code_window(win, surl, url, share_uk, mapped_code="",
+                            open_browser=False):
+    """把「缺提取码小窗」收敛到唯一入口（Qt 主线程调用）。
+
+    - 已有小窗且属于同一分享 → 复用并预填最新已知码（不覆盖用户已填内容）；
+    - 已有小窗属于别的分享 → 关掉旧的换新的（同一时刻只允许一个小窗）；
+    - 主窗隐藏在托盘时**仍然弹出**：新小窗是顶层窗口，热键场景必需。
+    - `open_browser`：仅在新开/复用小窗之外需要「未知分享者探针」时置真；
+      已在弹小窗时不重复开浏览器。
+
+    任何异常都不向外抛，返回小窗对象或 None。"""
+    dlg = getattr(win, "_share_ask_dlg", None)
+    if dlg is not None and not _share_window_alive(dlg):
+        # 已超时/关闭的旧窗：丢弃引用，按「不同分享」重建一个新窗。
+        try:
+            dlg.on_decision = None
+        except Exception:
+            pass
+        try:
+            dlg.close()
+        except Exception:
+            pass
+        try:
+            win._share_ask_dlg = None
+        except Exception:
+            pass
+        dlg = None
+    t_surl, t_uk = _share_dlg_target(dlg)
+    surl_s = str(surl or "").strip()
+    uk_s = str(share_uk or "").strip()
+    same = bool(dlg is not None and (
+        (t_surl and surl_s and t_surl == surl_s)
+        or (uk_s and t_uk and uk_s == t_uk)))
+    if same:
+        _prefill_share_code_window(dlg, mapped_code)
+        try:
+            dlg.show()
+        except Exception:
+            pass
+        return dlg
+    if dlg is not None:
+        # 不同分享：关旧换新。先摘掉旧窗回调，避免其关闭时的 ignore 回写
+        # 把刚建好的新窗引用清掉（`_on_share_code_decision` 会把引用置 None）。
+        try:
+            dlg.on_decision = None
+        except Exception:
+            pass
+        try:
+            dlg.close()
+        except Exception:
+            pass
+        try:
+            win._share_ask_dlg = None
+        except Exception:
+            pass
+    try:
+        from .dialogs import ShareCodeAskDialog
+    except Exception:
+        _share_log(win, "[分享] 缺少提取码询问组件，已跳过")
+        return None
+    try:
+        # 传 hub= 让 120s 超时日志（「分享询问超时(120s)，已关闭丢弃」）真正出现。
+        new_dlg = ShareCodeAskDialog(parent=win, surl=surl, url=url,
+                                     share_uk=share_uk, mapped_code=mapped_code,
+                                     hub=getattr(win, "hub", None))
+    except Exception as e:
+        _share_log(win, f"[分享] 打开提取码询问失败: {e}")
+        return None
+    try:
+        new_dlg.on_decision = (
+            lambda kind, code: win._on_share_code_decision(
+                kind, code, url, surl, share_uk))
+    except Exception:
+        pass
+    try:
+        win._share_ask_dlg = new_dlg
+    except Exception:
+        pass
+    try:
+        new_dlg.show()
+    except Exception:
+        try:
+            win._share_ask_dlg = None
+        except Exception:
+            pass
+        return None
+    if open_browser:
+        # 未知分享者：沿用既有「浏览器打开分享页做探针」行为（只在新弹小窗时一次）。
+        try:
+            import webbrowser
+            webbrowser.open(str(url), new=2)
+            _share_log(win, f"[分享] 未知分享者，已在浏览器打开分享页: {url}")
+        except Exception as e:
+            _share_log(win, f"[分享] 打开分享页失败: {e}")
+    return new_dlg
+
 
 class MainWindow(QMainWindow):
     def __init__(self, state, hub, show_event=None, pauser=None):
@@ -98,6 +477,10 @@ class MainWindow(QMainWindow):
         # d7：同一分享本次运行重复拉起需征得用户同意。进程内兜底集合：
         # baidu_manifest 计数器不可用（或测试桩）时保证「只在首见自动拉起」。
         self._share_launched_surls = set()
+        # 二维码解码期「预定任务」：手势在「无分享记录 + 正在解码二维码」时落空，
+        # 登记一次性补按（{kind, at}），解码出百度分享链接（share_link 事件）后自动
+        # 执行；超过 PENDING_SHARE_TTL_SEC 作废。Alt+3 本次不接线，kind 备用。
+        self._pending_share_gesture = None
         # d3：当前打开的「提取码询问」/「文件挑选」面板（防叠加）。后台 worker 只
         # 通过 hub 队列请求，控件一律在 Qt 线程构造。
         self._share_ask_dlg = None
@@ -188,6 +571,10 @@ class MainWindow(QMainWindow):
         self.log_box.setReadOnly(True)
         self.log_box.setMinimumHeight(60)
         log_lay.addWidget(self.log_box, 1)
+        # 日志里的链接交互：QPlainTextEdit 自身没有 anchor 支持（也没有 anchorAt），
+        # 用事件过滤器处理「悬停换手型光标 + 单击未使用链接」，**不换控件类型**。
+        self.log_box.viewport().installEventFilter(self)
+        self.log_box.viewport().setMouseTracking(True)
         self.splitter.addWidget(log_wrap)
         self.splitter.setSizes([300, 200])
         self.splitter.setStretchFactor(0, 0)
@@ -522,26 +909,141 @@ class MainWindow(QMainWindow):
             self.card_lay.insertWidget(self.card_lay.count() - 1, card)
         self._update_rainbow()
 
-    def _append_log(self, msg):
-        """按事件类型着色追加日志（可开关）。"""
-        if not self.state.snapshot().get("log_colors_enabled", True):
-            self.log_box.appendPlainText(msg)
-            return
+    def _log_color_for(self, msg):
+        """关键词 → 日志行颜色（_append_log 与链接降级共用，保证降级后与原行同色）。"""
         m = msg
         if "失败" in m or "出错" in m or "错误" in m:
-            color = PALETTE["log_error"]      # 错误：红
-        elif "完成" in m or "成功" in m or "开始监听" in m:
-            color = PALETTE["log_success"]    # 成功：绿
-        elif ("发现压缩包" in m or "开始智能解压" in m or "已捕获临时密码" in m
-              or "识别到二维码" in m or "正在打开" in m or "归位" in m
-              or "翻译" in m or "网址" in m):
-            color = PALETTE["log_info"]       # 信息：蓝
-        elif ("分卷" in m or "下载未完成" in m or "密码" in m
-              or "超时" in m or "监控" in m or "等待" in m):
-            color = PALETTE["log_wait"]       # 等待/提示：黄
-        else:
-            color = PALETTE["log_default"]    # 默认
-        self.log_box.appendHtml(f'<span style="color:{color}">{html.escape(msg)}</span>')
+            return PALETTE["log_error"]      # 错误：红
+        if "完成" in m or "成功" in m or "开始监听" in m:
+            return PALETTE["log_success"]    # 成功：绿
+        if ("发现压缩包" in m or "开始智能解压" in m or "已捕获临时密码" in m
+                or "识别到二维码" in m or "正在打开" in m or "归位" in m
+                or "翻译" in m or "网址" in m):
+            return PALETTE["log_info"]       # 信息：蓝
+        if ("分卷" in m or "下载未完成" in m or "密码" in m
+                or "超时" in m or "监控" in m or "等待" in m):
+            return PALETTE["log_wait"]       # 等待/提示：黄
+        return PALETTE["log_default"]        # 默认
+
+    def _append_log(self, msg):
+        """按事件类型着色追加日志（可开关）；彩色模式下 http(s) 链接渲染为可点 <a>。"""
+        if not self.state.snapshot().get("log_colors_enabled", True):
+            # 纯文本模式：不做链接渲染（无 <a>、无点击）。已知取舍：关掉彩色即无链接。
+            self.log_box.appendPlainText(msg)
+            return
+        self.log_box.appendHtml(_render_log_html(msg, self._log_color_for(msg)))
+
+    # ---------- 日志链接：悬停手型 + 单击静默复制 + 降级 ----------
+    def _hit_log_link(self, pos):
+        """定位点击处「尚未使用过」的链接：返回 (block, start, end, url) 或 None。
+
+        坐标系：pos 为 log_box viewport 坐标（cursorForPosition 所需）。命中判定用
+        「点击那一刻」该 block 的 position() + block 内偏移现场构造，不缓存绝对位置
+        或 block 号——3000 行上限会裁掉旧 block 使编号整体位移，任何持久映射都会错位。
+        """
+        cursor = self.log_box.cursorForPosition(pos)
+        block = cursor.block()
+        offset = cursor.positionInBlock()
+        for s, e, url in _find_log_urls(block.text()):
+            if s <= offset < e:
+                if self._block_span_has_anchor(block, s, e):
+                    return block, s, e, url
+                return None   # 已降级的链接：不再触发
+        return None
+
+    @staticmethod
+    def _block_span_has_anchor(block, start, end):
+        """该 block 上 [start, end) 区间是否仍带 anchorHref（即尚未被点过而降级）。
+
+        注意：QPlainTextEdit 的富文本格式**不在** `block.layout().formats()` 里
+        （实测恒为空），而在该 block 的文本 fragment（`block.begin()` 迭代出的
+        QTextFragment.charFormat()）上。因此这里遍历 fragment 判定，语义与「span 在
+        layout formats 里带 anchorHref」完全一致：只有**还没被点过**的链接才带 href。
+        """
+        try:
+            it = block.begin()
+            while not it.atEnd():
+                fr = it.fragment()
+                it += 1
+                if not fr.isValid():
+                    continue
+                fs = fr.position() - block.position()
+                fe = fs + fr.length()
+                if fs <= start and fe >= end:
+                    return bool(fr.charFormat().anchorHref())
+        except Exception:
+            pass
+        return False
+
+    def eventFilter(self, obj, event):
+        """log_box viewport 事件过滤器：悬停手型光标 + 单击未使用链接静默复制。"""
+        try:
+            if obj is self.log_box.viewport():
+                et = event.type()
+                if et == QEvent.MouseMove:
+                    hit = self._hit_log_link(event.pos())
+                    self.log_box.viewport().setCursor(
+                        Qt.PointingHandCursor if hit else Qt.IBeamCursor)
+                elif et == QEvent.MouseButtonRelease:
+                    # 用户正在拖选大段日志时绝不干扰：存在选区直接放过。
+                    if (event.button() == Qt.LeftButton
+                            and not self.log_box.textCursor().hasSelection()):
+                        hit = self._hit_log_link(event.pos())
+                        if hit is not None:
+                            self._on_log_link_clicked(*hit)
+                            return True
+        except Exception:
+            pass
+        return False
+
+    def _on_log_link_clicked(self, block, start, end, url):
+        """点击未使用链接：立即降级为普通文本色（即时反馈）并请求监控线程静默复制。"""
+        self._degrade_log_link(block, start, end, url)
+        try:
+            self.hub.clip_echo_q.put(url)
+        except Exception:
+            # hub 桩可能没有该属性：忽略（不复制，但链接已降级）
+            pass
+
+    def _degrade_log_link(self, block, start, end, url):
+        """就地去掉 [start,end) 的 anchor 并设成整行普通色。
+
+        位置用「当前 block.position() + block 内偏移」现场计算，随 block 移动自动
+        跟随，不依赖任何跨 block 的绝对位置缓存。
+        """
+        fmt = QTextCharFormat()
+        fmt.setAnchor(False)
+        fmt.setAnchorHref("")
+        fmt.setForeground(QColor(self._log_color_for(block.text())))
+        base = block.position()
+        cursor = QTextCursor(block)
+        cursor.setPosition(base + start)
+        cursor.setPosition(base + end, QTextCursor.KeepAnchor)
+        cursor.setCharFormat(fmt)
+
+    def _restore_log_link(self, url):
+        """复制失败时尽力恢复可点样式：找第一个已无 anchor 的该 URL 片段重套链接格式。"""
+        if not url:
+            return
+        try:
+            doc = self.log_box.document()
+            cursor = doc.find(url)
+            while not cursor.isNull():
+                block = cursor.block()
+                base = block.position()
+                start = cursor.selectionStart() - base
+                end = cursor.selectionEnd() - base
+                if not self._block_span_has_anchor(block, start, end):
+                    fmt = QTextCharFormat()
+                    fmt.setAnchor(True)
+                    fmt.setAnchorHref(url)
+                    fmt.setForeground(QColor(PALETTE["log_link"]))
+                    fmt.setFontUnderline(True)
+                    cursor.setCharFormat(fmt)
+                    return
+                cursor = doc.find(url, cursor)
+        except Exception:
+            pass
 
     # ---------- 主题（深浅色）----------
     def _on_system_theme_changed(self):
@@ -603,6 +1105,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._apply_titlebar)
 
     def _drain(self):
+        # 二维码「预定任务」过期清理：每轮 tick（200ms）一次；无任务时 O(1) 早退。
+        # 超时仍未见 share_link 事件 → 作废并记一行（防止若干秒后的无关分享被误补按）。
+        _pend0 = getattr(self, "_pending_share_gesture", None)
+        if _pend0 and (time.time() - _pend0.get("at", 0)) > PENDING_SHARE_TTL_SEC:
+            self._pending_share_gesture = None
+            self._append_log("[分享] 二维码预定任务已超时作废")
         while True:
             try:
                 item = self.hub.q.get_nowait()
@@ -632,12 +1140,27 @@ class MainWindow(QMainWindow):
                 self.progress.setRange(0, 100)
                 self.progress.setValue(0)
                 self.progress.hide()
+            elif item["type"] == "clip_done":
+                # 日志链接静默复制回执：成功什么都不做（点击时链接已降级，颜色即回执）；
+                # 失败则提示一句并尽力恢复可点样式，让用户能再点一次。成功/失败都不弹托盘。
+                if not item.get("ok"):
+                    self._append_log("[日志] 复制链接失败，可再点一次")
+                    self._restore_log_link(item.get("url"))
             elif item["type"] == "url_trust_ask":
                 self._handle_trust_ask(item)
             elif item["type"] == "share_link":
                 self._append_log(
                     f"[分享] 已记录: {item.get('url')}"
                     f"（托盘菜单「用客户端打开最近分享」可拉起客户端）")
+                # 预定任务优先：手势曾在二维码解码期落空，此刻记录已入库 → 按登记
+                # 时的 kind 派发（唯一分派点，等价于用户此刻按下对应热键）。命中即
+                # 消费该任务，并跳过本事件的 baidu_auto_invoke 分支（否则重复拉起）。
+                _pend = getattr(self, "_pending_share_gesture", None)
+                if (_pend
+                        and time.time() - _pend.get("at", 0) <= PENDING_SHARE_TTL_SEC):
+                    self._pending_share_gesture = None
+                    self._dispatch_pending_share(_pend)
+                    continue
                 # 实验性：开启「自动拉起」时才处理（默认关）。
                 # 链路含网络 IO，禁止阻塞 Qt 事件循环 → 交给后台线程。
                 if (self.state.snapshot().get("experimental_enabled")
@@ -665,6 +1188,26 @@ class MainWindow(QMainWindow):
                         self._confirm_share_reinvoke(surl, url, pwd)
                     else:
                         self._start_share_pick(url, surl, pwd, manual=False)
+                # 触发小窗（三触发之一）：链接本身无码、也查不到固定码 → 弹/聚焦
+                # 提取码小窗（**不管** baidu_auto_invoke 开关、不管是否手势）。有码
+                # 则不弹；未知分享者顺手开一次浏览器探针（已在弹小窗时不重复开）。
+                # 刻意放在 baidu_auto_invoke 分支之后：不改变其既有顺序与语义。
+                try:
+                    if self.state.snapshot().get("experimental_enabled"):
+                        _pwd = str(item.get("pwd") or "").strip()
+                        if not _pwd:
+                            _mapped = None
+                            try:
+                                _mapped = bm.mapped_code(item.get("share_uk"))
+                            except Exception:
+                                _mapped = None
+                            if not _mapped:
+                                _show_share_code_window(
+                                    self, item.get("surl"), item.get("url"),
+                                    item.get("share_uk"), mapped_code="",
+                                    open_browser=True)
+                except Exception:
+                    pass
             elif item["type"] == "share_pick":
                 # 后台 worker 请求挑选文件：在 Qt 线程构造挑选窗（worker 绝不碰控件）
                 self._show_share_pick(item)
@@ -684,6 +1227,59 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _register_pending_share(self, kind):
+        """二维码解码期「预定任务」共享登记助手（Alt+2 / Alt+3 共用，勿复制粘贴）。
+
+        返回 True 表示已登记或已刷新（调用方应立即 return，不再走各自的原提示）；
+        返回 False 表示当前不在解码期或实验性功能已关 → 调用方保持各自原文案逐字不变。
+        防御性调用 `qr_decoding_active()`：hub 桩可能没有该方法，不可用或抛异常一律
+        按 False，绝不让主界面因这条增强分支崩溃。"""
+        try:
+            if not self.state.snapshot().get("experimental_enabled"):
+                return False
+        except Exception:
+            return False
+        decoding = False
+        try:
+            _fn = getattr(self.hub, "qr_decoding_active", None)
+            if callable(_fn):
+                decoding = bool(_fn())
+        except Exception:
+            decoding = False
+        if not decoding:
+            return False
+        now = time.time()
+        pending = getattr(self, "_pending_share_gesture", None)
+        if pending and now - pending.get("at", 0) <= PENDING_SHARE_TTL_SEC:
+            # 同一时刻只保留一个预定任务：后按的手势为准，刷新 kind 与 at；
+            # 只记一行说明现在记的是哪一路，不重复弹托盘通知。
+            pending["kind"] = kind
+            pending["at"] = now
+            self._append_log(
+                f"[分享] 已刷新二维码预定任务（{PENDING_SHARE_TAG.get(kind, kind)}）")
+            return True
+        self._pending_share_gesture = {"kind": kind, "at": now}
+        reg_log, notify_msg = PENDING_SHARE_TEXT.get(
+            kind, PENDING_SHARE_TEXT["share"])
+        self._append_log(reg_log)
+        self._share_notify("二维码正在解析", notify_msg)
+        return True
+
+    def _dispatch_pending_share(self, pend):
+        """按 kind 派发预定任务（唯一分派点）：完全等价于此刻按下对应热键。
+
+        Alt+2 → `_open_recent_share()`；Alt+3 → `_open_recent_share_with_code()`（与
+        `_on_share_code_hotkey` 调用的同一入口，参数由入口内部从当前记录现算，绝不
+        在此自行拼参数语义）。将来合并 Alt+2/Alt+3 只需改这个 if/elif 的一行。"""
+        kind = pend.get("kind") or "share"
+        if kind == "share_code":
+            self._append_log(
+                "[分享] 二维码解析完成，按预定任务（固定提取码）自动拉起…（Alt+3）")
+            self._open_recent_share_with_code()
+        else:
+            self._append_log("[分享] 二维码解析完成，按预定任务自动拉起…（Alt+2）")
+            self._open_recent_share()
+
     def _open_recent_share(self):
         """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
 
@@ -698,6 +1294,10 @@ class MainWindow(QMainWindow):
             from .. import baidu_task as bt
             rec = bt.last_share()
             if not rec:
+                # 手势落空但二维码正在解码中 → 共享助手登记预定任务（Alt+2=share）；
+                # 返回 False（不在解码期/实验性关）时保持原提示逐字不变。
+                if self._register_pending_share("share"):
+                    return
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
             # 失效短路：该分享已在本进程被标记失效（抓页/探测/提交任一环节命中）→
@@ -711,41 +1311,51 @@ class MainWindow(QMainWindow):
                 self._append_log(f"[分享] 该分享链接已失效，已跳过拉起：{dead}")
                 self._share_notify("分享链接已失效", f"{rec.get('url')}\n{dead}")
                 return
-            # 记录时刻没有提取码时，才尝试「按最近捕获的提取码补上」：
-            # 提取码常常在链接记录之后几秒才被复制到剪贴板，记录时刻的候选搜索
-            # 只跑一次、拿不到 → 手动拉起会发空码。这里在拉起前再补一次，
-            # 但严格限时效（CODE_CANDIDATE_TTL 秒）；固定映射用户不静默套用。
-            _src_mapped = False
+            # 统一取值助手（优先级冻结）：小窗码 > 权威记录码 > 重新取 120s 内最近码。
+            # 关键修复：`code_source == "recent"`（抓取时按历史猜的码）不再被黏死——
+            # 手势时重新取值，取到更新的剪贴板码就覆盖旧猜测并写回记录（记录自愈），
+            # 避免几天前/几分钟前的旧猜测覆盖用户后来复制的正确码。
+            _code, _src = _effective_share_code(
+                self, rec.get("surl") or rec.get("url"),
+                rec.get("share_uk"), rec.get("pwd"), rec.get("code_source"))
+            if _code and _code != (rec.get("pwd") or "").strip():
+                rec["pwd"] = _code
+                rec["code_source"] = _src
+                _srcname = {"window": "小窗中填写", "recent": "最近捕获",
+                            "url": "链接自带", "text": "文本内嵌"}.get(
+                                _src, _src or "未知来源")
+                self._append_log(
+                    f"分享缺提取码：已按{_srcname}的提取码补上 -> {_code}"
+                    f"（来源 {_src or '未知'}）")
+            # 补码后仍无提取码：新版分享提取码必填，空码提交必然失败 —— 不再死胡同：
+            # 弹/聚焦提取码小窗并保留可操作提示。零网络请求、绝不唤起客户端、也不
+            # 累加 d7 拉起计数（否则之后真正成功的那次会被"重复拉起"误挡）。
             if not (rec.get("pwd") or "").strip():
+                _mapped = ""
                 try:
-                    _code, _src = bm.resolve_invoke_code(
-                        rec.get("share_uk"), self.state.temp_password_entries())
-                    if _src == "recent" and _code:
-                        rec["pwd"] = _code
-                        self._append_log(
-                            f"分享缺提取码：按最近 {int(bm.CODE_CANDIDATE_TTL)} 秒内"
-                            f"捕获的提取码补上 -> {_code}")
-                    elif _src == "mapped":
-                        _src_mapped = True
+                    _mapped = bm.mapped_code(rec.get("share_uk")) or ""
                 except Exception:
-                    pass          # 补码只是增强，绝不打断拉起
-            # 补码后仍无提取码：新版分享提取码必填，空码提交必然失败 —— 直接给出
-            # 可操作提示并返回：零网络请求、绝不唤起客户端、也不累加 d7 拉起计数
-            # （否则之后真正成功的那次会被"重复拉起需确认"误挡）。
-            if not (rec.get("pwd") or "").strip():
-                if _src_mapped:
+                    _mapped = ""
+                if _mapped:
                     self._append_log("[分享] 该分享者配有固定提取码，需用「固定提取码」手势")
                     self._share_notify(
                         "分享缺少提取码",
                         f"{rec.get('url')}\n该分享者配有固定提取码：请用「固定提取码」"
                         f"手势（托盘菜单 / Alt+3）下载。")
-                else:
-                    self._append_log("[分享] 该分享缺少提取码，已跳过拉起")
-                    self._share_notify(
-                        "分享缺少提取码",
-                        f"{rec.get('url')}\n该分享需要提取码：把「链接 + 提取码」整段"
-                        f"复制到剪贴板后再试。")
+                    return
+                self._append_log(
+                    "[分享] 该分享缺少提取码，已跳过拉起（请在右侧小窗填写提取码，"
+                    "或按 Alt+2 用临时码）")
+                self._share_notify(
+                    "分享缺少提取码",
+                    f"{rec.get('url')}\n该分享需要提取码：请在右侧小窗填写提取码"
+                    f"（或按 Alt+2 用临时码）。")
+                _show_share_code_window(
+                    self, rec.get("surl") or rec.get("url"), rec.get("url"),
+                    rec.get("share_uk"), mapped_code=_mapped)
                 return
+            # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起。
+            self._pending_share_gesture = None
             # 手动路径即用户明确同意：直接拉起，同时计数（与自动路径共用 d7 计数）
             self._bump_share_launch(rec.get("surl") or rec.get("url"))
             self._start_share_invoke(rec.get("url"), rec.get("pwd") or "", manual=True)
@@ -757,10 +1367,12 @@ class MainWindow(QMainWindow):
         self._open_recent_share()
 
     def _open_recent_share_with_code(self):
-        """托盘动作/热键：用分享者的「固定提取码」下载最近分享（d3 显式手势）。
+        """托盘动作/热键：用固定/小窗提取码下载最近分享（d3 显式手势，成功才绑定）。
 
         与「用客户端打开最近分享」并列，但走新的「准备 →（可选）挑选 → 提交」管线；
-        记录里 share_uk 没有固定映射时只记一行日志、不发起任何下载。"""
+        取值顺序：小窗码 > 取值助手（小窗/权威记录/最近）> 分享者固定映射。仍无码时
+        **不再死胡同**：弹/聚焦提取码小窗，等用户填完走「本次使用」或直接下载。
+        本次携带 `bind_code_uk`，由 worker 在**提交成功后**才把码写入固定映射。"""
         try:
             # 整条 2.F 属实验性功能：全局热键也可能被按下，这里必须再校验一次。
             if not self.state.snapshot().get("experimental_enabled"):
@@ -769,6 +1381,10 @@ class MainWindow(QMainWindow):
             from .. import baidu_task as bt
             rec = bt.last_share()
             if not rec:
+                # 手势落空但二维码正在解码中 → 共享助手登记预定任务（Alt+3=share_code）；
+                # 返回 False（不在解码期/实验性关）时保持原提示逐字不变。
+                if self._register_pending_share("share_code"):
+                    return
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
             # 失效短路：固定提取码也救不活失效链接 → 零网络请求、绝不唤起客户端，
@@ -784,16 +1400,40 @@ class MainWindow(QMainWindow):
                     "分享链接已失效",
                     f"{rec.get('url')}\n{dead}（固定提取码也无法下载）")
                 return
-            code = None
-            try:
-                code = bm.mapped_code(rec.get("share_uk"))
-            except Exception:
-                code = None
+            # 取值顺序（冻结）：小窗码 > 取值助手 > 该分享者固定映射码。
+            code, _src = _effective_share_code(
+                self, rec.get("surl") or rec.get("url"),
+                rec.get("share_uk"), rec.get("pwd"), rec.get("code_source"))
             if not code:
-                self._append_log("该分享者未配置固定提取码，无法按固定码下载")
+                try:
+                    code = bm.mapped_code(rec.get("share_uk")) or ""
+                except Exception:
+                    code = ""
+            if not code:
+                # 无固定码也不再死胡同：弹/聚焦提取码小窗，给出可操作提示。
+                _mapped = ""
+                try:
+                    _mapped = bm.mapped_code(rec.get("share_uk")) or ""
+                except Exception:
+                    _mapped = ""
+                self._append_log(
+                    "[分享] 该分享者未配置固定提取码，该分享需要提取码："
+                    "请在右侧小窗填写（或按 Alt+2 用临时码）")
+                self._share_notify(
+                    "分享缺少提取码",
+                    f"{rec.get('url')}\n该分享需要提取码：请在右侧小窗填写提取码"
+                    f"（或按 Alt+2 用临时码）。")
+                _show_share_code_window(
+                    self, rec.get("surl") or rec.get("url"), rec.get("url"),
+                    rec.get("share_uk"), mapped_code=_mapped)
                 return
-            # 计数已移入 _start_share_pick：手动路径同样计入（明确同意）
-            self._start_share_pick(rec.get("url"), rec.get("surl"), code, manual=True)
+            # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
+            self._pending_share_gesture = None
+            # 计数已移入 _start_share_pick：手动路径同样计入（明确同意）。
+            # Alt+3 = 绑定并下载：携带 bind_code_uk，worker 提交成功后才写库。
+            _call_start_share_pick(self, rec.get("url"), rec.get("surl"), code,
+                                   manual=True,
+                                   bind_code_uk=rec.get("share_uk"))
         except Exception as e:
             self._append_log(f"按固定提取码下载出错: {e}")
 
@@ -924,7 +1564,8 @@ class MainWindow(QMainWindow):
             self._share_invoke_busy = False
 
     # ---------- d3：分享「准备 →（可选）挑选 → 提交」管线 ----------
-    def _start_share_pick(self, url, surl, pwd, manual=False, item=None):
+    def _start_share_pick(self, url, surl, pwd, manual=False, item=None,
+                          bind_code_uk=None):
         """统一的分享管线入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
 
         `prepare_share` / `commit_download` / `list_share_dir` 均含网络 IO，**绝不能**
@@ -932,12 +1573,38 @@ class MainWindow(QMainWindow):
         一个分享管线。`item` 仅用于空提取码探测：确认需要提取码时把它回传给 Qt 线程弹
         询问面板（不传则询问面板按未知分享者处理）。
 
+        `bind_code_uk` 非空表示本次是「绑定并下载」（Alt+3 / 小窗 mapped 按钮）：
+        由 worker 在**提交成功后**把 `(share_uk, pwd)` 写入固定提取码映射。
+
         d7 计数在**忙检查通过之后**才计入（被忙标志跳过的启动不计），询问路径最终也
         汇入本入口，故同样计入一次。"""
         if self._share_invoke_busy:
             self._append_log("[分享] 上一个拉起尚未结束，已跳过"
                              if not manual else "[分享] 上一个拉起尚未结束，请稍候")
             return
+        # 小窗统一取值：属于该分享的小窗里若有校验通过的码，覆盖本次 pwd（覆盖
+        # Alt+3 / 询问 / 自动三条路）。此处**只**读小窗，不重算 recent——自动路径的
+        # 码由调用方决定，绝不在此改口径。
+        try:
+            _w_uk = ""
+            try:
+                _w_uk = (item or {}).get("share_uk") or ""
+            except Exception:
+                _w_uk = ""
+            # Alt 路径 item=None：与 `_effective_share_code`（用 rec.share_uk）同口径，
+            # 补取记录里的 share_uk，让「同 surl **或** 同 share_uk 即视为同窗」全部
+            # 由 `_share_code_in_window` 一处判定，不再出现两套归属判据。
+            if not _w_uk:
+                try:
+                    from .. import baidu_task as _bt
+                    _w_uk = (_bt.last_share() or {}).get("share_uk") or ""
+                except Exception:
+                    _w_uk = ""
+            _wcode, _ = _share_code_in_window(self, surl, _w_uk)
+            if _wcode:
+                pwd = _wcode
+        except Exception:
+            pass
         # 一次性提醒（本进程内只发一次；手动路径绝不提醒）：自动链路不携带浏览器
         # 登录态，客户端未运行时被唤起会进入未登录状态、可能被迫重新登录。
         if not manual and not self._share_nologin_warned:
@@ -954,9 +1621,11 @@ class MainWindow(QMainWindow):
         self._share_invoke_busy = True
         self._bump_share_launch(surl)
         threading.Thread(target=self._pick_share_worker,
-                         args=(url, surl, pwd, manual, item), daemon=True).start()
+                         args=(url, surl, pwd, manual, item, bind_code_uk),
+                         daemon=True).start()
 
-    def _pick_share_worker(self, url, surl, pwd, manual, item=None):
+    def _pick_share_worker(self, url, surl, pwd, manual, item=None,
+                           bind_code_uk=None):
         """后台线程：跑「准备 →（可选）挑选 → 提交」管线（网络 IO，绝不阻塞界面）。
 
         线程内**不碰 UI**：日志走线程安全的 `self.hub.log`，托盘提示与挑选窗/询问窗
@@ -1077,6 +1746,11 @@ class MainWindow(QMainWindow):
                 # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）；
                 # 子集选择相关的既有日志信息一律保留。
                 self.hub.log(f"[分享] 链路完成: {detail}")
+                # 绑定只在**提交成功后**落库：失败（ok3 假）只本次生效，绝不写库。
+                # `_persist_share_code` 内的诊断日志已做线程安全分流（worker 线程走
+                # hub 队列，见 `_persist_log`），故可安全在 worker 中调用。
+                if bind_code_uk:
+                    self._persist_share_code(bind_code_uk, pwd)
             else:
                 self.hub.log(f"[分享] 提交失败: {detail}")
                 self._share_notify("分享下载失败", f"{url}\n{detail}")
@@ -1265,82 +1939,78 @@ class MainWindow(QMainWindow):
         except Exception:
             return pairs
 
-    # ---------- d3：空提取码处理（绝不自动拉起） ----------
+    # ---------- d3：空提取码处理（弹/聚焦提取码小窗，绝不自动套用固定码） ----------
     def _share_ask_code(self, item, url, surl):
-        """空提取码处理（Qt 线程）：可见则弹询问面板；隐藏则只提示，绝不自动拉起。
+        """空提取码处理（Qt 线程）：弹/聚焦顶层提取码小窗（主窗隐藏时同样弹）。
 
         未知分享者（has_map=False）额外用浏览器打开分享页做「探针」，方便用户查看；
-        有固定映射（has_map=True）只弹询问、不开浏览器。任何异常都不向外抛。"""
+        有固定映射（has_map=True）只弹窗、不开浏览器。已在弹小窗（或复用）时不再
+        重复开浏览器。主窗隐藏在托盘时额外补一条托盘气泡：新小窗会弹出来，气泡仅
+        作补充提醒。任何异常都不向外抛。"""
         try:
             share_uk = item.get("share_uk")
             has_map = bool(item.get("has_map"))
-            if not self.isVisible():
-                # 托盘应用常驻后台：隐藏时不弹任何窗口，只记日志 + 托盘气泡提醒，
-                # 等用户主动打开主界面或用托盘菜单/热键走「固定提取码」入口。
-                self._append_log("[分享] 该分享缺少提取码，暂不自动下载")
-                try:
-                    self.hub.q.put({
-                        "type": "notify", "title": "分享缺少提取码",
-                        "msg": "该分享缺少提取码，可打开主界面用托盘菜单或"
-                               "「用固定提取码下载最近分享」处理。\n" + str(url)})
-                except Exception:
-                    pass
-                return
-            if getattr(self, "_share_ask_dlg", None) is not None:
-                self._append_log("[分享] 提取码询问已打开，本次分享不再重复弹出")
-                return
-            if not has_map:
-                # 未知分享者没有可预填的固定码：顺手用浏览器打开分享页，便于查看
-                try:
-                    import webbrowser
-                    webbrowser.open(str(url), new=2)
-                    self._append_log(f"[分享] 未知分享者，已在浏览器打开分享页: {url}")
-                except Exception as e:
-                    self._append_log(f"[分享] 打开分享页失败: {e}")
-            try:
-                from .dialogs import ShareCodeAskDialog
-            except Exception:
-                self._append_log("[分享] 缺少提取码询问组件，已跳过")
-                return
             mapped = None
             try:
                 mapped = bm.mapped_code(share_uk)
             except Exception:
                 mapped = None
+            visible = True
             try:
-                dlg = ShareCodeAskDialog(parent=self, surl=surl, url=url,
-                                         share_uk=share_uk, mapped_code=mapped)
-            except Exception as e:
-                self._append_log(f"[分享] 打开提取码询问失败: {e}")
-                return
-            dlg.on_decision = lambda kind, code: self._on_share_code_decision(
-                kind, code, url, surl, share_uk)
-            self._share_ask_dlg = dlg
-            try:
-                dlg.show()
+                visible = bool(self.isVisible())
             except Exception:
-                self._share_ask_dlg = None
+                visible = True
+            if not visible:
+                self._share_notify(
+                    "分享缺少提取码",
+                    "该分享缺少提取码，已在提取码小窗等待填写；也可打开主界面用"
+                    "托盘菜单或「用固定提取码下载最近分享」处理。\n" + str(url))
+            _show_share_code_window(self, surl, url, share_uk,
+                                    mapped_code=mapped, open_browser=not has_map)
         except Exception as e:
             self._append_log(f"[分享] 处理缺少提取码的分享出错: {e}")
 
     def _on_share_code_decision(self, kind, code, url, surl, share_uk):
-        """提取码询问回调（Qt 线程）：mapped=先落库再拉起；once=只本次；ignore=忽略。"""
+        """提取码询问回调（Qt 线程）：mapped=成功后才绑定；once=只本次；ignore=忽略。"""
         try:
             self._share_ask_dlg = None
             if kind == "ignore" or not code:
                 self._append_log(f"[分享] 已忽略缺少提取码的分享: {surl}")
                 return
-            if kind == "mapped":
-                self._persist_share_code(share_uk, code)
-            self._start_share_pick(url, surl, code, manual=False)
+            if kind == "mapped" and not str(share_uk or "").strip():
+                # 无法绑定到具体分享者：立即如实说明「仅本次生效」，不再假装成功。
+                self._append_log(
+                    "[分享] 未识别到分享者，固定提取码未能保存，仅本次生效")
+            # mapped：绑定交给 worker，**提交成功后**才写库（与 Alt+3 同源）；
+            # once：绝不写库。
+            # manual=True：本回调只由小窗/询问面板按钮触发，用户明确点击 = 手动，
+            # 绝不吃「实验性自动拉起不携带登录态」托盘提示（与 Alt+2/Alt+3 一致）。
+            bind_uk = share_uk if kind == "mapped" else None
+            _call_start_share_pick(self, url, surl, code, manual=True,
+                                   bind_code_uk=bind_uk)
         except Exception as e:
             self._append_log(f"[分享] 处理提取码选择出错: {e}")
+
+    def _effective_share_code(self, surl, share_uk, rec_pwd, code_source):
+        """正式取值助手（module 级 `_effective_share_code` 的薄包装，见其文档）。
+
+        优先级冻结：小窗码 > 权威记录码 > 重新取 120s 内最近码 > 空。"""
+        return _effective_share_code(self, surl, share_uk, rec_pwd, code_source)
+
+    def _show_share_code_window(self, surl, url, share_uk, mapped_code=""):
+        """正式缺码小窗入口（module 级 `_show_share_code_window` 的薄包装）。
+
+        同一时刻只允许一个小窗：同分享复用并预填、异分享关旧换新；主窗隐藏也弹。"""
+        return _show_share_code_window(self, surl, url, share_uk,
+                                       mapped_code=mapped_code)
 
     def _persist_share_code(self, share_uk, code):
         """把用户选择的固定提取码写入映射（pick=0）；旧签名不支持 pick 时退回 3 参。
 
-        持久化可能因未识别到分享者（share_uk 为空）等原因返回假值；此时明确告知
-        用户未能保存，绝不谎报「已保存」。"""
+        由 `state.add_share_code`（内部走 db，带锁，线程安全）落库；诊断日志经
+        `_persist_log` 分流，故本方法在 worker 线程调用也安全。持久化可能因未识别
+        到分享者（share_uk 为空）等原因返回假值；此时明确告知用户未能保存，绝不
+        谎报「已保存」。"""
         note = "自动加入(d3面板)"
         try:
             saved = self.state.add_share_code(share_uk, code, note, 0)
@@ -1348,13 +2018,15 @@ class MainWindow(QMainWindow):
             try:
                 saved = self.state.add_share_code(share_uk, code, note)
             except Exception as e:
-                self._append_log(f"[分享] 保存固定提取码失败: {e}")
+                _persist_log(self, f"[分享] 保存固定提取码失败: {e}")
                 return
         except Exception as e:
-            self._append_log(f"[分享] 保存固定提取码失败: {e}")
+            _persist_log(self, f"[分享] 保存固定提取码失败: {e}")
             return
         if not saved:
-            self._append_log("[分享] 未识别到分享者，固定提取码未能保存，仅本次生效")
+            _persist_log(self, "[分享] 未识别到分享者，固定提取码未能保存，仅本次生效")
+        else:
+            _persist_log(self, "[分享] 已把提取码绑定到该分享者")
 
     # ---------- 分享重复拉起（d7）：同一 surl 本次运行再次拉起需用户同意 ----------
     def _share_needs_consent(self, surl):
@@ -1616,5 +2288,4 @@ def _first_run_7z_check(state, hub, parent):
             dlg.exec_()
         QTimer.singleShot(0, show)
     threading.Thread(target=worker, daemon=True).start()
-
 

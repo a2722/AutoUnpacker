@@ -108,6 +108,8 @@ _PALETTES = {
         "info": "#2e86c1", "success": "#2e7d32",
         "log_error": "#ff8080", "log_success": "#8be28b",
         "log_info": "#7fb6ff", "log_wait": "#f2c97d", "log_default": "#d8e0ea",
+        # 日志里的可点链接：比 log_info(#7fb6ff) 更浓/更饱和的天蓝，便于区分
+        "log_link": "#2d7dff",
         "warn_text": "#c0392b", "warn_bg": "#ffe4e4", "warn_border": "#f2c2c2",
         "tray_icon": "#1f6feb",
         "trail": {"recorded": "#8a94a6", "kept": "#2e7d32", "deleted": "#c0392b",
@@ -119,6 +121,8 @@ _PALETTES = {
         "info": "#5aa9ff", "success": "#6fcf7f",
         "log_error": "#f44747", "log_success": "#4ec9b0",
         "log_info": "#569cd6", "log_wait": "#dcdcaa", "log_default": "#cccccc",
+        # 日志里的可点链接：比 log_info(#569cd6) 更亮更饱和的链接蓝
+        "log_link": "#3794ff",
         "warn_text": "#ff9a9a", "warn_bg": "#3a1f22", "warn_border": "#7a3b40",
         "tray_icon": "#4daafc",
         "trail": {"recorded": "#9aa4b2", "kept": "#6fcf7f", "deleted": "#ff6b6b",

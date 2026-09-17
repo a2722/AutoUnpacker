@@ -5,17 +5,18 @@
 - SevenZipSetupDialog 检测/安装/卸载 7-Zip（隔离版与全局版）
 - SettingsDialog 全部配置项编辑（监听路径、通知、信任名单、快捷键等）
 - CloseActionDialog 关闭行为询问；TrustAskDialog 新网址信任确认
-- ShareCodeAskDialog 分享缺提取码时的非阻塞询问（超时自动忽略）
+- ShareCodeAskDialog 分享缺提取码时贴右侧的非阻塞取码小窗（120s 到点关闭作废）
 关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog / ShareCodeAskDialog
 依赖：PyQt5、trail、sevenzip、trust、widgets
 注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
 """
+import inspect
 import re
 import threading
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import (QColor, QBrush)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame, QApplication, QShortcut)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QRegularExpression
+from PyQt5.QtGui import (QColor, QBrush, QKeySequence, QRegularExpressionValidator)
 
 from .. import trail as deletion_trail   # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
@@ -37,9 +38,33 @@ TRAIL_STATUS_TEXT = {
 
 TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 
-# 分享缺提取码询问面板的超时（秒）：到点自动按「忽略」处理。
-# 3 分钟为初始值，后续可统一调整；所有此类非阻塞提示都复用这一常量。
-SHARE_ASK_TIMEOUT_SEC = 180
+# 分享缺提取码取码小窗的超时（秒）：到点自动关闭并丢弃框内内容（不回调）。
+SHARE_ASK_TIMEOUT_SEC = 120
+
+# 右侧贴边小窗的几何常量（px）：距屏幕可用区右边距 / 窗宽。
+SHARE_ASK_EDGE_MARGIN = 16
+SHARE_ASK_WINDOW_WIDTH = 300
+
+
+def _call_decision(cb, kind, code, url, surl, share_uk):
+    """按注入 callable 可接受的位置参数个数回调 on_decision，兼容旧/新签名。
+
+    冻结词表：kind ∈ {"mapped", "once", "ignore"}（ignore 时 code 为空串）。
+    - 新接线：cb(kind, code, url, surl, share_uk)
+    - 旧接线（仍闭包 url/surl/uk 的 2 参 lambda）：cb(kind, code)
+    """
+    try:
+        params = list(inspect.signature(cb).parameters.values())
+        positional = sum(1 for p in params if p.kind in (
+            p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        var = any(p.kind == p.VAR_POSITIONAL for p in params)
+        use5 = var or positional >= 5
+    except (TypeError, ValueError):
+        use5 = True
+    if use5:
+        cb(kind, code, url, surl, share_uk)
+    else:
+        cb(kind, code)
 
 
 class DeleteTrailDialog(QDialog):
@@ -1478,179 +1503,282 @@ class TrustAskDialog(QDialog):
                 pass
 
 
+class _CodeLineEdit(QLineEdit):
+    """4 位提取码输入框：额外记住「setText 被 maxLength 截断」的越界输入。
+
+    QLineEdit.setText() 不经过校验器，且按 maxLength 静默截断（"abcde" ->
+    "abcd"），于是越界输入在框内看起来像合法 4 位码。这里在截断发生前记录
+    越界标记，供 current_code() 判为非法；用户实际键入/粘贴会清掉该标记，
+    回到正常校验路径（不改变可见外观与既有控件风格）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._overlong = False
+
+    def setText(self, text):
+        raw = str(text or "")
+        ml = self.maxLength()
+        # 先置标记再 super().setText()：textChanged 监听者能立刻读到最终状态
+        self._overlong = bool(ml >= 0 and len(raw) > ml)
+        super().setText(raw)
+
+    def keyPressEvent(self, event):
+        self._overlong = False
+        super().keyPressEvent(event)
+
+    def is_overlong(self):
+        return self._overlong
+
+
 class ShareCodeAskDialog(QDialog):
-    """分享缺提取码时的非阻塞询问面板（超时自动忽略）。
+    """分享缺提取码时贴屏幕右侧的非阻塞取码小窗（120s 到点自动关闭丢弃）。
 
-    识别到分享链接、但剪贴板附近没有有效提取码时，由调用方用 show() 展示；
-    非模态、不置顶、不抢焦点，默认 3 分钟后自动按「忽略」处理。点标题栏 ×
-    或按 Esc 关闭同样等价「忽略」，保证 on_decision 恰好被回调一次、
-    调用方不会永远等待。任何回调都不向外抛异常。
+    识别到分享链接、但剪贴板附近没有有效提取码时，由调用方用 show() 展示：
+    无父窗口的顶层工具窗（Qt.Tool | FramelessWindowHint | WindowStaysOnTopHint），
+    始终置顶可见、不进任务栏、不抢焦点（不 raise_() / 不 activateWindow()），
+    主窗口隐藏到托盘时也能出现。默认 120 秒倒计时，逐秒可见（「剩余 Ns」）；
+    到点只关闭并丢弃框内内容，绝不自动用框里的码发起任何操作。
 
-    on_decision(kind, code)：
-      kind == "mapped"  -> 用户选择「加入固定提取码映射」，code 为文本框内容
-      kind == "once"    -> 用户选择「只用本次」，code 为文本框内容
-      kind == "ignore"  -> 用户选择忽略，或面板超时 / 关闭时自动忽略
+    三个按钮即回调词表（语义见下），一律经 _finish 恰好回调一次，回调不向外抛异常：
+      「本次使用」   -> on_decision("once", code)
+      「绑定并下载」 -> on_decision("mapped", code)
+      「忽略」/关闭  -> on_decision("ignore", "")
+
+    只读访问器（供接线侧读取本窗当前状态）：
+      current_code() -> 通过校验的 4 位码，否则 ""
+      target_surl() / target_uk() -> 本窗对应的 surl / share_uk
+    本类只发回调、绝不写库；持久化由调用方负责。
     """
 
     def __init__(self, parent, surl, url, share_uk, mapped_code="",
                  timeout_sec=SHARE_ASK_TIMEOUT_SEC, on_decision=None,
                  state=None, hub=None):
-        super().__init__(parent)
+        # 顶层无父窗口：即便主窗口隐藏到托盘，本小窗仍能独立出现
+        super().__init__(None)
         self.surl = str(surl or "").strip()
         self.url = str(url or "").strip()
         self.share_uk = str(share_uk or "").strip()
-        self.on_decision = on_decision   # 由调用方注入：def (kind, code)
+        self.on_decision = on_decision   # 由调用方注入：def (kind, code[, url, surl, uk])
         self._state = state
         self._hub = hub
         self._done = False
+        self._timed_out = False
         try:
             self._timeout_sec = max(1, int(timeout_sec))
         except Exception:
             self._timeout_sec = SHARE_ASK_TIMEOUT_SEC
+        self._remain_sec = self._timeout_sec
 
         self.setWindowTitle("分享缺提取码")
-        # 非模态、不置顶：绝不 setModal(True) / exec_() / raise_
-        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint
-                            | Qt.WindowSystemMenuHint | Qt.WindowCloseButtonHint)
-        self.setModal(False)
-        self.resize(560, 400)
+        # 顶层工具窗 + 无边框 + 常驻置顶：不抢焦点、不进任务栏、托盘态下仍可见
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint
+                            | Qt.WindowStaysOnTopHint)
+        self.setModal(False)   # 沿用本项目「非阻塞提示」做法，绝不 exec_()
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 16, 18, 14)
-        lay.setSpacing(10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        card = QFrame()
+        card.setObjectName("card")
+        root.addWidget(card)
 
-        title = QLabel("识别到分享链接，但剪贴板附近没有有效提取码")
-        title.setObjectName("appTitle")
-        title.setWordWrap(True)
-        lay.addWidget(title)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 12)
+        lay.setSpacing(8)
 
-        meta = QLabel(
-            f"surl：{self.surl or '未知'}\n分享者：{self.share_uk or '未知'}")
+        # 标题行：标题 + 逐秒倒计时 + 关闭（等价「忽略」）
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        title = QLabel("分享缺提取码")
+        title.setStyleSheet(
+            f"color: {PALETTE['accent_text']}; font-weight: bold; font-size: 14px;")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.timeout_label = QLabel(f"剩余 {self._remain_sec}s")
+        self.timeout_label.setStyleSheet(
+            f"color: {PALETTE['muted']}; font-size: 12px;")
+        head.addWidget(self.timeout_label)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setToolTip("忽略并关闭（Esc）")
+        close_btn.setStyleSheet(
+            "QPushButton { border: none; background: transparent; padding: 0;"
+            f" color: {PALETTE['muted']}; font-size: 13px; }}"
+            f"QPushButton:hover {{ color: {PALETTE['danger']}; }}")
+        close_btn.clicked.connect(self._on_ignore_clicked)
+        head.addWidget(close_btn)
+        lay.addLayout(head)
+
+        meta = QLabel(f"分享者：{self.share_uk or '未知'}")
+        meta.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 12px;")
         meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(meta)
 
         # 链接太长时中间截断，完整链接放 tooltip（可选中复制）
         url_label = QLabel()
         url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        url_label.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         url_label.setText("链接：" + self.fontMetrics().elidedText(
-            self.url, Qt.ElideMiddle, 440))
+            self.url, Qt.ElideMiddle, SHARE_ASK_WINDOW_WIDTH - 60))
         url_label.setToolTip(self.url)
         lay.addWidget(url_label)
 
-        box = QGroupBox("提取码处理方式")
-        bl = QVBoxLayout(box)
-        bl.setSpacing(6)
-        self._group = QButtonGroup(box)
+        code_cap = QLabel("提取码（4 位）")
+        code_cap.setStyleSheet(
+            f"color: {PALETTE['muted2']}; font-size: 12px;")
+        lay.addWidget(code_cap)
 
-        row_a = QHBoxLayout()
-        self.mapped_rb = QRadioButton("加入该分享者的固定提取码映射")
-        self._group.addButton(self.mapped_rb)
-        row_a.addWidget(self.mapped_rb)
-        self.mapped_edit = QLineEdit()
-        self.mapped_edit.setPlaceholderText("请输入 4 位提取码")
-        if str(mapped_code or "").strip():
-            self.mapped_edit.setText(str(mapped_code).strip())
-        self.mapped_edit.setFixedWidth(150)
-        row_a.addWidget(self.mapped_edit)
-        row_a.addStretch(1)
-        bl.addLayout(row_a)
+        self.code_edit = _CodeLineEdit()
+        self.code_edit.setPlaceholderText("请输入 4 位提取码")
+        self.code_edit.setMaxLength(4)
+        self.code_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression("[A-Za-z0-9]{0,4}"), self))
+        prefill = str(mapped_code or "").strip()
+        if prefill:
+            self.code_edit.setText(prefill)
+        lay.addWidget(self.code_edit)
 
-        row_b = QHBoxLayout()
-        self.once_rb = QRadioButton("只用本次")
-        self._group.addButton(self.once_rb)
-        row_b.addWidget(self.once_rb)
-        self.once_edit = QLineEdit()
-        self.once_edit.setPlaceholderText("请输入 4 位提取码")
-        self.once_edit.setFixedWidth(150)
-        row_b.addWidget(self.once_edit)
-        row_b.addStretch(1)
-        bl.addLayout(row_b)
-
-        self.ignore_rb = QRadioButton("忽略本次")
-        self._group.addButton(self.ignore_rb)
-        bl.addWidget(self.ignore_rb)
-        lay.addWidget(box)
-
-        # 有预填映射时默认选中 a，否则默认「只用本次」（最快的一次性动作）
-        if self.mapped_edit.text().strip():
-            self.mapped_rb.setChecked(True)
-        else:
-            self.once_rb.setChecked(True)
-
-        self.err_label = QLabel("")   # 行内校验提示，不用任何模态弹窗
-        self.err_label.setWordWrap(True)
-        self.err_label.setStyleSheet(
-            f"color: {PALETTE['danger']}; font-size: 12px;")
-        lay.addWidget(self.err_label)
-
-        btns = QHBoxLayout()
-        btns.addStretch(1)
-        ignore_btn = QPushButton("忽略")
-        ignore_btn.clicked.connect(self._on_ignore_clicked)
-        ok_btn = QPushButton("确定")
-        ok_btn.setObjectName("primary")
-        ok_btn.setDefault(True)
-        ok_btn.clicked.connect(self._on_ok_clicked)
-        btns.addWidget(ignore_btn)
-        btns.addWidget(ok_btn)
-        lay.addLayout(btns)
-
-        self.timeout_label = QLabel(self._timeout_text())
-        self.timeout_label.setStyleSheet(
+        self.hint_label = QLabel("请输入 4 位提取码（字母或数字）")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet(
             f"color: {PALETTE['muted']}; font-size: 12px;")
-        lay.addWidget(self.timeout_label)
+        lay.addWidget(self.hint_label)
 
-        # 单次计时器：到点记录一行日志后按「忽略」处理
+        self.once_btn = QPushButton("本次使用（Alt+2）")
+        self.once_btn.setObjectName("primary")
+        self.once_btn.clicked.connect(self._on_once_clicked)
+        lay.addWidget(self.once_btn)
+
+        self.mapped_btn = QPushButton("绑定并下载（Alt+3）")
+        self.mapped_btn.clicked.connect(self._on_mapped_clicked)
+        lay.addWidget(self.mapped_btn)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self.ignore_btn = QPushButton("忽略")
+        self.ignore_btn.clicked.connect(self._on_ignore_clicked)
+        foot.addWidget(self.ignore_btn)
+        lay.addLayout(foot)
+
+        # 码无效时两个下载按钮置灰（有效即恢复），行内提示随状态变色
+        self.code_edit.textChanged.connect(self._refresh_state)
+        self._refresh_state()
+
+        # Alt+2 / Alt+3：鼠标路径的键盘等价（仅本窗激活时生效，不注册全局热键）
+        QShortcut(QKeySequence("Alt+2"), self).activated.connect(
+            self._on_once_clicked)
+        QShortcut(QKeySequence("Alt+3"), self).activated.connect(
+            self._on_mapped_clicked)
+
+        # 逐秒倒计时：单个 1s 重复 QTimer；到点走 _on_timeout（只关闭、不回调）
         self._timer = QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._on_timeout)
-        self._timer.start(self._timeout_sec * 1000)
+        self._timer.setInterval(1000)
+        self._timer.setSingleShot(False)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
 
-    def _timeout_text(self):
-        if self._timeout_sec >= 60:
-            return f"本窗口 {self._timeout_sec // 60} 分钟后自动忽略"
-        return f"本窗口 {self._timeout_sec} 秒后自动忽略"
+        self.setFixedWidth(SHARE_ASK_WINDOW_WIDTH)
+        self._place_right_edge()
 
-    def _selected(self):
-        """当前选中项 -> (kind, 对应输入框)；kind 为 ignore 时输入框为 None。"""
-        if self.mapped_rb.isChecked():
-            return "mapped", self.mapped_edit
-        if self.once_rb.isChecked():
-            return "once", self.once_edit
-        return "ignore", None
+    # ---- 只读访问器（供接线侧读取本窗当前状态；命名不得更改）----
+    def current_code(self):
+        """返回框内通过校验的 4 位码（字母/数字），否则返回空串。"""
+        txt = self.code_edit.text().strip()
+        if getattr(self.code_edit, "is_overlong", lambda: False)():
+            return ""
+        if re.fullmatch(r"[A-Za-z0-9]{4}", txt):
+            return txt
+        return ""
 
-    def _on_ok_clicked(self):
-        kind, edit = self._selected()
-        if kind == "ignore":
-            self._finish("ignore", "")
-            self.accept()
+    def target_surl(self):
+        """本窗对应的 surl（可能为空串）。"""
+        return self.surl
+
+    def target_uk(self):
+        """本窗对应的 share_uk（可能为空串）。"""
+        return self.share_uk
+
+    # ---- 状态刷新 / 按钮入口 ----
+    def _refresh_state(self):
+        """按框内内容刷新两个下载按钮可用态与行内提示（码无效即置灰）。"""
+        raw = self.code_edit.text().strip()
+        valid = bool(self.current_code())
+        self.once_btn.setEnabled(valid)
+        self.mapped_btn.setEnabled(valid)
+        if not raw:
+            self.hint_label.setText("请输入 4 位提取码（字母或数字）")
+            self.hint_label.setStyleSheet(
+                f"color: {PALETTE['muted']}; font-size: 12px;")
+        elif valid:
+            self.hint_label.setText("提取码格式有效")
+            self.hint_label.setStyleSheet(
+                f"color: {PALETTE['success']}; font-size: 12px;")
+        else:
+            self.hint_label.setText("提取码需为 4 位字母或数字")
+            self.hint_label.setStyleSheet(
+                f"color: {PALETTE['danger']}; font-size: 12px;")
+
+    def _submit(self, kind):
+        """按钮统一入口：码有效才提交（无效仅刷新提示，不回调）。"""
+        if self._done or self._timed_out:
             return
-        code = edit.text().strip()
-        if not re.fullmatch(r"[A-Za-z0-9]{4}", code):
-            self.err_label.setText(
-                "提取码需为 4 位字母或数字（例：ab12），请检查后重试。")
+        code = self.current_code()
+        if not code:
+            self._refresh_state()
             return
-        self.err_label.setText("")
         self._finish(kind, code)
-        self.accept()
+        self.close()
+
+    def _on_once_clicked(self):
+        self._submit("once")
+
+    def _on_mapped_clicked(self):
+        self._submit("mapped")
 
     def _on_ignore_clicked(self):
+        if self._done or self._timed_out:
+            return
         self._finish("ignore", "")
-        self.accept()
+        self.close()
+
+    # ---- 倒计时 / 超时 ----
+    def _update_countdown(self):
+        try:
+            self.timeout_label.setText(f"剩余 {self._remain_sec}s")
+        except Exception:
+            pass
+
+    def _tick(self):
+        """逐秒递减；归零即走超时关闭（关闭 + 丢弃，不回调）。"""
+        if self._done or self._timed_out:
+            return
+        self._remain_sec = max(0, self._remain_sec - 1)
+        self._update_countdown()
+        if self._remain_sec <= 0:
+            self._on_timeout()
 
     def _on_timeout(self):
-        # 超时：只记一行日志，然后关闭并按「忽略」处理（closeEvent 走同一出口）
+        """到点：停表、记一行日志、关闭并丢弃框内内容——绝不回调 on_decision。"""
+        if self._done or self._timed_out:
+            return
+        self._timed_out = True
+        self._remain_sec = 0
+        self._update_countdown()
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
         try:
             if self._hub is not None:
                 self._hub.log(
-                    f"分享询问超时({self._timeout_sec}s)，已忽略: {self.surl}")
+                    f"分享询问超时({self._timeout_sec}s)，已关闭丢弃: {self.surl}")
         except Exception:
             pass
         self.close()
-        self._finish("ignore", "")
 
     def _finish(self, kind, code):
-        """统一出口：on_decision 只回调一次，并停掉超时计时器。"""
+        """统一出口：on_decision 只回调一次，并停掉倒计时计时器。"""
         if self._done:
             return
         self._done = True
@@ -1662,17 +1790,42 @@ class ShareCodeAskDialog(QDialog):
         self.on_decision = None
         if cb is not None:
             try:
-                cb(kind, code)
+                _call_decision(cb, kind, code, self.url, self.surl, self.share_uk)
             except Exception:
                 pass
 
     def reject(self):
-        # Esc 关闭：等价「忽略」
-        self._finish("ignore", "")
+        # Esc 关闭：等价「忽略」（超时/已作答时不再重复回调）
+        if not self._timed_out:
+            self._finish("ignore", "")
         super().reject()
 
     def closeEvent(self, event):
-        # 点标题栏 ×：等价「忽略」（已作答时 _finish 内部自行跳过）
-        self._finish("ignore", "")
+        # 关闭按钮 / 代码关闭：等价「忽略」；超时关闭已置 _timed_out，不再回调
+        if not self._timed_out:
+            self._finish("ignore", "")
         super().closeEvent(event)
+
+    # ---- 几何：贴屏幕可用区右侧边缘，纵向居中（避开底部托盘区）----
+    def _available_geometry(self):
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                return scr.availableGeometry()
+        except Exception:
+            pass
+        return QRect(0, 0, 1280, 800)
+
+    def _place_right_edge(self):
+        try:
+            geo = self._available_geometry()
+            self.layout().activate()
+            self.adjustSize()
+            w = self.width()
+            h = self.height()
+            x = geo.x() + geo.width() - w - SHARE_ASK_EDGE_MARGIN
+            y = geo.y() + max(SHARE_ASK_EDGE_MARGIN, (geo.height() - h) // 2)
+            self.move(x, y)
+        except Exception:
+            pass
 

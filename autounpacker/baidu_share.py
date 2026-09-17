@@ -13,8 +13,9 @@
 关键入口：
 - `prepare_share(share_url, pwd="")` → (ok, prep)：跑 **0~4 步**，返回文件清单；
 - `commit_download(prep, fs_ids=None)` → (ok, detail)：跑 **5~10 步**，提交（子集）；
-- `invoke_download(share_url, pwd="")` → (ok, detail)：兼容保留的薄封装，
-  等价于 prepare + 提交全部条目（签名与返回值不变）。
+- `invoke_download(share_url, pwd="", on_wake=None)` → (ok, detail)：兼容保留的
+  薄封装，等价于 prepare + 提交全部条目；`on_wake` 在唤起客户端成功之后、复核
+  轮询之前回调一次（供上层「唤醒即通知」）。
 
 依赖：标准库（http.cookiejar / json / os / re / subprocess / ssl / time /
       urllib.request / urllib.parse）。**不引入任何第三方依赖**。
@@ -61,6 +62,11 @@ _SURL_RE = re.compile(r"/s/([A-Za-z0-9_-]+)")
 # 新版分享的提取码是强制必填项：空码去提交必然失败。`prepare_share` 在死链判定之后、
 # 任何 tplconfig/verify 请求之前就此短路，把原因交回上层去询问用户（供测试/上层引用）。
 NEED_CODE_REASON = "该分享需要提取码"
+
+# 唤起已发出、但后续 `/api/invoker/check` 复核返回 errno≠0 时的统一前缀。
+# 上层据此把「唤醒已发出、客户端未确认接单」与普通拉起失败区分开，对已发出的
+# 「已请求客户端下载」通知补一条纠正通知（时延整改：通知提前，复核降级为静默）。
+CHECK_FAIL_PREFIX = "唤起后校验失败"
 
 # 调 tasklist 时的无窗口标志（与 extract.py 一致；老版本 Python 无此常量时退化 0）。
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -476,7 +482,16 @@ def client_ready():
         return False
 
 
-def commit_download(prep, fs_ids=None, pairs=None):
+def _wake_detail(bid, seq):
+    """唤起客户端后的统一简述（`on_wake` 回调与成功返回值**共用同一措辞**）。
+
+    抽成助手是为了让「唤醒即通知」的通知文案与链路最终 `ok` 的文案逐字一致，
+    避免两处各写一遍字符串日后漂移。
+    """
+    return f"已唤起客户端下载（browserId={bid}, seq={seq}）"
+
+
+def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
     """分享「提交」段：用 prep 调 sharedownload 并唤起客户端（步骤 5~10）。
 
     选中规则（优先级从高到低）：
@@ -494,8 +509,14 @@ def commit_download(prep, fs_ids=None, pairs=None):
     6. `/api/invoker/get` → browserId；
     7. `/api/invoker/online` 上报在线；
     8. `/api/invoker/send` 投递 downloadInfo → seq；
-    9. `os.startfile("baiduyunguanjia://evoked-download/?…")` 唤起客户端；
-    10. 轮询 `/api/invoker/check` 至 status==2 或 errno≠0。
+    9. `os.startfile("baiduyunguanjia://evoked-download/?…")` 唤起客户端，随后
+       **立即回调 `on_wake(detail)`**（在复核轮询之前，供上层「唤醒即通知」）；
+    10. 复核轮询 `/api/invoker/check`：最多 3 次、每次间隔 1.5s（上限 4.5s），
+        status==2 提前跳出；errno≠0 才算失败；超时容忍（视为已唤起）。
+
+    参数：
+    - `on_wake`：可选回调。唤起成功后、复核轮询之前调用一次，收到
+      `_wake_detail(bid, seq)` 字符串；回调自身异常一律吞掉，绝不影响链路。
 
     返回 (ok: bool, detail: str)：成功时 detail 为简述，失败时为原因。**绝不抛异常。**
     """
@@ -621,9 +642,19 @@ def commit_download(prep, fs_ids=None, pairs=None):
                 f"&src_from=wp-download_web_share&src_type=web_sharelink_page")
         os.startfile(wake)
 
-        # 10. 轮询 check：status==2 即客户端已接单；errno≠0 视为失败；超时容忍。
+        # 9.5 唤醒已发出：先回调 on_wake（在复核轮询之前），让上层立即通知用户
+        #     「已请求客户端下载」。复核只作为静默兜底，不再阻塞这条告知。
+        if on_wake is not None:
+            try:
+                on_wake(_wake_detail(bid, seq))
+            except Exception:
+                pass
+
+        # 10. 复核 check：status==2 即客户端已接单；errno≠0 视为失败；超时容忍。
+        #     最多 3 次（上限 4.5s）：通知已在唤起那一刻发出，这里只是静默复核，
+        #     没必要再白等满 12s。
         err = None
-        for _ in range(8):
+        for _ in range(3):
             time.sleep(1.5)
             try:
                 chk = json.loads(_get(
@@ -639,22 +670,23 @@ def commit_download(prep, fs_ids=None, pairs=None):
             if chk.get("status") == 2:
                 break
         if err is not None:
-            return False, f"唤起后校验失败（errno={err}）"
-        return True, f"已唤起客户端下载（browserId={bid}, seq={seq}）"
+            return False, f"{CHECK_FAIL_PREFIX}（errno={err}）"
+        return True, _wake_detail(bid, seq)
     except Exception as e:
         return False, str(e)
 
 
-def invoke_download(share_url, pwd=""):
+def invoke_download(share_url, pwd="", on_wake=None):
     """兼容保留：prepare_share + commit_download(prep, None) 的薄封装。
 
     签名与 (ok, detail) 返回值、以及所有现有调用方都不受影响——行为等价于旧的
     「下载该分享的全部条目」。需要让用户挑选文件时，请改用 `prepare_share()` 拿
     `entries`，再用 `commit_download(prep, 选中的 fs_id 列表)` 提交子集。
+    `on_wake` 原样透传给 `commit_download`（唤醒成功后、复核轮询之前调用一次）。
     固定流程编号见 prepare_share（0~4）与 commit_download（5~10）。
     **绝不抛异常。**
     """
     ok, prep = prepare_share(share_url, pwd)
     if not ok:
         return False, prep
-    return commit_download(prep, None)
+    return commit_download(prep, None, on_wake=on_wake)

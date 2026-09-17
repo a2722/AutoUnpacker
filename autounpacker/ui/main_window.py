@@ -828,17 +828,26 @@ class MainWindow(QMainWindow):
     def _start_share_invoke(self, url, pwd, manual=False):
         """统一的分享拉起入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
 
-        `invoke_download` 含约 20s 轮询，**绝不能**在 UI 线程调用。"""
+        `invoke_download` 的复核轮询最多约 4.5s，但**绝不能**在 UI 线程调用。"""
         if self._share_invoke_busy:
             self._append_log("[分享] 上一个拉起尚未结束，已跳过"
                              if not manual else "[分享] 上一个拉起尚未结束，请稍候")
             return
         self._share_invoke_busy = True
+        # 看门狗提速：真实拉起已开始，让随后 30s 内即使空闲也按 active 间隔轮询，
+        # 客户端接单的新任务能更快被读到（失败静默，绝不影响拉起本身）。位置在
+        # 忙检查通过之后、线程启动之前：被忙标志跳过的请求不该提速，提速窗口也要
+        # 覆盖整条链路的复核期。导入沿用文件内既有的 `from .. import …` 局部风格。
+        try:
+            from .. import baidu_watch
+            baidu_watch.boost_interval(30)
+        except Exception:
+            pass
         threading.Thread(target=self._invoke_share_worker,
                          args=(url, pwd, manual), daemon=True).start()
 
     def _invoke_share_worker(self, url, pwd, manual):
-        """后台线程：跑完整拉起链路（约 20s 轮询）。
+        """后台线程：跑完整拉起链路（唤醒一发出即通知，复核轮询最多约 4.5s）。
 
         线程内**不碰 UI**：日志走线程安全的 `self.hub.log`，托盘提示走 `hub.q`
         队列（由 `_drain()` 在主线程消费）。异常一律吞掉，忙标志在 finally 复位。"""
@@ -847,14 +856,27 @@ class MainWindow(QMainWindow):
                 return
             self.hub.log(f"[分享] {'手动' if manual else '自动'}拉起客户端下载…: {url}")
             from .. import baidu_task as bt
-            ok, detail = bt.invoke_download(url, pwd=pwd)
-            if ok:
-                self.hub.log(f"[分享] 拉起成功: 已请求客户端下载（{detail}）")
+            from .. import baidu_share as bs
+            # 唤醒即通知：链路一发出唤醒就告知「已请求客户端下载」，不等复核轮询。
+            # 一次性守卫保证最多触发一次（on_wake 本就被链路只回调一次，这里再兜一层，
+            # 避免将来链路变化导致重复通知）。
+            fired = {"done": False}
+
+            def on_wake(detail):
+                if fired["done"]:
+                    return
+                fired["done"] = True
                 try:
+                    self.hub.log(f"[分享] 已请求客户端下载（{detail}）")
                     self.hub.q.put({"type": "notify", "title": "用客户端下载分享",
                                     "msg": str(url)})
                 except Exception:
                     pass
+
+            ok, detail = bt.invoke_download(url, pwd=pwd, on_wake=on_wake)
+            if ok:
+                # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）。
+                self.hub.log(f"[分享] 链路完成: {detail}")
             else:
                 self.hub.log(f"[分享] 拉起失败: {detail}")
                 # 失效判定优先：标记 + 「已失效」通知（用户手势后不该一片安静）。
@@ -869,15 +891,24 @@ class MainWindow(QMainWindow):
                         pass
                     self._share_notify("分享链接已失效", f"{url}\n{detail}")
                 else:
-                    # 缺码判定：原因可能是「该分享需要提取码」（空码闸门）。
-                    # 本函数已 import baidu_task as bt，但 bt 未转发该助手，
-                    # 故直接引用 baidu_share（异常一律按「非缺码」处理）。
+                    # 失败分流顺序：唤醒后校验失败（对已发通知的纠正）→ 缺码（空码
+                    # 闸门）→ 手动失败兜底。两个判定助手都在 baidu_share（bt 未转发），
+                    # 故直接引用本地已导入的 bs；异常一律按「否」处理。
                     try:
-                        from .. import baidu_share as bs
+                        check_failed = str(detail or "").startswith(bs.CHECK_FAIL_PREFIX)
+                    except Exception:
+                        check_failed = False
+                    try:
                         need_code = bs.is_need_code_reason(detail)
                     except Exception:
                         need_code = False
-                    if need_code:
+                    if check_failed:
+                        # 唤醒已发出、通知已发，但客户端未确认接单：补一条纠正通知。
+                        # 无论手动/自动都发——它是对已发通知的纠正，不是新的噪音。
+                        self._share_notify(
+                            "拉起后校验失败",
+                            f"{url}\n{detail}\n（客户端未确认接单，可在看板确认）")
+                    elif need_code:
                         # 空码闸门：不是"拉起失败"，而是"缺提取码"——给可操作的提示。
                         self._share_notify(
                             "分享缺少提取码",
@@ -936,6 +967,22 @@ class MainWindow(QMainWindow):
             if self._share_gate_blocked(manual, where="准备管线"):
                 return
             from .. import baidu_share as bs
+            # 唤醒即通知：与 `_invoke_share_worker` 同一策略——链路一发出唤醒就
+            # 告知「已请求客户端下载」，不等复核轮询。通知标题/正文与原先成功分支
+            # 保持逐字一致，只把时机提前；一次性守卫保证最多触发一次。
+            fired = {"done": False}
+
+            def on_wake(detail):
+                if fired["done"]:
+                    return
+                fired["done"] = True
+                try:
+                    self.hub.log(f"[分享] 提交成功: 已请求客户端下载（{detail}）")
+                    self.hub.q.put({"type": "notify", "title": "分享下载",
+                                    "msg": str(url)})
+                except Exception:
+                    pass
+
             if not pwd:
                 # 空提取码：先在后台线程探测是否根本不需要提取码（网络 IO）。
                 self.hub.log(f"[分享] 自动探测分享是否需要提取码…: {url}")
@@ -1023,12 +1070,13 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.hub.log(f"[分享] 重新准备出错: {e}")
                     return
-                ok3, detail = bs.commit_download(prep, pairs=pairs)
+                ok3, detail = bs.commit_download(prep, pairs=pairs, on_wake=on_wake)
             else:
-                ok3, detail = bs.commit_download(prep, None)
+                ok3, detail = bs.commit_download(prep, None, on_wake=on_wake)
             if ok3:
-                self.hub.log(f"[分享] 提交成功: 已请求客户端下载（{detail}）")
-                self._share_notify("分享下载", str(url))
+                # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）；
+                # 子集选择相关的既有日志信息一律保留。
+                self.hub.log(f"[分享] 链路完成: {detail}")
             else:
                 self.hub.log(f"[分享] 提交失败: {detail}")
                 self._share_notify("分享下载失败", f"{url}\n{detail}")

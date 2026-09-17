@@ -14,7 +14,8 @@
 
 「别干扰」设计（三件套）：
 - 进程守卫：百度网盘没运行就完全不读；
-- 自适应间隔：有活动任务 3s，空闲 12s；
+- 自适应间隔：有活动任务 3s，空闲 12s（`boost_interval()` 可在短窗口内把空闲
+  也临时提速到 active，供分享拉起手势后快速确认接单）；
 - 失败退避：连续读失败达阈值后指数降频（最高 60s），降级/恢复各只记一条日志。
 另：单实例入口，**只在 app.py 启动时调用一次**（本模块自身不在 import 时启线程）。
 """
@@ -134,6 +135,17 @@ def _baidu_running():
         return True
 
 
+def boost_interval(seconds=30):
+    """（时延整改）临时提速轮询：未来 `seconds` 秒内**即使空闲也按 active 间隔**轮询。
+
+    用于「分享拉起客户端下载」手势之后：客户端接单的新任务能更快被看门狗读到，
+    与手势日志落在同一时间尺度上。
+    只写 `_STATE["boost_until"]`，**不改动**既有 idle/active 判定与失败退避语义；
+    窗口到期自动失效（见轮询线程里的 `_idle_now`）。
+    """
+    _STATE["boost_until"] = time.time() + seconds
+
+
 # 「任务库选中」只打一次：启动期探测线程与轮询线程共用最近一次已打印的库路径。
 # 用锁包住 check-and-set，避免两线程几乎同时完成选库时各打一行。
 _DB_LOG_LOCK = threading.Lock()
@@ -176,6 +188,18 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
     idle = max(1.0, float(idle_interval))
     active = max(1.0, float(active_interval))
 
+    def _idle_now():
+        """空闲间隔：boost 窗口内提升为 active，其余情况仍是 idle。
+
+        boost 只加速「空闲 → active」，**不触碰**失败退避（降级仍按指数降频）。
+        """
+        try:
+            if time.time() < _STATE.get("boost_until", 0):
+                return active
+        except Exception:
+            pass
+        return idle
+
     def _log(msg):
         try:
             hub.log(f"[实验性] {msg}")
@@ -187,7 +211,7 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
         last_db = None
         was_running = True
         while True:
-            sleep_s = idle
+            sleep_s = _idle_now()
             try:
                 cfg = state.snapshot()
                 if not cfg.get("experimental_enabled", False):
@@ -235,8 +259,8 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                         _STATE["fail_count"] = 0
                         _STATE["degraded"] = False
                         _STATE["error"] = None
-                        _STATE["interval"] = idle
-                        sleep_s = idle
+                        _STATE["interval"] = _idle_now()
+                        sleep_s = _STATE["interval"]
                     else:
                         _STATE["fail_count"] += 1
                         _STATE["error"] = "读取 download_file 失败（可能被客户端独占）"
@@ -249,8 +273,8 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                                 _log(f"百度网盘任务库持续不可读，已降频到 {iv:g}s")
                             sleep_s = iv
                         else:
-                            _STATE["interval"] = idle
-                            sleep_s = idle
+                            _STATE["interval"] = _idle_now()
+                            sleep_s = _STATE["interval"]
                 else:
                     if _STATE["degraded"]:
                         _log("百度网盘任务库已恢复")
@@ -268,7 +292,7 @@ def start_active_watcher(state, hub, idle_interval=_INTERVAL_IDLE,
                         report_events(observe_tasks(rows, hist), hub)
                     except Exception:
                         pass
-                    _STATE["interval"] = active if rows else idle
+                    _STATE["interval"] = active if rows else _idle_now()
                     sleep_s = _STATE["interval"]
             except Exception:
                 pass

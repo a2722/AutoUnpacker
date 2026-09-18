@@ -375,12 +375,17 @@ def recent_code_from_history(history):
 CODE_CANDIDATE_TTL = 120.0
 
 
-def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None):
+def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None, since_ts=None):
     """只在「时间戳可解析且仍在时效内」的历史条目里选一个候选提取码。
 
     与 recent_code_from_history 的差别：本函数**严格要求时间戳**——
     只有满足 `0 <= now - ts <= ttl` 的条目才参与，无时间戳的条目一律忽略
     （手动拉起是事后补码，必须严格按时效，不能拿陈年旧码充数）。
+
+    `since_ts`（可选，原子配对下界）：给出时只接受 `ts > since_ts` 的条目。
+    调用方传入「最近一条分享记录的 ts」，即要求候选提取码必须**晚于上一条分享**
+    才被复制——这样旧码绝不会被套到新链接上（errno=-9 的根因）。`since_ts=None`
+    （默认）保持旧行为，不设下界。
 
     返回 (code|None, source)：在时效内、时间戳最大且 looks_like_share_code 的
     那条命中时返回 (code, "recent")；否则 (None, "")。
@@ -389,6 +394,10 @@ def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None):
     try:
         if now is None:
             now = time.time()
+        try:
+            since = float(since_ts) if since_ts is not None else None
+        except Exception:
+            since = None
         best_ts = None
         best_text = None
         for ent in (history or []):
@@ -402,6 +411,8 @@ def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None):
                 ts = float(ent[0])
             except Exception:
                 continue              # 时间戳不可解析：忽略
+            if since is not None and ts <= since:
+                continue              # 早于/等于上一条分享：与当前链接无关，排除
             age = now - ts
             if age < 0 or age > ttl:
                 continue              # 未生效 / 已过期
@@ -668,6 +679,31 @@ def last_share():
         return None
 
 
+def latest_share_ts(exclude_surl=None):
+    """_TRACK["shares"] 里最近一条分享记录的 ts（可排除某个 surl）；无记录返回 0.0。
+
+    供「提取码只与当前分享原子配对」的 since_ts 下界使用：早于最近一条分享记录
+    的码不再参与补码。排除某 surl 是为了「把某条记录本身当作上一条」时仍能取到
+    真正更早的那条。绝不抛异常。
+    """
+    try:
+        ex = str(exclude_surl or "")
+        best = 0.0
+        for key, rec in (_TRACK.get("shares") or {}).items():
+            if ex and (str(key) == ex
+                       or str((rec or {}).get("surl") or "") == ex):
+                continue
+            try:
+                ts = float((rec or {}).get("ts") or 0)
+            except Exception:
+                continue
+            if ts > best:
+                best = ts
+        return best
+    except Exception:
+        return 0.0
+
+
 def is_enabled(state=None, cfg=None):
     """实验性开关是否打开（供上层判断是否启用「百度清单」监听模式）。"""
     try:
@@ -887,6 +923,30 @@ def expected_files(db_path=None):
     for k in out:
         out[k].sort(key=lambda x: _norm_path(x.get("local_path")))
     return out
+
+
+def batch_of(local_path):
+    """该本地路径在清单里的 (uk, 批次显示名)；未跟踪/信息不足/任何异常返回 None。
+
+    只读内存跟踪表（不查库）；供跨名分卷配对的「同批次」加分信号使用，
+    不可用绝不影响结构路径。uk 优先取分享信息的 share_uk，其次从
+    `<shareid>.<uk>` 形式的批次键末尾取数字段。"""
+    try:
+        info = _TRACK["files"].get(_norm_path(local_path))
+        if not info:
+            return None
+        uk = str(((info.get("share") or {}).get("share_uk")) or "").strip()
+        if not uk:
+            batch = str(info.get("batch") or "")
+            parts = batch.split(".")
+            if len(parts) >= 2 and parts[-1].isdigit():
+                uk = parts[-1]
+        if not uk:
+            return None
+        name = str(info.get("batch_name") or info.get("batch") or "")
+        return (uk, name)
+    except Exception:
+        return None
 
 
 def leftover_tasks(db_path=None):

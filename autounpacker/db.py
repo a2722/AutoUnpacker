@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""统一 SQLite 小数据库（toolbox.db）：共享密码本、密码字典、百度粘性记忆、旧数据迁移。
+"""统一 SQLite 小数据库（toolbox.db）：共享密码本、密码字典、百度粘性记忆、任务/日志索引、旧数据迁移。
 
-职责：- 维护 passwords / password_dict / baidu_sticky / share_code_map 四张表（连接时自动建表，WAL 模式）
+职责：- 维护 passwords / password_dict / baidu_sticky / share_code_map / tasks / log_index 六张表（连接时自动建表，WAL 模式）
 - 共享密码本与密码字典的增删查（原存 config.json 与 ~/.smart_extract_password_dict.json）
 - 百度清单模式的粘性记忆（sticky_remember/sticky_known/sticky_list/sticky_prune）
 - 特殊用户固定提取码（find_share_code/find_share_entry/get_share_code_map/set_share_code_map/add_share_code）
+- 任务表与日志索引（add_task/find_open_task/update_task_state/get_task/list_tasks/count_tasks/task_logs；add_log_index/query_logs/prune_logs/prune_tasks）
 - migrate_legacy() 把旧 config 密码列表 / 旧字典 json 一次性迁入数据库
-关键入口：init_db() / get_passwords() / add_password() / load_password_dict() / sticky_remember() / find_share_code() / migrate_legacy()
+关键入口：init_db() / get_passwords() / add_password() / load_password_dict() / add_task() / add_log_index() / migrate_legacy()
 依赖：sqlite3、paths.DATA_DIR
-注意：所有操作持模块级线程锁且 check_same_thread=False；未来查表功能在此追加新表即可
+注意：所有操作持模块级线程锁且 check_same_thread=False；log_index.source_dir 为 NULL 表示全局日志（绝不用空字符串）
 """
 import json
 import sqlite3
@@ -48,6 +49,37 @@ CREATE TABLE IF NOT EXISTS share_code_map (
     updated_at INTEGER NOT NULL DEFAULT 0,
     pick INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS tasks (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_name     TEXT    NOT NULL,
+  file_size     INTEGER,
+  source_dir    TEXT,
+  output_dir    TEXT,
+  mode          TEXT,
+  state         TEXT    NOT NULL,
+  layer         INTEGER DEFAULT 1,
+  password_src  TEXT,
+  error         TEXT,
+  created_at    INTEGER NOT NULL,
+  started_at    INTEGER,
+  finished_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_state   ON tasks(state);
+CREATE INDEX IF NOT EXISTS idx_tasks_source  ON tasks(source_dir);
+CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS log_index (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  level      TEXT,
+  source_dir TEXT,
+  task_id    INTEGER,
+  text       TEXT,
+  link       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_log_ts     ON log_index(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_task   ON log_index(task_id);
+CREATE INDEX IF NOT EXISTS idx_log_source ON log_index(source_dir);
 """
 
 
@@ -366,3 +398,292 @@ def migrate_legacy(config, legacy_dict_file=None):
             except Exception:
                 pass
     return changed
+
+
+# ---------- 任务表（tasks）与日志索引（log_index） ----------
+# 设计口径（M1 数据层）：
+# - tasks 一行 = 一次「真正开始」的解压尝试；defer/跳过路径绝不建行，保证不会留下
+#   永远停在 queued/extracting 的僵尸行。
+# - log_index.source_dir 为 NULL 表示全局日志（轮询/剪贴板/二维码/更新/启动），
+#   绝不用空字符串表达「全局」；按路径筛选时 NULL 行永远通过。
+_TASK_COLS = ("id", "file_name", "file_size", "source_dir", "output_dir", "mode",
+              "state", "layer", "password_src", "error", "created_at",
+              "started_at", "finished_at")
+_LOG_COLS = ("id", "ts", "level", "source_dir", "task_id", "text", "link")
+
+
+def _task_row(row):
+    """把 tasks 行元组转成字段字典（列顺序与 _TASK_COLS 一致）。"""
+    return dict(zip(_TASK_COLS, row))
+
+
+def _log_row(row):
+    """把 log_index 行元组转成字段字典（列顺序与 _LOG_COLS 一致）。"""
+    return dict(zip(_LOG_COLS, row))
+
+
+def add_task(file_name, file_size=None, source_dir=None, output_dir=None,
+             mode=None, state="queued", layer=1):
+    """新建一个任务行，返回 task_id（失败返回 0）。
+
+    只在解压真正开始前调用；分卷未到齐 / 文件被占用等「稍后重试」路径不建行。
+    """
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "INSERT INTO tasks (file_name, file_size, source_dir, output_dir, "
+                    "mode, state, layer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(file_name or ""), file_size, source_dir, output_dir, mode,
+                     str(state or "queued"), int(layer or 1), int(time.time())))
+                conn.commit()
+                return int(cur.lastrowid or 0)
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def find_open_task(source_dir, file_name):
+    """查该 (source_dir, file_name) 最新一条非终态任务（queued/extracting/need_password）。
+
+    供监控线程「稍后重试」复用同一行：重试不再新建任务行，队列不会堆死行；
+    没有匹配或异常时返回 0（调用方据此新建）。
+    """
+    try:
+        name = str(file_name or "")
+        if not name:
+            return 0
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "SELECT id FROM tasks WHERE file_name = ? AND source_dir IS ? "
+                    "AND state IN ('queued','extracting','need_password') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (name, source_dir))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def update_task_state(task_id, state, *, error=None, password_src=None,
+                      output_dir=None, started_at=None, finished_at=None,
+                      layer=None):
+    """更新任务状态（可同时补写终态字段），返回是否命中行；任何异常都不抛。
+
+    只有显式传入（非 None）的字段才会被写入，避免把已有值误覆盖成 NULL。
+    """
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        return False
+    if tid <= 0:
+        return False
+    sets = ["state = ?"]
+    params = [str(state or "")]
+    for col, val in (("error", error), ("password_src", password_src),
+                     ("output_dir", output_dir), ("started_at", started_at),
+                     ("finished_at", finished_at), ("layer", layer)):
+        if val is not None:
+            sets.append(col + " = ?")
+            params.append(val)
+    params.append(tid)
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE tasks SET " + ", ".join(sets) + " WHERE id = ?", params)
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
+def get_task(task_id):
+    """按 id 取单个任务（dict）；不存在 / 非法 id / 异常一律返回 None。"""
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        return None
+    if tid <= 0:
+        return None
+    try:
+        rows = _execute(
+            "SELECT " + ", ".join(_TASK_COLS) + " FROM tasks WHERE id = ? LIMIT 1",
+            (tid,), fetch=True)
+    except Exception:
+        return None
+    return _task_row(rows[0]) if rows else None
+
+
+def list_tasks(scope="queue", result_filter=None, keyword=None, limit=500):
+    """按「队列 / 历史」范围列出任务（created_at 倒序），支持失败过滤与关键词。
+
+    scope="queue"   → state IN ('queued','extracting','need_password')
+    scope="history" → state IN ('done','failed','canceled')
+    result_filter="failed" 覆盖 scope，只返回 state='failed'。
+    keyword：大小写不敏感子串，匹配 file_name 或 output_dir。
+    """
+    if result_filter == "failed":
+        states = ("failed",)
+    elif scope == "history":
+        states = ("done", "failed", "canceled")
+    else:
+        states = ("queued", "extracting", "need_password")
+    sql = ("SELECT " + ", ".join(_TASK_COLS) + " FROM tasks WHERE state IN ("
+           + ", ".join("?" for _ in states) + ")")
+    params = list(states)
+    if keyword:
+        sql += (" AND (instr(lower(COALESCE(file_name, '')), ?) > 0"
+                " OR instr(lower(COALESCE(output_dir, '')), ?) > 0)")
+        kw = str(keyword).lower()
+        params.append(kw)
+        params.append(kw)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit or 500))
+    try:
+        rows = _execute(sql, tuple(params), fetch=True)
+        return [_task_row(r) for r in (rows or [])]
+    except Exception:
+        return []
+
+
+def count_tasks():
+    """统计各状态任务数，返回固定键字典（缺省 0），供底栏 / 分段控件直接使用。"""
+    out = {"queue": 0, "queued": 0, "extracting": 0, "need_password": 0,
+           "history": 0, "done": 0, "failed": 0, "canceled": 0}
+    try:
+        rows = _execute("SELECT state, COUNT(*) FROM tasks GROUP BY state", fetch=True)
+    except Exception:
+        return out
+    for state, n in (rows or []):
+        if state in out:
+            out[state] = int(n or 0)
+    out["queue"] = out["queued"] + out["extracting"] + out["need_password"]
+    out["history"] = out["done"] + out["failed"] + out["canceled"]
+    return out
+
+
+def task_logs(task_id, limit=2000):
+    """取某任务的日志索引行（ts 正序、同秒按 id 正序），供「该任务日志」视图。"""
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        return []
+    if tid <= 0:
+        return []
+    try:
+        rows = _execute(
+            "SELECT " + ", ".join(_LOG_COLS) + " FROM log_index "
+            "WHERE task_id = ? ORDER BY ts ASC, id ASC LIMIT ?",
+            (tid, int(limit or 2000)), fetch=True)
+        return [_log_row(r) for r in (rows or [])]
+    except Exception:
+        return []
+
+
+def add_log_index(ts, level, text, source_dir=None, task_id=None, link=None):
+    """写一行日志索引，返回 rowid（失败返回 0）；source_dir 为空一律存 NULL（全局）。"""
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "INSERT INTO log_index (ts, level, source_dir, task_id, text, link) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(ts), str(level or ""), source_dir or None, task_id,
+                     str(text or ""), link))
+                conn.commit()
+                return int(cur.lastrowid or 0)
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def query_logs(levels=None, sources=None, keyword=None, limit=1000):
+    """查询日志索引（ts 倒序、同秒按 id 倒序），级别 / 路径 / 关键词三滤镜可叠加。
+
+    - levels：级别集合；None/空 = 不按级别过滤
+    - sources：路径集合；source_dir 为 NULL 的全局日志**永远通过**
+    - keyword：大小写不敏感子串（在 text 内匹配）
+
+    SQL 与「先取全量再按 Python 过滤」等价：级别用 IN，路径用
+    `source_dir IS NULL OR source_dir IN (...)`，关键词用 instr(lower(text))。
+    """
+    try:
+        lv = list(levels) if levels else []
+        src = list(sources) if sources else []
+        sql = "SELECT " + ", ".join(_LOG_COLS) + " FROM log_index"
+        where = []
+        params = []
+        if lv:
+            where.append("level IN (" + ", ".join("?" for _ in lv) + ")")
+            params.extend(lv)
+        if src:
+            where.append("(source_dir IS NULL OR source_dir IN ("
+                         + ", ".join("?" for _ in src) + "))")
+            params.extend(src)
+        if keyword:
+            where.append("instr(lower(COALESCE(text, '')), ?) > 0")
+            params.append(str(keyword).lower())
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit or 1000))
+        rows = _execute(sql, tuple(params), fetch=True)
+        return [_log_row(r) for r in (rows or [])]
+    except Exception:
+        return []
+
+
+def prune_logs(before_ts):
+    """删除 ts < before_ts 的日志索引行，返回删除行数（失败返回 0）。"""
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute("DELETE FROM log_index WHERE ts < ?",
+                                   (int(before_ts),))
+                conn.commit()
+                return max(0, int(cur.rowcount or 0))
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def prune_tasks(limit=500):
+    """只保留最新 limit 条终态任务，返回删除行数；非终态行永不删除。
+
+    终态 = done/failed/canceled；「最新」按 created_at DESC, id DESC 判定。
+    """
+    try:
+        keep = int(limit) if limit is not None else 500
+    except Exception:
+        keep = 500
+    if keep < 0:
+        keep = 0
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "DELETE FROM tasks WHERE state IN ('done','failed','canceled') "
+                    "AND id NOT IN (SELECT id FROM tasks WHERE state IN "
+                    "('done','failed','canceled') ORDER BY created_at DESC, id DESC "
+                    "LIMIT ?)", (keep,))
+                conn.commit()
+                return max(0, int(cur.rowcount or 0))
+            finally:
+                conn.close()
+    except Exception:
+        return 0

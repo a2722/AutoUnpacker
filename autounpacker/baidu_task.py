@@ -59,6 +59,7 @@ from .baidu_manifest import (  # noqa: F401
     remember_share_link,
     share_link_for,
     last_share,
+    latest_share_ts,
     # 2.F：失效分享页识别 + 进程内标记（monitors 抓取即判定、手势短路用）
     DEAD_SHARE_PREFIX,
     detect_dead_share_page,

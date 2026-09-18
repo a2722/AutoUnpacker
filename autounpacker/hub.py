@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Hub 消息中枢：后台线程 → GUI 的队列 + 日志落盘；StdoutCapture 把 print 转发进 GUI。
+"""Hub 消息中枢：后台线程 → GUI 的队列 + 日志落盘 + log_index 双写；StdoutCapture 把 print 转发进 GUI。
 
-职责：- Hub.log()/notify() 投递日志与通知到队列并写 logs\\YYYY-MM-DD.log
+职责：- Hub.log()/notify() 投递日志与通知到队列、写 logs\\YYYY-MM-DD.log，并写 toolbox.db 的 log_index
+- 线程级日志上下文（set_log_context/clear_log_context/current_log_context）：解压线程
+  里 print 出的行自动带上 source_dir / task_id，无需逐处透传参数
+- guess_level()：日志文本 → error/success/wait/info（与主窗口日志着色同一套关键词）
+- LogRecord / emit_record()：带 task_id / source_dir 的结构化日志入口
 - 单日日志防爆（200MB 上限 / 单行截断）+ 14 天旧日志清理
-- notify 按类型开关过滤（NOTIFY_KEYS 映射配置项）
+- notify 按类型开关过滤（NOTIFY_KEYS 映射配置项），同时把通知文本入 log_index
 - StdoutCapture 幂等包装 sys.stdout，把 pythonw 下的 print 转发为 Hub 日志
-关键入口：Hub / install_stdout_capture() / restore_stdout_capture()
-依赖：paths.LOGS_DIR、queue/threading
-注意：stdout 捕获只在进程入口（app.main）安装一次，勿在工作线程里重复安装
+关键入口：Hub / LogRecord / guess_level() / set_log_context() / install_stdout_capture()
+依赖：paths.LOGS_DIR、db、queue/threading
+注意：不引入 Qt；队列 + 定时 drain 的线程模型不变，_drain 仍是唯一 fan-out 点
 """
 import io
 import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
+from . import db
 from . import paths
 
 # 日志防爆保护：
@@ -22,6 +28,65 @@ from . import paths
 # - LOG_MAX_LINE：单条日志最长字符数（防超长内容一次写爆）
 LOG_MAX_BYTES = 200 * 1024 * 1024   # 200 MB / 天
 LOG_MAX_LINE = 4096
+
+
+@dataclass
+class LogRecord:
+    """一条结构化日志（落盘 / 入队 / 写 log_index 三处共用同一份字段）。"""
+    ts: int
+    level: str                  # 'error'|'success'|'wait'|'info'|'link'
+    text: str
+    source_dir: str | None = None      # None = 全局日志
+    task_id: int | None = None
+    link: str | None = None
+
+
+# 线程级日志上下文：FolderWatcher 在单个守护线程里同步解压，解压前后 set/clear，
+# 期间该线程 print 出的每一行经 StdoutCapture → Hub.log() 都能归属到目录 / 任务。
+_log_ctx = threading.local()
+
+
+def set_log_context(source_dir=None, task_id=None):
+    """设置当前线程的日志上下文（监听路径 / 任务 id），供 Hub.log 缺省取值。"""
+    _log_ctx.source_dir = source_dir
+    _log_ctx.task_id = task_id
+
+
+def clear_log_context():
+    """清除当前线程的日志上下文（任务结束即调，防止污染后续解压）。"""
+    for attr in ("source_dir", "task_id"):
+        try:
+            delattr(_log_ctx, attr)
+        except AttributeError:
+            pass
+
+
+def current_log_context():
+    """返回当前线程的 (source_dir, task_id)；未设置时为 (None, None)。"""
+    return (getattr(_log_ctx, "source_dir", None),
+            getattr(_log_ctx, "task_id", None))
+
+
+def guess_level(text):
+    """按关键词把日志文本分级：error / success / wait / info（默认 info）。
+
+    与 MainWindow._log_color_for 的判定顺序完全一致（错误 > 成功 > 信息 > 等待），
+    只是把颜色换成级别名，供 log_index 与新版日志页过滤使用。
+    """
+    m = text or ""
+    if "失败" in m or "出错" in m or "错误" in m:
+        return "error"
+    if "完成" in m or "成功" in m or "开始监听" in m:
+        return "success"
+    if ("发现压缩包" in m or "开始智能解压" in m or "已捕获临时密码" in m
+            or "识别到二维码" in m or "正在打开" in m or "归位" in m
+            or "翻译" in m or "网址" in m):
+        return "info"
+    if ("分卷" in m or "下载未完成" in m or "密码" in m
+            or "超时" in m or "监控" in m or "等待" in m):
+        return "wait"
+    return "info"
+
 
 class Hub:
     """后台线程 → GUI 的消息队列，同时把日志写入持久化文件（logs\YYYY-MM-DD.log）便于排查。
@@ -55,9 +120,27 @@ class Hub:
         # 两侧只持有同一个 hub，跨线程共享状态挂在这里（不新增消息类型）。
         self._qr_lock = threading.Lock()
         self._qr_decoding = 0
+        # 分享输入「在途」计数：QRMonitor 把 text/image/放行抓取工作项入队时 +1，
+        # 工作线程处理完该项（含分享记录写入）后 -1。手势据此判断「当前有输入正在
+        # 解析」→ 登记一次性意图，避免按压时直接拉起上一条分享（详见 pending 方法）。
+        # 与 _qr_decoding 相互独立：解码期只是整条链路的中间一小段。
+        self._share_lock = threading.Lock()
+        self._share_inputs = 0
         self.state = state
         self._log_lock = threading.Lock()
         self._cleanup_old_logs()
+
+    def set_log_context(self, source_dir=None, task_id=None):
+        """透传模块级线程日志上下文（见 set_log_context()）。"""
+        set_log_context(source_dir, task_id)
+
+    def clear_log_context(self):
+        """清除当前线程的日志上下文（解压结束 / 监控线程退出前调用）。"""
+        clear_log_context()
+
+    def current_log_context(self):
+        """返回当前线程的 (source_dir, task_id)；未设置时为 (None, None)。"""
+        return current_log_context()
 
     def qr_begin_decode(self):
         """进入二维码解码期（子进程运行期）+1。"""
@@ -74,14 +157,43 @@ class Hub:
         with self._qr_lock:
             return self._qr_decoding > 0
 
+    def share_input_begin(self):
+        """进入「分享输入在途」期（工作项入队）+1。绝不抛异常。"""
+        try:
+            with self._share_lock:
+                self._share_inputs += 1
+        except Exception:
+            pass
+
+    def share_input_end(self):
+        """退出「分享输入在途」期 -1（最小钳到 0，防止异常路径把计数拉成负数）。"""
+        try:
+            with self._share_lock:
+                self._share_inputs = max(0, self._share_inputs - 1)
+        except Exception:
+            pass
+
+    def share_input_pending(self):
+        """当前是否有分享输入（文本/图片/放行抓取）尚未处理完。绝不抛异常。"""
+        try:
+            with self._share_lock:
+                return self._share_inputs > 0
+        except Exception:
+            return False
+
     @staticmethod
     def _cleanup_old_logs():
-        """删除 14 天前的日志文件，防止无限累积"""
+        """删除 14 天前的日志文件，并同步清理 log_index 旧行，防止无限累积"""
+        cutoff = time.time() - 14 * 86400
+        # log_index 跟随日志文件的 14 天策略同步删除；DB 打嗝绝不影响 Hub 构造。
+        try:
+            db.prune_logs(int(cutoff))
+        except Exception:
+            pass
         try:
             d = paths.LOGS_DIR
             if not d.exists():
                 return
-            cutoff = time.time() - 14 * 86400
             for p in d.glob("*.log"):
                 try:
                     if p.stat().st_mtime < cutoff:
@@ -110,16 +222,62 @@ class Hub:
         except Exception:
             pass
 
-    def log(self, msg):
+    def log(self, msg, source_dir=None, task_id=None, level=None, link=None):
+        """写一行日志：落盘 + 入 GUI 队列 + 写 log_index（source_dir 为 NULL=全局）。
+
+        未显式给 source_dir/task_id 时，从当前线程的日志上下文取（解压线程由
+        monitors 在解压前后设置 / 清除），使 extract 里 print 出的行自动归属任务。
+        """
+        if source_dir is None or task_id is None:
+            csd, ctid = current_log_context()
+            if source_dir is None:
+                source_dir = csd
+            if task_id is None:
+                task_id = ctid
+        lv = level or guess_level(msg)
+        now = int(time.time())
         self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
         try:
-            self.q.put({"type": "log", "msg": f"[{time.strftime('%H:%M:%S')}] {msg}"})
+            self.q.put({"type": "log", "msg": f"[{time.strftime('%H:%M:%S')}] {msg}",
+                        "text": msg, "ts": now, "level": lv,
+                        "source_dir": source_dir, "task_id": task_id, "link": link})
+        except Exception:
+            pass
+        try:
+            db.add_log_index(now, lv, msg, source_dir, task_id, link)
+        except Exception:
+            pass
+
+    def emit_record(self, rec):
+        """按调用方给定的 LogRecord 落盘 + 入队 + 写 log_index（原样使用 rec.ts）。"""
+        try:
+            self._write_file(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {rec.text}")
+        except Exception:
+            pass
+        try:
+            self.q.put({"type": "log",
+                        "msg": f"[{time.strftime('%H:%M:%S')}] {rec.text}",
+                        "text": rec.text, "ts": rec.ts, "level": rec.level,
+                        "source_dir": rec.source_dir, "task_id": rec.task_id,
+                        "link": rec.link})
+        except Exception:
+            pass
+        try:
+            db.add_log_index(rec.ts, rec.level, rec.text, rec.source_dir,
+                             rec.task_id, rec.link)
         except Exception:
             pass
 
     def notify(self, title, msg):
         # 日志始终记录（便于排查），弹窗通知按开关过滤
-        self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [通知] {title}: {msg}")
+        line = f"[通知] {title}: {msg}"
+        self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}")
+        # 通知文本也进 log_index（级别固定 info），让新版日志页能过滤到
+        try:
+            db.add_log_index(int(time.time()), "info", line)
+        except Exception:
+            pass
         if self.state is not None:
             cfg = self.state.snapshot()
             if not cfg.get("notify_enabled", True):

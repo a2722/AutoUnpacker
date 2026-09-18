@@ -61,6 +61,13 @@ _FLUENT = {
     "tip_bg": "#ffffff", "tip_fg": "#1b1b1b", "tip_border": "#d1d1d1",
     "sb_handle": "#c8c8c8", "sb_hover": "#b0b0b0",
     "ind_bg": "#ffffff", "ind_border": "#8a8a8a",
+    # M2 新增：目录胶囊/日志筛选文字、需要处理竖条、底栏播报、模式卡浅底
+    # （值取自 mockups/assets/base.css，两套主题键集必须完全一致）
+    "chip_off_fg": "#6b7688", "nbar_err": "#c0392b", "nbar_warn": "#e8d07a",
+    "ticker_fg": "#6b7688", "accent_soft": "rgba(0,103,192,0.08)",
+    # M2 追加：成功绿（模式卡「推荐」徽标文字 = base.css --success）、
+    # 中性计数徽标文字（标签页徽标 = base.css --muted2）
+    "success_fg": "#2e7d32", "badge_fg": "#3d4756",
 }
 
 _DEVTOOL = {
@@ -94,6 +101,11 @@ _DEVTOOL = {
     "tip_bg": "#252526", "tip_fg": "#cccccc", "tip_border": "#454545",
     "sb_handle": "#424242", "sb_hover": "#4f4f4f",
     "ind_bg": "#2d2d30", "ind_border": "#9a9a9a",
+    # M2 新增（键集与 _FLUENT 完全一致）：chip_off_fg/nbar_err/nbar_warn/ticker_fg/accent_soft
+    "chip_off_fg": "#9aa4b2", "nbar_err": "#ff6b6b", "nbar_warn": "#6b5518",
+    "ticker_fg": "#9aa4b2", "accent_soft": "rgba(14,99,156,0.16)",
+    # M2 追加：与 _FLUENT 同键（base.css devtool --success / --muted2）
+    "success_fg": "#6fcf7f", "badge_fg": "#b8c0cc",
 }
 
 _TOKENS = {"fluent": _FLUENT, "devtool": _DEVTOOL}
@@ -110,8 +122,15 @@ _PALETTES = {
         "log_info": "#7fb6ff", "log_wait": "#f2c97d", "log_default": "#d8e0ea",
         # 日志里的可点链接：比 log_info(#7fb6ff) 更浓/更饱和的天蓝，便于区分
         "log_link": "#2d7dff",
+        # UX-3 颜色角色：蓝色 = 仅可交互。时间戳恒为暗灰；捕获到的密码「值」
+        # 用等宽 + 淡底 chip（控制台恒为深色底，两套主题共用同一组值）。
+        "log_ts": "#6b7688",
+        "log_value_bg": "rgba(255,255,255,0.10)",
+        "log_value_fg": "#e8eef7",
         "warn_text": "#c0392b", "warn_bg": "#ffe4e4", "warn_border": "#f2c2c2",
         "tray_icon": "#1f6feb",
+        # M2：模式卡/日志筛选 chip 的「主色浅底」（QSS token 同值；内联样式也会用到）
+        "accent_soft": "rgba(0,103,192,0.08)",
         "trail": {"recorded": "#8a94a6", "kept": "#2e7d32", "deleted": "#c0392b",
                   "restored": "#1f6feb", "failed": "#ad1457"},
     },
@@ -123,8 +142,14 @@ _PALETTES = {
         "log_info": "#569cd6", "log_wait": "#dcdcaa", "log_default": "#cccccc",
         # 日志里的可点链接：比 log_info(#569cd6) 更亮更饱和的链接蓝
         "log_link": "#3794ff",
+        # UX-3 键集与 fluent 完全一致（见上）：时间戳暗灰 / 值 chip 淡底。
+        "log_ts": "#9aa4b2",
+        "log_value_bg": "rgba(255,255,255,0.10)",
+        "log_value_fg": "#e8eef7",
         "warn_text": "#ff9a9a", "warn_bg": "#3a1f22", "warn_border": "#7a3b40",
         "tray_icon": "#4daafc",
+        # M2：模式卡/日志筛选 chip 的「主色浅底」（QSS token 同值）
+        "accent_soft": "rgba(14,99,156,0.16)",
         "trail": {"recorded": "#9aa4b2", "kept": "#6fcf7f", "deleted": "#ff6b6b",
                   "restored": "#5aa9ff", "failed": "#ff6fa5"},
     },
@@ -195,6 +220,12 @@ QPushButton#danger {
     background: $danger_bg; color: $danger_fg; border: 1px solid $danger_border;
 }
 QPushButton#danger:hover { background: $danger_hover; }
+/* 状态栏失败药丸（StatusBar.fail_btn 是定高 20px 的紧凑药丸）：#danger 的
+   通用纵向内边距（5px）是给对话框常规按钮的，塞进 20px 药丸只会把 13px
+   字号挤到只露中间 8px（DPI 矩阵实测 clip_h=True）。给状态栏实例把纵向
+   内边距清零，20px 药丸才真正装得下文字（墨迹 13px，上下各余 3~4px）；
+   横向沿用 12px，药丸宽度与底栏总高（30px）都不动。 */
+QWidget#statusBar QPushButton#danger { padding: 0 12px; }
 QPushButton#pause {
     background: $pause_bg; border: 1px solid $pause_border; border-radius: $radius_ctl;
     padding: 3px 8px; color: $pause_fg; font-weight: bold;
@@ -269,6 +300,12 @@ QToolTip {
     background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border; padding: 4px;
 }
 
+/* 点击日志链接后的「已复制 / 复制失败」小气泡：复用 tip_* token，无新色值 */
+QLabel#toastBubble {
+    background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border;
+    border-radius: $radius_ctl; padding: 4px 10px; font-size: 12px;
+}
+
 QScrollBar:vertical { background: transparent; width: 11px; }
 QScrollBar::handle:vertical { background: $sb_handle; border-radius: 5px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: $sb_hover; }
@@ -277,6 +314,164 @@ QScrollBar:horizontal { background: transparent; height: 11px; }
 QScrollBar::handle:horizontal { background: $sb_handle; border-radius: 5px; min-width: 24px; }
 QScrollBar::handle:horizontal:hover { background: $sb_hover; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* =======================================================================
+   M2 新组件：目录胶囊 / 标签页 / 分段 / 日志筛选 / 模式卡 / 任务表 /
+   播报 / 需要处理 / 目录设置弹窗
+   （动态属性选择器必须配合 widgets.repolish() 使用；状态灯是自绘控件，
+     其颜色只由目录状态决定，不参与以下任何选中/激活规则）
+   ======================================================================= */
+
+/* ---- 目录胶囊条 ---- */
+QWidget#dirStrip { background: transparent; border-bottom: 1px solid $card_border; }
+QWidget#navTabs { background: transparent; border-bottom: 1px solid $card_border; }
+QPushButton#dirChip {
+    background: $ctl_bg; border: 1px solid $ctl_border; border-radius: 999px;
+    color: $ctl_fg; padding: 0; font-size: 12.5px;
+}
+QPushButton#dirChip[selected="true"] {
+    background: $item_sel_bg; color: $item_sel_fg; border: 1px solid $ctl_focus;
+}
+QPushButton#dirChip[selected="false"] {
+    background: $ctl_bg; color: $ctl_fg; border: 1px solid $ctl_border;
+}
+QPushButton#dirChip:hover { background: $btn_hover; }
+QPushButton#dirChip[selected="true"] QLabel { color: $item_sel_fg; }
+QPushButton#dirChip[selected="false"] QLabel { color: $ctl_fg; }
+QPushButton#dirChip QLabel#chipState { color: $chip_off_fg; font-size: 11.5px; }
+QPushButton#dirChip QLabel#chipPath { font-family: Consolas, "Cascadia Mono", monospace; }
+QPushButton#dirChip[add="true"] {
+    background: $ctl_bg; border: 1px dashed $ctl_border; color: $chip_off_fg;
+}
+QPushButton#dirChip[add="true"] QLabel { color: $chip_off_fg; }
+QProgressBar#chipProg {
+    background: $prog_bg; border: none; border-radius: 2px;
+    max-height: 4px; min-height: 4px;
+}
+QProgressBar#chipProg::chunk { background: $prog_chunk; border-radius: 2px; }
+QLabel#stripHint { color: $chip_off_fg; font-size: 11px; }
+
+/* ---- 顶部标签页（激活态用 2px 下划线，禁止用背景块） ---- */
+QPushButton#navTab {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    border-radius: 0; padding: 0; color: $section_fg; font-size: 13px;
+}
+QPushButton#navTab:hover { background: transparent; color: $window_fg; }
+QPushButton#navTab[active="true"] {
+    color: $title_fg; border-bottom: 2px solid $title_fg; font-weight: 600;
+}
+QPushButton#navTab[active="false"] {
+    color: $section_fg; border-bottom: 2px solid transparent;
+}
+QPushButton#navTab[active="true"] QLabel { color: $title_fg; font-weight: 600; }
+QPushButton#navTab[active="false"] QLabel { color: $section_fg; }
+QPushButton#navTab QLabel#navBadge {
+    background: $cat_hover; color: $badge_fg; border: 1px solid $card_border;
+    border-radius: 999px; padding: 1px 7px; font-size: 11px; font-weight: 600;
+}
+
+/* ---- 分段控件（队列/历史、全部/失败 …） ---- */
+QFrame#segBox { background: $ctl_bg; border: 1px solid $ctl_border; border-radius: $radius_ctl; }
+QPushButton#segItem {
+    background: transparent; border: none; border-radius: 0;
+    padding: 4px 11px; color: $section_fg; font-size: 12px;
+}
+QPushButton#segItem:hover { background: $btn_hover; }
+QPushButton#segItem[active="true"] {
+    background: $item_sel_bg; color: $item_sel_fg; font-weight: 600;
+}
+
+/* ---- 运行日志页：按路径筛选 chip（点击切换选中；与目录胶囊故意不同） ---- */
+QFrame#logChip { background: transparent; border: 1px solid $card_border; border-radius: 999px; }
+QFrame#logChip[active="true"] {
+    border: 1px solid $ctl_focus; background: $accent_soft; color: $ctl_fg;
+}
+QFrame#logChip[active="false"] {
+    background: transparent; border: 1px solid $card_border; color: $chip_off_fg;
+}
+QFrame#logChip[active="true"] QLabel { color: $ctl_fg; }
+QFrame#logChip[active="false"] QLabel { color: $chip_off_fg; }
+
+/* ---- 目录设置弹窗：监听模式 = 两张平铺卡（严禁 QComboBox） ---- */
+QPushButton#modeCard {
+    background: $ctl_bg; border: 1px solid $ctl_border; border-radius: $radius_card;
+    padding: 0; text-align: left;
+}
+QPushButton#modeCard[checked="true"] { border: 1px solid $ctl_focus; background: $accent_soft; }
+QPushButton#modeCard[checked="false"] { border: 1px solid $ctl_border; background: $ctl_bg; }
+QPushButton#modeCard:hover { border: 1px solid $ctl_focus; }
+QFrame#modeCheck { background: $ind_bg; border: 1px solid $ind_border; border-radius: 3px; }
+QPushButton#modeCard[checked="true"] QFrame#modeCheck { background: $sel_bg; border: 1px solid $sel_bg; }
+QLabel#modeTitle { font-size: 13px; font-weight: 600; color: $ctl_fg; }
+QLabel#modeDesc { font-size: 11.5px; color: $chip_off_fg; }
+QLabel#modeBadge {
+    background: $accent_soft; color: $success_fg; border: 1px solid $card_border;
+    border-radius: 999px; padding: 1px 7px; font-size: 11px; font-weight: 600;
+}
+
+/* ---- 任务表（QTableView + TaskModel；状态列胶囊由委托自绘） ---- */
+QTableView#taskTable {
+    background: $table_bg; border: 1px solid $table_border; border-radius: $radius_card;
+    gridline-color: $table_grid; alternate-background-color: $table_alt;
+    color: $window_fg; selection-background-color: $table_sel_bg;
+    selection-color: $table_sel_fg; outline: none; font-size: 12.5px;
+}
+QTableView#taskTable::item { padding: 3px 6px; border-bottom: 1px solid $table_grid; }
+QTableView#taskTable::item:selected {
+    background: $table_sel_bg; color: $table_sel_fg;
+}
+QTableView#taskTable QHeaderView::section {
+    background: $head_bg; color: $head_fg; font-weight: bold; font-size: 11.5px;
+    border: none; border-bottom: 1px solid $head_border; padding: 7px 10px;
+}
+QPushButton#rowAct { background: transparent; border: none; padding: 0; }
+QPushButton#rowAct:hover { background: $btn_hover; border-radius: $radius_ctl; }
+
+/* ---- 底栏纵向播报（一次一句，禁止截断/横滚） ---- */
+QLabel#tipRow { color: $ticker_fg; font-size: 11px; }
+
+/* ---- 通用 ghost 按钮（行内小按钮 / 清除筛选 / 网盘下载目录） ---- */
+QPushButton#ghost { background: transparent; border: 1px solid transparent; color: $window_fg; }
+QPushButton#ghost:hover { background: $btn_hover; }
+QPushButton#ghostSm {
+    background: transparent; border: 1px solid transparent; color: $window_fg;
+    padding: 1px 8px; font-size: 11.5px; min-height: 20px;
+}
+QPushButton#ghostSm:hover { background: $btn_hover; }
+
+/* ---- 「需要处理」列表行：3px 竖条 + 纯文本（禁止胶囊包文字） ---- */
+QFrame#needBar[urgency="err"] { background: $nbar_err; border: none; border-radius: 2px; }
+QFrame#needBar[urgency="warn"] { background: $nbar_warn; border: none; border-radius: 2px; }
+QFrame#needSep { background: $table_grid; border: none; }
+QFrame#needSepLast { background: $card_border; border: none; }
+QLabel#needTitle { font-size: 12px; color: $chip_off_fg; }
+QLabel#needName { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; color: $chip_off_fg; }
+QLabel#needNote { font-size: 11px; color: $chip_off_fg; }
+QLabel#needTs { font-size: 11px; color: $chip_off_fg; }
+QLabel#needCount { font-weight: bold; color: $window_fg; }
+
+/* ---- 目录设置弹窗 ---- */
+QFrame#dlgHead { border-bottom: 1px solid $card_border; }
+QLabel#dTitle { font-size: 15px; font-weight: 700; color: $window_fg; }
+QLabel#dlgPath { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: $chip_off_fg; }
+QLabel#dlgState {
+    background: $accent_soft; border: 1px solid $card_border; border-radius: 9px;
+    padding: 1px 8px; font-size: 11px; font-weight: 600; color: $chip_off_fg;
+}
+QLabel#fLabel { font-size: 12px; color: $chip_off_fg; }
+QLabel#dlgHint { font-size: 11.5px; color: $chip_off_fg; }
+QFrame#dlgCurrent { background: $cat_hover; border: 1px solid $card_border; border-radius: $radius_card; }
+QPushButton#iconBtn {
+    background: transparent; border: 1px solid transparent; border-radius: $radius_ctl; padding: 0;
+}
+QPushButton#iconBtn:hover { background: $btn_hover; }
+QPushButton#danger QLabel { color: $danger_fg; }
+QFrame#dlgFoot { border-top: 1px solid $card_border; }
+QProgressBar#thinProg {
+    background: $prog_bg; border: none; border-radius: 2px;
+    max-height: 4px; min-height: 4px;
+}
+QProgressBar#thinProg::chunk { background: $prog_chunk; border-radius: 2px; }
 """)
 
 
@@ -347,6 +542,15 @@ _CURRENT = {"theme": DEFAULT_THEME}
 def current_theme():
     """返回当前已应用的主题名。"""
     return _CURRENT["theme"]
+
+
+def tokens(theme=None):
+    """返回指定主题（默认当前主题）的 token 字典。
+
+    只读用途：自绘控件（状态灯 / 胶囊 / 图标）需要按当前主题取 QSS token 的
+    颜色值，而这些值不在 `PALETTE` 里。**不要修改返回的字典**。
+    """
+    return _TOKENS.get(str(theme or current_theme()).lower(), _FLUENT)
 
 
 def _capture_base(app):
@@ -550,6 +754,28 @@ def _ensure_combo_popup_fix(app):
     app.installEventFilter(fixer)
     _COMBO_FIX["installed"] = True
     _COMBO_FIX["filter"] = fixer
+    # 退出期防护（实测 0xC0000005）：解释器终结阶段 Qt 仍会向挂着的 app 级过滤器
+    # 派发少量事件，此时 sip 已无法安全回调 Python 覆写，触发访问违例（控件树越大、
+    # 运行期 setStyleSheet 后越容易命中）。atexit 先于解释器终结执行，在这里把
+    # 过滤器摘掉：运行期修复完全不受影响，终结期不再有 Python 回调。
+    try:
+        import atexit
+
+        atexit.register(lambda: _detach_combo_popup_fix(app))
+    except Exception:
+        pass
+
+
+def _detach_combo_popup_fix(app):
+    """退出期摘掉 app 级事件过滤器（幂等；Qt 侧失败一律忽略，绝不影响退出）。"""
+    fixer = _COMBO_FIX.get("filter")
+    if fixer is None:
+        return
+    _COMBO_FIX["filter"] = None
+    try:
+        app.removeEventFilter(fixer)
+    except Exception:
+        pass
 
 
 def apply_theme(app, theme):

@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""各类对话框：删除回溯、7-Zip 管理、设置、关闭行为确认、网址信任确认。
+"""各类对话框：删除回溯、7-Zip 管理、设置、关闭行为确认、网址信任确认、目录设置。
 
 职责：- DeleteTrailDialog 展示删除回溯记录并一键还原
 - SevenZipSetupDialog 检测/安装/卸载 7-Zip（隔离版与全局版）
 - SettingsDialog 全部配置项编辑（监听路径、通知、信任名单、快捷键等）
 - CloseActionDialog 关闭行为询问；TrustAskDialog 新网址信任确认
-- ShareCodeAskDialog 分享缺提取码时贴右侧的非阻塞取码小窗（120s 到点关闭作废）
-关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog / ShareCodeAskDialog
+- ShareCodeAskDialog 分享缺提取码时贴主窗右缘的非阻塞取码小窗（120s 到点关闭作废）
+- WatchDirDialog 目录设置弹窗（对应原型 12；监听模式为两张平铺卡，严禁下拉框）
+关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog /
+          ShareCodeAskDialog / WatchDirDialog
 依赖：PyQt5、trail、sevenzip、trust、widgets
 注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
 """
@@ -14,13 +16,15 @@ import inspect
 import re
 import threading
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame, QApplication, QShortcut)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QRegularExpression
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QSpinBox, QMessageBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QGroupBox, QRadioButton, QButtonGroup, QListWidget, QStackedWidget, QLayout, QComboBox, QScrollArea, QFrame, QApplication, QShortcut, QFileDialog, QProgressBar)
+from PyQt5.QtCore import (Qt, QTimer, pyqtSignal, QObject, QRect, QRegularExpression,
+                          QEvent, QPoint, QPropertyAnimation, QEasingCurve)
 from PyQt5.QtGui import (QColor, QBrush, QKeySequence, QRegularExpressionValidator)
 
 from .. import trail as deletion_trail   # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
-from .widgets import HotkeyEdit, TRAIL_STATUS_COLORS
+from .widgets import (HotkeyEdit, TRAIL_STATUS_COLORS, Glyph, LayoutButton,
+                      ModeSelector, DIR_STATE_TEXT, dir_state_key)
 from .style import PALETTE
 from . import style as ui_style
 from ..trust import trust_entry_categories
@@ -41,7 +45,10 @@ TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 # 分享缺提取码取码小窗的超时（秒）：到点自动关闭并丢弃框内内容（不回调）。
 SHARE_ASK_TIMEOUT_SEC = 120
 
-# 右侧贴边小窗的几何常量（px）：距屏幕可用区右边距 / 窗宽。
+# 取码小窗几何常量（px）：
+# SHARE_ASK_EDGE_MARGIN —— 与**主窗右缘**的间隙（贴着主窗、略向外一点）；
+#   主窗不可用（无父 / 测试桩直接构造）时，退回旧行为「距屏幕可用区右边距」。
+# SHARE_ASK_WINDOW_WIDTH —— 小窗固定宽度。
 SHARE_ASK_EDGE_MARGIN = 16
 SHARE_ASK_WINDOW_WIDTH = 300
 
@@ -1532,13 +1539,15 @@ class _CodeLineEdit(QLineEdit):
 
 
 class ShareCodeAskDialog(QDialog):
-    """分享缺提取码时贴屏幕右侧的非阻塞取码小窗（120s 到点自动关闭丢弃）。
+    """分享缺提取码时贴在主窗右缘的非阻塞取码小窗（120s 到点自动关闭丢弃）。
 
     识别到分享链接、但剪贴板附近没有有效提取码时，由调用方用 show() 展示：
-    无父窗口的顶层工具窗（Qt.Tool | FramelessWindowHint | WindowStaysOnTopHint），
-    始终置顶可见、不进任务栏、不抢焦点（不 raise_() / 不 activateWindow()），
-    主窗口隐藏到托盘时也能出现。默认 120 秒倒计时，逐秒可见（「剩余 Ns」）；
-    到点只关闭并丢弃框内内容，绝不自动用框里的码发起任何操作。
+    挂在**主窗上的子工具窗**（Qt.Tool | FramelessWindowHint，不做全局置顶），
+    贴着主窗右缘滑出、跟随主窗移动/缩放；主窗隐藏/最小化时一并隐藏——那时
+    调用方根本不会创建本窗（改为日志 + 托盘气泡，见 main_window）。不进任务栏、
+    不抢焦点（不 raise_() / 不 activateWindow()，且设 WA_ShowWithoutActivating）。
+    默认 120 秒倒计时，逐秒可见（「剩余 Ns」）；到点只关闭并丢弃框内内容，绝不
+    自动用框里的码发起任何操作。
 
     三个按钮即回调词表（语义见下），一律经 _finish 恰好回调一次，回调不向外抛异常：
       「本次使用」   -> on_decision("once", code)
@@ -1554,8 +1563,10 @@ class ShareCodeAskDialog(QDialog):
     def __init__(self, parent, surl, url, share_uk, mapped_code="",
                  timeout_sec=SHARE_ASK_TIMEOUT_SEC, on_decision=None,
                  state=None, hub=None):
-        # 顶层无父窗口：即便主窗口隐藏到托盘，本小窗仍能独立出现
-        super().__init__(None)
+        # UX-5：挂到传进来的主窗上（子工具窗，随主窗移动/隐藏）。非 QWidget
+        # （既有测试桩）按无父处理；无父时几何退回旧「贴屏幕右缘」行为。
+        p = parent if isinstance(parent, QWidget) else None
+        super().__init__(p)
         self.surl = str(surl or "").strip()
         self.url = str(url or "").strip()
         self.share_uk = str(share_uk or "").strip()
@@ -1571,9 +1582,11 @@ class ShareCodeAskDialog(QDialog):
         self._remain_sec = self._timeout_sec
 
         self.setWindowTitle("分享缺提取码")
-        # 顶层工具窗 + 无边框 + 常驻置顶：不抢焦点、不进任务栏、托盘态下仍可见
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint
-                            | Qt.WindowStaysOnTopHint)
+        # 子工具窗 + 无边框：父窗存在时始终位于主窗之上（但不越过整个桌面）；
+        # UX-5 明确去掉 WindowStaysOnTopHint。不抢焦点：不 raise_/activateWindow，
+        # 且 WA_ShowWithoutActivating 保证 show() 不激活本窗。
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setModal(False)   # 沿用本项目「非阻塞提示」做法，绝不 exec_()
 
         root = QVBoxLayout(self)
@@ -1679,7 +1692,11 @@ class ShareCodeAskDialog(QDialog):
         self._timer.start()
 
         self.setFixedWidth(SHARE_ASK_WINDOW_WIDTH)
-        self._place_right_edge()
+        # UX-5：跟随父窗 Move/Resize 的锚定状态（showEvent 安装、hideEvent 卸载，
+        # 绝不留悬挂过滤器；滑出动画引用保存在 _slide_anim，随控件一起销毁）。
+        self._anchor_parent = None
+        self._slide_anim = None
+        self._place_beside_parent()
 
     # ---- 只读访问器（供接线侧读取本窗当前状态；命名不得更改）----
     def current_code(self):
@@ -1806,7 +1823,7 @@ class ShareCodeAskDialog(QDialog):
             self._finish("ignore", "")
         super().closeEvent(event)
 
-    # ---- 几何：贴屏幕可用区右侧边缘，纵向居中（避开底部托盘区）----
+    # ---- 几何：优先贴主窗右缘（跟随主窗）；无父时退回旧「贴屏幕右缘」 ----
     def _available_geometry(self):
         try:
             scr = QApplication.primaryScreen()
@@ -1816,7 +1833,18 @@ class ShareCodeAskDialog(QDialog):
             pass
         return QRect(0, 0, 1280, 800)
 
+    def _screen_geometry_for(self, widget):
+        """widget 所在屏幕的可用区；取不到时退回主屏（_available_geometry）。"""
+        try:
+            scr = widget.screen()
+            if scr is not None:
+                return scr.availableGeometry()
+        except Exception:
+            pass
+        return self._available_geometry()
+
     def _place_right_edge(self):
+        """无父回退：贴屏幕可用区右缘、纵向居中（避开底部托盘区）。"""
         try:
             geo = self._available_geometry()
             self.layout().activate()
@@ -1826,6 +1854,521 @@ class ShareCodeAskDialog(QDialog):
             x = geo.x() + geo.width() - w - SHARE_ASK_EDGE_MARGIN
             y = geo.y() + max(SHARE_ASK_EDGE_MARGIN, (geo.height() - h) // 2)
             self.move(x, y)
+        except Exception:
+            pass
+
+    def _parent_target_pos(self):
+        """小窗目标全局位置：贴主窗右缘、与主窗顶部对齐，再收进屏幕可用区。
+
+        返回 QPoint；无父（或父窗几何不可读）返回 None，由调用方走 _place_right_edge。"""
+        p = self.parentWidget()
+        if p is None:
+            return None
+        try:
+            fg = p.frameGeometry()
+            if fg.width() <= 0 or fg.height() <= 0:
+                fg = p.geometry()
+        except Exception:
+            return None
+        try:
+            self.layout().activate()
+            self.adjustSize()
+        except Exception:
+            pass
+        w, h = self.width(), self.height()
+        x = fg.x() + fg.width() + SHARE_ASK_EDGE_MARGIN
+        y = fg.y() + SHARE_ASK_EDGE_MARGIN
+        geo = self._screen_geometry_for(p)
+        if geo is not None:
+            x = min(x, geo.x() + geo.width() - w)
+            y = min(y, geo.y() + geo.height() - h)
+            x = max(geo.x(), x)
+            y = max(geo.y(), y)
+        return QPoint(x, y)
+
+    def _place_beside_parent(self, animate=False):
+        """把窗摆到主窗右缘；animate=True 时用约 160ms 的「从主窗右缘滑出」动画。
+
+        起始点刻意放在目标点**左侧**（叠进主窗右缘约 12px），再向右滑到贴边位置：
+        视觉上是「从程序右侧平移出来」，而不是从屏幕外侧滑进来。"""
+        target = self._parent_target_pos()
+        if target is None:
+            self._place_right_edge()
+            return
+        if animate:
+            try:
+                start = QPoint(target.x() - 28, target.y())
+                self.move(start)
+                anim = QPropertyAnimation(self, b"pos", self)
+                anim.setDuration(160)
+                anim.setEasingCurve(QEasingCurve.OutCubic)
+                anim.setStartValue(start)
+                anim.setEndValue(target)
+                self._slide_anim = anim
+                anim.start()
+                return
+            except Exception:
+                pass
+        try:
+            self.move(target)
+        except Exception:
+            pass
+
+    # ---- 跟随主窗：Move/Resize 重锚定；主窗隐藏/最小化则一并隐藏 ----
+    def _install_parent_filter(self):
+        """在父窗上安装事件过滤器（重复安装前先移除，绝不叠加/悬挂）。"""
+        p = self.parentWidget()
+        if p is None or self._anchor_parent is p:
+            return
+        self._remove_parent_filter()
+        try:
+            p.installEventFilter(self)
+            self._anchor_parent = p
+        except Exception:
+            self._anchor_parent = None
+
+    def _remove_parent_filter(self):
+        p = self._anchor_parent
+        self._anchor_parent = None
+        if p is None:
+            return
+        try:
+            p.removeEventFilter(self)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            self._install_parent_filter()
+        except Exception:
+            pass
+        try:
+            self._place_beside_parent(animate=True)
+        except Exception:
+            pass
+
+    def hideEvent(self, event):
+        try:
+            self._remove_parent_filter()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def eventFilter(self, obj, event):
+        """父窗事件：移动/缩放即重锚定；父窗隐藏/最小化则把自己也藏起来。"""
+        try:
+            p = self._anchor_parent
+            if p is not None and obj is p:
+                et = event.type()
+                if et in (QEvent.Move, QEvent.Resize):
+                    if self.isVisible():
+                        self._place_beside_parent(animate=False)
+                elif et == QEvent.WindowStateChange:
+                    if p.isMinimized() or not p.isVisible():
+                        self.hide()
+                elif et == QEvent.Hide:
+                    self.hide()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+
+class WatchDirDialog(QDialog):
+    """目录设置弹窗（对应原型 12）：宽 600、模态、居中于父窗口。
+
+    由目录胶囊点击后打开：`WatchDirDialog(state, idx, parent)`。结构：
+    - 头部：目录图标 + 标题 + 等宽路径 + 实时状态徽标 + 关闭；
+    - 表单：监听路径 / 解压到 / 监听模式（**两张平铺卡，严禁 QComboBox**）/
+      启用监听 + 解压成功后删除源文件 / 回收站说明 /「当前正在处理」卡片；
+    - 底部：移除目录（危险，左）+ 取消 / 保存（右）。
+
+    保存走现有通道：变动的字段逐个 `state.update_path(idx, field, value)`，
+    随后 emit saved(idx)。「移除目录」只 emit removeRequested(idx)——
+    二次确认由宿主负责，本弹窗绝不弹确认框。Esc / 取消 = reject()。
+
+    遮罩：项目没有 dim-mask 原语，这里用父窗口的一个 rgba(0,0,0,.34) 子控件
+    自带实现（showEvent 建、hideEvent/closeEvent 拆；无父窗口时自动忽略），
+    全部包在 try/except 中，任何失败都不影响弹窗本身。
+    """
+
+    saved = pyqtSignal(int)
+    removeRequested = pyqtSignal(int)
+
+    def __init__(self, state, idx, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.idx = int(idx)
+        self._scrim = None
+        self._orig = self._load_entry()
+        self._state_key = dir_state_key(self._orig.get("state") or "listening")
+        self._progress = None
+        try:
+            if self._orig.get("progress") is not None:
+                self._progress = int(round(float(self._orig["progress"])))
+        except Exception:
+            self._progress = None
+        self._current_name = ""
+        self._current_layer = None
+
+        self.setWindowTitle("目录设置")
+        self.setModal(True)
+        self.setFixedWidth(600)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_head())
+        body = QWidget(self)
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(16, 14, 16, 14)
+        body_lay.setSpacing(11)
+        self._build_body(body_lay)
+        root.addWidget(body)
+        root.addWidget(self._build_foot())
+        self._refresh_state_badge()
+        self._render_current()
+
+    # ---- 读取入口 ----
+    def _load_entry(self):
+        """取当前 entry：优先 state.snapshot()，退化到 state.cfg；异常一律空字典。"""
+        for getter in (lambda: self.state.snapshot(),
+                       lambda: getattr(self.state, "cfg", {})):
+            try:
+                data = getter() or {}
+                paths_cfg = data.get("watch_paths") or []
+                if 0 <= self.idx < len(paths_cfg) and isinstance(paths_cfg[self.idx], dict):
+                    return dict(paths_cfg[self.idx])
+            except Exception:
+                continue
+        return {}
+
+    def _field_label(self, text):
+        lbl = QLabel(text, self)
+        lbl.setObjectName("fLabel")
+        lbl.setFixedWidth(62)
+        return lbl
+
+    # ---- 头部 / 表单 / 底部 ----
+    def _build_head(self):
+        head = QFrame(self)
+        head.setObjectName("dlgHead")
+        lay = QHBoxLayout(head)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(10)
+        lay.addWidget(Glyph("folder", head, 20, role="accent"))
+        title = QLabel("目录设置", head)
+        title.setObjectName("dTitle")
+        lay.addWidget(title)
+        full_path = str(self._orig.get("path") or "")
+        self.path_label = QLabel(head)
+        self.path_label.setObjectName("dlgPath")
+        try:
+            self.path_label.setText(self.path_label.fontMetrics().elidedText(
+                full_path or "—", Qt.ElideMiddle, 240))
+        except Exception:
+            self.path_label.setText(full_path or "—")
+        self.path_label.setToolTip(full_path)
+        lay.addWidget(self.path_label)
+        lay.addStretch(1)
+        self.state_badge = QLabel(head)
+        self.state_badge.setObjectName("dlgState")
+        lay.addWidget(self.state_badge)
+        close_btn = QPushButton(head)
+        close_btn.setObjectName("iconBtn")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setToolTip("关闭")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_lay = QHBoxLayout(close_btn)
+        close_lay.setContentsMargins(0, 0, 0, 0)
+        close_lay.addWidget(Glyph("close", close_btn, 16), 0, Qt.AlignCenter)
+        close_btn.clicked.connect(self.reject)
+        lay.addWidget(close_btn)
+        return head
+
+    def _build_body(self, lay):
+        # 监听路径
+        row1 = QHBoxLayout()
+        row1.setSpacing(9)
+        row1.addWidget(self._field_label("监听路径"))
+        self.path_edit = QLineEdit(str(self._orig.get("path") or ""), self)
+        self.path_edit.setPlaceholderText("监听目录路径")
+        row1.addWidget(self.path_edit, 1)
+        browse1 = QPushButton("浏览", self)
+        browse1.clicked.connect(self._browse_path)
+        row1.addWidget(browse1)
+        lay.addLayout(row1)
+
+        # 解压到
+        row2 = QHBoxLayout()
+        row2.setSpacing(9)
+        row2.addWidget(self._field_label("解压到"))
+        self.out_edit = QLineEdit(str(self._orig.get("output_dir") or ""), self)
+        self.out_edit.setPlaceholderText("留空 · 同目录建同名文件夹")
+        row2.addWidget(self.out_edit, 1)
+        browse2 = QPushButton("浏览", self)
+        browse2.clicked.connect(self._browse_out)
+        row2.addWidget(browse2)
+        lay.addLayout(row2)
+
+        # 监听模式：两张平铺卡（严禁 QComboBox）
+        row3 = QHBoxLayout()
+        row3.setSpacing(9)
+        row3.addWidget(self._field_label("监听模式"), 0, Qt.AlignTop)
+        self.mode_sel = ModeSelector(self)
+        self.mode_sel.set_modes([
+            ("surface", "表层 · 安全",
+             "只处理监听目录最外一层的压缩包，行为与旧版一致，不会深入子目录。",
+             "推荐"),
+            ("baidu", "百度清单 · 含子目录",
+             "额外按网盘任务清单处理下载到子目录里的压缩包与分卷，"
+             "清单不可用时自动退回表层。", None),
+        ])
+        self.mode_sel.set_mode(str(self._orig.get("mode") or "surface"))
+        row3.addWidget(self.mode_sel, 1)
+        lay.addLayout(row3)
+
+        # 开关
+        row4 = QHBoxLayout()
+        row4.setSpacing(9)
+        row4.addWidget(self._field_label("开关"))
+        self.enabled_cb = QCheckBox("启用监听", self)
+        self.enabled_cb.setChecked(bool(self._orig.get("enabled", True)))
+        row4.addWidget(self.enabled_cb)
+        row4.addSpacing(14)
+        self.del_cb = QCheckBox("解压成功后删除源文件", self)
+        self.del_cb.setChecked(bool(self._orig.get("delete_source", False)))
+        row4.addWidget(self.del_cb)
+        row4.addStretch(1)
+        lay.addLayout(row4)
+
+        # 回收站说明
+        hint_row = QHBoxLayout()
+        hint_row.setSpacing(7)
+        hint_row.addWidget(Glyph("shield", self, 13, role="muted"))
+        hint = QLabel(
+            "删除是把源文件移入回收站，可在「删除回溯」标签页一键还原，不会永久丢失。",
+            self)
+        hint.setObjectName("dlgHint")
+        hint.setWordWrap(True)
+        hint_row.addWidget(hint, 1)
+        lay.addLayout(hint_row)
+
+        # 当前正在处理
+        self.current_card = QFrame(self)
+        self.current_card.setObjectName("dlgCurrent")
+        c_lay = QVBoxLayout(self.current_card)
+        c_lay.setContentsMargins(14, 12, 14, 12)
+        c_lay.setSpacing(6)
+        c_top = QHBoxLayout()
+        c_top.setSpacing(8)
+        c_top.addWidget(Glyph("archive", self.current_card, 13, role="muted"))
+        c_title = QLabel("当前正在处理：", self.current_card)
+        c_title.setObjectName("dlgHint")
+        c_top.addWidget(c_title)
+        self.current_name = QLabel("", self.current_card)
+        self.current_name.setObjectName("dlgPath")
+        self.current_name.setStyleSheet("font-weight: 600;")
+        c_top.addWidget(self.current_name)
+        c_top.addStretch(1)
+        self.current_pct = QLabel("", self.current_card)
+        self.current_pct.setObjectName("dlgPath")
+        c_top.addWidget(self.current_pct)
+        c_lay.addLayout(c_top)
+        self.current_bar = QProgressBar(self.current_card)
+        self.current_bar.setObjectName("thinProg")
+        self.current_bar.setTextVisible(False)
+        self.current_bar.setRange(0, 100)
+        self.current_bar.setValue(0)
+        c_lay.addWidget(self.current_bar)
+        lay.addWidget(self.current_card)
+
+    def _build_foot(self):
+        foot = QFrame(self)
+        foot.setObjectName("dlgFoot")
+        lay = QHBoxLayout(foot)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(8)
+        self.remove_btn = LayoutButton(foot)
+        self.remove_btn.setObjectName("danger")
+        self.remove_btn.setCursor(Qt.PointingHandCursor)
+        rm_lay = QHBoxLayout(self.remove_btn)
+        rm_lay.setContentsMargins(0, 0, 0, 0)
+        rm_lay.setSpacing(6)
+        rm_lay.addWidget(Glyph("trash", self.remove_btn, 13, role="danger"))
+        rm_lay.addWidget(QLabel("移除目录", self.remove_btn))
+        self.remove_btn.clicked.connect(self._on_remove)
+        lay.addWidget(self.remove_btn)
+        lay.addStretch(1)
+        self.cancel_btn = QPushButton("取消", foot)
+        self.cancel_btn.clicked.connect(self.reject)
+        lay.addWidget(self.cancel_btn)
+        self.save_btn = QPushButton("保存", foot)
+        self.save_btn.setObjectName("primary")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self._on_save)
+        lay.addWidget(self.save_btn)
+        return foot
+
+    # ---- 状态展示 ----
+    def _refresh_state_badge(self):
+        text = DIR_STATE_TEXT.get(self._state_key, self._state_key)
+        if self._state_key == "extracting" and self._progress is not None:
+            text += " %d%%" % int(self._progress)
+        try:
+            self.state_badge.setText("● " + text)
+            color = PALETTE["success"]
+            if self._state_key == "error":
+                color = PALETTE["danger"]
+            elif self._state_key in ("paused", "waiting"):
+                color = PALETTE["muted"]
+            elif self._state_key == "listening":
+                color = PALETTE["accent_text"]
+            self.state_badge.setStyleSheet("color: %s;" % color)
+        except Exception:
+            pass
+
+    def _render_current(self):
+        name = str(self._current_name or "")
+        layer_txt = ""
+        if self._current_layer is not None and str(self._current_layer) != "":
+            layer_txt = " · 第 %s 层" % self._current_layer
+        try:
+            if name:
+                name = self.current_name.fontMetrics().elidedText(
+                    name, Qt.ElideMiddle, 240)
+        except Exception:
+            pass
+        text = (name + layer_txt) if name else (layer_txt.lstrip(" ·") or "—")
+        self.current_name.setText(text)
+        self.current_name.setToolTip(text)
+        pct = self._progress
+        self.current_pct.setText(("%d%%" % int(pct)) if pct is not None else "")
+        self.current_bar.setValue(int(pct) if pct is not None else 0)
+
+    # ---- 公开 API ----
+    def set_current(self, name, layer=None, progress=None):
+        """「当前正在处理」卡片：文件名 · 第 N 层 + 百分比 + 细进度条。"""
+        self._current_name = str(name or "")
+        self._current_layer = layer
+        if progress is not None:
+            try:
+                self._progress = max(0, min(100, int(round(float(progress)))))
+            except Exception:
+                self._progress = 0
+            self._state_key = "extracting"
+            self._refresh_state_badge()
+        self._render_current()
+
+    def entry(self):
+        """当前面板上的值（保存前宿主可只读获取）。"""
+        return {
+            "path": self.path_edit.text().strip(),
+            "output_dir": self.out_edit.text().strip(),
+            "mode": self.mode_sel.mode() or "surface",
+            "enabled": bool(self.enabled_cb.isChecked()),
+            "delete_source": bool(self.del_cb.isChecked()),
+        }
+
+    # ---- 交互 ----
+    def _on_save(self):
+        cur = self.entry()
+        for field in ("path", "output_dir", "mode", "enabled", "delete_source"):
+            value = cur.get(field)
+            if value != self._orig.get(field):
+                try:
+                    self.state.update_path(self.idx, field, value)
+                except Exception:
+                    pass
+        try:
+            self.saved.emit(self.idx)
+        except Exception:
+            pass
+        self.accept()
+
+    def _on_remove(self):
+        """只发信号：二次确认由宿主负责（本弹窗绝不弹确认框）。"""
+        try:
+            self.removeRequested.emit(self.idx)
+        except Exception:
+            pass
+
+    def _browse_path(self):
+        try:
+            d = QFileDialog.getExistingDirectory(self, "选择监听目录")
+        except Exception:
+            d = ""
+        if d:
+            self.path_edit.setText(d)
+
+    def _browse_out(self):
+        try:
+            d = QFileDialog.getExistingDirectory(self, "选择解压输出目录")
+        except Exception:
+            d = ""
+        if d:
+            self.out_edit.setText(d)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+    # ---- 遮罩（极简自带实现） ----
+    def _ensure_scrim(self):
+        if self._scrim is not None:
+            return
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        try:
+            sc = QFrame(parent)
+            sc.setObjectName("dlgScrim")
+            sc.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            sc.setAttribute(Qt.WA_StyledBackground, True)
+            sc.setStyleSheet("background: rgba(0,0,0,0.34);")
+            sc.setGeometry(parent.rect())
+            sc.show()
+            sc.raise_()
+            self._scrim = sc
+        except Exception:
+            self._scrim = None
+
+    def _destroy_scrim(self):
+        sc = self._scrim
+        self._scrim = None
+        if sc is None:
+            return
+        try:
+            sc.hide()
+            sc.setParent(None)
+            sc.deleteLater()
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        self._ensure_scrim()
+        super().showEvent(event)
+        self._center_on_parent()
+
+    def hideEvent(self, event):
+        self._destroy_scrim()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._destroy_scrim()
+        super().closeEvent(event)
+
+    def _center_on_parent(self):
+        try:
+            parent = self.parentWidget()
+            if parent is None:
+                return
+            self.adjustSize()
+            pg = parent.frameGeometry()
+            self.move(pg.center().x() - self.width() // 2,
+                      pg.center().y() - self.height() // 2)
         except Exception:
             pass
 

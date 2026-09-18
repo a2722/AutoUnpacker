@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "qr_clipboard_action": "none",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
     "qr_url_redirect": True,
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
+    "output_time_now": True,         # 解压成功后把产物顶层时间戳校准为现在（避免旧日期在大目录里沉底）
     "qr_url_enabled": True,          # 复制 http(s) 网址时尝试访问并识别二维码图片
     "url_exclude_temp_password": True,  # 带 :// 的网址不记录为临时密码（xxxx.com 域名形式仍记录）
     "temp_password_filter": True,       # 临时密码智能过滤（排除路径/文件名/句子等；关闭则照单全收）
@@ -48,6 +49,7 @@ DEFAULT_CONFIG = {
     ],
     "sevenzip_check_done": False,   # 首次启动的 7-Zip 检测已完成（避免每次启动都检查/弹窗）
     "poll_interval": 2,
+    "task_history_limit": 500,     # 任务历史保留条数（只清理终态任务，非终态永不删）
     "passwords": [],
     "auto_add_clipboard_password": False,
     "watch_paths": [
@@ -77,6 +79,10 @@ DEFAULT_CONFIG = {
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
     "baidu_pick_before_download": False,  # 实验性：分享下载前总是先让我挑选文件（默认关）
+    "share_gesture_wait_sec": 60,   # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
+    # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
+    # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
+    "pair_split_enabled": True,     # 跨名分卷链配对唯一总闸（验证通过即改名为首卷系列；无 auto 开关）
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
@@ -139,6 +145,7 @@ def _sanitize_cfg(cfg):
         cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "none"
         cfg["qr_url_redirect"] = bool(cfg.get("qr_url_redirect", True))
         cfg["promote_merge"] = bool(cfg.get("promote_merge", True))
+        cfg["output_time_now"] = bool(cfg.get("output_time_now", True))
         cfg["qr_url_enabled"] = bool(cfg.get("qr_url_enabled", True))
         cfg["url_exclude_temp_password"] = bool(cfg.get("url_exclude_temp_password", True))
         cfg["temp_password_filter"] = bool(cfg.get("temp_password_filter", True))
@@ -151,6 +158,11 @@ def _sanitize_cfg(cfg):
                 1, min(24 * 365, int(cfg.get("temp_password_ttl_hours", 24))))
         except Exception:
             cfg["temp_password_ttl_hours"] = 24
+        try:
+            cfg["task_history_limit"] = max(
+                1, min(100000, int(cfg.get("task_history_limit", 500))))
+        except Exception:
+            cfg["task_history_limit"] = 500
         cfg["translation_move_enabled"] = bool(cfg.get("translation_move_enabled", True))
         cfg["log_colors_enabled"] = bool(cfg.get("log_colors_enabled", True))
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))
@@ -200,6 +212,14 @@ def _sanitize_cfg(cfg):
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
         cfg["baidu_pick_before_download"] = bool(cfg.get("baidu_pick_before_download", False))
+        cfg["pair_split_enabled"] = bool(cfg.get("pair_split_enabled", True))
+        # pair_split_auto 已退场：丢弃陈旧键，老配置里残留也不影响行为（无害）
+        cfg.pop("pair_split_auto", None)
+        try:
+            cfg["share_gesture_wait_sec"] = max(
+                5, min(600, int(cfg.get("share_gesture_wait_sec", 60))))
+        except Exception:
+            cfg["share_gesture_wait_sec"] = 60
         _ut = str(cfg.get("ui_theme", "auto") or "auto").strip().lower()
         cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
         _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()

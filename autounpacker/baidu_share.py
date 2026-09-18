@@ -68,6 +68,45 @@ NEED_CODE_REASON = "该分享需要提取码"
 # 「已请求客户端下载」通知补一条纠正通知（时延整改：通知提前，复核降级为静默）。
 CHECK_FAIL_PREFIX = "唤起后校验失败"
 
+# 整条分享链路的聚合截止预算（秒）：prepare / commit 共享同一份预算
+# （prepare_share 把它放进 prep 的内部键 `_deadline`）。单次 HTTP 请求的
+# timeout=15 保持不变；本常量兜住「多步串联」的总时长（含 verify 节流、分页
+# list、复核轮询），任一步骤异常变慢时链路会在预算耗尽后的下一个检查点终止，
+# 不会把管线拖到无限长。
+SHARE_CHAIN_DEADLINE_SEC = 90
+
+
+def _chain_deadline(prep=None):
+    """返回本次链路的聚合截止时刻（墙钟秒）。
+
+    prep 里已有 `_deadline`（prepare_share 写入的内部键）时沿用同一预算，
+    让 prepare → commit 两段共享一个总超时；否则从此刻起算一个新预算。
+    **绝不抛异常**：返回 None 表示时钟不可用，调用方按「永不超时」处理。
+    """
+    try:
+        d = float((prep or {}).get("_deadline"))
+        if d > 0:
+            return d
+    except Exception:
+        pass
+    try:
+        return time.time() + SHARE_CHAIN_DEADLINE_SEC
+    except Exception:
+        return None
+
+
+def _deadline_hit(deadline):
+    """聚合预算是否已耗尽（墙钟到点）。deadline 为 None → 永不判超时。绝不抛异常。"""
+    try:
+        return deadline is not None and time.time() >= deadline
+    except Exception:
+        return False
+
+
+def _timeout_reason():
+    """聚合超时的统一失败原因（上层原样展示给用户）。"""
+    return f"分享链路超时（{SHARE_CHAIN_DEADLINE_SEC}s）"
+
 # 调 tasklist 时的无窗口标志（与 extract.py 一致；老版本 Python 无此常量时退化 0）。
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -218,10 +257,14 @@ def prepare_share(share_url, pwd=""):
         share_url = str(share_url or "").strip()
         referer_share = share_url
         op = _build_opener()
+        # 聚合预算：整条 prepare 从这里起算；写进 prep 让 commit 共享同一预算。
+        deadline = _chain_deadline()
 
         # 0. 预热：先访问分享页（可能 404），吞掉异常只为拿 cookie。
         #    （2.F）顺手留住页面 HTML 做「失效分享」探测：命中即在 verify 之前短路
         #    返回——绝不消耗本流程唯一一次、且间隔受限的 verify 配额。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         try:
             page0 = _get(op, f"{_S}/s/{surl_full}?pwd={pwd}", referer_share)
         except Exception:
@@ -239,6 +282,8 @@ def prepare_share(share_url, pwd=""):
 
         # 1. tplconfig：取 sign / timestamp。字段未齐时给出明确中文原因，
         #    不再让裸 ["data"] 取值抛 KeyError 被外层兜成英文 "'data'"。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         tpl = json.loads(_get(
             op,
             f"{_S}/share/tplconfig?surl={surl_full}&fields=sign,timestamp"
@@ -257,6 +302,8 @@ def prepare_share(share_url, pwd=""):
         # 2. verify：校验提取码 → randsk（即 sekey），后面 extra 要用。
         #    §4：本次调用最多 1 次 verify——失败即停，不换码、不重试；
         #    两次 verify 之间至少间隔 _VERIFY_MIN_GAP 秒。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         _verify_wait()
         try:
             vbody = _post(
@@ -292,6 +339,8 @@ def prepare_share(share_url, pwd=""):
         entries = []
         seen_fs = set()
         for p in range(1, 21):
+            if _deadline_hit(deadline):
+                return False, _timeout_reason()
             try:
                 resp = json.loads(_get(
                     op,
@@ -332,6 +381,8 @@ def prepare_share(share_url, pwd=""):
             return False, "分享列表为空"
 
         # 4. 分享页取 share_uk / shareid（不在 URL 里，只能从 HTML 解析）。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         try:
             page = _get(op, f"{_S}/s/{surl_full}?pwd={pwd}", referer_share)
         except Exception:
@@ -352,6 +403,7 @@ def prepare_share(share_url, pwd=""):
             "entries": entries,
             "_op": op,
             "_share_url": share_url,
+            "_deadline": deadline,
         }
     except Exception as e:
         return False, str(e)
@@ -528,6 +580,10 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
             return False, ("网盘客户端未在运行：已跳过拉起（避免用无登录态的方式冷启动客户端，"
                            "那会导致你被迫重新登录）。请先手动打开百度网盘客户端后重试。")
 
+        # 聚合预算：prep 带 `_deadline`（prepare 起的）则共享同一总预算，
+        # 否则从此刻起算。每一步网络请求前都检查，超时立即失败（绝不发起新请求）。
+        deadline = _chain_deadline(prep)
+
         entries = prep.get("entries") if isinstance(prep, dict) else None
         if not isinstance(entries, list) or not entries:
             return False, "分享列表为空"
@@ -587,6 +643,8 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         #    令牌，该令牌已覆盖 fid_list 里的每一个条目，客户端据此下载。
         #    百度单次上限约 999 个（超了会返回 31075），此处不拆分、原样提交；
         #    失败时照实返回错误，不静默丢弃任何条目。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         sd = json.loads(_post(
             op,
             f"{_S}/api/sharedownload?{_Q}"
@@ -613,16 +671,22 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
             return False, f"sharedownload 未取到 filelist 令牌（errno={sd.get('errno')}）"
 
         # 6. invoker/get：拿 browserId。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         bid = json.loads(_get(
             op, f"{_S}/api/invoker/get?{_Q}&t={_now_ms()}", referer_api))["browserId"]
         if not bid:
             return False, "invoker/get 未取到 browserId"
 
         # 7. invoker/online：上报客户端在线。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         _get(op, f"{_S}/api/invoker/online?browserId={bid}&{_Q}&t={_now_ms()}",
              referer_api)
 
         # 8. invoker/send：把下载令牌投递给客户端 → seq。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         info = {"method": "DownloadShareItems", "uk": "0", "checkuser": False,
                 "filelist": blob, "share_url": share_url,
                 "src_from": "wp-download_web_share",
@@ -638,6 +702,8 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
             return False, f"invoker/send 未返回 seq（errno={j6.get('errno')}）"
 
         # 9. 唤起客户端下载。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
         wake = (f"baiduyunguanjia://evoked-download/?browserId={bid}&seq={seq}"
                 f"&src_from=wp-download_web_share&src_type=web_sharelink_page")
         os.startfile(wake)
@@ -655,6 +721,9 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         #     没必要再白等满 12s。
         err = None
         for _ in range(3):
+            # 预算耗尽就不再白等复核：唤醒已发出，按既有的「超时容忍」成功返回。
+            if _deadline_hit(deadline):
+                break
             time.sleep(1.5)
             try:
                 chk = json.loads(_get(

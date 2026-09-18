@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
-"""通用工具：开机时间点、配置路径规范化、文件占用检测、崩溃日志。
+"""通用工具：开机时间点、配置路径规范化、文件占用检测、崩溃日志、网址边界识别。
 
 职责：- _boot_tick()/_boot_time() 识别「同一次系统启动」（GetTickCount64）
 - _norm_path_for_cfg() 配置路径去重规范化
 - _can_open_append() 检测文件是否被其他进程独占（下载器写入中）
 - _install_crash_log() 把未捕获异常追加进 crash.log（不吞掉原有 excepthook）
-关键入口：_boot_time() / _boot_tick() / _can_open_append() / _install_crash_log()
-依赖：ctypes、sys、threading、paths
+- split_urls()/trim_url()/is_url_like()/is_baidu_pan_url() 全局唯一的网址边界
+  （日志渲染、剪贴板/二维码取址、百度网盘判定都走这里，别处不要再立正则）
+关键入口：_boot_time() / _boot_tick() / _can_open_append() / _install_crash_log() /
+          split_urls() / trim_url() / is_url_like() / is_baidu_pan_url()
+依赖：ctypes、sys、threading、paths、urllib.parse
 注意：_can_open_append 绝不用 "ab" 模式打开（会凭空重建 0 字节幽灵文件）
+注意：split_urls 用**正向字符集**（URL_CHARS）匹配，中文/全角括号/空白处必停；
+      中文说明永远不该被吞进网址（用户反馈的「一次性复制链接吞掉后续说明」）
 """
 import ctypes
 import os
+import re
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 from . import paths
 
@@ -128,5 +135,110 @@ def _install_crash_log():
                 pass
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 网址边界识别（全局唯一权威）
+#
+# 旧代码曾有三套互不相同的规则（日志一套、剪贴板一套、内联正则一套），
+# 结果「一次性复制的网址把后面的中文说明也吞进去」。这里统一为：
+# 从 http(s):// 或 www. 起，只吃 URL_CHARS 里的 ASCII 字符，遇到第一个不在
+# 集合内的字符（中文、全角括号、引号、空白…）立即停止，再剔除尾部标点。
+# ---------------------------------------------------------------------------
+# 正向字符集（RFC 3986 组成字符 + 括号，允许路径里的 (...)/[...]）。
+URL_CHARS = r"A-Za-z0-9\-._~:/?#\[\]@!$&()*+,;=%"
+# 尾部垃圾字符（中英文句读/引号/括号等，两套旧规则的并集 + ·…）。
+URL_TRAIL_JUNK = ".,;:!?、。，；：！？）】》」』)]}>·…"
+
+_URL_RE = re.compile(r"(?:https?://|www\.)[" + URL_CHARS + r"]+", re.I)
+# 百度网盘主机（含子域）：pan（网页版分享/文件页）/ yun（旧域名）/ eyun（企业版）。
+_BAIDU_PAN_HOSTS = ("pan.baidu.com", "yun.baidu.com", "eyun.baidu.com")
+
+
+def _drop_unmatched_tail(text, opener, closer):
+    """反复剥掉尾部「未配对的收尾符」（如 .../a) 里多出来的 ')'）。"""
+    while text.endswith(closer) and text.count(opener) < text.count(closer):
+        text = text[:-1]
+    return text
+
+
+def trim_url(url):
+    """剔除网址尾部的标点/垃圾字符，返回干净网址（纯字符串处理，绝不抛异常）。
+
+    规则（有界循环防异常输入死循环）：
+    1. 平衡的 ASCII 括号对属于网址本身（如维基 `/wiki/Foo_(bar)`），保留；
+       只有**未配对**的尾 `)` / `]` 才剥掉（如 `https://a.com/a)`）。
+    2. 其余 URL_TRAIL_JUNK 字符（中英文句读/引号/全角括号等）从右侧反复剔除。
+    3. 剔除后又露出的未配对收尾符回到规则 1 继续处理（如 `a)。`）。
+    """
+    s = str(url or "")
+    for _ in range(8):
+        before = s
+        s = _drop_unmatched_tail(s, "(", ")")
+        s = _drop_unmatched_tail(s, "[", "]")
+        while s and s[-1] in URL_TRAIL_JUNK and s[-1] not in ")]":
+            s = s[:-1]
+        if s == before:
+            break
+    return s
+
+
+def split_urls(text):
+    """返回 [(start, end, url)]：text 里所有网址及其**真实边界**区间。
+
+    匹配在第一个不属于 URL_CHARS 的字符处停止（中文/全角括号/引号/空白都不在
+    集合内），再用 trim_url 剔除尾部标点。因此
+    「[分享] 已记录: https://pan.baidu.com/s/1Abc（托盘菜单…）」只会截出裸链接，
+    后面的中文说明绝不会被吞进网址。一行内多个网址全部收录；无网址返回 []。
+    """
+    if not text:
+        return []
+    spans = []
+    for m in _URL_RE.finditer(text):
+        url = trim_url(m.group(0))
+        if not url:
+            continue
+        spans.append((m.start(), m.start() + len(url), url))
+    return spans
+
+
+def is_url_like(text):
+    """整段（去首尾空白后）是否就是**一个**网址（尾部标点不算内容）。
+
+    例：`https://a.com/x`、`https://a.com/x。` 为真；`看 https://a.com/x`、
+    `https://a.com/x 提取码：abcd` 为假。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    spans = split_urls(s)
+    if len(spans) != 1:
+        return False
+    start, end, _url = spans[0]
+    if start != 0:
+        return False
+    return trim_url(s[end:]) == ""
+
+
+def is_baidu_pan_url(url):
+    """网址主机是否属于百度网盘：pan/yun/eyun.baidu.com 及其子域。
+
+    用于实验性模式的「pan.baidu 一律静默、禁止显式浏览器打开」判定。
+    解析失败/空值一律返回 False，绝不抛异常。
+    """
+    try:
+        s = str(url or "").strip()
+        if not s:
+            return False
+        parts = urlsplit(s if "://" in s else "//" + s)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    if not host:
+        return False
+    for base in _BAIDU_PAN_HOSTS:
+        if host == base or host.endswith("." + base):
+            return True
+    return False
 
 

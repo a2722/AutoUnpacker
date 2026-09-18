@@ -2,6 +2,7 @@
 """程序入口：单实例检测、Qt 插件路径注入、后台线程启动、GUI 组装。
 
 职责：- 在导入 PyQt5 前注入 Qt 平台插件路径（修复 venv 下 no Qt platform plugin）
+- 在构造 QApplication 前开启 Qt 高 DPI 缩放（分辨率 + 系统「文本大小」百分比自适应）
 - 单实例检测（命名事件 + --force 强制新开）、crash.log 与 faulthandler 安装
 - 初始化日志/数据库/配置，启动 FolderWatcher 与 QRMonitor 后台线程
 - 组装 QApplication 与 MainWindow，处理首次启动的 7-Zip 检测
@@ -72,10 +73,52 @@ def _ensure_qt_platform_plugins():
         pass
 
 
+def _setup_high_dpi():
+    """在构造 QApplication 前开启 Qt 高 DPI 缩放（适配分辨率与系统文本缩放百分比）。
+
+    必须在**任何 Qt 对象（QApplication/QCoreApplication）创建之前**调用才生效：
+    属性与取整策略都在 QGuiApplication 构造时被读取一次。分两层：
+    1. 环境变量兜底（冻结/无 manifest 的 pythonw 场景，用户已设置则不覆盖）：
+       只设 QT_ENABLE_HIGHDPI_SCALING=1。**不设** QT_AUTO_SCREEN_SCALE_FACTOR=0
+       ——实测 Qt 5.15.2 下它反而会关闭系统缩放（125% 机器上 dpr 掉回 1.0），
+       与目标相反。
+    2. Qt 属性 + 取整策略，逐项 getattr 探测，任何一个不存在都跳过（兼容旧版）：
+       AA_EnableHighDpiScaling / AA_UseHighDpiPixmaps（Qt ≥ 5.6）；
+       HighDpiScaleFactorRoundingPolicy.PassThrough（Qt ≥ 5.14）——否则
+       125%/150%/175% 会被取整成 100%/200%，窗口与字号全部错位。
+    异常全部吞掉：宁可退回系统位图拉伸，也绝不因缩放设置挡启动。
+    """
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    try:
+        from PyQt5.QtCore import Qt, QCoreApplication
+    except Exception:
+        return
+    for name in ("AA_EnableHighDpiScaling", "AA_UseHighDpiPixmaps"):
+        try:
+            attr = getattr(Qt, name, None)
+            if attr is not None:
+                QCoreApplication.setAttribute(attr, True)
+        except Exception:
+            pass
+    try:
+        from PyQt5.QtGui import QGuiApplication
+        policy = getattr(Qt, "HighDpiScaleFactorRoundingPolicy", None)
+        setter = getattr(QGuiApplication, "setHighDpiScaleFactorRoundingPolicy", None)
+        if policy is not None and setter is not None:
+            setter(policy.PassThrough)
+    except Exception:
+        pass
+
+
 def main():
     if sys.platform != "win32":
         print("此程序仅支持 Windows")
         return 1
+
+    # HiDPI 属性/策略必须最先设置：QApplication 构造时读取一次，之后设置无效。
+    # （_ensure_qt_platform_plugins 的兜底分支可能构造 QCoreApplication，
+    # 所以本调用必须排在它前面。）
+    _setup_high_dpi()
 
     # Qt 平台插件路径必须在任何 PyQt5 导入（含 password_book/main_window
     # 等 UI 模块）之前注入，否则 venv 下窗口直接闪退。
@@ -147,6 +190,12 @@ def main():
         db.init_db()
         if db.migrate_legacy(cfg, db.LEGACY_DICT_FILE):
             save_config(cfg)
+    except Exception:
+        pass
+
+    # 任务历史按配置收敛（只删终态、保留最新 N 条；失败绝不影响启动）
+    try:
+        db.prune_tasks(int(cfg.get("task_history_limit", 500) or 500))
     except Exception:
         pass
 

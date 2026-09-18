@@ -1050,6 +1050,18 @@ def is_zip_open_error(error):
     return any(m in err for m in ZIP_OPEN_ERROR_MARKERS)
 
 
+def is_archive_open_error(error):
+    """错误是否属于「归档打不开/被截断」——分卷链不完整的典型签名。
+
+    与 is_split_gap_error 的区别：不要求报错归档的文件名是分卷名。分卷首卷
+    拼出的载荷文件名通常不带编号（如 xxx.7z），7-Zip 对它报 Cannot open /
+    Unexpected end 即说明拼出来的不是完整归档（缺兄弟分卷）。"""
+    err = str(error or "")
+    return (is_zip_open_error(err)
+            or "Unexpected end of archive" in err
+            or "Missing volume" in err)
+
+
 def strip_embedded_zip(path, dest_dir):
     """把多段伪装文件内嵌的 ZIP 部分剥离成独立 zip 文件（7-Zip 对超大/越界偏移的
     内嵌 ZIP64 打不开，剥离后可正常处理，含 AES 加密）。失败返回 None。"""
@@ -1087,7 +1099,8 @@ def strip_embedded_zip(path, dest_dir):
                 out.write(chunk)
                 remaining -= len(chunk)
         if remaining > 0:
-            dest.unlink(missing_ok=True)
+            # 重新组装中断的临时 zip 是失败中间产物：移入回收站，绝不永久删除
+            _recycle_paths([dest], permanent_fallback=False)
             return None
         return dest
     except Exception:
@@ -1179,7 +1192,8 @@ def _stage_rar_volumes(source):
             raise OSError("staging master missing")
         return master, stage
     except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
+        # staging 构造失败：半成品临时目录移入回收站（绝不永久删除）
+        _recycle_paths([stage], permanent_fallback=False)
         return None
 
 
@@ -1210,7 +1224,8 @@ def _stage_fake_volume(source, fmt):
             raise OSError("staging fake volume missing")
         return dest, stage
     except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
+        # staging 构造失败：半成品临时目录移入回收站（绝不永久删除）
+        _recycle_paths([stage], permanent_fallback=False)
         return None
 
 
@@ -1222,6 +1237,9 @@ class ExtractService:
         self.layer_records = []
         self.temp_dirs = set()
         self.temp_root = Path(tempfile.gettempdir())
+        # 失败路径标记：置位后 _cleanup 把中间目录移入回收站（绝不永久删除）；
+        # 成功路径保持原有 rmtree 行为不变。
+        self.recycle_cleanup = False
 
     def emit(self, msg):
         self.logs.append(msg)
@@ -1237,11 +1255,19 @@ class ExtractService:
 
     def _cleanup(self):
         for p in self.temp_dirs:
-            shutil.rmtree(p, ignore_errors=True)
+            self._release_temp(p)
         self.temp_dirs.clear()
         for p in getattr(self, "stage_dirs", []):
-            shutil.rmtree(p, ignore_errors=True)
+            self._release_temp(p)
         self.stage_dirs.clear()
+
+    def _release_temp(self, path):
+        """清掉一个中间目录：成功路径维持 rmtree；失败路径移入回收站
+        （用户规则：解压失败的中间文件必须可恢复，绝不永久删除）。"""
+        if self.recycle_cleanup:
+            _recycle_paths([path], permanent_fallback=False)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
 
     @staticmethod
     def _retry_unlink(path, max_attempts=5):
@@ -1261,8 +1287,17 @@ class ExtractService:
     def extract(self, task):
         self.temp_root = self._temp_root_for(task.get("output_dir"))
         self.stage_dirs = []
+        self.recycle_cleanup = False
         try:
-            return self._extract_inner(task)
+            result = self._extract_inner(task)
+        except BaseException:
+            # 异常中断同样按失败处理：中间目录走回收站
+            self.recycle_cleanup = True
+            raise
+        else:
+            if not is_clean_success(result):
+                self.recycle_cleanup = True
+            return result
         finally:
             self._cleanup()
 
@@ -1285,6 +1320,13 @@ class ExtractService:
         user_passwords = task.get("passwords", [])
         original_size = Path(task["source_path"]).stat().st_size
         max_depth = self.options["max_depth"]
+
+        source_name = Path(task["source_path"]).name
+        # 分卷首卷（.001/.part1/.z01…）：首卷拼出的载荷打不开 ⇒ 缺兄弟分卷
+        root_is_first_volume = (is_volume_name(source_name)
+                                and is_first_volume(source_name))
+        failed_layers = []        # 任何失败层都让整体结果不再是成功
+        split_incomplete = False  # 分卷链不完整（缺兄弟分卷）
 
         queue = deque([{"archive": Path(task["source_path"]),
                         "depth": 1}])
@@ -1354,11 +1396,18 @@ class ExtractService:
                         self.emit(f"[第{depth}层] 7-Zip 打不开多段伪装 ZIP（可能是 ZIP64/大文件偏移），剥离伪装头后重试")
                         retry_task = dict(layer_task)
                         retry_task["source_path"] = stripped
-                        fallback_attempts.append(SevenZipEngine(self.engine.path).extract(retry_task, self.options, depth))
-                        try:
-                            stripped.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        retry_out = SevenZipEngine(self.engine.path).extract(
+                            retry_task, self.options, depth)
+                        fallback_attempts.append(retry_out)
+                        # 剥离出的临时 zip 是中间产物：重试成功维持原样删除，
+                        # 失败移入回收站（绝不永久删除）
+                        if retry_out.get("success"):
+                            try:
+                                stripped.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        else:
+                            _recycle_paths([stripped], permanent_fallback=False)
                 if any(a["success"] for a in fallback_attempts):
                     result = next(a for a in fallback_attempts if a["success"])
                 elif self._all_entries_extracted(extract_dir, item["archive"]):
@@ -1390,15 +1439,42 @@ class ExtractService:
             if not result["success"]:
                 if depth == 1:
                     self.emit(f"[第{depth}层] 解压失败: {result['error']}")
+                    # 首卷打不开/被截断 ⇒ 分卷链不完整（缺兄弟分卷），不是终态失败
+                    split_incomplete = (root_is_first_volume
+                                        and is_archive_open_error(result["error"]))
+                    if split_incomplete:
+                        self.emit(f"[第{depth}层] 分卷链不完整（缺少兄弟分卷，"
+                                  f"首卷拼出的载荷不是有效归档），保留源文件等待到齐")
+                    # 第 1 层失败同样入 layer_records（失败层必须留痕，供审计）
+                    failed_record = {
+                        "layer": depth,
+                        "archive_name": item["archive"].name,
+                        "used_password": None,
+                        "success": False,
+                        "error": result["error"],
+                    }
+                    self.layer_records.append(failed_record)
+                    failed_layers.append(failed_record)
+                    self.recycle_cleanup = True   # 失败：中间文件走回收站
                     self._cleanup()
-                    return {
+                    err_text = result["error"]
+                    if split_incomplete:
+                        err_text = f"分卷链不完整（缺少兄弟分卷），{err_text}"
+                    failure = {
                         "task_id": task_id, "success": False,
+                        "incomplete": True,
+                        "failed_layers": failed_layers,
                         "depth_reached": len(self.layer_records),
                         "extracted_files": [], "used_password": None,
                         "layer_records": self.layer_records,
-                        "logs": self.logs, "error": result["error"],
+                        "logs": self.logs, "error": err_text,
                     }
-                # 嵌套层失败：不整体失败，保留失败文件，前面已解出的内容继续有效
+                    if split_incomplete:
+                        failure["split_incomplete"] = True
+                    return failure
+                # 嵌套层失败：失败文件先保留（移到输出目录），但任何失败层都会
+                # 让整体判失败（见循环末尾 failed_layers 汇总）——不提升、不删源、
+                # 不报「完成」；前面层已解出的内容由失败回退统一移入回收站。
                 # 例外：嵌套层是分卷且报缺卷/打不开（Unexpected end / Missing
                 # volume / Cannot open）时，说明分卷未到齐或兄弟卷未归拢，
                 # 不应当作"已完成"吞掉失败——整体标记为失败，让监听层 defer
@@ -1458,13 +1534,22 @@ class ExtractService:
                         self.emit(f"[第{depth}层] 已保留失败文件: {dest.name}")
                 except OSError as e:
                     self.emit(f"[第{depth}层] 保留失败文件出错: {e}")
-                self.layer_records.append({
+                failed_record = {
                     "layer": depth,
                     "archive_name": item["archive"].name,
                     "used_password": None,
                     "success": False,
                     "error": result["error"],
-                })
+                }
+                self.layer_records.append(failed_record)
+                failed_layers.append(failed_record)
+                # 首卷拼出的直接载荷（第 2 层）打不开 ⇒ 分卷链被截断（缺兄弟
+                # 分卷），不能当「嵌套失败可跳过」吞掉：整体判失败等分卷补齐。
+                if (depth == 2 and root_is_first_volume
+                        and is_archive_open_error(result["error"])):
+                    split_incomplete = True
+                    self.emit(f"[第{depth}层] 分卷链不完整（缺少兄弟分卷，"
+                              f"首卷拼出的载荷不是有效归档），整体判失败待重试")
                 continue
 
             used_password = result["used_password"]
@@ -1566,11 +1651,32 @@ class ExtractService:
                     self.move_to_output(extract_dir, output_dir)
                 self.emit(f"[第{depth}层] 完成")
 
+        if failed_layers:
+            self.recycle_cleanup = True   # 失败：中间文件走回收站
         self._cleanup()
         # 正常解压路径也会清理空目录（如内层压缩包所在文件夹在内容被
         # 消费后变空），避免残留空文件夹。
         if output_dir.exists():
             remove_empty_dirs(output_dir)
+        if failed_layers:
+            # 有层失败就绝不是成功：不提升、不回收源文件、不报「完成」。
+            first = failed_layers[0]
+            err = f"第{first['layer']}层解压失败: {first['error']}"
+            if len(failed_layers) > 1:
+                err += f"；共 {len(failed_layers)} 层未解出"
+            if split_incomplete:
+                err = f"分卷链不完整（缺少兄弟分卷），{err}"
+            self.emit(f"[结果] 解压未完成（{err}），已保留源文件")
+            return {
+                "task_id": task_id, "success": False,
+                "incomplete": True,
+                "failed_layers": failed_layers,
+                "split_incomplete": bool(split_incomplete),
+                "depth_reached": len(self.layer_records),
+                "extracted_files": [], "used_password": None,
+                "layer_records": self.layer_records,
+                "logs": self.logs, "error": err,
+            }
         final_files = [p for p in output_dir.rglob("*") if p.is_file()] if output_dir.exists() else []
         return {
             "task_id": task_id, "success": True,
@@ -1648,6 +1754,18 @@ def parse_passwords(items):
     return result
 
 
+def is_clean_success(result):
+    """结果是否为「干净的整体成功」：success 且无失败层/不完整/分卷缺卷标记。
+
+    后处理（提升内容、删除源文件）与「完成」报告的唯一闸门：任何一层失败
+    （引擎失败、打不开、错误跳过、CRC/大小不符）或分卷未到齐都不算成功。"""
+    if not result or not result.get("success"):
+        return False
+    return not (result.get("incomplete")
+                or result.get("failed_layers")
+                or result.get("split_incomplete"))
+
+
 def build_post_actions(args):
     actions = []
     if args.move_to:
@@ -1657,6 +1775,7 @@ def build_post_actions(args):
         actions.append({"action_type": "promote_content",
                         "promote_to": promote_to,
                         "merge": bool(getattr(args, "promote_merge", False)),
+                        "delete_source": bool(getattr(args, "delete_source", False)),
                         "delete_hook": getattr(args, "delete_hook", None)})
     elif args.delete_source:
         actions.append({"action_type": "delete_source",
@@ -1669,7 +1788,7 @@ def build_post_actions(args):
 
 
 def apply_post_actions(result, source, output_dir, actions):
-    if not result["success"]:
+    if not is_clean_success(result):
         return
     for action in actions:
         try:
@@ -1682,7 +1801,8 @@ def apply_post_actions(result, source, output_dir, actions):
             elif action["action_type"] == "promote_content":
                 res = promote_extracted_content(
                     output_dir, action["promote_to"], source,
-                    action.get("delete_hook"), merge=action.get("merge", False))
+                    action.get("delete_hook"), merge=action.get("merge", False),
+                    delete_src=action.get("delete_source", False))
                 result["logs"].append(f"[后处理] {res['note']}")
                 if res["promoted"]:
                     result["promoted_dir"] = res["promoted"]
@@ -1721,6 +1841,131 @@ def remove_empty_dirs(directory):
         directory.rmdir()
     except OSError:
         pass
+
+
+def _set_created_time(path, ts):
+    """把 Windows「创建时间」设为 ts；非 Windows 无此概念，直接视为成功。
+
+    优先 pywin32（项目热键/托盘层已依赖，打包内已带）；不可用时退回 ctypes。
+    打开目录句柄必须带 FILE_FLAG_BACKUP_SEMANTICS，否则 CreateFile 对目录失败。"""
+    if os.name != "nt":
+        return True
+    ft = int((ts + 11644473600) * 10000000)   # 1601-01-01 起的 100ns 计数
+    try:
+        import pywintypes
+        import win32con
+        import win32file
+    except ImportError:
+        pywintypes = None
+    if pywintypes is not None:
+        handle = win32file.CreateFileW(
+            str(path), win32con.GENERIC_WRITE,
+            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE
+            | win32con.FILE_SHARE_DELETE,
+            None, win32con.OPEN_EXISTING, win32con.FILE_FLAG_BACKUP_SEMANTICS, None)
+        try:
+            win32file.SetFileTime(handle, pywintypes.Time(ts), None, None)
+        finally:
+            win32file.CloseHandle(handle)
+        return True
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD,
+                                     ctypes.c_void_p]
+    kernel32.SetFileTime.argtypes = [ctypes.c_void_p,
+                                     ctypes.POINTER(wintypes.FILETIME),
+                                     ctypes.POINTER(wintypes.FILETIME),
+                                     ctypes.POINTER(wintypes.FILETIME)]
+    handle = kernel32.CreateFileW(str(path), 0x40000000, 0x1 | 0x2 | 0x4,
+                                  None, 3, 0x02000000, None)
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        return False
+    try:
+        created = wintypes.FILETIME(ft & 0xFFFFFFFF, (ft >> 32) & 0xFFFFFFFF)
+        return bool(kernel32.SetFileTime(handle, ctypes.byref(created), None, None))
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def stamp_output_now(paths):
+    """把产物顶层条目的 修改/访问/创建时间 校准为现在。
+
+    7-Zip 解压目录时会还原归档里保存的目录时间戳（含创建时间），穿透/提升后的
+    成品文件夹会带着压缩包里的旧日期，在大目录里按日期排序就沉到底部找不到。
+    这里只校准传入的条目本身，不递归子文件；单个条目失败只记录问题、绝不抛出，
+    不影响解压结果。返回 (已校准的路径列表, 失败描述列表)。"""
+    now = time.time()
+    stamped, problems = [], []
+    for p in paths:
+        p = Path(p)
+        try:
+            os.utime(p, (now, now))
+        except OSError as e:
+            problems.append(f"{p.name}: {e}")
+            continue
+        try:
+            if not _set_created_time(p, now):
+                problems.append(f"{p.name}: 创建时间未设置")
+        except Exception as e:
+            problems.append(f"{p.name}: {e}")
+        stamped.append(p)
+    return stamped, problems
+
+
+def _final_output_targets(result, out_dir, pre_entries, args):
+    """本次解压最终产物的顶层条目：提升成功=提升出的文件夹；--move-to 搬走内容时
+    =目标目录里本次搬出的顶层条目；否则=输出目录里本次新建的顶层条目（用户
+    预先放进输出目录的内容不动）。"""
+    promoted = result.get("promoted_dir")
+    if promoted:
+        p = Path(promoted)
+        return [p] if p.exists() else []
+    moved_to = getattr(args, "move_to", None)
+    if moved_to:
+        target = Path(moved_to)
+        seen, tops = set(), []
+        for f in result.get("extracted_files") or []:
+            try:
+                rel = Path(f).relative_to(target)
+            except (OSError, ValueError):
+                continue
+            if rel.parts and rel.parts[0] not in seen:
+                seen.add(rel.parts[0])
+                p = target / rel.parts[0]
+                if p.exists():
+                    tops.append(p)
+        return tops
+    try:
+        return [p for p in Path(out_dir).iterdir() if p not in pre_entries]
+    except OSError:
+        return []
+
+
+def _stamp_output_times(result, out_dir, pre_entries, args):
+    """干净成功后按 output_time_now 开关校准最终产物顶层时间（失败只提示不抛错）。"""
+    try:
+        from . import config as app_config
+        if not bool(app_config.load_config().get("output_time_now", True)):
+            return
+    except Exception:
+        pass
+    targets = _final_output_targets(result, out_dir, pre_entries, args)
+    if not targets:
+        return
+    stamped, problems = stamp_output_now(targets)
+    if stamped:
+        names = [p.name for p in stamped]
+        shown = "、".join(names[:3]) + (f" 等 {len(names)} 项" if len(names) > 3 else "")
+        msg = f"已将输出时间戳校准到现在（避免在大目录里被旧日期淹没）: {shown}"
+        print(msg)
+        result["logs"].append(msg)
+    if problems:
+        warn = f"输出时间戳部分校准失败（不影响解压）: {'; '.join(problems[:2])}"
+        print(warn)
+        result["logs"].append(warn)
 
 
 PART_RE = re.compile(r"^(?P<name>.+)\.part\d+\.rar$")
@@ -1925,11 +2170,15 @@ def is_volume_file(source_name, candidate, stem):
     return False
 
 
-def _recycle_paths(paths):
-    """把存在的路径移入回收站（不可用时回退永久删除）。
+def _recycle_paths(paths, permanent_fallback=True):
+    """把存在的路径移入回收站。
 
-    返回 (recycled, failed)：recycled=已移入回收站的路径，failed=回收站不可用后
-    已永久删除的路径（与 delete_source / delete_hook 的语义一致）。不存在的忽略。"""
+    permanent_fallback=True（默认，成功路径沿用）：回收站不可用时回退永久删除。
+    permanent_fallback=False（解压失败路径专用）：回收站不可用时**保留原样**，
+    绝不永久删除——满足「涉及解压失败的都不能走永久删除」。
+
+    返回 (recycled, failed)：recycled=已移入回收站的路径；failed=回收站不可用时
+    已永久删除的路径（True）或未能回收、保留在原地的路径（False）。不存在的忽略。"""
     targets = [str(p) for p in paths if Path(p).exists()]
     if not targets:
         return [], []
@@ -1942,11 +2191,12 @@ def _recycle_paths(paths):
             failed = [t for t in targets if t not in recycled]
     except Exception:
         recycled, failed = [], list(targets)
-    for p in failed:
-        try:
-            Path(p).unlink(missing_ok=True)
-        except OSError:
-            pass
+    if permanent_fallback:
+        for p in failed:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
     return recycled, failed
 
 
@@ -2005,11 +2255,15 @@ def _merge_dir(src, dst):
             shutil.move(str(entry), str(target))
 
 
-def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=False):
+def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=False,
+                              delete_src=False):
     """解压后处理：输出目录顶层只有 1 个文件夹时，把该文件夹提升到指定地区。
 
-    然后源文件 + 输出目录（含中间文件）移入回收站，并回调 hook
-    标记删除回溯。条件不满足（0 个或多于 1 个顶层文件夹）时退化为仅删除源文件。
+    delete_src=True 时，随后把源文件（含分卷）与输出目录移入回收站并回调 hook 标记
+    删除回溯；delete_src=False（默认，数据安全优先）时只做提升，绝不回收源文件/分卷，
+    仅原地清理提升后空掉的输出目录。
+    条件不满足（0 个或多于 1 个顶层文件夹）时：delete_src=True 退化为仅删除源文件，
+    delete_src=False 则原样保留源文件。
     merge=True 且目标同名文件夹无文件冲突时，直接并入（不建 (N) 文件夹）；
     有同名文件冲突时仍按原逻辑重命名为 name(N)。
     """
@@ -2027,6 +2281,9 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     # 否则（顶层文件 + 空文件夹并存，如压缩包里有个空目录）提升会搬错内容，
     # 把真实文件随输出目录一起回收。
     if len(top_dirs) != 1 or top_files:
+        if not delete_src:
+            return {"promoted": None, "recycled": [], "hook_called": False,
+                    "note": "顶层文件夹数≠1 或存在顶层文件，未提升，保留源文件"}
         delete_source(source, hook)
         return {"promoted": None, "recycled": [], "hook_called": True,
                 "note": "顶层文件夹数≠1 或存在顶层文件，未提升，仅删除源文件"}
@@ -2058,7 +2315,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
                 occupies_source = False
             if not occupies_source and is_volume_name(source.name):
                 occupies_source = is_volume_file(source.name, dest.name, source.stem)
-        if occupies_source:
+        if occupies_source and delete_src:
             pre_recycled, pre_failed = _recycle_paths([dest])
 
         if dest.is_dir() and merge and not _dirs_conflict(src_dir, dest):
@@ -2087,6 +2344,15 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
                         "note": f"提升失败: {e}"}
     else:
         promoted = str(src_dir)
+
+    # delete_source=False：只完成内容提升，绝不回收源文件与分卷；提升后已空掉的
+    # 输出目录用原地清理（空目录）而非回收，确保源数据一定留在原位。
+    if not delete_src:
+        if not same_place:
+            remove_empty_dirs(output_dir)
+        return {"promoted": promoted, "recycled": list(pre_recycled),
+                "hook_called": False,
+                "note": f"已提升 {Path(promoted).name}，保留源文件与分卷"}
 
     # 源文件路径已被提升后的文件夹复用（occupies_source）时，该路径此刻是成品
     # 目录，不能再当源文件回收（否则会把刚提升出来的内容一起删掉）。
@@ -2194,12 +2460,14 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
     # 记录解压前输出目录是否为空：失败回退时只清理"本次产生"的半成品，
     # 不误删用户预先放进自定义输出目录的内容
     try:
-        was_empty = not any(out_dir.iterdir())
+        pre_entries = set(out_dir.iterdir())
     except OSError:
-        was_empty = True
+        pre_entries = set()
+    was_empty = not pre_entries
     print(f"输出目录: {out_dir}")
 
     svc = ExtractService(engine, options)
+    result = None
     try:
         result = svc.extract({
             "id": task_id,
@@ -2211,24 +2479,36 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
         })
     finally:
         if staged:
-            shutil.rmtree(staged, ignore_errors=True)
+            # 规范化命名的临时 staging 目录也是中间产物：成功维持原样删除，
+            # 失败移入回收站（里面只是源文件的硬链接/副本，源文件不受影响）。
+            if result is not None and not is_clean_success(result):
+                _recycle_paths([staged], permanent_fallback=False)
+            else:
+                shutil.rmtree(staged, ignore_errors=True)
 
     if result["success"] and result["used_password"] and options["use_dict"]:
         add_dict_password(result["used_password"])
 
-    apply_post_actions(result, source, out_dir, build_post_actions(args))
+    # 只有「干净的整体成功」才允许后处理（提升内容 / 删除源文件）。
+    # 任何层失败都不是成功：源文件与分卷原样保留。
+    if is_clean_success(result):
+        apply_post_actions(result, source, out_dir, build_post_actions(args))
 
-    if result["success"]:
+    if is_clean_success(result):
         print(f"=== 完成，穿透 {result['depth_reached']} 层，共 {len(result['extracted_files'])} 个文件 ===")
+        _stamp_output_times(result, out_dir, pre_entries, args)
     else:
-        print(f"=== 失败: {result['error']} ===")
-        # 回退：解压失败时不残留半成品/空输出目录。源文件(含分卷)未删除，
-        # 之后可重试。仅当输出目录"解压前为空"(即本次新建)才整体清理，
-        # 避免误删用户预先放入自定义输出目录的内容。
+        print(f"=== 解压未完成（已保留源文件）: {result['error']} ===")
+        # 回退：解压失败时中间文件移入回收站（可恢复），绝不永久删除。
+        # 源文件(含分卷)未删除，之后可重试。仅当输出目录"解压前为空"
+        # (即本次新建)才整体回收，避免误删用户预先放入自定义输出目录的内容。
         try:
             if out_dir.exists() and was_empty and not result.get("keep_output_dir"):
-                shutil.rmtree(out_dir, ignore_errors=True)
-                print(f"已回退并清理输出目录: {out_dir}")
+                recycled, _failed = _recycle_paths([out_dir], permanent_fallback=False)
+                if recycled:
+                    print(f"已回退，中间文件已移入回收站: {out_dir}")
+                else:
+                    print(f"已回退（中间文件移入回收站失败，保留原样）: {out_dir}")
         except Exception:
             pass
     return result

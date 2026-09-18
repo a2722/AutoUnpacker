@@ -6,7 +6,7 @@
 - QRMonitor：剪贴板二维码识别 + 短文本临时密码捕获 + 网址信任门卫（黑白名单判定）；
   轮询线程只负责「检测 + 入队」，单独的守护工作线程串行执行网络/子进程/浏览器等阻塞 I/O
 关键入口：FolderWatcher / QRMonitor
-依赖：extract、trail、db、trust、baidu_task（实验性，惰性导入）
+依赖：extract、trail、db、trust、volume_pair、baidu_task（实验性，惰性导入）
 注意：剪贴板/二维码依赖（win32clipboard/PIL）为惰性探测，缺失时自动禁用相关功能
 """
 import os
@@ -25,8 +25,12 @@ from . import paths
 from . import extract as smart_extract   # noqa: F401  保留原名引用
 from . import trail as deletion_trail     # noqa: F401
 from . import db                          # noqa: F401
+from . import volume_pair
 from .trust import (_host_of, decide_host, remember_auto_domain)
-from .utils import _can_open_append
+# 网址边界识别统一走 utils（正向字符集 + 尾部标点规则只有一份）：剪贴板文本
+# 「网址 + 中文说明/提取码」的截断见 utils.split_urls 的文档。
+from .utils import (_can_open_append, split_urls, is_url_like,
+                    is_baidu_pan_url)
 
 # 剪贴板/二维码可用性：改为惰性探测（首次用到时才 import 并缓存结果）。
 # 目的：win32clipboard/PIL 在启动路径上不再加载，缩短冷启动时间；
@@ -37,14 +41,6 @@ _QR_PROBED = False
 _CLIP_PROBED = False
 _clipboard_mod = None   # 探测成功后缓存的 win32clipboard 模块
 _imagegrab_mod = None   # 探测成功后缓存的 PIL.ImageGrab 模块
-
-# URL 允许的 ASCII 字符集（RFC 3986 组成字符），用于把「网址 + 中文说明/提取码」
-# 这类剪贴板文本截断成真正的网址。若把空格/中文一并交给 urllib，会抛
-# "URL can't contain control characters"（用户反馈的 drive.uc.cn 提取码场景）。
-_URL_CHARS = r"A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%"
-_URL_RE = re.compile(r"https?://[" + _URL_CHARS + r"]+", re.I)
-_WWW_URL_RE = re.compile(r"www\.[" + _URL_CHARS + r"]+", re.I)
-_URL_TRAILING_JUNK = ".,;:!?、。，；：！？）】》」"
 
 
 def _ensure_clipboard():
@@ -95,6 +91,7 @@ class FolderWatcher(threading.Thread):
     TRANSLATION_MAX_SIZE = 10 * 1024 * 1024  # 翻译 json 最大 10MB
     TRANSLATION_WINDOW = 5 * 60              # 小文件夹先出现时的监控窗口（秒）
     VOL_MAX_WAIT = 300   # 首卷分卷"只有满卷"时最长等待(秒)：之后兜底按现状尝试解压
+    PAIR_WAIT_EXTEND_SEC = 600  # 已检测到改名链但未通过验证时的有界延长等待(秒)：绝不强解截断链
     SPLIT_MAX_WAIT = 1800        # 跨目录分卷等待兄弟卷的最长时间(秒)：超时放弃（仅保留不删）
     SPLIT_RECHECK_INTERVAL = 10  # 跨目录分卷复查间隔(秒)：节流「全监听根 rglob」
     BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
@@ -142,6 +139,9 @@ class FolderWatcher(threading.Thread):
         self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
         # 跨目录分卷等待期 {norm_source_path: {anchor, ident, since, last_check, last_sig}}
         self._split_pending = {}
+        # 每目录最近一次发布的 (state, progress, name)：新版 GUI 胶囊 / 状态灯用；
+        # 只在值变化时投递，避免 2s 轮询把队列刷爆（见 _set_dir_state）。
+        self._dir_state = {}
 
     @staticmethod
     def _file_identity(path):
@@ -200,6 +200,24 @@ class FolderWatcher(threading.Thread):
         except Exception:
             return str(path)
 
+    def _set_dir_state(self, path, state, progress=None, name=None):
+        """发布一条目录状态消息（dir_state，供新版 GUI 胶囊 / 状态灯消费）。
+
+        - path 统一规范化为键，消息里的 dir 也用规范化路径；
+        - 同一目录 (state, progress, name) 未变化则不重复发布（防 2s 轮询刷屏）；
+        - 纯队列 put，绝不新增线程、绝不阻塞 GUI。
+        """
+        try:
+            key = self._norm_path(path)
+            sig = (state, progress, name)
+            if self._dir_state.get(key) == sig:
+                return
+            self._dir_state[key] = sig
+            self.hub.q.put({"type": "dir_state", "dir": key, "state": state,
+                            "progress": progress, "name": name})
+        except Exception:
+            pass
+
     def run(self):
         # stdout 捕获由进程入口（app.main）统一幂等安装，这里不再改进程级全局。
         while True:
@@ -208,6 +226,11 @@ class FolderWatcher(threading.Thread):
             # 暂停 = 原「停止监听」：不再轮询、不再检测新文件，恢复后重新扫描
             if not self.state.running or (self.pauser is not None
                                           and self.pauser.is_paused()):
+                # 暂停期间所有（启用的）监听路径上报 paused；_set_dir_state 自带
+                # 「值不变不重复发」，所以每 2s 空转也不会刷屏。
+                for wc in cfg.get("watch_paths", []):
+                    if wc.get("enabled") and wc.get("path"):
+                        self._set_dir_state(wc["path"], "paused")
                 time.sleep(interval)
                 continue
             enabled = {}
@@ -221,6 +244,11 @@ class FolderWatcher(threading.Thread):
                     for rk in [k for k in self._rewalk if k[0] == key]:
                         self._rewalk.pop(rk, None)   # churn 计数随监听路径移除清理
             for path, wc in enabled.items():
+                # 空闲目录回到 listening（extracting/waiting 视为忙碌，交给 _handle
+                # 自己收敛；error 会在本轮或下一轮被这里复位为 listening）。
+                cur = self._dir_state.get(self._norm_path(path), (None, None, None))[0]
+                if cur not in ("extracting", "waiting"):
+                    self._set_dir_state(path, "listening")
                 try:
                     self._poll(Path(path), wc)
                 except Exception as e:
@@ -776,7 +804,10 @@ class FolderWatcher(threading.Thread):
         日志节流：等待状态下每次轮询都会调用本函数，只在「等待原因/分卷
         集合」发生变化时打一条日志，避免每 2 秒刷屏。
         返回 True=可解压，False=继续等待（由 _handle 返回 defer）。"""
-        abs_fp = str(fp)
+        # 同一文件可能以两种拼写到达：_baidu_poll 用清单里的原始大小写路径，
+        # _poll 用监听根的 normcase 路径。统一用 _norm_path 归一键，两条调用
+        # 路径共享同一份等待状态（否则同一等待原因会被打两遍日志）。
+        abs_fp = self._norm_path(fp)
         state = self._vol_wait.setdefault(
             abs_fp, {"last_sig": None, "last_change": time.time(), "last_log": None})
         now = time.time()
@@ -898,6 +929,18 @@ class FolderWatcher(threading.Thread):
             _wlog(("all-full", name, sig),
                   f"首卷已出现，分卷未到齐（等待更小的尾卷）: {name}"
                   f"（已到 {len(vols)} 个满卷）")
+        # 跨名分卷链配对：同目录里可能有被改名上传的兄弟分卷（可能不止一卷），
+        # 属于基础解压逻辑的一部分、强制开启。唯一链 + 7z 验证通过即改名配对；
+        # 失败/模糊一律只提示不动手，绝不改变既有等待语义。
+        if self._pair_split_check(fp, state):
+            return False
+        # 已检测到改名链但验证未通过：300s 不能强解截断链，改为有界延长到
+        # PAIR_WAIT_EXTEND_SEC，到点再按现有分卷尝试（只提示，绝不删除源文件）。
+        if state.get("pair_chain_pending"):
+            if now - state["last_change"] >= self.PAIR_WAIT_EXTEND_SEC:
+                self._vol_wait.pop(abs_fp, None)
+                self.hub.log(f"仍有缺失分卷，按现有分卷尝试（不会删除源文件）: {name}")
+                return True
             return False
         if now - state["last_change"] >= self.VOL_MAX_WAIT:
             # 长时间无变化 → 兜底强制放行（覆盖恰好整倍数/下载中断的罕见情况）
@@ -905,6 +948,223 @@ class FolderWatcher(threading.Thread):
             self.hub.log(f"分卷等待超时（{self.VOL_MAX_WAIT}s），按现有分卷尝试解压: {name}")
             return True
         return False
+
+    # ---------- 跨名分卷配对（同目录·疑似改名上传的兄弟尾卷） ----------
+    def _pair_split_check(self, fp, state):
+        """跨名分卷配对检查的对外入口：任何异常都吞成 False，绝不影响等待逻辑。"""
+        try:
+            return self._pair_split_check_impl(fp, state)
+        except Exception:
+            return False
+
+    def _pair_split_check_impl(self, fp, state):
+        """「全满卷等待尾卷」时的跨名分卷链检查（实现）。
+
+        基础解压逻辑的一部分、强制开启：唯一链 + 7z 验证 verified → 立即把整条链
+        改名成首卷系列（无任何 auto 开关参与，只保留 pair_split_enabled 唯一总闸）。
+        断号/模糊/证据不足/未验证一律只提示、零动作；任何异常都吞掉，绝不影响等待逻辑。
+        返回 True = 已改名（调用方本轮 defer：下一轮重扫，现有管线自行接手）。
+        """
+        try:
+            cfg = self.state.snapshot()
+        except Exception:
+            return False
+        if not cfg.get("pair_split_enabled", True):
+            return False
+        try:
+            info, reason = volume_pair.best_chain(fp)
+        except Exception:
+            return False
+        first = Path(fp)
+        if info is None:
+            # 没有可用链：断号/模糊只提示一次；no_candidates 静默（普通等待）
+            state["pair_chain_pending"] = False
+            try:
+                self._pair_split_notice(first, reason, state)
+            except Exception:
+                pass
+            return False
+        vols = info.get("volumes") or []
+        if not vols:
+            return False
+        vol_paths = [Path(v.get("path")) for v in vols]
+        chain_paths = [first] + vol_paths
+        chaintxt = " + ".join(p.name for p in chain_paths)
+        labels = []
+        for key, label in (("number_adjacent", "编号相邻"),
+                           ("first_has_signature", "首卷有包头"),
+                           ("cand_lacks_signature", "续卷无包头"),
+                           ("size_fits_split", "尺寸相符"),
+                           ("same_dir", "同目录")):
+            if any((v.get("evidence") or {}).get(key) for v in vols):
+                labels.append(label)
+        # 验证去重键覆盖整条链：路径 + 尺寸 + mtime + 口令数；只有身份变化才重验证
+        passwords = self._pair_split_passwords()
+        vkey = (tuple((self._norm_path(p), self._file_identity(p))
+                      for p in chain_paths), len(passwords))
+        if state.get("pair_verify_key") == vkey:
+            vstate = state.get("pair_verify_state", "")
+            detail = state.get("pair_verify_detail", "")
+        else:
+            state["pair_verify_key"] = vkey
+            vstate, detail = self._pair_split_verify(first, vol_paths, passwords)
+            state["pair_verify_state"] = vstate
+            state["pair_verify_detail"] = detail
+            self.hub.log(f"跨名分卷配对验证: {chaintxt} → {vstate}（{detail}）")
+        info_txt = f"链已到 {len(vol_paths) + 1} 卷"
+        if info.get("missing"):
+            info_txt += f"，缺第 {info['missing']} 卷"
+        verified_txt = vstate or "未验证"
+        hint = (f"疑似同一压缩包被改名上传（{info_txt}）: {chaintxt}"
+                f"（证据：{'/'.join(labels) if labels else '结构信号'}；"
+                f"已验证={verified_txt}）")
+        hint_key = (tuple(p.name for p in chain_paths), vstate)
+        if state.get("pair_hint_key") != hint_key:
+            state["pair_hint_key"] = hint_key
+            self.hub.log(hint)
+            self.hub.notify("疑似改名分卷", hint)
+        if vstate != volume_pair.STATE_VERIFIED:
+            state["pair_chain_pending"] = True
+            return False
+        # 验证通过 → 强制改名整条链：先查全部目标名，任一已存在则整链零动作
+        targets = []
+        for v, p in zip(vols, vol_paths):
+            tname = volume_pair.sibling_target_name(first, v.get("number"))
+            if not tname:
+                self.hub.log(f"跨名分卷配对已通过验证，但无法确定改名目标名: {p.name}")
+                state["pair_chain_pending"] = False
+                return False
+            targets.append(p.with_name(tname))
+        for dest in targets:
+            if dest.exists():
+                self.hub.log(f"跨名分卷配对整链零动作（目标已存在）: {dest}")
+                state["pair_chain_pending"] = False
+                return False
+        renamed, failed = [], []
+        for p, dest in zip(vol_paths, targets):
+            try:
+                old = Path(p)
+                old.rename(dest)
+                renamed.append((old, dest))
+            except OSError as e:
+                failed.append(p)
+                self.hub.log(f"跨名分卷配对改名失败（继续其余，下一轮可自愈）: "
+                             f"{p.name} → {dest.name}: {e}")
+        for old, dest in renamed:
+            # 改名是唯一被允许的“动作”，且必须可发现/可逆：日志同时给旧、新绝对路径
+            self.hub.log(f"跨名分卷配对已改名（可手动改回）: {old} → {dest}")
+        if not renamed:
+            # 全部失败：保持延长等待，留待下一轮重试（绝不放弃到强解）
+            state["pair_chain_pending"] = True
+            return False
+        state["pair_chain_pending"] = False
+        self._pair_split_forget(first, vol_paths, [d for _old, d in renamed])
+        return True
+
+    def _pair_split_notice(self, first, reason, state):
+        """没有可用链时按原因给一条一次性提示（按原因去重）；no_candidates 静默。
+
+        断号/模糊/证据不足/出错一律零动作，只写日志（绝不 notify、绝不改文件）。"""
+        if not reason or reason == "no_candidates":
+            return
+        if reason.startswith("gap:"):
+            miss = reason.split(":", 1)[1]
+            msg = (f"疑似同一压缩包被改名上传（链已到 1 卷，缺第 {miss} 卷）: "
+                   f"{first.name}（证据：结构信号；已验证=未验证）")
+        elif reason.startswith("ambiguous:"):
+            n = reason.split(":", 1)[1]
+            msg = (f"疑似同一压缩包被改名上传（第 {n} 卷处有多个候选，无法决断）: "
+                   f"{first.name}（原因：ambiguous:{n}）")
+        elif reason == "weak_evidence":
+            msg = (f"疑似同一压缩包被改名上传，但结构证据不足，暂不动作: {first.name}"
+                   f"（原因：weak_evidence）")
+        else:
+            msg = f"跨名分卷链配对未决: {first.name}（原因：{reason}）"
+        key = (first.name, reason)
+        if state.get("pair_notice_key") != key:
+            state["pair_notice_key"] = key
+            self.hub.log(msg)
+
+    @staticmethod
+    def _pair_split_mtime(path):
+        try:
+            return Path(path).stat().st_mtime
+        except OSError:
+            return None
+
+    def _pair_split_passwords(self):
+        """候选口令：密码本 + 本次临时密码 + 字典口令（去重，封顶 64 次尝试）。"""
+        out = []
+        try:
+            for p in self.state.all_passwords() or []:
+                s = str(p)
+                if s and s not in out:
+                    out.append(s)
+        except Exception:
+            pass
+        try:
+            for p in smart_extract.get_dict_passwords() or []:
+                s = str(p)
+                if s and s not in out:
+                    out.append(s)
+        except Exception:
+            pass
+        return out[:volume_pair.MAX_PASSWORD_ATTEMPTS]
+
+    def _pair_split_verify(self, first_fp, volume_paths, passwords):
+        """硬链接装配 + 7z 验证整条链（独立方法，便于测试替换；绝不抛异常）。"""
+        try:
+            return volume_pair.verify(
+                first_fp, list(volume_paths or []), passwords=passwords)
+        except Exception as e:
+            return volume_pair.STATE_INCONCLUSIVE, f"验证出错: {e}"
+
+    @staticmethod
+    def _pair_split_flatten(paths):
+        """把 Path / Path 列表 统一摊平成 [Path...]（None 安全）。"""
+        out = []
+        for p in (paths if isinstance(paths, (list, tuple, set)) else [paths]):
+            try:
+                if p is not None:
+                    out.append(Path(p))
+            except Exception:
+                continue
+        return out
+
+    def _pair_split_forget(self, first_fp, old_paths, new_paths):
+        """改名成功后清掉整条链的监听痕迹：下一轮重扫即重新识别完整分卷组。"""
+        try:
+            paths = self._pair_split_flatten(first_fp)
+            paths += self._pair_split_flatten(old_paths)
+            paths += self._pair_split_flatten(new_paths)
+            for p in paths:
+                self.traced.pop(self._norm_path(p), None)
+                self._vol_wait.pop(self._norm_path(p), None)
+            names = {p.name for p in paths}
+            parent_key = self._norm_path(Path(first_fp).parent)
+            for key in list(self.seen):
+                try:
+                    if not (parent_key == key
+                            or parent_key.startswith(key + os.sep)):
+                        continue   # 只清包含该文件的监听目录，不误伤同名兄弟
+                except Exception:
+                    continue
+                try:
+                    self.seen[key].difference_update(names)
+                except Exception:
+                    pass
+                ident_map = self._seen_ident.get(key)
+                if isinstance(ident_map, dict):
+                    for n in names:
+                        ident_map.pop(n, None)
+                probe = self.probing.get(key)
+                if isinstance(probe, dict):
+                    for n in names:
+                        probe.pop(n, None)
+                for n in names:
+                    self._rewalk.pop((key, n), None)
+        except Exception:
+            pass
 
     def _handle(self, fp, wc, traced=False, initial_scan=False, out=None):
         """返回: "done"=已处理/已定型, "skip"=当前不是压缩包(可复查), "defer"=稍后重试"""
@@ -915,6 +1175,7 @@ class FolderWatcher(threading.Thread):
             return "defer"
         if smart_extract.is_incomplete_download(fp):
             self.hub.log(f"下载未完成，暂不解压（等待后缀消失）: {name}")
+            self._set_dir_state(wc.get("path"), "waiting", name=name)
             return "done"
         if smart_extract.is_do_not_extract(name):
             self.hub.log(f"移动安装包，保持原样不自动解压: {name}")
@@ -931,6 +1192,7 @@ class FolderWatcher(threading.Thread):
         # 视为仍在写入，defer 等下一轮。独立 if 返回，不打断下方 elif 链。
         if not _can_open_append(fp):
             self.hub.log(f"文件仍被占用（可能正在写入/合并碎片），暂不解压: {name}")
+            self._set_dir_state(wc.get("path"), "waiting", name=name)
             return "defer"
         # 非首卷分卷（.part2.rar / .002 / .z02 / .r01 等）不是解压入口，
         # 单独交给 7-Zip 必然失败；等首卷出现时统一处理整个分卷。
@@ -949,9 +1211,11 @@ class FolderWatcher(threading.Thread):
         # 尾卷，就继续等待。
         elif smart_extract.is_volume_name(name) and smart_extract.is_first_volume(name):
             if not self._volume_ready(fp):
+                self._set_dir_state(wc.get("path"), "waiting", name=name)
                 return "defer"
         elif smart_extract.volume_download_pending(fp):
             self.hub.log(f"分卷未到齐（其他分卷仍在下载），暂不解压，等待下载完成: {name}")
+            self._set_dir_state(wc.get("path"), "waiting", name=name)
             return "defer"
         # 相同/嵌套监听路径下，防止同一个压缩包被重复处理；
         # 用「大小+时间」识别身份：同名新文件（内容不同）不会被跳过
@@ -973,6 +1237,8 @@ class FolderWatcher(threading.Thread):
             record = deletion_trail.new_record(fp, wc.get("path"))
             deletion_trail.add_record(record)
         self.hub.notify("发现压缩包", f"{name}\n开始智能解压...")
+        # 提前置 0：建任务行之前若抛异常，终态更新按「无任务」跳过（避免 UnboundLocalError）
+        tid = 0
         try:
             try:
                 engine = smart_extract.create_engine("auto")
@@ -1009,6 +1275,17 @@ class FolderWatcher(threading.Thread):
                     lambda recycled, failed, rid=record["id"]:
                     deletion_trail.mark_deleted(rid, recycled, failed))
             self.hub.q.put({"type": "progress_start"})
+            self._set_dir_state(wc.get("path"), "extracting", 0, name)
+            # 任务行只在「所有 defer 闸门都过、真正要解压」时创建；重试路径先复用同目录
+            # 同名的未完成任务行，避免每次重试都新建行、把队列堆满死行。
+            tid = db.find_open_task(wc.get("path"), name) or db.add_task(
+                file_name=name, file_size=(ident[0] if ident else None),
+                source_dir=wc.get("path"), output_dir=out_dir,
+                mode=str(wc.get("mode") or "surface"), state="queued")
+            db.update_task_state(tid, "extracting", started_at=int(time.time()))
+            # 线程级日志上下文：从解压一直保持到终态处理结束（见外层 finally 清除），
+            # 这样「该任务日志」才包含完成 / 失败 / 差错等收尾行。
+            self.hub.set_log_context(source_dir=wc.get("path"), task_id=tid)
             try:
                 result = smart_extract.extract_one(
                     engine, str(fp), out_dir, passwords, options, args,
@@ -1017,12 +1294,19 @@ class FolderWatcher(threading.Thread):
                 self.hub.q.put({"type": "progress_done"})
             if out is not None:
                 out["result"] = result     # 供 _split_recheck 读锚点重试的结果
-            if result and result["success"]:
+            if (result and result["success"]
+                    and not (result.get("incomplete") or result.get("failed_layers")
+                             or result.get("split_incomplete"))):
                 self._lock_retry.pop(abs_fp, None)
+                db.update_task_state(tid, "done", finished_at=int(time.time()),
+                                     output_dir=(result.get("promoted_dir") or out_dir))
+                self._set_dir_state(wc.get("path"), "listening", name=name)
                 msg = f"{name} 完成，穿透 {result['depth_reached']} 层，共 {len(result['extracted_files'])} 个文件"
                 self.hub.log(msg)
                 self.hub.notify("智能解压完成", msg)
-                if record is not None and not args.delete_source and not promote_to:
+                # 未删除源文件（delete_source=False）时标记 kept：promote 路径下
+                # 只有删除开关为真才回收源码，故此分支现可正常到达。
+                if record is not None and not args.delete_source:
                     deletion_trail.mark_kept(record["id"])
                 # 只追溯本次解压产生的压缩包文件，不监听其他文件
                 trace_targets = ([result["promoted_dir"]] if result.get("promoted_dir")
@@ -1030,6 +1314,22 @@ class FolderWatcher(threading.Thread):
                 self._trace_produced(trace_targets, wc)
             else:
                 err = (result or {}).get("error") or "未知错误"
+                # 分卷未到齐/链不完整（首卷拼出的载荷不是有效归档、缺兄弟分卷）：
+                # 不是终态失败——源文件与分卷原样保留，撤销记录与追踪，任务回
+                # 等待态，等分卷补齐后重试（保持既有 queued 重试语义）。
+                if (result or {}).get("split_incomplete"):
+                    self.hub.log(f"{name} 分卷未到齐（分卷链不完整，缺少兄弟分卷），稍后重试: {err}")
+                    db.update_task_state(tid, "queued", error="分卷未到齐，稍后重试")
+                    self._set_dir_state(wc.get("path"), "waiting", name=name)
+                    self.traced.pop(abs_fp, None)
+                    if record is not None:
+                        try:
+                            deletion_trail.save_records(
+                                [r for r in deletion_trail.load_records()
+                                 if r.get("id") != record["id"]])
+                        except Exception:
+                            pass
+                    return "defer"
                 # 分卷可能仍未到齐（7-Zip 可能报 Missing volume，也可能因
                 # 密码错误/损坏掩盖缺卷）。只要按大小判断尚未到齐，本轮失败
                 # 就不算数：撤销记录与追踪，下轮重新检查，等尾卷到齐后再解压。
@@ -1042,6 +1342,8 @@ class FolderWatcher(threading.Thread):
                              or "Missing volume" in err
                              or not self._volume_ready(fp))):
                     self.hub.log(f"{name} 分卷可能未到齐，稍后重试: {err}")
+                    db.update_task_state(tid, "queued", error="分卷可能未到齐，稍后重试")
+                    self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self.traced.pop(abs_fp, None)
                     if record is not None:
                         try:
@@ -1059,6 +1361,9 @@ class FolderWatcher(threading.Thread):
                     anchor = Path(result["split_gap_archive"])
                     self.hub.log(
                         f"{name} 分卷缺兄弟卷（{err[:80]}），等待跨目录归拢: {anchor.name}")
+                    db.update_task_state(tid, "queued",
+                                         error="分卷缺兄弟卷，等待跨目录归拢")
+                    self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self._split_pending[abs_fp] = {
                         "anchor": str(anchor), "ident": ident,
                         "since": time.time(), "last_check": 0.0,
@@ -1084,6 +1389,8 @@ class FolderWatcher(threading.Thread):
                     if cnt <= 3:
                         self._lock_retry[abs_fp] = cnt
                         self.hub.log(f"{name} 输出文件被占用（{cnt}/3），稍后自动重试: {err[:120]}")
+                        db.update_task_state(tid, "queued", error="输出文件被占用，稍后重试")
+                        self._set_dir_state(wc.get("path"), "waiting", name=name)
                         self.traced.pop(abs_fp, None)
                         if record is not None:
                             try:
@@ -1096,13 +1403,26 @@ class FolderWatcher(threading.Thread):
                     self._lock_retry.pop(abs_fp, None)
                 self.hub.log(f"{name} 解压失败: {err}")
                 self.hub.notify("智能解压失败", f"{name}\n{err}")
+                db.update_task_state(
+                    tid, ("need_password" if "密码" in err else "failed"),
+                    error=err, finished_at=int(time.time()))
+                self._set_dir_state(wc.get("path"), "error", name=name)
                 if record is not None:
                     deletion_trail.mark_failed(record["id"], err)
         except BaseException as e:
             self.hub.log(f"{name} 解压出错: {e}")
             self.hub.notify("智能解压出错", f"{name}\n{e}")
+            if tid:
+                db.update_task_state(
+                    tid, ("need_password" if "密码" in str(e) else "failed"),
+                    error=str(e), finished_at=int(time.time()))
+            self._set_dir_state(wc.get("path"), "error", name=name)
             if record is not None:
                 deletion_trail.mark_failed(record["id"], str(e))
+        finally:
+            # 终态处理完毕才清上下文：成功 / 失败 / 差错 / 各处 defer 的 return 全覆盖，
+            # 绝不让陈旧上下文污染监听线程后续自己的日志行。
+            self.hub.clear_log_context()
         return "done"
 
     def _split_signature(self, anchor):
@@ -1171,6 +1491,7 @@ class FolderWatcher(threading.Thread):
         anchor = Path(st["anchor"])
         if not fp.exists() or not anchor.exists():
             self._split_pending.pop(abs_fp, None)
+            self._set_dir_state(wc.get("path"), "listening")
             return "done"
         moved = self._gather_and_consolidate(anchor, wc)
         sig = self._split_signature(anchor)
@@ -1194,6 +1515,7 @@ class FolderWatcher(threading.Thread):
             self.hub.log(f"跨目录分卷 {self.SPLIT_MAX_WAIT}s 内未到齐，放弃自动归拢"
                          f"（分卷已保留: {anchor}；源文件保留: {fp.name}）")
             self._split_pending.pop(abs_fp, None)
+            self._set_dir_state(wc.get("path"), "error")
             try:
                 rec = deletion_trail.new_record(fp, wc.get("path"))
                 deletion_trail.add_record(rec)
@@ -1215,12 +1537,24 @@ class FolderWatcher(threading.Thread):
             self.hub.log(f"回收源文件出错（保留原文件）: {fp.name}: {e}")
 
     def _progress_cb(self, ratio, layer, name):
-        """解压引擎进度回调 → GUI 队列（_drain 更新进度条）。ratio=None=忙碌。"""
+        """解压引擎进度回调 → GUI 队列（_drain 更新进度条）。ratio=None=忙碌。
+
+        进度消息额外带上当前任务 id（取自线程日志上下文），供新版 GUI 归属进度；
+        同时把所在目录上报为 extracting + 百分比。
+        """
+        try:
+            _sd, tid = self.hub.current_log_context()
+        except Exception:
+            _sd, tid = None, None
         try:
             self.hub.q.put({"type": "progress", "ratio": ratio,
-                            "layer": layer, "name": name})
+                            "layer": layer, "name": name, "task_id": tid})
         except Exception:
             pass
+        if _sd:
+            self._set_dir_state(_sd, "extracting",
+                                int(ratio * 100) if ratio is not None else None,
+                                name)
 
     def _trace_produced(self, extracted_files, wc, depth=0):
         """多层解压后，只专门追溯本次产生的压缩包文件（限制深度防死循环）"""
@@ -1259,34 +1593,75 @@ _FILE_EXT_RE = re.compile(
     r"rar|zip|7z|tar|gz|txt|json|xml|lnk|exe|dll|msi|pdf|db|log|"
     r"vmd|pmx|pmd|fx|fxsub|dds)$", re.I)
 
+# 一眼不是提取码的字符（用 \x22/\x27 写引号，避免转义地狱）：
+# 中英文引号/括号、CJK 标点与全角形式、CJK 表意文字。
+# 用户日志里的误捕串（"[18:56:42]"、引号中文句子）靠这条拦下。
+_NON_PASSWORD_CHARS_RE = re.compile(
+    r"[\x22\x27()\[\]{}<>“”‘’（）【】〔〕《》「」『』]"
+    r"|[\u3000-\u303f\uff00-\uffef]"
+    r"|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+# 域名样文本（可带路径/查询）：pan.baidu / pan.baidu.com/s/1abc
+_DOMAIN_LIKE_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+([/?#].*)?$")
+# 纯时间 / ISO-ish 日期：18:56:42 / 2026-09-18 / 2026/09/18
+_TIME_LIKE_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+_DATE_LIKE_RE = re.compile(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$")
+# 纯字母/下划线（无数字无符号）且 ≥8 位：像标识符/环境变量名（First_Project_）
+_IDENTIFIER_LIKE_RE = re.compile(r"^[A-Za-z_]+$")
+
 
 def _looks_like_non_password(text):
     """严格过滤（对应「智能过滤」子项）：多行/路径/文件名/句子等明显不是提取码。
 
     不含网址判断——网址由更宽松的父项「网址排除」负责。
-    另：含版本号样式 / ≥4 个空白分词 also 视为非密码（标题/版本串）。"""
-    t = text.strip().strip('"').strip("'").strip()
-    if not t:
+    既有规则（空/多行/句读标点/盘符路径/反斜杠/扩展名/版本号/≥4 分词）全部保留；
+    另按用户日志实据新增：
+    - 含 CJK 表意文字、中英文引号/括号、全角标点 → 非密码（引号中文句子）；
+    - 纯时间（18:56:42）/ ISO-ish 日期（2026-09-18、2026/09/18）→ 非密码；
+    - 域名样（pan.baidu、pan.baidu.com/s/1abc，含带路径）→ 非密码；
+    - 纯字母/下划线且 ≥8 位（First_Project_，像标识符）→ 非密码；
+    - 去空白后超过 64 字符 → 非密码。
+
+    本函数绝不抛异常：任何内部错误一律返回 True（保守地按「不是密码」处理，
+    宁可漏记也不把垃圾写进临时密码/密码本）。"""
+    try:
+        t = "" if text is None else str(text)
+        t = t.strip()
+        # 引号/括号/CJK/全角在「去首尾引号」之前判：带引号的整段文本
+        #（如「"自动在浏览器中打开（二维码解出的链接）"」）一律不是密码。
+        if _NON_PASSWORD_CHARS_RE.search(t):
+            return True
+        t = t.strip('"').strip("'").strip()
+        if not t:
+            return True
+        if "\n" in t or "\r" in t:
+            return True                                       # 提取码都是单行
+        if any(c in t for c in "，。！？；：、…"):
+            return True                                       # 含句读标点 → 是句子不是提取码
+        if (re.match(r"^[A-Za-z]:[\\/]", t) or t.startswith("\\\\")
+                or t.startswith("//")):
+            return True                                       # 盘符 / UNC / 网络路径
+        if "\\" in t and re.search(r"[A-Za-z]", t):
+            return True                                       # 含反斜杠的路径样文本
+        if _FILE_EXT_RE.search(t):
+            return True                                       # 带常见扩展名的文件名
+        # 标题/版本样式（如「PIXEL CALL GIRLS -REI- 1.30」）：多词 + 版本号一眼不是提取码。
+        # 只挡这两类窄形态，普通多词口令（「my pass」）与 4 位提取码不受影响；
+        # 用户若真要捕获这类串，可在设置里关掉「智能过滤」子项。
+        if re.search(r"\d+\.\d+", t):
+            return True                                       # 含版本号样式 x.y
+        if len([w for w in re.split(r"\s+", t) if w]) >= 4:
+            return True                                       # 4 个及以上空白分词 → 标题/句子
+        if len(t) > 64:
+            return True                                       # 超长文本不是提取码
+        if _TIME_LIKE_RE.match(t) or _DATE_LIKE_RE.match(t):
+            return True                                       # 纯时间 / ISO 日期
+        if _DOMAIN_LIKE_RE.match(t):
+            return True                                       # 域名样（含带路径的链接文本）
+        if len(t) >= 8 and _IDENTIFIER_LIKE_RE.match(t):
+            return True                                       # 纯字母下划线标识符
+        return False
+    except Exception:
         return True
-    if "\n" in t or "\r" in t:
-        return True                                       # 提取码都是单行
-    if any(c in t for c in "，。！？；：、…"):
-        return True                                       # 含句读标点 → 是句子不是提取码
-    if (re.match(r"^[A-Za-z]:[\\/]", t) or t.startswith("\\\\")
-            or t.startswith("//")):
-        return True                                       # 盘符 / UNC / 网络路径
-    if "\\" in t and re.search(r"[A-Za-z]", t):
-        return True                                       # 含反斜杠的路径样文本
-    if _FILE_EXT_RE.search(t):
-        return True                                       # 带常见扩展名的文件名
-    # 标题/版本样式（如「PIXEL CALL GIRLS -REI- 1.30」）：多词 + 版本号一眼不是提取码。
-    # 只挡这两类窄形态，普通多词口令（「my pass」）与 4 位提取码不受影响；
-    # 用户若真要捕获这类串，可在设置里关掉「智能过滤」子项。
-    if re.search(r"\d+\.\d+", t):
-        return True                                       # 含版本号样式 x.y
-    if len([w for w in re.split(r"\s+", t) if w]) >= 4:
-        return True                                       # 4 个及以上空白分词 → 标题/句子
-    return False
 
 
 def _should_capture_temp_password(text, cfg):
@@ -1294,15 +1669,21 @@ def _should_capture_temp_password(text, cfg):
 
     - 父（宽松）url_exclude_temp_password：带 :// 的网址不记；关闭则照单全收。
     - 子（更严格）temp_password_filter：在父级基础上再排除多行/路径/文件名/
-      句子，且只收 <60 字符；仅在父项开启时才有意义。
+      句子/引号中文/时间日期/域名/标识符等，且只收 <60 字符（旧上限，比
+      「>64 才算长」更严，保留不动）。
+    本函数绝不抛异常：内部错误按「不记」处理（宁可不捕获，也不污染密码本）。
     """
-    if not bool(cfg.get("url_exclude_temp_password", True)):
-        return True                                   # 父关 → 照单全收
-    if "://" in text.strip():
-        return False                                  # 父级：网址不记
-    if bool(cfg.get("temp_password_filter", True)):
-        return len(text) < 60 and not _looks_like_non_password(text)
-    return True
+    try:
+        t = "" if text is None else str(text)
+        if not bool(cfg.get("url_exclude_temp_password", True)):
+            return True                                   # 父关 → 照单全收
+        if "://" in t.strip():
+            return False                                  # 父级：网址不记
+        if bool(cfg.get("temp_password_filter", True)):
+            return len(t) < 60 and not _looks_like_non_password(t)
+        return True
+    except Exception:
+        return False
 
 
 class QRMonitor(threading.Thread):
@@ -1422,6 +1803,10 @@ class QRMonitor(threading.Thread):
             except Exception as e:
                 self.hub.log(f"剪贴板监控出错: {e}")
             finally:
+                # 分享输入在途计数：处理完（含分享记录写入）才归还；clipcopy 等
+                # 不可能产出 share_link 的项不计，见 _share_input_counted。
+                if self._share_input_counted(item):
+                    self._share_input_end()
                 self.task_q.task_done()
 
     def _enqueue(self, item):
@@ -1433,6 +1818,9 @@ class QRMonitor(threading.Thread):
         因此这里淘汰最旧的一项，保证最新的用户操作一定被处理。
 
         满队列日志只在一次「溢出连续段」里记一条，恢复正常入队后复位标志。"""
+        counted = self._share_input_counted(item)
+        if counted:
+            self._share_input_begin()
         try:
             self.task_q.put_nowait(item)
             self._queue_full_logged = False
@@ -1441,16 +1829,51 @@ class QRMonitor(threading.Thread):
             pass
         evicted = False
         try:
-            self.task_q.get_nowait()       # 淘汰最旧的一项
-            self.task_q.task_done()        # 与被淘汰项配平 unfinished_tasks
-            self.task_q.put_nowait(item)   # 单消费者只出不进，此处不会再 Full
+            old = self.task_q.get_nowait()   # 淘汰最旧的一项
+            self.task_q.task_done()          # 与被淘汰项配平 unfinished_tasks
+            if self._share_input_counted(old):
+                self._share_input_end()      # 被淘汰项不会再经 worker → 就地归还计数
+            self.task_q.put_nowait(item)     # 单消费者只出不进，此处不会再 Full
             evicted = True
         except (queue.Empty, queue.Full):
-            pass
+            if counted:
+                self._share_input_end()      # 本项未能入队 → 归还计数（绝不悬空）
         if not self._queue_full_logged:
             self._queue_full_logged = True
             self.hub.log("剪贴板处理队列已满，已淘汰最旧的一项" if evicted
                          else "剪贴板处理队列已满，本次任务已丢弃")
+
+    @staticmethod
+    def _share_input_counted(item):
+        """该工作项是否计入「分享输入在途」：text / image / 信任放行的抓取。
+
+        clipcopy（日志链接静默复制）不可能产出 share_link，刻意不计——否则一次
+        复制就会让手势误以为「有解析在途」而白白等待。绝不抛异常。"""
+        try:
+            kind = item[0]
+            if kind in ("text", "image"):
+                return True
+            return kind == "grant" and len(item) > 2 and item[2] == "fetch"
+        except Exception:
+            return False
+
+    def _share_input_begin(self):
+        """把「分享输入在途」+1（hub 桩没有该能力时静默跳过）。绝不抛异常。"""
+        try:
+            fn = getattr(self.hub, "share_input_begin", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
+    def _share_input_end(self):
+        """把「分享输入在途」-1（hub 桩没有该能力时静默跳过）。绝不抛异常。"""
+        try:
+            fn = getattr(self.hub, "share_input_end", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
 
     def _capture_text_password(self):
         """监控剪贴板文本：短文本(<60)存入临时密码；同时记录最近的非图片内容
@@ -1625,7 +2048,10 @@ class QRMonitor(threading.Thread):
              action=code 且文本内含提取码 → 抬升该提取码；否则写回全部内容
 
         信任判定（decide_host）在重定向之后执行：未信任的域名不自动打开
-        浏览器，投递到主窗口询问；黑名单/内置敏感地址直接静默拒绝。"""
+        浏览器，投递到主窗口询问；黑名单/内置敏感地址直接静默拒绝。
+
+        UX-4（实验性）：开总开关后 pan.baidu（含 yun/eyun 子域）一律静默跳过
+        （不进信任询问、不在浏览器打开），只记一行说明。"""
         try:
             cfg = self.state.snapshot()
             redirect = cfg.get("qr_url_redirect", True)
@@ -1645,8 +2071,14 @@ class QRMonitor(threading.Thread):
                     self.hub.log(f"识别到二维码（非 URL）: {text[:60]}")
                     self._write_qr_result(text, action)
                     continue
-                is_pure_url = (text.strip() == url
-                               or re.match(r"^https?://\S+$", text.strip(), re.I))
+                # UX-4（实验性）：pan.baidu（含 yun/eyun 子域）一律走静默通道
+                # （分享链路 / 客户端）——不进信任询问、不在浏览器打开。
+                # 未开实验性或非百度网址时行为完全不变。
+                if cfg.get("experimental_enabled") and is_baidu_pan_url(url):
+                    self.hub.log(
+                        "已开启实验性：pan.baidu 网址改走静默通道，不在浏览器打开")
+                    continue
+                is_pure_url = is_url_like(text)
                 if redirect:
                     new_url = self._redirect_url(url, rules)
                     if new_url != url:
@@ -1750,9 +2182,29 @@ class QRMonitor(threading.Thread):
         except Exception as e:
             self.hub.log(f"自动信任名单保存失败: {e}")
 
-    def _open_browser(self, url):
-        """在默认浏览器打开网址（供信任放行后执行）。"""
+    def _baidu_open_blocked(self, url):
+        """实验性模式下的「显式打开 pan.baidu」封禁判定（True=已拦截并记一行）。
+
+        这是总开关授予的第二条：静默权限换显式打开封禁。与信任流程无关；
+        配置/状态读不到或异常时一律按「不拦截」处理，绝不打断既有流程。"""
         try:
+            if not is_baidu_pan_url(url):
+                return False
+            if not self.state.snapshot().get("experimental_enabled"):
+                return False
+        except Exception:
+            return False
+        self.hub.log("已开启实验性：pan.baidu 网址改走静默通道，不在浏览器打开")
+        return True
+
+    def _open_browser(self, url):
+        """在默认浏览器打开网址（供信任放行后执行）。
+
+        UX-4：实验性开启时 pan.baidu 显式打开被总开关封禁（静默通道），
+        只记一行说明、绝不调用 webbrowser。"""
+        try:
+            if self._baidu_open_blocked(url):
+                return
             self.hub.log(f"识别到二维码 URL: {url}，正在打开...")
             webbrowser.open(url, new=2, autoraise=True)
         except Exception as e:
@@ -1849,19 +2301,21 @@ class QRMonitor(threading.Thread):
 
     @staticmethod
     def _extract_url(text):
-        """从任意文本里截出第一个真正可用的网址（沿 ASCII URL 字符集切分）。
+        """从任意文本里截出第一个真正可用的网址（统一走 utils.split_urls 边界）。
 
-        关键是**在首个非法字符处截断**：复制「链接 + 空格 + 码：XXXX」时，
-        空格与中文都不属于 URL 字符集，因此不会再把「码：XXXX」吞进网址。
-        只在此返回 None 表示没有网址。"""
+        关键是**在首个非法字符处截断**：复制「链接 + 空格 + 码：XXXX」或
+        「链接（中文说明）」时，空格与中文都不属于 URL 字符集，因此不会把
+        说明文字吞进网址。语义冻结：优先 http(s) 链接；只有 www. 开头时
+        补 "http://" 前缀后返回。只在此返回 None 表示没有网址。"""
         if not text:
             return None
-        m = _URL_RE.search(text)
-        if m:
-            return m.group(0).rstrip(_URL_TRAILING_JUNK)
-        m = _WWW_URL_RE.search(text)
-        if m:
-            return "http://" + m.group(0).rstrip(_URL_TRAILING_JUNK)
+        spans = split_urls(text)
+        for _s, _e, url in spans:
+            if url.lower().startswith("http"):
+                return url
+        for _s, _e, url in spans:
+            if url.lower().startswith("www."):
+                return "http://" + url
         return None
 
     # ---------- 网址形式的二维码图片识别 ----------
@@ -1884,8 +2338,19 @@ class QRMonitor(threading.Thread):
             # 而提取码必须仍从**整段原文**里找（见下方 _extract_pwd_code(raw)）。
             raw = text or ""
             url = self._extract_url(raw) or raw
-            if not _bt.parse_share_url(url):
+            p_share = _bt.parse_share_url(url)
+            if not p_share:
                 return False
+            # 原子配对（D）：本链接入库**之前**先取「最近一条分享记录」的时间戳，
+            # 作为本轮补码的下界——比它还早的提取码一律不再参与，避免把旧码
+            # 套到新链接上（errno=-9 的根因之一）。排除**本 surl**（同一链接被
+            # 用户重新复制/再次解析时，旧记录正是在被本次解析覆盖的那条，不能
+            # 拿它当「上一条」——否则同一时刻抓到的码会被同刻时间戳误拒）。
+            try:
+                prev_share_ts = _bt.latest_share_ts(
+                    exclude_surl=p_share.get("surl"))
+            except Exception:
+                prev_share_ts = 0.0
             html = ""
             try:
                 data = self._fetch_url(url)
@@ -1930,7 +2395,14 @@ class QRMonitor(threading.Thread):
                 else:
                     code = None
                     try:
-                        code, _ = _bt.fresh_code_from_history(self._history())
+                        try:
+                            # 收紧：只认「晚于上一条分享记录」的码（since_ts）。
+                            code, _ = _bt.fresh_code_from_history(
+                                self._history(), since_ts=prev_share_ts)
+                        except TypeError:
+                            # 兼容只接受旧签名 (history[, ttl, now]) 的替身：
+                            # 退回旧调用，语义不变（since_ts 是可选增强）。
+                            code, _ = _bt.fresh_code_from_history(self._history())
                     except Exception:
                         code = None
                     if code:
@@ -1974,7 +2446,10 @@ class QRMonitor(threading.Thread):
         去重，供用户信任确认后的放行重试）。
 
         检查点A：访问前先做信任判定——未信任的网址不发起任何请求，
-        黑名单/内置敏感地址静默拒绝，公网新域名投递主窗口询问。"""
+        黑名单/内置敏感地址静默拒绝，公网新域名投递主窗口询问。
+
+        UX-4（实验性）：开总开关后 pan.baidu 一律静默（不询问信任、不抓页、
+        不在浏览器打开），只记一行说明。"""
         # 剪贴板里复制的往往是「链接 + 空格 + 码：XXXX」整段文本，先截出真正
         # 的网址再访问，否则空格/中文会让 urllib 抛 "URL can't contain control
         # characters"（用户反馈的 drive.uc.cn 提取码场景）。
@@ -1997,6 +2472,11 @@ class QRMonitor(threading.Thread):
         # 「提取码：XXXX」，其内部会再自行截出干净 URL 用于抓页与记录
         # （见 _handle_baidu_share）。原先传 text=url 会把提取码整段丢掉。
         if cfg.get("experimental_enabled") and self._handle_baidu_share(raw):
+            return
+        # UX-4（实验性）：pan.baidu（含 yun/eyun 子域）一律静默——不进信任询问、
+        # 不抓页、不在浏览器打开。未开实验性或非百度网址时行为完全不变。
+        if cfg.get("experimental_enabled") and is_baidu_pan_url(text):
+            self.hub.log("已开启实验性：pan.baidu 网址改走静默通道，不在浏览器打开")
             return
         host = _host_of(text)
         decision, cat = decide_host(cfg, host, "fetch")

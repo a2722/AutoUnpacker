@@ -7,7 +7,7 @@
 - 7-Zip 与 Python zipfile 两套解压引擎（密码经 stdin 传递，绝不进命令行）
 - ExtractService 驱动多层嵌套解压（含 RAR 分卷规范化、伪装 ZIP 剥离兜底、暂停/进度回调）
 关键入口：analyze_file() / create_engine() / PauseController / ExtractService.extract()
-依赖：sevenzip、db（密码字典）、标准库（subprocess/zipfile/ctypes）
+依赖：sevenzip、passwords.resolution（密码候选/字典，旧名经 re-export）、db（仅 main() 初始化）、标准库（subprocess/zipfile/ctypes）
 注意：7z 命令绝不能带 -p（裸 -p 走控制台读密码，stdin 管道读不到，密码永远不生效）
 """
 import argparse
@@ -28,6 +28,15 @@ from pathlib import Path
 
 from .config import delete_policy_permanent_fallback
 from .deletion import engine as deletion_engine
+# 密码候选/字典实现已移至 passwords/resolution.py；旧名 re-export 保留在
+# extract 命名空间，调用点与测试打桩（ex.get_dict_passwords）语义不变。
+from .passwords.resolution import (  # noqa: F401
+    get_password_for_layer,
+    load_password_dict,
+    save_password_dict,
+    get_dict_passwords,
+    add_dict_password,
+)
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -476,75 +485,6 @@ def perform_sanitization(path):
         path.rename(new_path)
         return new_path
     return path
-
-
-def get_password_for_layer(layer, user_passwords, extracted=None, default=None, dict_passwords=(), prev_used=None):
-    """生成某层的候选密码列表（按尝试顺序）。
-
-    - 嵌套层优先用上一层成功密码 prev_used（内外层常共用同一密码）；
-    - 再按层序号映射 user_passwords[idx]（旧行为，兼容每层不同密码）；
-    - 最后补文件名提取密码 / 默认密码 / 字典密码，全部去重。
-    """
-    passwords = []
-    seen = set()
-    if prev_used and layer > 1:
-        passwords.append(prev_used)
-        seen.add(prev_used)
-    idx = max(0, layer - 1)
-    if idx < len(user_passwords):
-        p = user_passwords[idx]
-        if p not in seen:
-            passwords.append(p)
-            seen.add(p)
-    for i, p in enumerate(user_passwords):
-        if i != idx and p not in seen:
-            passwords.append(p)
-            seen.add(p)
-    if extracted and extracted not in seen:
-        passwords.append(extracted)
-        seen.add(extracted)
-    if default and default not in seen:
-        passwords.append(default)
-        seen.add(default)
-    for p in dict_passwords:
-        if p not in seen:
-            passwords.append(p)
-            seen.add(p)
-    if not passwords:
-        passwords.append("")
-    return passwords
-
-
-def load_password_dict():
-    try:
-        import db
-        return db.load_password_dict()
-    except Exception:
-        return {}
-
-
-def save_password_dict(data):
-    try:
-        import db
-        db.save_password_dict(data)
-    except Exception:
-        pass
-
-
-def get_dict_passwords():
-    try:
-        import db
-        return db.get_dict_passwords()
-    except Exception:
-        return []
-
-
-def add_dict_password(password):
-    try:
-        from . import db
-        db.add_dict_password(password)
-    except Exception:
-        pass
 
 
 def find_sevenzip_path():

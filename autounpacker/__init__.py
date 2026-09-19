@@ -35,11 +35,13 @@
   workers/qr_worker.py        二维码识别子进程（强制 UTF-8 输出，防乱码）
   workers/clipboard_worker.py 剪贴板读取子进程
 
-百度网盘任务库（实验性，只读）
-  baidu_task.py               ★门面：只转发，保持既有导入路径不变
-  baidu_db.py                 只读访问层（选库、短连接查询、列容错、读活动/历史）
-  baidu_manifest.py           批次/分卷还原 + 任务跟踪事件（纯逻辑、无线程）
-  baidu_watch.py              轮询线程（进程守卫/自适应间隔/退避）+ 诊断 + 启动探测
+百度网盘任务库（实验性，只读；实现已收拢到 baidu/ 子包）
+  baidu/task.py               ★门面：只转发，保持既有导入路径不变
+  baidu/db.py                 只读访问层（选库、短连接查询、列容错、读活动/历史）
+  baidu/manifest.py           批次/分卷还原 + 任务跟踪事件（纯逻辑、无线程）
+  baidu/watch.py              轮询线程（进程守卫/自适应间隔/退避）+ 诊断 + 启动探测
+  baidu/share.py              分享链接「拉起客户端下载」全链路（invoke_download）
+  （旧路径 baidu_*.py 为兼容别名 shim，sys.modules 直接指向本子包对应模块）
 
 更新 / 界面
   updater.py                  GitHub Releases 版本检查 + 下载/校验/update.bat
@@ -49,7 +51,7 @@
   ui/style.py                 QSS 主题样式
 
 阅读建议：先读本表 → 再读目标模块顶部的 docstring（职责/入口/依赖/注意）→
-只在必要时才通读实现。安全红线集中在 extract.py（删源）与 baidu_db.py（只读）。
+只在必要时才通读实现。安全红线集中在 extract.py（删源）与 baidu/db.py（只读）。
 ==================================================================
 """
 from .paths import (PROJECT_ROOT, DATA_DIR, CONFIG_FILE, TEMP_PW_FILE,

@@ -391,18 +391,27 @@ class TaskPage(QWidget):
         return EMPTY_TASK_LOG_EMPTY
 
     # ---- 宿主装载入口 ----
-    def set_tasks(self, rows, counts=None):
-        """装载任务行并尽量保持选中；选中项已不在新集合时清空选中并发 taskDeselected。"""
+    def set_tasks(self, rows, counts=None, preserve_view=False):
+        """装载任务行并尽量保持选中；选中项已不在新集合时清空选中并发 taskDeselected。
+
+        preserve_view=True：生命周期刷新专用——除选中（本就按 id 保留）外，重装后
+        再还原表格滚动位置，避免用户在盯着队列时被反复弹回顶部；用户显式刷新 /
+        换范围仍走默认（重建后回顶）。
+        """
         if counts is not None:
             self.set_counts(counts)
         rows = [r for r in (rows or []) if isinstance(r, dict)]
         keep = self.current_task_id()
-        self.table.set_tasks(rows)
+        scroll = self.table.scroll_value() if preserve_view else None
+        self.table.set_tasks(rows, scroll_to_top=not preserve_view)
         try:
             self.table_empty.set_empty(not rows)
         except Exception:
             pass
-        if keep is not None and self.table.select_task(keep):
+        restored = bool(keep is not None and self.table.select_task(keep))
+        if preserve_view and scroll is not None:
+            self.table.set_scroll_value(scroll)
+        if restored:
             return                          # 保留选中：table 会发 taskActivated
         if keep is not None:
             self.set_current_task(None)

@@ -358,7 +358,7 @@ _DIR_STATE_ALIASES = {
 # 底栏播报默认 5 句（与 mockups/assets/parts.js::TIPS_LIST 逐字一致）；
 # 末句的快捷键在运行期由 set_hotkey() 重新拼装，这里只作回退。
 DEFAULT_TIPS = [
-    "拖入压缩包即可直接解压，不必先放进监听目录",
+    "拖入压缩包即可直接解压；拖入二维码图片可直接识别",
     "分卷不全会等到齐再解，不会误判失败",
     "密码本可从二维码截图自动收录提取码",
     "点底栏的「失败」可直接筛出失败条目",
@@ -1248,6 +1248,18 @@ def _task_state_key(row):
     return _STATE_ALIASES.get(s, s)
 
 
+# 显示行指纹用的字段：任一字段变化都会改变表格内容（用于跳过无变化的整表重建）
+_TASK_SIG_KEYS = ("id", "state", "state_text", "file_name", "file", "output_dir",
+                  "out", "size", "file_size", "pwd", "password_src", "cost",
+                  "started_at", "finished_at", "created_at", "error", "progress")
+
+
+def _task_rows_signature(rows):
+    """显示行集合的廉价指纹：只比较会影响展示的字段，不做任何格式化。"""
+    return tuple(tuple(r.get(k) for k in _TASK_SIG_KEYS)
+                 for r in (rows or []) if isinstance(r, dict))
+
+
 def _row_file(row):
     return str(row.get("file_name") or row.get("file") or "")
 
@@ -1309,6 +1321,17 @@ class TaskModel(QAbstractTableModel):
     (COL_STATE, COL_FILE, COL_SIZE, COL_PWD, COL_COST, COL_OUT, COL_ACT) = range(7)
     STATE_ROLE = Qt.UserRole + 1
 
+    # 每列内容对齐：单元格与表头文字共用同一口径（表头文字才能与单元格文字对齐）
+    _ALIGN = {
+        COL_STATE: Qt.AlignLeft | Qt.AlignVCenter,
+        COL_FILE: Qt.AlignLeft | Qt.AlignVCenter,
+        COL_SIZE: Qt.AlignRight | Qt.AlignVCenter,
+        COL_PWD: Qt.AlignLeft | Qt.AlignVCenter,
+        COL_COST: Qt.AlignRight | Qt.AlignVCenter,
+        COL_OUT: Qt.AlignLeft | Qt.AlignVCenter,
+        COL_ACT: Qt.AlignLeft | Qt.AlignVCenter,
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows = []
@@ -1341,7 +1364,11 @@ class TaskModel(QAbstractTableModel):
         return len(self.HEADERS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation != Qt.Horizontal or role != Qt.DisplayRole:
+        if orientation != Qt.Horizontal:
+            return None
+        if role == Qt.TextAlignmentRole:
+            return int(self._ALIGN.get(section, Qt.AlignLeft | Qt.AlignVCenter))
+        if role != Qt.DisplayRole:
             return None
         if 0 <= section < len(self.HEADERS):
             return self.HEADERS[section]
@@ -1387,8 +1414,8 @@ class TaskModel(QAbstractTableModel):
             if col == self.COL_STATE:
                 return self._display(row, col)
             return None
-        if role == Qt.TextAlignmentRole and col in (self.COL_SIZE, self.COL_COST):
-            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == Qt.TextAlignmentRole:
+            return int(self._ALIGN.get(col, Qt.AlignLeft | Qt.AlignVCenter))
         return None
 
 
@@ -1497,16 +1524,47 @@ class TaskTable(QTableView):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self.setColumnWidth(col, width)
         self._action_widgets = []
+        self._last_tasks_sig = None      # 上次装载的显示行指纹（保视图刷新短路用）
         sm = self.selectionModel()
         if sm is not None:
             sm.currentRowChanged.connect(self._on_current_row)
         self.doubleClicked.connect(self._on_double_clicked)
 
-    def set_tasks(self, rows):
+    def set_tasks(self, rows, scroll_to_top=True):
+        """重建任务表。
+
+        scroll_to_top=True（默认，保持既有行为）：重建后回到顶部，供用户显式
+        刷新 / 换范围使用。scroll_to_top=False：留给生命周期刷新——由调用方
+        （TaskPage.set_tasks(preserve_view=True)）在选中恢复后再还原滚动位置。
+
+        生命周期刷新（scroll_to_top=False）下若显示行指纹与上次完全一致，
+        直接返回：不重置模型、不重建行内操作控件（最多 ~500 行 → 1000+ 控件）。
+        调用方（TaskPage）的计数 / 空态 / 选中恢复逻辑照常执行。
+        """
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        sig = _task_rows_signature(rows)
+        if not scroll_to_top and sig == self._last_tasks_sig:
+            return
+        self._last_tasks_sig = sig
         self._clear_actions()
         self._model.set_tasks(rows)
         self._build_actions()
-        self.scroll_to_top()
+        if scroll_to_top:
+            self.scroll_to_top()
+
+    def scroll_value(self):
+        """当前垂直滚动位置（异常时返回 0，绝不打断刷新）。"""
+        try:
+            return int(self.verticalScrollBar().value())
+        except Exception:
+            return 0
+
+    def set_scroll_value(self, value):
+        """还原垂直滚动位置（尽力而为；越界由控件自行钳制）。"""
+        try:
+            self.verticalScrollBar().setValue(int(value))
+        except Exception:
+            pass
 
     def task_model(self):
         return self._model

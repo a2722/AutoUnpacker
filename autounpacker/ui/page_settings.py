@@ -2,37 +2,40 @@
 """设置页（正式页面）：把全部配置项做成页内分区表单，替代过渡占位页。
 
 职责：
-- SettingsPage：11 个分区覆盖 config.DEFAULT_CONFIG 的全部键；每个控件右侧
+- SettingsPage：9 个分区覆盖 config.DEFAULT_CONFIG 的全部键；每个控件右侧
   都带「立即生效 / 需重启」标签（常量 TAG_LIVE / TAG_RESTART），绝不虚标；
 - 「保存」：逐键走 AppState.set()（config.save_config 原子写）后再回读校验，
   成功/失败如实回报（save_config 自身吞异常，不回读就会假报成功）；
 - 「恢复默认」：二次确认后写回 config._sanitize_cfg(DEFAULT_CONFIG)（与
   load_config 的口径一致），再回填控件；
-- 监听目录：列表 + 添加/编辑/删除 + 路径校验；编辑复用既有 WatchDirDialog
-  （只消费其公开 API：构造 / exec_() / saved / removeRequested，绝不改它）；
+- 目录（分区索引）：左侧 QListWidget#settingsCat 列在滚动区之外，点击滚动
+  页内 self.scroll 到对应卡片；滚动卡片时反向同步选中项（best-effort）；
+- 监听目录不再在本页增删改（页头胶囊条 → WatchDirDialog 已覆盖），本页只把
+  watch_paths 逐条原样写回，绝不丢字段；
+- #stripHint 描述行：11px CJK 墨迹几乎顶满 em 框，QLabel 折行高度按
+  fontMetrics().height() 算、绘制按 lineSpacing() 排，默认上下各裁 1px；
+  由 QSS padding + polish 后的 _fit_hint() 兜底（见 style.py 注释）；
 - 主题：走既有 ui_style.resolve_theme + apply_theme + ui_theme_cached + 回调
   路径，绝不手写 QSS、绝不新增主题 token。
 
 关键入口：SettingsPage；常量 TAG_LIVE / TAG_RESTART
 依赖：PyQt5、config（DEFAULT_CONFIG/_sanitize_cfg/load_config）、style（PALETTE）、
-      widgets（Glyph/HotkeyEdit）、dialogs（WatchDirDialog）
-注意：本页是「表单 + 保存」模型：除监听目录的增删改经 WatchDirDialog 即时写回
-      （既有契约）外，其余控件只在点「保存」时统一写入。
+      widgets（Glyph/HotkeyEdit）
+注意：本页是「表单 + 保存」模型：所有控件只在点「保存」时统一写入。
 注意：集成（把本页装进主窗口标签壳）由集成步骤完成；本模块只提供页面与信号：
       settingsSaved / settingsReset / watchPathsChanged / hotkeyChanged(str) /
       themeChanged(str) / notice(str)。
 注意：本模块不联网、不起线程、不重启应用；所有异常都转成页内 notice 提示。
 注意（allow: SIZE_OK）：按任务要求「单文件承载全部设置表单、不得新建兄弟模块」，
-      11 个分区 + 38 个顶层键全覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
+      9 个分区 + 全部顶层键覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
       「键 -> 控件 -> 生效标签」的覆盖契约在一个文件里可直接审计。
 """
 import json
-import os
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                             QLineEdit, QListWidget, QListWidgetItem,
+                             QFileDialog, QFrame, QHBoxLayout, QLabel,
+                             QLineEdit, QListWidget,
                              QMessageBox, QPlainTextEdit, QPushButton,
                              QRadioButton, QScrollArea, QSizePolicy, QSpinBox,
                              QVBoxLayout, QWidget)
@@ -40,7 +43,6 @@ from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 from ..config import DEFAULT_CONFIG, _sanitize_cfg
 from ..config import load_config
 from . import style as ui_style
-from .dialogs import WatchDirDialog
 from .style import PALETTE
 from .widgets import Glyph, HotkeyEdit
 
@@ -143,10 +145,10 @@ class SettingsPage(QWidget):
         self._controls = {}        # 配置键 -> [控件]（含 url_trust.* / watch_paths.* 点号路径）
         self._tags = {}            # 配置键 -> TAG_LIVE / TAG_RESTART
         self._tag_labels = {}      # 配置键 -> [标签控件]
-        self._sections = []        # 分区标题（保持插入顺序）
+        self._sections = []        # 分区标题（保持插入顺序，与目录一一对应）
+        self._section_cards = {}   # 分区标题 -> 卡片 QFrame（目录跳转 / 滚动同步用）
+        self._cat_syncing = False  # 目录 <-> 滚动条 同步重入保护
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
-        self._watchdir_dlg = None
-        self._out_dirty = False        # 用户是否改过「输出目录」主控
         self._delete_dirty = False     # 用户是否改过「删除源文件」主控
         self._theme_pref = "auto"
         self._notice_failed = False
@@ -158,9 +160,25 @@ class SettingsPage(QWidget):
     # 构建
     # ------------------------------------------------------------------
     def _build_ui(self):
+        self._sections = []
+        self._section_cards = {}
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # 左右两栏：[目录 | 页内滚动区]；两者都在页的最外层，目录不随内容滚动。
+        body = QHBoxLayout()
+        body.setContentsMargins(12, 0, 0, 0)
+        body.setSpacing(8)
+
+        self.cat_list = QListWidget(self)
+        self.cat_list.setObjectName("settingsCat")
+        self.cat_list.setFixedWidth(160)
+        self.cat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cat_list.setToolTip("点击跳转到对应分区。")
+        self.cat_list.currentRowChanged.connect(self._on_cat_row_changed)
+        self.cat_list.hide()            # 无分区时隐藏（_refresh_catalog 里恢复）
+        body.addWidget(self.cat_list)
 
         scroll = QScrollArea(self)
         scroll.setObjectName("settingsScroll")
@@ -173,7 +191,11 @@ class SettingsPage(QWidget):
         self._lay.setContentsMargins(12, 12, 12, 10)
         self._lay.setSpacing(10)
         scroll.setWidget(inner)
-        root.addWidget(scroll, 1)
+        body.addWidget(scroll, 1)
+        root.addLayout(body, 1)
+
+        # 用户在卡片区滚动时保持目录选中同步（best-effort，重入由 _cat_syncing 保护）
+        scroll.verticalScrollBar().valueChanged.connect(self._sync_cat_to_scroll)
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -185,18 +207,18 @@ class SettingsPage(QWidget):
         self._lay.addWidget(self._hint(
             "所有修改点「保存」后写入配置；带「需重启」标签的项在下次启动生效。", inner))
 
-        self._build_watch_section()
-        self._build_output_section()
-        self._build_extract_section()
-        self._build_share_section()
-        self._build_ui_section()
-        self._build_general_section()
-        self._build_notify_section()
-        self._build_qr_section()
-        self._build_trust_section()
-        self._build_hotkey_section()
-        self._build_close_section()
+        # 分区顺序 = 目录顺序；每条 _build_*_section 内部调用 _section() 建卡。
+        self._build_extract_section()      # 解压行为
+        self._build_general_section()      # 常规
+        self._build_ui_section()           # 界面
+        self._build_share_section()        # 分享与手势
+        self._build_qr_section()           # 二维码与剪贴板
+        self._build_notify_section()       # 通知与实验性
+        self._build_trust_section()        # 网址信任
+        self._build_hotkey_section()       # 全局快捷键
+        self._build_close_section()        # 托盘与关闭
         self._lay.addStretch(1)
+        self._refresh_catalog()
 
         # 底部动作条（固定在滚动区之外）
         foot = QFrame(self)
@@ -243,6 +265,7 @@ class SettingsPage(QWidget):
             box.addWidget(self._hint(desc, card))
         self._lay.addWidget(card)
         self._sections.append(title)
+        self._section_cards[title] = card
         return box
 
     def _reg(self, key, widget):
@@ -258,6 +281,7 @@ class SettingsPage(QWidget):
         if tag == TAG_RESTART:
             lbl.setToolTip(_RESTART_TIP)
         row.addWidget(lbl)
+        self._watch_hint(lbl)
         for k in (keys if isinstance(keys, (list, tuple)) else [keys]):
             self._tags.setdefault(str(k), tag)
             self._tag_labels.setdefault(str(k), []).append(lbl)
@@ -270,13 +294,106 @@ class SettingsPage(QWidget):
         if warn:
             lbl.setStyleSheet("color: %s;" % PALETTE["warn_text"])
             self._warn_labels.append(lbl)
-        return lbl
+        return self._watch_hint(lbl)
 
     def _sub_label(self, lay, text):
         lbl = QLabel(str(text), self)
         lbl.setObjectName("stripHint")
         lay.addWidget(lbl)
+        self._watch_hint(lbl)
         return lbl
+
+    # ---- #stripHint 折行高度兜底（修 CJK 描述行裁切） ----
+    def _watch_hint(self, lbl):
+        """让页面在标签 polish / 样式变化后重算其最小高度（返回同一标签）。
+
+        注意：**此处不立刻计算** fontMetrics——构造期样式表尚未 polish，
+        字号还不是 11px；lineSpacing 只在 polish 后才可信。"""
+        try:
+            lbl.installEventFilter(self)
+        except Exception:
+            pass
+        return lbl
+
+    def _fit_hint(self, lbl):
+        """把说明标签的最小高度抬到 lineSpacing() + 2。
+
+        QLabel(setWordWrap=True) 的 heightForWidth 按 fontMetrics().height()（11）
+        计算，绘制线盒却按 lineSpacing()（13）排；默认上下各裁 1px、左缘也无余量。
+        lineSpacing 只在样式表 polish 后（11px 字号）才可信，所以此处**不在构造时
+        计算**，而在 polish / 样式变化 / 显示后由本方法兜底；左缘余量由 QSS
+        `padding: 0 1px` 提供（纵向 padding 无效，见 style.py 注释）。"""
+        try:
+            need = int(lbl.fontMetrics().lineSpacing()) + 2
+            if lbl.minimumHeight() < need:
+                lbl.setMinimumHeight(need)
+        except Exception:
+            pass
+
+    def _fit_all_hints(self):
+        for lbl in self.findChildren(QLabel):
+            if lbl.objectName() == "stripHint":
+                self._fit_hint(lbl)
+
+    def eventFilter(self, obj, event):
+        try:
+            if (obj.objectName() == "stripHint"
+                    and event.type() in (QEvent.Polish, QEvent.StyleChange)):
+                self._fit_hint(obj)
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_all_hints()
+
+    # ---- 目录（分区索引） ----
+    def _refresh_catalog(self):
+        """按 _sections 顺序重建目录，并记住每项对应的卡片（唯一真源）。"""
+        rows = [t for t in self._sections if t in self._section_cards]
+        self.cat_list.blockSignals(True)
+        self.cat_list.clear()
+        for title in rows:
+            self.cat_list.addItem(title)
+        if rows:
+            self.cat_list.setCurrentRow(0)
+        self.cat_list.blockSignals(False)
+        self.cat_list.setVisible(bool(rows))
+
+    def _on_cat_row_changed(self, row):
+        """点目录项 → 滚动**页内**滚动区到对应卡片（绝不碰外层 pageScroll）。"""
+        if self._cat_syncing or row < 0 or row >= len(self._sections):
+            return
+        card = self._section_cards.get(self._sections[row])
+        if card is None:
+            return
+        self._cat_syncing = True
+        try:
+            self.scroll.ensureWidgetVisible(card, 0, 8)
+        finally:
+            self._cat_syncing = False
+
+    def _sync_cat_to_scroll(self, value):
+        """页内滚动时把目录选中项同步到视口顶部所在卡片（best-effort）。"""
+        if self._cat_syncing or not self._sections:
+            return
+        row = 0
+        for n, title in enumerate(self._sections):
+            card = self._section_cards.get(title)
+            if card is None:
+                continue
+            if card.y() <= int(value) + 1:
+                row = n
+            else:
+                break
+        if self.cat_list.currentRow() == row:
+            return
+        self._cat_syncing = True
+        try:
+            self.cat_list.setCurrentRow(row)
+        finally:
+            self._cat_syncing = False
 
     def _check_row(self, lay, key, text, tag=TAG_LIVE, tip=None, extra_keys=None):
         cb = QCheckBox(text, self)
@@ -330,94 +447,6 @@ class SettingsPage(QWidget):
         return radios, grp
 
     # ------------------------------------------------------------------
-    # 分区：监听目录
-    # ------------------------------------------------------------------
-    def _build_watch_section(self):
-        box = self._section(
-            "folder", "监听目录",
-            "压缩包放入任一启用中的目录即被处理；「目录设置」弹窗的增删改会即时写回配置。")
-        self.watch_list = QListWidget(self)
-        self.watch_list.setObjectName("settingsCat")
-        self.watch_list.setMinimumHeight(96)
-        self.watch_list.setToolTip("双击条目 = 打开目录设置弹窗（修改即保存）。")
-        self.watch_list.itemDoubleClicked.connect(lambda _it: self._on_edit_path())
-        box.addWidget(self.watch_list)
-        self._reg("watch_paths", self.watch_list)
-        self._reg("watch_paths.path", self.watch_list)
-        self._reg("watch_paths.enabled", self.watch_list)
-        self._reg("watch_paths.mode", self.watch_list)
-        self.watch_validate_label = self._hint("", self)
-        box.addWidget(self.watch_validate_label)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self.add_dir_btn = QPushButton("添加目录", self)
-        self.add_dir_btn.setObjectName("primary")
-        self.add_dir_btn.setCursor(Qt.PointingHandCursor)
-        self.add_dir_btn.clicked.connect(self._on_add_path)
-        row.addWidget(self.add_dir_btn)
-        self.edit_dir_btn = QPushButton("编辑目录", self)
-        self.edit_dir_btn.setCursor(Qt.PointingHandCursor)
-        self.edit_dir_btn.clicked.connect(self._on_edit_path)
-        row.addWidget(self.edit_dir_btn)
-        self.del_dir_btn = QPushButton("删除目录", self)
-        self.del_dir_btn.setObjectName("danger")
-        self.del_dir_btn.setCursor(Qt.PointingHandCursor)
-        self.del_dir_btn.clicked.connect(self._on_remove_selected)
-        row.addWidget(self.del_dir_btn)
-        self._tagged(row, ["watch_paths", "watch_paths.path",
-                           "watch_paths.enabled", "watch_paths.mode"], TAG_LIVE)
-        box.addLayout(row)
-        box.addWidget(self._hint(
-            "删除 = 从监听列表移除，不影响已解压文件；解压成功后删除源文件另见「解压行为」。"))
-
-    # ------------------------------------------------------------------
-    # 分区：输出与移动
-    # ------------------------------------------------------------------
-    def _build_output_section(self):
-        box = self._section(
-            "download", "输出与移动",
-            "统一指定所有监听目录的解压产物去向；留空 = 在各监听目录下建同名文件夹。")
-        self.out_edit = QLineEdit(self)
-        self.out_edit.setPlaceholderText("留空 · 各监听目录下建同名文件夹")
-        self.out_edit.setToolTip(
-            "写入全部监听目录的 output_dir；单个目录可在「目录设置」弹窗里单独指定。")
-        self.out_edit.textEdited.connect(lambda _t: self._set_out_dirty())
-        self.out_edit.textChanged.connect(lambda _t: self._refresh_out_state())
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        lbl = QLabel("输出目录", self)
-        lbl.setObjectName("fLabel")
-        lbl.setFixedWidth(96)
-        row.addWidget(lbl)
-        row.addWidget(self.out_edit, 1)
-        self.out_browse_btn = QPushButton("浏览", self)
-        self.out_browse_btn.setCursor(Qt.PointingHandCursor)
-        self.out_browse_btn.clicked.connect(self._browse_output_dir)
-        row.addWidget(self.out_browse_btn)
-        self._reg("watch_paths.output_dir", self.out_edit)
-        self._tagged(row, ["watch_paths.output_dir"], TAG_LIVE)
-        box.addLayout(row)
-        self.out_state_label = self._hint("", self)
-        box.addWidget(self.out_state_label)
-        box.addWidget(self._hint(
-            "命令行解压（extract.py）另支持 --move-to <目录>：解压成功后把产物移动到指定"
-            "文件夹；界面内统一由上方「输出目录」决定。"))
-
-    def _set_out_dirty(self):
-        self._out_dirty = True
-        self._refresh_out_state()
-
-    def _browse_output_dir(self):
-        try:
-            d = QFileDialog.getExistingDirectory(self, "选择解压输出目录")
-        except Exception:
-            d = ""
-        if d:
-            self.out_edit.setText(d)
-            self._set_out_dirty()
-
-    # ------------------------------------------------------------------
     # 分区：解压行为
     # ------------------------------------------------------------------
     def _build_extract_section(self):
@@ -433,7 +462,12 @@ class SettingsPage(QWidget):
         drow.setSpacing(8)
         drow.addWidget(self.delete_master_cb)
         self._reg("watch_paths.delete_source", self.delete_master_cb)
-        self._tagged(drow, ["watch_paths.delete_source"], TAG_LIVE)
+        # 本页不再持有监听目录的增删改控件（页头胶囊条 → WatchDirDialog 负责），
+        # 但删除源文件总控仍写回 watch_paths 的 delete_source 字段；为保持
+        # 「DEFAULT_CONFIG 顶层键都有归属控件」的契约，把顶层 watch_paths 也归到
+        # 这个总控上（它是本页唯一触及 watch_paths 的控件）。
+        self._reg("watch_paths", self.delete_master_cb)
+        self._tagged(drow, ["watch_paths", "watch_paths.delete_source"], TAG_LIVE)
         box.addLayout(drow)
         self.delete_state_label = self._hint("", self)
         box.addWidget(self.delete_state_label)
@@ -698,7 +732,7 @@ class SettingsPage(QWidget):
     def _build_qr_section(self):
         box = self._section(
             "search", "二维码与剪贴板", "剪贴板二维码识别、链接识别与临时密码过滤。")
-        self.qr_cb = self._check_row(box, "qr_enabled", "启用剪贴板二维码识别",
+        self.qr_cb = self._check_row(box, "qr_enabled", "启用二维码识别（剪贴板图片 / 拖入图片）",
                                      TAG_LIVE)
         self.qr_redirect_cb = self._check_row(
             box, "qr_url_redirect", "二维码链接域名重定向", TAG_LIVE,
@@ -987,28 +1021,14 @@ class SettingsPage(QWidget):
             cur_close = "ask"
         self._close_rbs[cur_close].setChecked(True)
 
-        # 监听目录 + 输出/删除主控
-        self._reload_watch_list(cfg)
+        # 删除源文件主控（各目录可单独覆盖；只有用户真的改过才统一覆盖）
         entries = [e for e in (cfg.get("watch_paths") or []) if isinstance(e, dict)]
-        out_val, out_same = _common(entries, "output_dir")
-        self._out_dirty = False
-        self.out_edit.blockSignals(True)
-        if entries and out_same:
-            self.out_edit.setText(str(out_val or ""))
-        else:
-            self.out_edit.clear()
-        self.out_edit.blockSignals(False)
-        if entries and not out_same:
-            self.out_edit.setPlaceholderText("（各监听目录当前不同 · 修改后统一写入全部）")
-        else:
-            self.out_edit.setPlaceholderText("留空 · 各监听目录下建同名文件夹")
         del_val, del_same = _common(entries, "delete_source")
         self._delete_dirty = False
         if del_same:
             self.delete_master_cb.setChecked(bool(del_val))
         else:
             self.delete_master_cb.setChecked(False)
-        self._refresh_out_state()
         self._refresh_delete_state()
         self._clear_notice()
 
@@ -1029,72 +1049,6 @@ class SettingsPage(QWidget):
                 if edit is not None:
                     values = (sub or {}).get(key) or []
                     edit.setPlainText("\n".join(str(x) for x in values))
-
-    def _reload_watch_list(self, cfg=None):
-        """重建监听目录列表：带启用/输出/删源/模式与路径校验标记。"""
-        if cfg is None:
-            cfg = self._snapshot()
-        entries = [e for e in (cfg.get("watch_paths") or []) if isinstance(e, dict)]
-        self.watch_list.clear()
-        for e in entries:
-            path = str(e.get("path") or "").strip()
-            parts = ["[启用]" if e.get("enabled", True) else "[停用]",
-                     path or "（空路径）"]
-            out = str(e.get("output_dir") or "").strip()
-            parts.append("输出: %s" % (out or "同目录同名文件夹"))
-            if e.get("delete_source"):
-                parts.append("删源")
-            mode = "百度清单" if str(e.get("mode") or "").lower() == "baidu" else "表层"
-            parts.append("模式: %s" % mode)
-            problem = self._entry_problem(e)
-            if problem:
-                parts.append("⚠ %s" % problem)
-            item = QListWidgetItem("  ".join(parts))
-            item.setToolTip("%s\n双击打开目录设置弹窗。" % (path or "（空路径）"))
-            self.watch_list.addItem(item)
-        text, count = self._validate_text(entries)
-        self.watch_validate_label.setText(text)
-        self.watch_validate_label.setVisible(bool(count))
-
-    def _entry_problem(self, entry):
-        path = str(entry.get("path") or "").strip()
-        if not path:
-            return "空路径"
-        try:
-            if not os.path.isdir(path):
-                return "目录不存在"
-        except Exception:
-            return ""
-        return ""
-
-    def _validate_text(self, entries):
-        empty = [e for e in entries
-                 if not str(e.get("path") or "").strip()]
-        missing = [str(e.get("path") or "") for e in entries
-                   if str(e.get("path") or "").strip()
-                   and not os.path.isdir(str(e.get("path")))]
-        parts = []
-        if empty:
-            parts.append("%d 条空路径" % len(empty))
-        if missing:
-            parts.append("%d 条目录不存在：%s" % (
-                len(missing), "、".join(missing[:3])))
-        if not parts:
-            return "", 0
-        return "路径校验：" + "；".join(parts), len(empty) + len(missing)
-
-    def _refresh_out_state(self):
-        entries = [e for e in (self._snapshot().get("watch_paths") or [])
-                   if isinstance(e, dict)]
-        if not entries:
-            self.out_state_label.setText("")
-            return
-        same = bool(_common(entries, "output_dir")[1])
-        if same:
-            text = "当前：%s" % (self.out_edit.text().strip() or "留空（同目录同名文件夹）")
-        else:
-            text = "当前：各监听目录不同（修改上方输入框并保存 = 统一覆盖全部）"
-        self.out_state_label.setText(text)
 
     def _refresh_delete_state(self):
         entries = [e for e in (self._snapshot().get("watch_paths") or [])
@@ -1219,13 +1173,12 @@ class SettingsPage(QWidget):
         return ut
 
     def _collect_watch_paths(self, cfg):
-        """监听目录条目 + 两个主控（只在用户真的改过时才统一覆盖，绝不误伤混合值）。"""
+        """监听目录条目（逐条原样写回；只在删源主控被改过时才统一覆盖）。
+
+        每个目录的字段（path/enabled/output_dir/delete_source/mode）都从配置快照
+        深拷贝后原样返回——绝不丢键、绝不误改未动过的字段。"""
         entries = [dict(e) for e in (cfg.get("watch_paths") or [])
                    if isinstance(e, dict)]
-        if self._out_dirty:
-            val = str(self.out_edit.text()).strip()
-            for e in entries:
-                e["output_dir"] = val
         if self._delete_dirty:
             val = bool(self.delete_master_cb.isChecked())
             for e in entries:
@@ -1377,111 +1330,6 @@ class SettingsPage(QWidget):
             return "主题切换失败：%s" % e
 
     # ------------------------------------------------------------------
-    # 监听目录（复用 WatchDirDialog 的公开 API）
-    # ------------------------------------------------------------------
-    def _open_watchdir(self, idx):
-        """打开既有目录设置弹窗；返回 exec_ 返回码（打不开返回 None）。"""
-        try:
-            dlg = WatchDirDialog(self.state, int(idx), self.window() or self)
-        except Exception as e:
-            self._notice("打开目录设置失败：%s" % e, ok=False)
-            return None
-        try:
-            dlg.saved.connect(self._on_watchdir_saved)
-            dlg.removeRequested.connect(self._on_watchdir_remove)
-        except Exception:
-            pass
-        self._watchdir_dlg = dlg
-        try:
-            return dlg.exec_()
-        finally:
-            self._watchdir_dlg = None
-
-    def _on_watchdir_saved(self, idx):
-        self._load_from_cfg()
-        self.watchPathsChanged.emit()
-        self._notice("监听目录已保存")
-
-    def _on_watchdir_remove(self, idx):
-        """弹窗「移除目录」只发信号：二次确认与移除由本页负责（既有分工不变）。"""
-        if not self._remove_path(int(idx), confirm=True):
-            return
-        dlg = self._watchdir_dlg
-        if dlg is not None:
-            try:
-                dlg.reject()
-            except Exception:
-                pass
-
-    def _on_add_path(self):
-        """添加目录：先建空条目 → 打开目录设置弹窗 → 取消则回收空条目。"""
-        cfg = self._snapshot()
-        entries = [dict(e) for e in (cfg.get("watch_paths") or [])
-                   if isinstance(e, dict)]
-        entries.append({"path": "", "enabled": True, "output_dir": "",
-                        "delete_source": False, "mode": "surface"})
-        try:
-            self.state.set("watch_paths", entries)
-        except Exception as e:
-            self._notice("添加目录失败：%s" % e, ok=False)
-            return
-        idx = len(entries) - 1
-        self._load_from_cfg()
-        code = self._open_watchdir(idx)
-        if code is None:
-            self._remove_path(idx, confirm=False)
-            return
-        if code != QDialog.Accepted:
-            paths = [dict(e) for e in (self._snapshot().get("watch_paths") or [])
-                     if isinstance(e, dict)]
-            if 0 <= idx < len(paths) and not str(paths[idx].get("path") or "").strip():
-                self._remove_path(idx, confirm=False)
-
-    def _on_edit_path(self):
-        idx = self._selected_index()
-        if idx is None:
-            self._notice("请先在列表中选择一个监听目录", ok=False)
-            return
-        self._open_watchdir(idx)
-
-    def _on_remove_selected(self):
-        idx = self._selected_index()
-        if idx is None:
-            self._notice("请先在列表中选择一个监听目录", ok=False)
-            return
-        self._remove_path(idx, confirm=True)
-
-    def _selected_index(self):
-        row = self.watch_list.currentRow()
-        if 0 <= row < self.watch_list.count():
-            return row
-        return None
-
-    def _remove_path(self, idx, confirm=True):
-        paths = [dict(e) for e in (self._snapshot().get("watch_paths") or [])
-                 if isinstance(e, dict)]
-        if not (0 <= idx < len(paths)):
-            return False
-        label = str(paths[idx].get("path") or "").strip() or "（空路径）"
-        if confirm:
-            ret = QMessageBox.question(
-                self, "移除目录", "确定移除该监听目录？\n%s" % label,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ret != QMessageBox.Yes:
-                self._notice("已取消移除")
-                return False
-        paths.pop(idx)
-        try:
-            self.state.set("watch_paths", paths)
-        except Exception as e:
-            self._notice("移除目录失败：%s" % e, ok=False)
-            return False
-        self._load_from_cfg()
-        self.watchPathsChanged.emit()
-        self._notice("已移除监听目录：%s" % label)
-        return True
-
-    # ------------------------------------------------------------------
     # 提示 / 主题刷新 / 供宿主调用的读取入口
     # ------------------------------------------------------------------
     def _clear_notice(self):
@@ -1527,6 +1375,8 @@ class SettingsPage(QWidget):
                 glyph.update()
             except Exception:
                 pass
+        # 11px 字体随新样式表重贴：说明行高度兜底需要按新 lineSpacing 重算
+        self._fit_all_hints()
 
     def reload(self):
         """宿主外部改过配置（如「密码本」页）后，重新回填本页控件。"""

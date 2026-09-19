@@ -2,7 +2,7 @@
 """共享应用状态 AppState：GUI 写、后台线程读；临时密码本机生命周期管理。
 
 职责：- 线程安全的配置读写（snapshot/set/update_path/set_path）
-- 长期密码本代理到 toolbox.db（passwords/set_passwords/all_passwords）
+- 长期密码本代理到 toolbox.db（passwords/set_passwords/all_passwords + 行级 password_rows/add_password_row/update_password_row/delete_password_row）
 - 特殊用户固定提取码代理到 toolbox.db（share_code_map/set_share_code_map/add_share_code/find_share_entry）
 - 临时密码的捕获、过期裁剪、条数上限、开机内持久化（temp_passwords.json）
 关键入口：AppState
@@ -24,6 +24,10 @@ class AppState:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.Lock()
+        # 配置落盘的串行锁：与 self.lock（保护 self.cfg 的内存结构）职责分离。
+        # _persist() 先取 self._save_lock 再取 self.lock，写文件时只持 _save_lock，
+        # 从而既不让磁盘 I/O 占住状态锁，也不会出现两次写互相覆盖的丢更新。
+        self._save_lock = threading.Lock()
         self.running = True
         self._temp_passwords = []
         self._temp_ts = {}          # 密码 -> 捕获时间戳（用于按有效期过期）
@@ -132,27 +136,54 @@ class AppState:
         except Exception:
             pass
 
+    def _snapshot_locked(self):
+        """self.cfg 的深拷贝；调用方必须已持 self.lock。"""
+        return json.loads(json.dumps(self.cfg))
+
+    def _persist(self):
+        """把当前配置原子写盘；序列化走稳定快照、文件写串行且不占状态锁。
+
+        旧实现先释放 self.lock，再让 save_config 对**活的** self.cfg 做
+        json.dumps：并发 set/update_path 改动字典时 json.dumps 抛
+        `RuntimeError: dictionary changed size during iteration`，被 save_config
+        的 `except Exception: pass` 吞掉 → 改动**静默丢失**；即便不抛，两次写
+        也可能互相覆盖产生丢更新。修复：
+        - 序列化只针对 self.lock 内取得的稳定快照（绝不在遍历时被改动）；
+        - 文件写在 self._save_lock 内串行，且**写前一刻**才在锁内取快照，
+          故最后一次完成的写必然包含此前已提交的全部改动（不丢更新）；
+        - 仍复用 config.save_config 的 .tmp + os.replace 原子写。
+        save_config 自身不取 self.lock，因此这里不会死锁；异常一律吞掉，
+        绝不让「落盘」反向打断调用方。
+        """
+        try:
+            with self._save_lock:
+                with self.lock:
+                    snap = self._snapshot_locked()
+                save_config(snap)
+        except Exception:
+            pass
+
     def snapshot(self):
         with self.lock:
-            return json.loads(json.dumps(self.cfg))
+            return self._snapshot_locked()
 
     def set(self, key, value, save=True):
         with self.lock:
             self.cfg[key] = value
         if save:
-            save_config(self.cfg)
+            self._persist()
 
     def update_path(self, idx, field, value):
         with self.lock:
             if 0 <= idx < len(self.cfg["watch_paths"]):
                 self.cfg["watch_paths"][idx][field] = value
-        save_config(self.cfg)
+        self._persist()
 
     def set_path(self, idx, entry):
         with self.lock:
             if 0 <= idx < len(self.cfg["watch_paths"]):
                 self.cfg["watch_paths"][idx] = entry
-        save_config(self.cfg)
+        self._persist()
 
     # ---------- 共享密码本（存于 toolbox.db） ----------
     def passwords(self):
@@ -166,6 +197,23 @@ class AppState:
     def add_long_password(self, p):
         """往长期密码本里追加一个密码"""
         db.add_password(p, source="manual")
+
+    # ---------- 长期密码本行级 API（密码本页用；代理到 toolbox.db） ----------
+    def password_rows(self):
+        """行级读取长期密码本（含 id/source/created_at/note），与 passwords() 同序。"""
+        return db.list_passwords()
+
+    def add_password_row(self, p, source="manual", note=""):
+        """行级新增长期口令（重复口令被忽略），返回新（或已存在）行 id；失败返回 0。"""
+        return db.add_password(p, source=source, note=note)
+
+    def update_password_row(self, pid, password=None, note=None, source=None):
+        """行级更新长期口令（只写显式提供的字段），返回是否命中该行。"""
+        return db.update_password(pid, password=password, note=note, source=source)
+
+    def delete_password_row(self, pid):
+        """行级按 id 精确删除一条长期口令，返回是否命中。"""
+        return db.delete_password(pid)
 
     # ---------- 特殊用户固定提取码（存于 toolbox.db） ----------
     def share_code_map(self):
@@ -235,6 +283,23 @@ class AppState:
             self._prune_temp()
             self._save_temp_passwords()
             return first
+
+    def remove_temp_password(self, p):
+        """从临时密码表移除一条（本次开机内有效），返回是否确有移除。
+
+        与 add_temp_password/clear_temp_passwords 同锁同约定：密码列表与时间戳
+        字典同时清理（时间戳缺失也照样删列表项，保持一致），再走 _save_temp_passwords
+        落盘，避免磁盘残留已删除条目。空串 / 未收录的密码返回 False。"""
+        p = str(p).strip()
+        if not p:
+            return False
+        with self.lock:
+            if p not in self._temp_passwords:
+                return False
+            self._temp_passwords = [x for x in self._temp_passwords if x != p]
+            self._temp_ts.pop(p, None)
+            self._save_temp_passwords()
+            return True
 
     def clear_temp_passwords(self):
         with self.lock:

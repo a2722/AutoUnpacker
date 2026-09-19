@@ -3,7 +3,8 @@
 
 职责：
 - ShareFilesDialog 展示 prepare_share 返回的根层条目；目录首次展开时经 on_expand
-  懒加载其子项（1 次请求/目录），文件是叶子；
+  懒加载其子项（1 次请求/目录），文件是叶子；勾选目录＝勾选整棵子树：未加载的
+  子目录按上限自动异步展开，结果到达后其子项随之勾选；
 - 展开请求在工作线程执行，结果经 Queue + QTimer 回到 UI 线程，界面绝不卡顿；
 - 提供「全选 / 反选 / 仅选文件」与「已选文件数 + 合计大小」实时统计；
 - 「下载选中」只把勾选的文件（任意嵌套层级）拼成 [(fs_id, path), ...] 交给 on_commit。
@@ -34,6 +35,19 @@ ROLE_STATE = Qt.UserRole + 1          # dummy / loading / loaded / failed / file
 
 # 展开结果轮询间隔（毫秒）：worker 线程只投队列，UI 线程定时来取。
 POLL_INTERVAL_MS = 80
+
+# 勾选目录后自动展开的三重上限（GUI 不阻塞，也不许无界起线程 / 发请求）：
+# - 深度：根层目录为 0，深度 ≥ MAX_AUTO_DEPTH 的目录不再自动展开；
+# - 节点：自动展开累计加载的条目数达到上限即停（只统计自动展开的部分）；
+# - 并发：同一时刻最多 MAX_AUTO_INFLIGHT 个自动展开在途，其余排队等待补位。
+MAX_AUTO_DEPTH = 4
+MAX_AUTO_NODES = 2000
+MAX_AUTO_INFLIGHT = 4
+
+# 状态行文案：手工展开 / 勾选目录的自动展开 / 触顶提示。
+LOADING_TEXT = "正在展开…"
+AUTO_LOADING_TEXT = "正在展开目录…"
+AUTO_CAP_TEXT = "目录层级过深或内容过多，已停止自动展开；可手动展开后勾选。"
 
 
 def format_size(n):
@@ -105,6 +119,9 @@ class ShareFilesDialog(QDialog):
         self._guard = False           # 批量改勾选时抑制 itemChanged 递归
         self._busy = False            # 是否已 setOverrideCursor(WaitCursor)
         self._pending = {}            # path -> 等待展开结果的目录节点
+        self._auto_pending = set()    # 自动展开在途的目录 path（并发上限用）
+        self._auto_queue = []         # 并发位满时排队等待自动展开的目录节点
+        self._auto_loaded_nodes = 0   # 自动展开累计加载的条目数（节点上限用）
         self._results = queue.Queue()  # worker 线程投递 (path, ok, data)
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(POLL_INTERVAL_MS)
@@ -128,8 +145,9 @@ class ShareFilesDialog(QDialog):
             sub.setStyleSheet("color: %s;" % PALETTE["muted"])
             lay.addWidget(sub)
 
-        hint = ("勾选需要下载的文件；目录可逐层展开，勾选目录＝勾选其中已加载的文件。\n"
-                "未展开的目录不会被提交；同一个链接可以再次打开，重新挑一部分。")
+        hint = ("勾选需要下载的文件；勾选目录＝连同其中的文件一起选中"
+                "（未加载的子目录会自动展开，深度/数量有限）。\n"
+                "同一个链接可以再次打开，重新挑一部分。")
         if timeout_hint_sec:
             try:
                 secs = int(timeout_hint_sec)
@@ -145,7 +163,7 @@ class ShareFilesDialog(QDialog):
 
         tools = QHBoxLayout()
         self.btn_all = QPushButton("全选")
-        self.btn_all.setToolTip("勾选当前已加载的全部条目（含目录）")
+        self.btn_all.setToolTip("勾选全部条目（未加载的目录会自动展开并选中其中内容）")
         self.btn_all.clicked.connect(self._select_all)
         self.btn_invert = QPushButton("反选")
         self.btn_invert.setToolTip("把当前已加载文件的勾选状态取反")
@@ -238,16 +256,16 @@ class ShareFilesDialog(QDialog):
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable
                       | Qt.ItemIsUserCheckable)
         item.setToolTip(0, payload["path"] or payload["name"])
+        # 父目录已勾选时（勾选后展开），其子项（文件 / 子目录）随之勾选。
+        pre = (parent is not None
+               and bool(parent.data(0, ROLE_PAYLOAD))
+               and parent.checkState(0) == Qt.Checked)
         if payload["kind"] == "dir":
             item.setData(0, ROLE_STATE, "dummy")
-            item.setCheckState(0, Qt.Unchecked)
+            item.setCheckState(0, Qt.Checked if pre else Qt.Unchecked)
             self._make_placeholder(item, "（点击展开加载）")
         else:
             item.setData(0, ROLE_STATE, "file")
-            # 父目录已勾选时（预先勾选后展开），子文件随之勾选。
-            pre = (parent is not None
-                   and bool(parent.data(0, ROLE_PAYLOAD))
-                   and parent.checkState(0) == Qt.Checked)
             item.setCheckState(0, Qt.Checked if pre else Qt.Unchecked)
         return item
 
@@ -264,14 +282,16 @@ class ShareFilesDialog(QDialog):
             return
         self._begin_expand(item, payload["path"])
 
-    def _begin_expand(self, item, path):
-        """清掉旧占位、挂「正在展开…」、开工（线程只投队列）。"""
+    def _begin_expand(self, item, path, auto=False):
+        """清掉旧占位、挂「正在展开…」、开工（线程只投队列）。
+
+        auto=True 表示这是「勾选目录」触发的自动展开，状态行区分文案。"""
         while item.childCount():
             item.takeChild(0)
         item.setData(0, ROLE_STATE, "loading")
         self._make_placeholder(item, "正在展开…")
         self._pending[path] = item
-        self.status_lbl.setText("正在展开…")
+        self.status_lbl.setText(AUTO_LOADING_TEXT if auto else LOADING_TEXT)
         self._set_busy(True)
         if not self._poll_timer.isActive():
             self._poll_timer.start()
@@ -291,7 +311,7 @@ class ShareFilesDialog(QDialog):
 
     @_safe_slot
     def _poll_results(self):
-        """UI 线程定时取展开结果并落树。"""
+        """UI 线程定时取展开结果并落树；随后给排队中的自动展开补位。"""
         got = False
         while True:
             try:
@@ -300,16 +320,19 @@ class ShareFilesDialog(QDialog):
                 break
             got = True
             self._apply_result(path, ok, data)
+        self._drain_auto_queue()
         if not self._pending:
             self._poll_timer.stop()
             self._set_busy(False)
-            if self.status_lbl.text() == "正在展开…":
+            if self.status_lbl.text() in (LOADING_TEXT, AUTO_LOADING_TEXT):
                 self.status_lbl.setText("")
         if got:
             self._update_totals()
 
     def _apply_result(self, path, ok, data):
         item = self._pending.pop(path, None)
+        was_auto = path in self._auto_pending
+        self._auto_pending.discard(path)
         if item is None or item.treeWidget() is not self.tree:
             return                      # 对话框已关闭 / 节点已不存在
         if not ok:
@@ -329,6 +352,11 @@ class ShareFilesDialog(QDialog):
             self._sync_parents(item.parent())
         finally:
             self._guard = False
+        if was_auto:
+            self._auto_loaded_nodes += len(data)
+        # 勾选态目录的自动展开链：本次结果里的子目录继续按上限排队。
+        if item.checkState(0) == Qt.Checked:
+            self._auto_expand_checked_children(item)
 
     def _fail_node(self, item, reason):
         """展开失败：就地显示原因，保留占位子项以便再次展开重试。"""
@@ -339,6 +367,83 @@ class ShareFilesDialog(QDialog):
                                PALETTE["danger"])
         item.setToolTip(0, "展开失败：%s" % reason)
         self.status_lbl.setText("展开失败：%s" % reason)
+
+    # ── 勾选目录的自动展开（异步、有界） ────────────────────────────────────
+    def _depth_of(self, item):
+        """节点深度：根层为 0，只数带 payload 的祖先。"""
+        depth = 0
+        parent = item.parent()
+        while parent is not None and parent.data(0, ROLE_PAYLOAD):
+            depth += 1
+            parent = parent.parent()
+        return depth
+
+    def _schedule_auto_expand(self, item):
+        """把「已勾选但未加载」的目录排进自动展开（深度/节点/并发三重上限）。
+
+        在途已满则先入队、有结果补位时再展开；触顶则就地提示并放弃，
+        绝不无界起线程，也绝不阻塞 GUI。
+        """
+        payload = item.data(0, ROLE_PAYLOAD)
+        if not payload or payload["kind"] != "dir":
+            return
+        if item.checkState(0) != Qt.Checked:
+            return
+        if item.data(0, ROLE_STATE) not in ("dummy", "failed"):
+            return
+        path = payload["path"]
+        if not path or path in self._pending:
+            return
+        if (self._depth_of(item) >= MAX_AUTO_DEPTH
+                or self._auto_loaded_nodes >= MAX_AUTO_NODES):
+            self.status_lbl.setText(AUTO_CAP_TEXT)
+            return
+        if len(self._auto_pending) >= MAX_AUTO_INFLIGHT:
+            if not any(x is item for x in self._auto_queue):
+                self._auto_queue.append(item)
+            return
+        self._auto_pending.add(path)
+        self._begin_expand(item, path, auto=True)
+
+    def _auto_expand_checked_children(self, item):
+        """展开落地后：已勾选子目录里仍未加载的继续排队自动展开。"""
+        targets = []
+        for i in range(item.childCount()):
+            child = item.child(i)
+            payload = child.data(0, ROLE_PAYLOAD)
+            if (payload and payload["kind"] == "dir"
+                    and child.checkState(0) == Qt.Checked
+                    and child.data(0, ROLE_STATE) in ("dummy", "failed")):
+                targets.append(child)
+        for child in targets:
+            self._schedule_auto_expand(child)
+
+    def _expand_checked_unloaded_dirs(self):
+        """「全选」等显式勾选动作后：把已勾选未加载目录排入自动展开。"""
+        targets = []
+        for item in self._iter_items():
+            payload = item.data(0, ROLE_PAYLOAD)
+            if (payload and payload["kind"] == "dir"
+                    and item.checkState(0) == Qt.Checked
+                    and item.data(0, ROLE_STATE) in ("dummy", "failed")):
+                targets.append(item)
+        for item in targets:
+            self._schedule_auto_expand(item)
+
+    def _drain_auto_queue(self):
+        """有空闲并发位时，逐个复核并启动队列中的自动展开。"""
+        while self._auto_queue and len(self._auto_pending) < MAX_AUTO_INFLIGHT:
+            item = self._auto_queue.pop(0)
+            if item.treeWidget() is not self.tree:
+                continue
+            payload = item.data(0, ROLE_PAYLOAD)
+            if not payload or payload["kind"] != "dir":
+                continue
+            if item.checkState(0) != Qt.Checked:
+                continue
+            if item.data(0, ROLE_STATE) not in ("dummy", "failed"):
+                continue
+            self._schedule_auto_expand(item)
 
     # ── 勾选联动与统计 ──────────────────────────────────────────────────────
     @_safe_slot
@@ -351,23 +456,32 @@ class ShareFilesDialog(QDialog):
         self._guard = True
         try:
             if payload["kind"] == "dir":
-                self._check_files_deep(item, item.checkState(0) == Qt.Checked)
+                checked = item.checkState(0) == Qt.Checked
+                # 勾选＝整棵子树：已加载的立即联动，未加载的按上限异步补齐。
+                self._check_files_deep(item, checked)
+                if checked:
+                    self._schedule_auto_expand(item)
             self._sync_parents(item.parent())
         finally:
             self._guard = False
         self._update_totals()
 
     def _check_files_deep(self, item, checked):
-        """递归勾选/取消 item 下已加载的文件（占位行没有 payload，自动跳过）。"""
+        """递归勾选/取消 item 下已加载条目（占位行没有 payload，自动跳过）。
+
+        勾选方向上，未加载的子目录交给 _schedule_auto_expand 异步补齐；
+        取消方向上只动已加载部分，在途展开的结果到达后也不会再勾选。
+        """
         for i in range(item.childCount()):
             child = item.child(i)
             payload = child.data(0, ROLE_PAYLOAD)
             if not payload:
                 continue
-            if payload["kind"] == "file":
-                child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-            else:
+            child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+            if payload["kind"] == "dir":
                 self._check_files_deep(child, checked)
+                if checked and child.data(0, ROLE_STATE) in ("dummy", "failed"):
+                    self._schedule_auto_expand(child)
 
     def _subtree_counts(self, item):
         """返回 (已加载文件总数, 其中勾选数)，只数文件，目录不参与大小。"""
@@ -416,8 +530,20 @@ class ShareFilesDialog(QDialog):
             it += 1
             item = it.value()
 
+    def _has_loading_checked_dir(self):
+        """是否还有「已勾选目录」的展开在途（在途期间禁止提交）。"""
+        for item in self._pending.values():
+            try:
+                if item.checkState(0) == Qt.Checked:
+                    return True
+            except RuntimeError:    # 底层控件已销毁
+                continue
+        return False
+
     def _update_totals(self):
-        """统计勾选的文件数与合计大小（目录单独计数，绝不计入大小）。"""
+        """统计勾选的文件数与合计大小（目录单独计数，绝不计入大小）。
+
+        还有已勾选目录在展开时，下载按钮保持禁用并提示，直到全部落定。"""
         files = dirs = 0
         size = 0
         for item in self._iter_items():
@@ -438,7 +564,11 @@ class ShareFilesDialog(QDialog):
                                    % (files, extra, format_size(size)))
         else:
             self.total_lbl.setText("未选择文件")
-        self.btn_download.setEnabled(files > 0)
+        # 还有「已勾选目录」在展开：禁用下载，防止提交半量选择。
+        loading = self._has_loading_checked_dir()
+        self.btn_download.setEnabled(files > 0 and not loading)
+        if loading and self.status_lbl.text() in ("", LOADING_TEXT, AUTO_LOADING_TEXT):
+            self.status_lbl.setText(AUTO_LOADING_TEXT)
 
     @_safe_slot
     def _select_all(self):
@@ -449,6 +579,8 @@ class ShareFilesDialog(QDialog):
                     item.setCheckState(0, Qt.Checked)
         finally:
             self._guard = False
+        # 与新语义一致：被全选勾上的未加载目录同样自动展开并选中内容。
+        self._expand_checked_unloaded_dirs()
         self._update_totals()
 
     @_safe_slot
@@ -493,6 +625,9 @@ class ShareFilesDialog(QDialog):
 
     @_safe_slot
     def _on_download(self):
+        if self._has_loading_checked_dir():
+            self.status_lbl.setText(AUTO_LOADING_TEXT)
+            return                      # 还有勾选目录在展开：绝不提交半量选择
         pairs = self._collect_pairs()
         if not pairs:
             return
@@ -520,6 +655,8 @@ class ShareFilesDialog(QDialog):
         try:
             self._poll_timer.stop()
             self._pending.clear()
+            self._auto_pending.clear()
+            del self._auto_queue[:]
             while True:
                 try:
                     self._results.get_nowait()

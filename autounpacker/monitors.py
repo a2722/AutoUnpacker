@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 from . import paths
@@ -31,6 +31,21 @@ from .trust import (_host_of, decide_host, remember_auto_domain)
 # 「网址 + 中文说明/提取码」的截断见 utils.split_urls 的文档。
 from .utils import (_can_open_append, split_urls, is_url_like,
                     is_baidu_pan_url)
+
+
+def _tasks_changed(hub):
+    """任务生命周期事件（尽力而为）：Hub 实现了 tasks_changed 才投递。
+
+    监听/拖放链路每次写 tasks 表后调用；测试桩 Hub 未实现该方法时静默跳过，
+    绝不让「上报刷新」这一增强反过来打断既有的解压/失败处理流程。
+    """
+    try:
+        cb = getattr(hub, "tasks_changed", None)
+        if cb is not None:
+            cb()
+    except Exception:
+        pass
+
 
 # 剪贴板/二维码可用性：改为惰性探测（首次用到时才 import 并缓存结果）。
 # 目的：win32clipboard/PIL 在启动路径上不再加载，缩短冷启动时间；
@@ -77,6 +92,20 @@ def _imagegrab():
         return _imagegrab_mod
     return None
 
+
+# 分卷等待期「目录持续活动」的容忍上限（秒）：分卷目录里只要还有文件在下载/增长，
+# 就不在此期间强解（洞1：改名上传的兄弟卷因此被看见）。但连续活动超过本上限后
+# 不再以此压制兜底——否则一个无限增长的不相关文件能让等待永不结束。
+PAIR_DIR_ACTIVE_MAX_SEC = 1800
+
+# 截断分卷链的有界重试（与 _lock_retry 同一精神）：最多尝试 SPLIT_INCOMPLETE_MAX 次，
+# 每次退避递增（SPLIT_INCOMPLETE_DELAYS：300→900→1800s），到顶后放弃自动重试并如实
+# 告知一次；源文件与分卷一律原样保留（绝不回收/删除）。源文件身份（size/mtime）或
+# 源目录内容变化 → 计数清零、重新武装（新到的分卷会立即重新触发重试）。不加配置键。
+SPLIT_INCOMPLETE_MAX = 3
+SPLIT_INCOMPLETE_DELAYS = (300, 900, 1800)
+
+
 class FolderWatcher(threading.Thread):
     """多路径监听线程（只监听目录表面，不递归子孙文件夹）"""
 
@@ -88,10 +117,18 @@ class FolderWatcher(threading.Thread):
     # 又不会让非压缩包文件永久 churn。达到上限后仅当大小**稳定下来**（可能是
     # 下载已完成）时才给一次复查机会；仍非压缩包则继续保持上限。
     REWALK_MAX_STREAK = 60
+    # traced 的硬上限（≈几千条）：traced 每个已处理文件一条，长会话/大量下载会
+    # 单调增长吃内存。超过本上限按 LRU 淘汰最旧条目；被等待/重试状态引用的条目
+    # 绝不被淘汰（见 _traced_protected）。原始下载文件另有 trail.already_handled
+    # 的持久去重兜底，故淘汰只可能让极老、之后又变化过的中间产物被再处理一次。
+    TRACED_MAX = 4096
     TRANSLATION_MAX_SIZE = 10 * 1024 * 1024  # 翻译 json 最大 10MB
     TRANSLATION_WINDOW = 5 * 60              # 小文件夹先出现时的监控窗口（秒）
     VOL_MAX_WAIT = 300   # 首卷分卷"只有满卷"时最长等待(秒)：之后兜底按现状尝试解压
     PAIR_WAIT_EXTEND_SEC = 600  # 已检测到改名链但未通过验证时的有界延长等待(秒)：绝不强解截断链
+    PAIR_DIR_ACTIVE_MAX_SEC = PAIR_DIR_ACTIVE_MAX_SEC  # 兼容「类属性常量」访问（值同模块常量）
+    SPLIT_INCOMPLETE_MAX = SPLIT_INCOMPLETE_MAX        # 截断分卷链最多重试次数（同模块常量）
+    SPLIT_INCOMPLETE_DELAYS = SPLIT_INCOMPLETE_DELAYS  # 截断分卷链退避序列（秒）
     SPLIT_MAX_WAIT = 1800        # 跨目录分卷等待兄弟卷的最长时间(秒)：超时放弃（仅保留不删）
     SPLIT_RECHECK_INTERVAL = 10  # 跨目录分卷复查间隔(秒)：节流「全监听根 rglob」
     BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
@@ -118,8 +155,9 @@ class FolderWatcher(threading.Thread):
         # 消失」复位，避免长期占内存。
         self._rewalk = {}
         # 已处理过的文件身份 {norm_path: (size, mtime)}：同名但内容不同的
-        # 新文件（重新下载/替换）不会被误当成已处理而跳过
-        self.traced = {}
+        # 新文件（重新下载/替换）不会被误当成已处理而跳过。有界 LRU：
+        # 超 TRACED_MAX 淘汰最旧；仍被等待/重试引用的条目不淘汰（见 _traced_put）。
+        self.traced = OrderedDict()
         self.probing = {}  # {watch_key: {name: 剩余复查轮数}}
         # 翻译文件监控窗口 {小文件夹路径: (json_stem, 首次发现时间)}
         self._pending_trans = {}
@@ -130,6 +168,9 @@ class FolderWatcher(threading.Thread):
         self._vol_wait = {}
         # 输出文件被占用的重试计数 {abs_path: 次数}（上限 3 次，防死循环）
         self._lock_retry = {}
+        # 截断分卷链的有界重试 {abs_path: {ident, dir_sig, count, given_up}}：
+        # 身份/目录变化自动重新武装；到上限后 given_up=True 不再放行（保留源与分卷）
+        self._split_incomplete_retry = {}
         # 百度清单模式（Tier-2）：已处理集合 / 稳定观察 / 已告警 / 粘性记忆缓存
         self._bt_seen = {}      # {watch_key: set(norm_abs_path)}
         self._bt_probe = {}     # {watch_key: {norm_abs_path: (size, 稳定起始时间)}}
@@ -189,6 +230,67 @@ class FolderWatcher(threading.Thread):
             return False
         return True
 
+    # ---------- traced 有界化（LRU，详见 TRACED_MAX 注释） ----------
+    def _traced_protected(self):
+        """仍被等待/重试/归拢状态引用的文件绝对路径集合。
+
+        淘汰 traced 时必须保证：仍被某条 defer/retry 依赖的文件身份不被清掉。
+        审计结论：这些等待状态各自持有身份副本（_split_pending["ident"] /
+        _split_incomplete_retry["ident"] / _lock_retry 计数 / _vol_wait 签名），
+        **不读取 self.traced**；且各 defer 分支在返回前都会主动
+        self.traced.pop(abs_fp)。这里再把这些状态的键取并集作额外保险，
+        淘汰时永不误伤仍在等待的文件。任何异常都退化为空集合（不影响淘汰本身）。
+        """
+        protected = set()
+        for d in (self._split_pending, self._lock_retry,
+                  self._split_incomplete_retry, self._vol_wait):
+            try:
+                protected.update(d.keys())
+            except Exception:
+                pass
+        return protected
+
+    def _traced_put(self, key, ident):
+        """写入/刷新一个已处理文件身份；超出 TRACED_MAX 时 LRU 淘汰最旧。
+
+        与旧 `self.traced[key] = ident` 等价，仅多了「有界 + 保护等待中条目」。
+        任何异常都退回普通写入，绝不让内存治理反过来打断解压主流程。
+        """
+        try:
+            tr = self.traced
+            tr[key] = ident
+            tr.move_to_end(key)
+            if len(tr) > self.TRACED_MAX:
+                protected = self._traced_protected()
+                for k in list(tr):
+                    if len(tr) <= self.TRACED_MAX:
+                        break
+                    if k in protected:
+                        continue   # 等待/重试仍依赖：绝不淘汰
+                    tr.pop(k, None)
+        except Exception:
+            try:
+                self.traced[key] = ident
+            except Exception:
+                pass
+
+    def _traced_touch(self, key):
+        """命中时把条目移到末尾（近似 LRU：最近被读取的条目更难被淘汰）。"""
+        try:
+            self.traced.move_to_end(key)
+        except Exception:
+            pass
+
+    def _purge_traced_under(self, watch_key):
+        """监听路径被移除/禁用时，清掉其下所有 traced 条目（不再监听即无需去重记忆）。"""
+        try:
+            prefix = watch_key + os.sep
+            for k in [k for k in self.traced
+                      if k == watch_key or k.startswith(prefix)]:
+                self.traced.pop(k, None)
+        except Exception:
+            pass
+
     @staticmethod
     def _norm_path(path):
         """规范化路径，用于去重（忽略大小写与尾部分隔符）"""
@@ -243,6 +345,7 @@ class FolderWatcher(threading.Thread):
                     self._seen_ident.pop(key, None)  # 身份镜像随 seen 一起清理
                     for rk in [k for k in self._rewalk if k[0] == key]:
                         self._rewalk.pop(rk, None)   # churn 计数随监听路径移除清理
+                    self._purge_traced_under(key)    # 该路径不再监听：去重记忆一并清理
             for path, wc in enabled.items():
                 # 空闲目录回到 listening（extracting/waiting 视为忙碌，交给 _handle
                 # 自己收敛；error 会在本轮或下一轮被这里复位为 listening）。
@@ -906,12 +1009,17 @@ class FolderWatcher(threading.Thread):
                     self._vol_wait.pop(abs_fp, None)
                     self.hub.log(f"分卷已到齐（含尾卷，共 {len(vols)} 个编号分卷）: {name}")
                     return True
-                state["last_sig"] = None
-                state["last_change"] = now
-                _wlog(("no-final", name, tuple(sorted(vols))),
-                      f"首卷已出现，分卷未到齐（缺末卷 {final_name}）: {name}"
-                      f"（已到编号分卷 {sorted(vols)}）")
-                return False
+                # 空闲制：只有分卷集合/大小真的变化时才重置计时。原实现每轮无条件
+                # 重置 last_change，使下面的 300s 兜底永远不可达（洞2）。
+                if state["last_sig"] != sig:
+                    state["last_sig"] = sig
+                    state["last_change"] = now
+                    _wlog(("no-final", name, tuple(sorted(vols))),
+                          f"首卷已出现，分卷未到齐（缺末卷 {final_name}）: {name}"
+                          f"（已到编号分卷 {sorted(vols)}）")
+                # 洞2：末卷缺失时同样进入「跨名链探测 + 有界兜底」共享逻辑，
+                # 使改名上传的兄弟卷会被探测、300s 兜底也能到点触发。
+                return self._pair_probe_or_timeout(fp, abs_fp, state, name, now)
             self._vol_wait.pop(abs_fp, None)
             self.hub.log(f"分卷已到齐（含末卷，共 {len(vols)} 个编号分卷）: {name}")
             return True
@@ -929,11 +1037,39 @@ class FolderWatcher(threading.Thread):
             _wlog(("all-full", name, sig),
                   f"首卷已出现，分卷未到齐（等待更小的尾卷）: {name}"
                   f"（已到 {len(vols)} 个满卷）")
+        # 跨名分卷链配对 + 目录活跃度 + 有界兜底放行（与「缺独立末卷」分支共用）
+        return self._pair_probe_or_timeout(fp, abs_fp, state, name, now)
+
+    # ---------- 分卷等待共用出口：跨名探测 + 目录活跃 + 有界兜底 ----------
+    def _pair_probe_or_timeout(self, fp, abs_fp, state, name, now):
+        """「全满卷等待尾卷」与「缺独立末卷（xxx.7z.001 风格）」两个等待分支共用的收尾。
+
+        顺序：跨名分卷链探测 → 目录活跃度重置空闲计时 → 有界兜底放行。
+        返回 True=放行尝试解压，False=本轮继续等待。绝不重复实现兜底逻辑。
+        """
         # 跨名分卷链配对：同目录里可能有被改名上传的兄弟分卷（可能不止一卷），
         # 属于基础解压逻辑的一部分、强制开启。唯一链 + 7z 验证通过即改名配对；
         # 失败/模糊一律只提示不动手，绝不改变既有等待语义。
         if self._pair_split_check(fp, state):
             return False
+        # 目录仍在活动（有文件在下载，或与上一轮快照相比出现新文件/大小增长）→
+        # 视为「还在到齐路上」，重置空闲计时，绝不在此期间强解。与文件名无关：
+        # 改名上传的兄弟卷正是这样被看见的。连续活动超上限后不再压制兜底。
+        if self._pair_dir_active(fp, state, now):
+            state["last_change"] = now
+        # 截断分卷链的有界重试：按已尝试次数提升本次退避阈值（300→900→1800s）；
+        # 已放弃或达上限则不再放行（继续等新分卷，源文件与分卷一律保留）。
+        # 源文件身份或源目录内容变化 → _split_retry_gate 清计数重新武装。
+        _retry = self._split_retry_gate(fp, abs_fp)
+        if _retry is not None:
+            if (_retry.get("given_up")
+                    or _retry.get("count", 0) >= self.SPLIT_INCOMPLETE_MAX):
+                return False
+            _wait = self.SPLIT_INCOMPLETE_DELAYS[
+                min(_retry.get("count", 0),
+                    len(self.SPLIT_INCOMPLETE_DELAYS) - 1)]
+        else:
+            _wait = self.VOL_MAX_WAIT
         # 已检测到改名链但验证未通过：300s 不能强解截断链，改为有界延长到
         # PAIR_WAIT_EXTEND_SEC，到点再按现有分卷尝试（只提示，绝不删除源文件）。
         if state.get("pair_chain_pending"):
@@ -942,18 +1078,131 @@ class FolderWatcher(threading.Thread):
                 self.hub.log(f"仍有缺失分卷，按现有分卷尝试（不会删除源文件）: {name}")
                 return True
             return False
-        if now - state["last_change"] >= self.VOL_MAX_WAIT:
-            # 长时间无变化 → 兜底强制放行（覆盖恰好整倍数/下载中断的罕见情况）
+        if now - state["last_change"] >= _wait:
+            # 长时间无变化 → 兜底强制放行（覆盖恰好整倍数/下载中断的罕见情况）；
+            # 截断链重试时 _wait 按退避升级（300→900→1800s）。
             self._vol_wait.pop(abs_fp, None)
-            self.hub.log(f"分卷等待超时（{self.VOL_MAX_WAIT}s），按现有分卷尝试解压: {name}")
+            self.hub.log(f"分卷等待超时（{_wait}s），按现有分卷尝试解压: {name}")
             return True
         return False
+
+    def _pair_dir_active(self, fp, state, now):
+        """同目录是否仍在活动（与文件名无关），供分卷等待重置空闲计时。
+
+        活动 = 目录里有任何未完成下载文件，或与上一轮快照相比出现新文件/大小变化
+        （包含改名上传的兄弟卷到达、任何文件增长）。快照存 state["dir_snapshot"]。
+        连续活动超过 PAIR_DIR_ACTIVE_MAX_SEC 后返回 False（不再压制兜底），并只在
+        该次连续活动首次达上限时如实打一条日志——无限增长的不相关文件不能永远延期。
+        注意：这不替代既有的三个重置源（同组分卷下载中/编号缺口/大小签名变化），
+        只是在其之外补上「与文件名无关」的一条。"""
+        try:
+            cur = {}
+            incomplete = False
+            for e in Path(fp).parent.iterdir():
+                try:
+                    if not e.is_file():
+                        continue
+                    cur[e.name] = e.stat().st_size
+                    if smart_extract.is_incomplete_download(e):
+                        incomplete = True
+                except OSError:
+                    continue
+        except OSError:
+            return False
+        prev = state.get("dir_snapshot")
+        # 只看「出现新文件 / 大小变化（增长）」：纯删除不算活动（下载器清理临时文件
+        # 或分卷被改名归位时都会删除旧名，不该因此误判为「仍在到齐」）。
+        changed = False
+        if prev is not None:
+            for ename, esize in cur.items():
+                if prev.get(ename) != esize:
+                    changed = True
+                    break
+        state["dir_snapshot"] = cur
+        if not (incomplete or changed):
+            state["dir_active_since"] = None
+            return False
+        since = state.get("dir_active_since")
+        if since is None:
+            since = now
+            state["dir_active_since"] = since
+        if now - since >= PAIR_DIR_ACTIVE_MAX_SEC:
+            if state.get("dir_active_capped") != since:
+                state["dir_active_capped"] = since
+                self.hub.log(
+                    f"目录持续变化已超 {PAIR_DIR_ACTIVE_MAX_SEC}s，"
+                    f"不再延长分卷等待，按现有分卷尝试: {Path(fp).name}")
+            return False
+        return True
+
+    # ---------- 截断分卷链的有界重试（同 _lock_retry 精神） ----------
+    def _dir_sig(self, fp):
+        """源文件所在目录的内容签名（名+大小），用于「新卷到达即重新武装重试」。
+
+        只取顶层普通文件；单项 stat 失败跳过；目录不可读返回空元组（视为无变化）。"""
+        try:
+            out = []
+            for e in Path(fp).parent.iterdir():
+                try:
+                    if e.is_file():
+                        out.append((e.name, e.stat().st_size))
+                except OSError:
+                    continue
+            return tuple(sorted(out))
+        except OSError:
+            return ()
+
+    def _split_retry_gate(self, fp, abs_fp):
+        """分卷链不完整的有界重试闸门。
+
+        返回重试状态 dict（含 count/given_up），无记录返回 None。源文件身份
+        （size/mtime）或源目录内容变化 → 清记录（重新武装，退避从头算起，新到的
+        分卷因此立即重新触发重试）。无记录时只做一次字典查找，健康路径零开销。"""
+        st = self._split_incomplete_retry.get(abs_fp)
+        if st is None:
+            return None
+        ident = self._file_identity(fp)
+        if (not self._is_same_traced(st.get("ident"), ident)
+                or st.get("dir_sig") != self._dir_sig(fp)):
+            self._split_incomplete_retry.pop(abs_fp, None)
+            self.hub.log(
+                f"源文件或所在目录有变化，重新武装分卷重试（计数清零）: {fp.name}")
+            return None
+        return st
+
+    def _note_split_incomplete(self, fp, abs_fp, ident):
+        """记录一次「分卷链不完整」尝试，返回累计次数（含本次）。
+
+        身份或源目录内容变化 → 从 0 重新计数（重新武装）。只增计数，不做放行决策；
+        放行/放弃由 _pair_probe_or_timeout 与 _handle 依据计数判定。"""
+        sig = self._dir_sig(fp)
+        st = self._split_incomplete_retry.get(abs_fp)
+        if (st is None
+                or not self._is_same_traced(st.get("ident"), ident)
+                or st.get("dir_sig") != sig):
+            st = {"ident": ident, "dir_sig": sig, "count": 0, "given_up": False}
+        st["count"] += 1
+        st["given_up"] = False
+        self._split_incomplete_retry[abs_fp] = st
+        return st["count"]
 
     # ---------- 跨名分卷配对（同目录·疑似改名上传的兄弟尾卷） ----------
     def _pair_split_check(self, fp, state):
         """跨名分卷配对检查的对外入口：任何异常都吞成 False，绝不影响等待逻辑。"""
         try:
             return self._pair_split_check_impl(fp, state)
+        except Exception:
+            return False
+
+    def pair_split_for_drop(self, fp):
+        """拖放场景的跨名分卷链配对入口（与监听路径共用 _pair_split_check 同一套实现）。
+
+        拖放是一次性动作、没有「下一轮重扫」，故显式传一次性 state：既不读取也不写入
+        监听路径对每个文件的等待/验证记忆，绝不污染监听状态。任何异常一律吞掉并返回
+        False，绝不影响拖放解压流程。返回 True = 验证通过并已把改名兄弟卷改成首卷系列名。
+        """
+        try:
+            return self._pair_split_check(fp, {})
         except Exception:
             return False
 
@@ -1229,8 +1478,9 @@ class FolderWatcher(threading.Thread):
                 return self._split_recheck(fp, wc)
             self._split_pending.pop(abs_fp, None)   # 文件变了（重新下载等）：走正常流程
         if self._is_same_traced(self.traced.get(abs_fp), ident):
+            self._traced_touch(abs_fp)   # LRU：命中即刷新，避免活跃条目被淘汰
             return "done"
-        self.traced[abs_fp] = ident
+        self._traced_put(abs_fp, ident)
         # 只给最初始源文件建立删除回溯记录（多层解压产生的次级中间文件不标记）
         record = None
         if not traced:
@@ -1282,7 +1532,9 @@ class FolderWatcher(threading.Thread):
                 file_name=name, file_size=(ident[0] if ident else None),
                 source_dir=wc.get("path"), output_dir=out_dir,
                 mode=str(wc.get("mode") or "surface"), state="queued")
+            _tasks_changed(self.hub)
             db.update_task_state(tid, "extracting", started_at=int(time.time()))
+            _tasks_changed(self.hub)
             # 线程级日志上下文：从解压一直保持到终态处理结束（见外层 finally 清除），
             # 这样「该任务日志」才包含完成 / 失败 / 差错等收尾行。
             self.hub.set_log_context(source_dir=wc.get("path"), task_id=tid)
@@ -1298,8 +1550,10 @@ class FolderWatcher(threading.Thread):
                     and not (result.get("incomplete") or result.get("failed_layers")
                              or result.get("split_incomplete"))):
                 self._lock_retry.pop(abs_fp, None)
+                self._split_incomplete_retry.pop(abs_fp, None)
                 db.update_task_state(tid, "done", finished_at=int(time.time()),
                                      output_dir=(result.get("promoted_dir") or out_dir))
+                _tasks_changed(self.hub)
                 self._set_dir_state(wc.get("path"), "listening", name=name)
                 msg = f"{name} 完成，穿透 {result['depth_reached']} 层，共 {len(result['extracted_files'])} 个文件"
                 self.hub.log(msg)
@@ -1318,8 +1572,33 @@ class FolderWatcher(threading.Thread):
                 # 不是终态失败——源文件与分卷原样保留，撤销记录与追踪，任务回
                 # 等待态，等分卷补齐后重试（保持既有 queued 重试语义）。
                 if (result or {}).get("split_incomplete"):
-                    self.hub.log(f"{name} 分卷未到齐（分卷链不完整，缺少兄弟分卷），稍后重试: {err}")
-                    db.update_task_state(tid, "queued", error="分卷未到齐，稍后重试")
+                    # 截断分卷链的有界重试：最多 SPLIT_INCOMPLETE_MAX 次（退避
+                    # 300→900→1800s，见 _pair_probe_or_timeout）。到顶放弃自动重试
+                    # 并如实告知一次；源文件与分卷原样保留（绝不回收/删除）。
+                    _cnt = self._note_split_incomplete(fp, abs_fp, ident)
+                    if _cnt >= self.SPLIT_INCOMPLETE_MAX:
+                        # 到顶放弃自动重试：任务行必须落**终态**（failed，可重试），
+                        # 绝不留永远 queued 的僵尸行（见 db.py tasks 设计口径）。
+                        # 源文件与分卷一律原样保留；如实告知一次（日志 + 通知各一条）。
+                        # 返回 "defer" 不变：文件继续留在观察范围，新分卷到达时
+                        # _split_retry_gate 会重新武装并再次尝试。
+                        self._split_incomplete_retry[abs_fp]["given_up"] = True
+                        self.hub.log(
+                            f"{name} 分卷链不完整，已重试 {self.SPLIT_INCOMPLETE_MAX} 次"
+                            f"仍未到齐，放弃自动重试（源文件与分卷保留，可补齐后手动处理）")
+                        self.hub.notify(
+                            "分卷等待放弃",
+                            f"{name}\n分卷链不完整，已停止自动重试（源文件与分卷保留）")
+                        db.update_task_state(
+                            tid, "failed",
+                            error="分卷链不完整且已放弃自动重试"
+                                  "（保留源文件与分卷，可手动重试）",
+                            finished_at=int(time.time()))
+                    else:
+                        self.hub.log(
+                            f"{name} 分卷未到齐（分卷链不完整，缺少兄弟分卷），稍后重试: {err}")
+                        db.update_task_state(tid, "queued", error="分卷未到齐，稍后重试")
+                    _tasks_changed(self.hub)
                     self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self.traced.pop(abs_fp, None)
                     if record is not None:
@@ -1343,6 +1622,7 @@ class FolderWatcher(threading.Thread):
                              or not self._volume_ready(fp))):
                     self.hub.log(f"{name} 分卷可能未到齐，稍后重试: {err}")
                     db.update_task_state(tid, "queued", error="分卷可能未到齐，稍后重试")
+                    _tasks_changed(self.hub)
                     self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self.traced.pop(abs_fp, None)
                     if record is not None:
@@ -1363,6 +1643,7 @@ class FolderWatcher(threading.Thread):
                         f"{name} 分卷缺兄弟卷（{err[:80]}），等待跨目录归拢: {anchor.name}")
                     db.update_task_state(tid, "queued",
                                          error="分卷缺兄弟卷，等待跨目录归拢")
+                    _tasks_changed(self.hub)
                     self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self._split_pending[abs_fp] = {
                         "anchor": str(anchor), "ident": ident,
@@ -1390,6 +1671,7 @@ class FolderWatcher(threading.Thread):
                         self._lock_retry[abs_fp] = cnt
                         self.hub.log(f"{name} 输出文件被占用（{cnt}/3），稍后自动重试: {err[:120]}")
                         db.update_task_state(tid, "queued", error="输出文件被占用，稍后重试")
+                        _tasks_changed(self.hub)
                         self._set_dir_state(wc.get("path"), "waiting", name=name)
                         self.traced.pop(abs_fp, None)
                         if record is not None:
@@ -1406,6 +1688,7 @@ class FolderWatcher(threading.Thread):
                 db.update_task_state(
                     tid, ("need_password" if "密码" in err else "failed"),
                     error=err, finished_at=int(time.time()))
+                _tasks_changed(self.hub)
                 self._set_dir_state(wc.get("path"), "error", name=name)
                 if record is not None:
                     deletion_trail.mark_failed(record["id"], err)
@@ -1416,6 +1699,7 @@ class FolderWatcher(threading.Thread):
                 db.update_task_state(
                     tid, ("need_password" if "密码" in str(e) else "failed"),
                     error=str(e), finished_at=int(time.time()))
+                _tasks_changed(self.hub)
             self._set_dir_state(wc.get("path"), "error", name=name)
             if record is not None:
                 deletion_trail.mark_failed(record["id"], str(e))
@@ -1568,8 +1852,9 @@ class FolderWatcher(threading.Thread):
                 abs_pf = self._norm_path(pf)
                 ident = self._file_identity(pf)
                 if self._is_same_traced(self.traced.get(abs_pf), ident):
+                    self._traced_touch(abs_pf)
                     continue
-                self.traced[abs_pf] = ident
+                self._traced_put(abs_pf, ident)
                 self.hub.log(f"追溯解压产生的压缩包: {pf.name}")
                 self._handle(pf, wc, traced=True)
 
@@ -2034,6 +2319,44 @@ class QRMonitor(threading.Thread):
         self.last_hash = h
         self._enqueue(("image", image))
 
+    def feed_image_file(self, path):
+        """把磁盘上的图片文件按「剪贴板图片」同款链路送入二维码识别（公共接口）。
+
+        供外部（主窗口的二维码图片拖放 / 文件投放）调用：只做「读配置 → PIL 打开
+        → 复用 _process（md5 去重 + _enqueue(("image", image))）」，不触碰 UI，可在
+        非 UI 线程安全调用。受 qr_enabled 总开关约束；路径缺失 / 不可读 / PIL 打不
+        开时记一行日志并返回 False。返回值只表示「已受理并交给解码链路」，不代表
+        一定解码出内容。任何异常都吞成一行日志，绝不抛出。
+        """
+        try:
+            cfg = self.state.snapshot()
+            if not cfg.get("qr_enabled"):
+                self.hub.log(
+                    "二维码图片投放已忽略：二维码识别开关未开启（qr_enabled=False）")
+                return False
+        except Exception as e:
+            self.hub.log(f"二维码图片投放失败：读取配置出错: {e}")
+            return False
+        try:
+            p = Path(path)
+            if not p.is_file():
+                self.hub.log(f"二维码图片投放失败：文件不存在或不可读: {path}")
+                return False
+            from PIL import Image
+            image = Image.open(str(p))
+            image.load()          # 强制解码，非图片会在此抛出并被下面捕获
+        except Exception as e:
+            self.hub.log(f"二维码图片投放失败：无法打开图片 {path}: {e}")
+            return False
+        try:
+            # 与剪贴板图片完全同一条链路：md5 去重 + _enqueue(("image", image))，
+            # 解码由工作线程 _decode_qr + _handle_decoded_texts 统一完成。
+            self._process(image)
+        except Exception as e:
+            self.hub.log(f"二维码图片投放失败：入队出错: {e}")
+            return False
+        return True
+
     def _handle_decoded_texts(self, texts):
         """对解码出的文本做统一处理。
 
@@ -2254,13 +2577,24 @@ class QRMonitor(threading.Thread):
                 self.hub.log(f"二维码解码子进程启动失败: {e}")
                 return []
             if proc.returncode != 0:
+                stderr = proc.stderr or b""
                 try:
-                    err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+                    err = stderr.decode("utf-8", "replace").strip().splitlines()
                 except Exception:
                     err = []
                 detail = err[-1] if err else f"退出码 {proc.returncode}"
-                kind = ("解码失败" if b"__ERROR__" in (proc.stderr or b"")
-                        else "解码进程异常退出（已隔离）")
+                # qr_worker.py 实际输出 __OPEN_ERROR__（图片打开失败，退出码 3）与
+                # __DECODE_ERROR__（解码失败，退出码 4）；二者都不含子串 __ERROR__，
+                # 旧判定会把两种真实原因都误报成「进程异常退出」。这里按真实标记区分，
+                # 并把标记前缀从用户可见文案里去掉（保留子进程的原始错误详情）。
+                if b"__OPEN_ERROR__" in stderr:
+                    kind, marker = "图片打开失败", "__OPEN_ERROR__"
+                elif b"__DECODE_ERROR__" in stderr:
+                    kind, marker = "解码失败", "__DECODE_ERROR__"
+                else:
+                    kind, marker = "解码进程异常退出（已隔离）", ""
+                if marker:
+                    detail = detail.replace(marker, "", 1).strip() or detail
                 self.hub.log(f"二维码{kind}: {detail[:80]}")
                 return []
             try:
@@ -2596,5 +2930,9 @@ class QRMonitor(threading.Thread):
         if data[:4] == b"\x00\x00\x01\x00":
             return True  # ICO
         return False
+
+    # 公共别名（契约冻结）：外部按 QRMonitor.is_image_bytes(bytes) 调用；旧私有名
+    # _is_image_bytes 继续可用（内部与既有测试依赖），保持原实现不动。
+    is_image_bytes = _is_image_bytes
 
 

@@ -349,7 +349,12 @@ QProgressBar#chipProg {
     max-height: 4px; min-height: 4px;
 }
 QProgressBar#chipProg::chunk { background: $prog_chunk; border-radius: 2px; }
-QLabel#stripHint { color: $chip_off_fg; font-size: 11px; }
+/* 说明文字（#stripHint）：字号 11px 的 CJK 墨迹几乎顶满 em 框，QLabel 折行
+   高度按 fontMetrics().height()（11）算、绘制却按 lineSpacing()（13）排线，
+   于是上下各被裁 1px；左缘也无余量。给左右各 1px padding（纵向 padding 无效：
+   sizeHint 会同步增大、内容区仍等于 height()），纵向余量由页面在 polish 后
+   setMinimumHeight(lineSpacing + 2) 兜底（见 page_settings._fit_hint）。 */
+QLabel#stripHint { color: $chip_off_fg; font-size: 11px; padding: 0 1px; }
 
 /* ---- 顶部标签页（激活态用 2px 下划线，禁止用背景块） ---- */
 QPushButton#navTab {
@@ -422,7 +427,7 @@ QTableView#taskTable::item:selected {
 }
 QTableView#taskTable QHeaderView::section {
     background: $head_bg; color: $head_fg; font-weight: bold; font-size: 11.5px;
-    border: none; border-bottom: 1px solid $head_border; padding: 7px 10px;
+    border: none; border-bottom: 1px solid $head_border; padding: 7px 8px;
 }
 QPushButton#rowAct { background: transparent; border: none; padding: 0; }
 QPushButton#rowAct:hover { background: $btn_hover; border-radius: $radius_ctl; }

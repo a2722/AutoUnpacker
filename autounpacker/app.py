@@ -209,6 +209,9 @@ def main():
 
     watcher = FolderWatcher(state, hub, pauser)
     qr = QRMonitor(state, hub, pauser)
+    # 暴露给 UI：拖入二维码图片的入口需要实例调用 feed_image_file（见
+    # MainWindow._handle_drop_file）。缺失时 UI 侧 getattr 回落为「跳过并记日志」。
+    hub.qr_monitor = qr
     watcher.start()
     qr.start()
 

@@ -4,10 +4,12 @@
 职责：- 维护 passwords / password_dict / baidu_sticky / share_code_map / tasks / log_index 六张表（连接时自动建表，WAL 模式）
 - 共享密码本与密码字典的增删查（原存 config.json 与 ~/.smart_extract_password_dict.json）
 - 百度清单模式的粘性记忆（sticky_remember/sticky_known/sticky_list/sticky_prune）
-- 特殊用户固定提取码（find_share_code/find_share_entry/get_share_code_map/set_share_code_map/add_share_code）
+- 特殊用户固定提取码（find_share_code/find_share_entry/get_share_code_map/set_share_code_map/add_share_code/
+  update_share_code/delete_share_code）
 - 任务表与日志索引（add_task/find_open_task/update_task_state/get_task/list_tasks/count_tasks/task_logs；add_log_index/query_logs/prune_logs/prune_tasks）
 - migrate_legacy() 把旧 config 密码列表 / 旧字典 json 一次性迁入数据库
-关键入口：init_db() / get_passwords() / add_password() / load_password_dict() / add_task() / add_log_index() / migrate_legacy()
+关键入口：init_db() / get_passwords() / set_passwords() / list_passwords() / add_password() /
+          update_password() / delete_password() / load_password_dict() / add_task() / add_log_index() / migrate_legacy()
 依赖：sqlite3、paths.DATA_DIR
 注意：所有操作持模块级线程锁且 check_same_thread=False；log_index.source_dir 为 NULL 表示全局日志（绝不用空字符串）
 """
@@ -22,6 +24,10 @@ DB_FILE = APP_DIR / "toolbox.db"
 LEGACY_DICT_FILE = Path.home() / ".smart_extract_password_dict.json"
 
 _lock = threading.Lock()
+
+# 已完成「老库补列」迁移的库文件路径集合：每个库文件每进程只迁移一次。
+# 所有调用 _connect() 的函数都持 _lock，因此该集合的读写受同一把锁保护。
+_migrated = set()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS passwords (
@@ -90,14 +96,30 @@ def _connect():
         conn.execute("PRAGMA synchronous=NORMAL")
     except Exception:
         pass
-    conn.executescript(_SCHEMA)
-    # 老库的 share_code_map 可能已存在但缺 pick 列（CREATE TABLE IF NOT EXISTS 不会补列），
-    # 而「需要挑选」标记是后加的，所以这里显式补一列：列已存在时 SQLite 报
-    # duplicate column name，直接忽略即可——迁移幂等、只增列、不改动任何旧数据、绝不抛错。
-    try:
-        conn.execute("ALTER TABLE share_code_map ADD COLUMN pick INTEGER NOT NULL DEFAULT 0")
-    except Exception:
-        pass
+    # 建表脚本（_SCHEMA 全部 CREATE TABLE/INDEX）与老库补列迁移（CREATE TABLE IF
+    # NOT EXISTS 不会补列）每个库文件每进程只跑一次。调用方均持 _lock，故 _migrated
+    # 的读写受现有锁保护；老库首次使用仍会补列，换一个 DB 路径仍会建表+迁移，
+    # 迁移失败照旧吞掉、应用照常可用——只是不再在每次查询前重复执行整套 schema
+    # 脚本与两条同样的 ALTER（旧实现每次都跑，是应用最热的 DB 开销，尤其每条日志
+    # 追加都会 _connect 一次）。
+    # 注意：PRAGMA journal_mode/synchronous 仍是逐连接设置（synchronous 本就是
+    # 连接级、不随库持久化），故保留在 gated 块之外，语义不变。
+    if str(DB_FILE) not in _migrated:
+        conn.executescript(_SCHEMA)
+        # 老库的 share_code_map 可能已存在但缺 pick 列（CREATE TABLE IF NOT EXISTS 不会补列），
+        # 而「需要挑选」标记是后加的，所以这里显式补一列：列已存在时 SQLite 报
+        # duplicate column name，直接忽略即可——迁移幂等、只增列、不改动任何旧数据、绝不抛错。
+        # 老库的 passwords 同理可能已存在但缺 note 列（行级 API 的备注是后加的），
+        # 同样显式补一列且忽略「列已存在」：迁移幂等、只增列、不动旧行、绝不抛错。
+        for stmt in (
+            "ALTER TABLE share_code_map ADD COLUMN pick INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE passwords ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
+        _migrated.add(str(DB_FILE))
     return conn
 
 
@@ -130,35 +152,153 @@ def get_passwords():
 
 
 def set_passwords(plist):
+    """整体覆盖长期密码本：按列表顺序重写（去空白 / 去重 / 保序）。
+
+    备注与来源不再随重写丢失：重写前先记下每个口令已有的 note / source，重写时
+    按口令原样写回——「排序保存 / 旧弹窗保存」这类整表路径不再静默清空行级 API
+    写入的备注（并被移出列表的口令照旧删除）。旧库没有 note 列时由 _connect()
+    补列，缺省为空串。
+    """
+    clean = []
+    seen = set()
+    for p in plist or []:
+        p = str(p).strip()
+        if p and p not in seen:
+            seen.add(p)
+            clean.append(p)
     with _lock:
         conn = _connect()
         try:
+            old = {}
+            try:
+                for pw, note, source in conn.execute(
+                        "SELECT password, note, source FROM passwords"):
+                    old[str(pw)] = (str(note or ""), str(source or "manual"))
+            except Exception:
+                old = {}                   # 极端老表缺列时按「无备注」处理，不阻断重写
             conn.execute("DELETE FROM passwords")
             now = int(time.time())
-            for p in plist or []:
-                p = str(p).strip()
-                if p:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO passwords (password, created_at) VALUES (?, ?)",
-                        (p, now))
+            for p in clean:
+                note, source = old.get(p, ("", "manual"))
+                conn.execute(
+                    "INSERT OR IGNORE INTO passwords (password, created_at, source, note) "
+                    "VALUES (?, ?, ?, ?)",
+                    (p, now, source, note))
             conn.commit()
         finally:
             conn.close()
 
 
-def add_password(p, source="manual"):
+def list_passwords():
+    """行级读取长期密码本，返回按 id 升序（= 解压尝试顺序，与 get_passwords() 同序）的行列表：
+
+    [{"id", "password", "source", "created_at", "note"}, ...]
+
+    每行的 source 是库里真实存储的来源值（老行缺省 'manual'），note 缺省 ''；任何异常返回 []。
+    """
+    try:
+        rows = _execute(
+            "SELECT id, password, source, created_at, note FROM passwords ORDER BY id",
+            fetch=True)
+        return [{"id": r[0], "password": r[1], "source": r[2],
+                 "created_at": r[3], "note": r[4] or ""} for r in (rows or [])]
+    except Exception:
+        return []
+
+
+def add_password(p, source="manual", note=""):
+    """新增一条长期口令，返回该行 id（供页面行级定位 / 编辑 / 删除）。
+
+    重复口令沿用原有 INSERT OR IGNORE + UNIQUE 语义：绝不覆盖、绝不抛错；
+    被忽略时 INSERT 的 lastrowid 会残留旧值，故改为按口令回查已有行 id 返回。
+    空口令或任何异常返回 0。
+    """
     p = str(p).strip()
     if not p:
-        return
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO passwords (password, created_at, source) VALUES (?, ?, ?)",
-                (p, int(time.time()), source))
-            conn.commit()
-        finally:
-            conn.close()
+        return 0
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO passwords (password, created_at, source, note) "
+                    "VALUES (?, ?, ?, ?)",
+                    (p, int(time.time()), str(source or "manual"), str(note or "")))
+                conn.commit()
+                if cur.rowcount:
+                    return int(cur.lastrowid or 0)
+                row = conn.execute(
+                    "SELECT id FROM passwords WHERE password = ? LIMIT 1", (p,)).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def update_password(pid, password=None, note=None, source=None):
+    """按行 id 更新长期密码本，只写入显式提供（非 None）的字段，返回是否命中该行。
+
+    - password 去首尾空白后为空视为非法，整次放弃（返回 False，不改任何列）；
+    - 新口令与别的行重复会触发 UNIQUE 约束，同样返回 False 且不改动任何行；
+    - 一个字段都没提供时返回 False；任何异常都不抛。
+    """
+    try:
+        tid = int(pid)
+    except Exception:
+        return False
+    if tid <= 0:
+        return False
+    sets = []
+    params = []
+    if password is not None:
+        p = str(password).strip()
+        if not p:
+            return False
+        sets.append("password = ?")
+        params.append(p)
+    if note is not None:
+        sets.append("note = ?")
+        params.append(str(note))
+    if source is not None:
+        sets.append("source = ?")
+        params.append(str(source))
+    if not sets:
+        return False
+    params.append(tid)
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE passwords SET " + ", ".join(sets) + " WHERE id = ?", params)
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
+def delete_password(pid):
+    """按行 id 精确删除一行长期口令（同名口令也只删这一行），返回是否命中；任何异常都不抛。"""
+    try:
+        tid = int(pid)
+    except Exception:
+        return False
+    if tid <= 0:
+        return False
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute("DELETE FROM passwords WHERE id = ?", (tid,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
 
 
 # ---------- 密码字典 ----------
@@ -368,6 +508,76 @@ def add_share_code(share_uk, code, note="", pick=0):
             finally:
                 conn.close()
         return True
+    except Exception:
+        return False
+
+
+def update_share_code(share_uk, new_share_uk=None, code=None, note=None, pick=None):
+    """按原 share_uk 更新一条固定提取码，只写显式提供（非 None）的字段，返回是否命中该行。
+
+    - new_share_uk 去空白后为空视为非法，整次放弃（返回 False，不改任何列）；
+    - code 去空白后为空视为非法，同样整次放弃；
+    - 新 share_uk 与别的行重复会触发主键约束，返回 False 且不写任何行；
+    - note / pick 为 None 表示不改（pick 兼容 True/"1"/"pick" 等 int-ish 写法）；
+    - 命中则顺带刷新 updated_at；任何异常都不抛。
+    """
+    uk = str(share_uk or "").strip()
+    if not uk:
+        return False
+    sets = []
+    params = []
+    if new_share_uk is not None:
+        nuk = str(new_share_uk or "").strip()
+        if not nuk:
+            return False
+        sets.append("share_uk = ?")
+        params.append(nuk)
+    if code is not None:
+        cd = str(code or "").strip()
+        if not cd:
+            return False
+        sets.append("code = ?")
+        params.append(cd)
+    if note is not None:
+        sets.append("note = ?")
+        params.append(str(note))
+    if pick is not None:
+        sets.append("pick = ?")
+        params.append(_pick_flag(pick))
+    if not sets:
+        return False
+    sets.append("updated_at = ?")
+    params.append(int(time.time()))
+    params.append(uk)
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE share_code_map SET " + ", ".join(sets) + " WHERE share_uk = ?",
+                    params)
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
+def delete_share_code(share_uk):
+    """按 share_uk 精确删除一行固定提取码，返回是否命中；任何异常都不抛。"""
+    uk = str(share_uk or "").strip()
+    if not uk:
+        return False
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute("DELETE FROM share_code_map WHERE share_uk = ?", (uk,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
     except Exception:
         return False
 

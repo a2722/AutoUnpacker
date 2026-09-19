@@ -6,7 +6,8 @@
       - 筛选：全部 / 按原因（记录状态）/ 按日期（今天/昨天/更早）；
         搜索同时命中 文件名 与 原路径（大小写不敏感）
       - 行内操作：打开所在文件夹 / 复制原路径；
-        批量操作：还原选中 / 导出 CSV（QFileDialog）/ 清空记录（强二次确认）
+        批量操作：还原选中（Shift/Ctrl 多选，逐条还原并如实汇报跳过/失败）/
+        导出 CSV（QFileDialog）/ 清空记录（强二次确认）
       - 空态：无记录与「筛选无结果」两种文案
 关键入口：TrailPage / record_time() / day_key() / record_reason() /
           record_matches() / export_rows()
@@ -97,11 +98,13 @@ def day_key(rec, now=None):
 
 
 def record_reason(rec):
-    """原因列文案：状态词 + 备注；含永久删除文件时追加不可还原提示。"""
+    """原因列文案：状态词 + 备注；备注已自带状态词时不再重复；含永久删除文件时追加不可还原提示。"""
     status = str(rec.get("status") or "")
     text = TRAIL_STATUS_TEXT.get(status, status or "—")
     note = str(rec.get("note") or "").strip()
-    if note:
+    if note and note.startswith(text):
+        text = note          # mark_failed/mark_kept 的备注本就以状态词开头，合并列不再重复
+    elif note:
         text += " · " + note
     if rec.get("failed_paths") and "无法还原" not in text:
         text += " · 含无法还原的文件"
@@ -181,11 +184,20 @@ class _TrailModel(QAbstractTableModel):
             return 0
         return len(self.HEADERS)
 
+    def _text_alignment(self, col):
+        """该列文本对齐（表头与单元格共用同一来源，修「表头与内容对不齐」）。"""
+        if col == self.COL_SIZE:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        return int(Qt.AlignLeft | Qt.AlignVCenter)
+
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation != Qt.Horizontal:
             return None
         if role == Qt.DisplayRole and 0 <= section < len(self.HEADERS):
             return self.HEADERS[section]
+        if role == Qt.TextAlignmentRole and 0 <= section < len(self.HEADERS):
+            # 表头文字对齐 = 该列单元格对齐（大小列右对齐，其余左对齐）
+            return self._text_alignment(section)
         if role == Qt.ToolTipRole and section == self.COL_SOURCE:
             # 记录不含任务号：如实说明该列展示的是源文件所在的监听目录
             return "记录不含任务号：这里显示源文件所在的监听目录"
@@ -213,8 +225,8 @@ class _TrailModel(QAbstractTableModel):
             if col == self.COL_REASON:
                 return record_reason(rec)
             return None
-        if role == Qt.TextAlignmentRole and col == self.COL_SIZE:
-            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == Qt.TextAlignmentRole:
+            return self._text_alignment(col)
         if role == Qt.ForegroundRole and col == self.COL_REASON:
             return QBrush(QColor(TRAIL_STATUS_COLORS.get(
                 str(rec.get("status") or ""), PALETTE["muted"])))
@@ -242,6 +254,7 @@ class _TrailTable(QTableView):
     """删除回溯表：_TrailModel + 行内操作按钮（打开所在文件夹 / 复制原路径）。
 
     行内按钮只发信号（携带原路径），由页面决定真正动作（便于测试与宿主替换）。
+    多选 = ExtendedSelection（Shift 连选 / Ctrl 点选，无复选框）。
     """
 
     openRequested = pyqtSignal(str)
@@ -253,7 +266,7 @@ class _TrailTable(QTableView):
         self._model = _TrailModel(self)
         self.setModel(self._model)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)   # Shift/Ctrl 多选
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setAlternatingRowColors(True)
         self.setShowGrid(False)
@@ -264,6 +277,12 @@ class _TrailTable(QTableView):
         hh = self.horizontalHeader()
         hh.setHighlightSections(False)
         hh.setStretchLastSection(False)
+        # 表头默认左对齐；每列的精确对齐由 _TrailModel.headerData 的 TextAlignmentRole 决定
+        hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # 本页局部对齐修正：全局 QSS 表头左右内边距 10px、单元格 6px，且单元格文本
+        # 另带 ~2px 焦点边距；本表头局部覆盖为 9px，使文字左/右缘与单元格逐像素对齐
+        # （不改 style.py 这个共享文件，只作用于本表）。
+        hh.setStyleSheet("QHeaderView::section { padding: 7px 9px; }")
         hh.setSectionResizeMode(_TrailModel.COL_NAME, QHeaderView.Stretch)
         hh.setSectionResizeMode(_TrailModel.COL_REASON, QHeaderView.Stretch)
         for col, width in ((_TrailModel.COL_TIME, 150), (_TrailModel.COL_SIZE, 80),
@@ -289,6 +308,16 @@ class _TrailTable(QTableView):
             return int(self.currentIndex().row())
         except Exception:
             return -1
+
+    def selected_rows(self):
+        """当前选中的所有行号（升序、去重；无选中返回空列表）。"""
+        sm = self.selectionModel()
+        if sm is None:
+            return []
+        try:
+            return sorted({idx.row() for idx in sm.selectedRows()})
+        except Exception:
+            return []
 
     def _build_actions(self):
         for row in range(self._model.rowCount()):
@@ -429,9 +458,8 @@ class TrailPage(QWidget):
         self.table.copyRequested.connect(self._on_copy)
         root.addWidget(self.table, 1)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_TRAIL)
-        sm = self.table.selectionModel()
-        if sm is not None:
-            sm.currentRowChanged.connect(lambda *_a: self._sync_restore_button())
+        self._sel_model = None
+        self._wire_table_selection()
         self._refresh_counts()
         self.reload()
 
@@ -507,6 +535,7 @@ class TrailPage(QWidget):
                 if record_matches(r, self.keyword(), status, day)]
         self._visible = rows
         self.table.set_records(rows)
+        self._wire_table_selection()      # 模型重置后确保仍连着当前选择模型
         if not self._records:
             self.table_empty.set_empty(True, EMPTY_TRAIL)
         else:
@@ -544,16 +573,62 @@ class TrailPage(QWidget):
         self._day = str(data)
         self.apply_filters()
 
+    # ---- 选中（Shift/Ctrl 多选） ----
+    def _wire_table_selection(self):
+        """把 selectionChanged 接到 _sync_restore_button；选择模型被替换时自动重连。"""
+        sm = self.table.selectionModel()
+        if sm is self._sel_model:
+            return
+        if self._sel_model is not None:
+            try:
+                self._sel_model.selectionChanged.disconnect(self._on_table_selection)
+            except Exception:
+                pass
+        self._sel_model = sm
+        if sm is not None:
+            sm.selectionChanged.connect(self._on_table_selection)
+
+    def _on_table_selection(self, *_args):
+        self._sync_restore_button()
+
     def _selected_record(self):
+        """当前行记录（行内操作与单行提示用）；无当前行返回 None。"""
         row = self.table.current_row()
         if row < 0:
             return None
         return self.table.record_at(row)
 
-    def _sync_restore_button(self):
-        rec = self._selected_record()
-        ok = bool(rec) and str(rec.get("status") or "") == "deleted"
-        self.restore_btn.setEnabled(ok)
+    def _selected_records(self):
+        """当前选中的所有记录（按行号升序）；无选中返回空列表。"""
+        out = []
+        for row in self.table.selected_rows():
+            rec = self.table.record_at(row)
+            if rec:
+                out.append(rec)
+        return out
+
+    def _sync_restore_button(self, *_args):
+        """还原按钮：选中的记录里至少一条「已删除」才可用；tooltip 如实反映数量。
+
+        全是不可还原项时保持禁用（无任何可做之事，沿用原单行语义与既有用例）；
+        混合选择保持可用，由 _on_restore 逐条跳过不可还原项并在回执里如实计数。
+        """
+        recs = self._selected_records()
+        restorable = [r for r in recs
+                      if str(r.get("status") or "") == "deleted"]
+        n_sel, n_ok = len(recs), len(restorable)
+        self.restore_btn.setEnabled(n_ok > 0)
+        if n_sel == 0:
+            self.restore_btn.setToolTip("先选中要还原的记录（可 Shift/Ctrl 多选）")
+        elif n_ok == 0:
+            self.restore_btn.setToolTip(
+                "选中的 %d 项均不是「已删除（回收站）」状态，无法还原" % n_sel)
+        elif n_ok < n_sel:
+            self.restore_btn.setToolTip(
+                "还原选中的 %d 项（另有 %d 项不是「已删除」状态，将跳过）"
+                % (n_ok, n_sel - n_ok))
+        else:
+            self.restore_btn.setToolTip("还原选中的 %d 项" % n_ok)
 
     # ---- 行内操作 ----
     def _on_open(self, path):
@@ -584,28 +659,67 @@ class TrailPage(QWidget):
 
     # ---- 批量操作 ----
     def _on_restore(self):
-        """还原选中记录：仅「已删除」可还原，确认后经 trail.restore_record 还原。"""
-        rec = self._selected_record()
-        if rec is None:
-            QMessageBox.information(self, "删除回溯", "请先选中一条记录")
+        """还原选中的全部记录（Shift/Ctrl 多选）：逐条经 trail.restore_record 还原。
+
+        仅「已删除（回收站）」可还原；非该状态的选中项跳过，并在回执里如实计数。
+        部分失败同样如实汇报（成功/失败/跳过分开计，绝不把失败说成成功）。
+        """
+        recs = self._selected_records()
+        if not recs:
+            QMessageBox.information(self, "删除回溯", "请先选中要还原的记录")
             return
-        if str(rec.get("status") or "") != "deleted":
+        restorable = [r for r in recs
+                      if str(r.get("status") or "") == "deleted"]
+        skipped = len(recs) - len(restorable)
+        if not restorable:
             QMessageBox.information(
-                self, "删除回溯", "只有「已删除（回收站）」状态的记录可以还原")
+                self, "删除回溯",
+                "选中的 %d 项均不是「已删除（回收站）」状态，无法还原" % len(recs))
             return
+        ask = "确认还原选中的 %d 项？\n文件将回到原位置。" % len(restorable)
+        if skipped:
+            ask += "\n另有 %d 项不是「已删除（回收站）」状态，将跳过。" % skipped
         if QMessageBox.question(
-                self, "删除回溯", "从回收站还原所选文件？\n文件将回到原位置。",
+                self, "删除回溯", ask,
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        try:
-            ok, msg = deletion_trail.restore_record(str(rec.get("id") or ""))
-        except Exception as e:
-            ok, msg = False, str(e)
-        self.reload()
-        if ok:
-            self.notice.emit(str(msg))
-        QMessageBox.information(
-            self, "还原结果", str(msg) if ok else "还原失败\n%s" % msg)
+        ok_n, fail_n = 0, 0
+        success_msgs, first_fail = [], ""
+        for rec in restorable:
+            try:
+                ok, msg = deletion_trail.restore_record(str(rec.get("id") or ""))
+            except Exception as e:
+                ok, msg = False, str(e)
+            if ok:
+                ok_n += 1
+                success_msgs.append(str(msg))
+            else:
+                fail_n += 1
+                if not first_fail:
+                    first_fail = str(msg or "")
+        self.reload()                      # 已还原的整条记录按既有语义从视图消失
+        if ok_n == 1 and fail_n == 0:
+            # 单条成功沿用后端消息（既有回执语义），仅在确有跳过项时追加说明
+            summary = success_msgs[0]
+            if skipped:
+                summary += "（另有 %d 项不是「已删除」状态，已跳过）" % skipped
+        else:
+            parts = ["成功 %d 项" % ok_n, "失败 %d 项" % fail_n]
+            if skipped:
+                parts.append("跳过 %d 项（非「已删除」）" % skipped)
+            summary = "还原完成：" + "，".join(parts)
+        self.notice.emit(summary)
+        if fail_n == 0:
+            detail = "还原成功：%d 项" % ok_n
+            if skipped:
+                detail += "；跳过 %d 项（非「已删除」状态）" % skipped
+        else:
+            detail = "还原完成：成功 %d 项，失败 %d 项" % (ok_n, fail_n)
+            if skipped:
+                detail += "；跳过 %d 项（非「已删除」状态）" % skipped
+            if first_fail:
+                detail += "\n首个失败：%s" % first_fail
+        QMessageBox.information(self, "还原结果", detail)
 
     def _on_export(self):
         """导出当前可见记录为 CSV（QFileDialog 选路径；UTF-8 BOM 便于 Excel 打开）。"""

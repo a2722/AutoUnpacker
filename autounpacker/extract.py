@@ -506,6 +506,7 @@ def get_password_for_layer(layer, user_passwords, extracted=None, default=None, 
     for p in dict_passwords:
         if p not in seen:
             passwords.append(p)
+            seen.add(p)
     if not passwords:
         passwords.append("")
     return passwords
@@ -596,7 +597,12 @@ def _pwd_stdin_bytes(pwd):
     return pwd.encode("utf-8", "replace") + b"\n"
 
 
-def run_silent(args, password=None):
+# 短 7z 元数据调用（列表/探测）的墙钟超时上限。只用于 run_silent 这种
+# 「秒级完成」的调用；长时解压循环（SevenZipEngine.extract）不受此限制。
+RUN_SILENT_TIMEOUT = 90.0
+
+
+def run_silent(args, password=None, timeout=RUN_SILENT_TIMEOUT):
     """运行 7-Zip；密码经 stdin 传递。
 
     重要：参数里绝不能带 -p（裸 -p 会触发 7z 走控制台 ReadConsole 读密码，
@@ -604,19 +610,95 @@ def run_silent(args, password=None):
     才会从 stdin 读一行密码——这样密码就不出现在进程命令行里，
     任务管理器/WMI 看不到。
 
-    password=None 时 stdin 指向 DEVNULL（无密码提示时不会卡住）。"""
-    stdin_data = None
-    stdin_mode = subprocess.DEVNULL
+    传密码时只用 `input=` 一个机制（它会自动把 stdin 设成 PIPE）；不传密码
+    时 stdin 指向 DEVNULL（无密码提示时不会卡住）。绝不能同时给
+    `input=` 和 `stdin=`，否则 CPython 直接抛
+    ValueError: stdin and input arguments may not both be used.
+
+    仅用于列表/探测这类短调用：超过 timeout 秒即杀掉 7z 并返回失败结果
+    （returncode=-1），绝不抛异常、绝不无限阻塞 watcher 线程。"""
+    kwargs = {
+        "capture_output": True,
+        "creationflags": CREATE_NO_WINDOW,
+        "timeout": timeout,
+    }
     if password is not None:
-        stdin_data = _pwd_stdin_bytes(password)
-        stdin_mode = subprocess.PIPE
+        kwargs["input"] = _pwd_stdin_bytes(password)   # 隐式 stdin=PIPE
+    else:
+        kwargs["stdin"] = subprocess.DEVNULL
     try:
-        r = subprocess.run(args, capture_output=True, input=stdin_data,
-                           stdin=stdin_mode, creationflags=CREATE_NO_WINDOW)
-    except OSError as e:
+        r = subprocess.run(args, **kwargs)
+    except subprocess.TimeoutExpired:
+        return _RunResult(-1, "", f"7-Zip 元数据调用超时（>{timeout:.0f}s）")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         return _RunResult(-1, "", str(e))
     return _RunResult(r.returncode, _decode_7z(r.stdout or b""),
                       _decode_7z(r.stderr or b""))
+
+
+def concise_error(raw_error, code=None):
+    """把 7-Zip 的原始多行输出压缩成一句「面向用户的中文原因」。
+
+    旧行为把整段 7z 输出（版本横幅 + 帮助文本 + 错误行）直接塞进
+    result["error"]，托盘通知与队列错误单元格因此显示成一大块不可读文本。
+    这里只保留真正的原因；原始输出仍完整留在 result["logs"]（诊断不丢）。
+
+    参数 code: 7z 退出码（0/1=警告，2=致命错误，7=命令行错误，8=内存不足，
+    255=用户中断）。退出码是比在文本里猜更稳的分类依据。
+    """
+    raw = str(raw_error or "")
+    low = raw.lower()
+    # 退出码优先级：7z 的致命/命令行错误码本身就是权威信号
+    if code == 7:
+        return "不是压缩包或已损坏"
+    if code == 8:
+        return "7-Zip 内存不足"
+    if code == 255:
+        return "解压被中断"
+    if "wrong password" in low or "密码错误" in raw:
+        return "密码错误"
+    if "missing volume" in low:
+        return "分卷链不完整（缺少兄弟分卷）"
+    if "unexpected end of archive" in low:
+        return "不是压缩包或已损坏"
+    if any(m.lower() in low for m in ZIP_OPEN_ERROR_MARKERS):
+        return "不是压缩包或已损坏"
+    if "crc failed" in low or "data error" in low or "crc 校验" in raw:
+        return "数据校验失败（CRC 不符，文件可能已损坏）"
+    if "is not supported" in low or "unsupported method" in low:
+        return "不支持的压缩算法"
+    # 输出文件被占用：必须保留 monitors 用来判定「稍后自动重试」的原始标记词
+    # （monitors.py 用这些词决定是否重试，不能因为压缩成短句就丢掉）。
+    lock_tokens = []
+    if "cannot delete output file" in low:
+        lock_tokens.append("Cannot delete output file")
+    if "另一个程序正在使用此文件" in raw:
+        lock_tokens.append("正在使用此文件")
+    if "进程无法访问" in raw:
+        lock_tokens.append("进程无法访问")
+    if "another process is using" in low:
+        lock_tokens.append("another process is using")
+    if "being used by another process" in low:
+        lock_tokens.append("being used by another process")
+    if lock_tokens:
+        return "输出文件被占用（" + "、".join(lock_tokens) + "，稍后自动重试）"
+    if "cannot find" in low or "the system cannot find" in low:
+        return "文件不存在或路径无法访问"
+    # 认不出具体原因时，给一句短而诚实的兜底（绝不回填整段原始输出）
+    if code is not None:
+        return f"解压失败（7-Zip 退出码 {code}）"
+    return "解压失败"
+
+
+def result_raw_error(result):
+    """取结果用于「错误分类」的原始文本。
+
+    新契约下 result["error"] 是简短中文原因，result["raw_error"] 才是原始
+    7z 输出；旧的测试桩/旧引擎结果没有 raw_error 键时回退到 error，
+    保证 is_zip_open_error / is_archive_open_error 等文本判定不回归。"""
+    if not result:
+        return ""
+    return str(result.get("raw_error") or result.get("error") or "")
 
 
 def parse_sevenzip_listing(output):
@@ -796,7 +878,7 @@ class PythonZipEngine:
         if fmt:
             # 非 ZIP 格式（rar/7z/tar…）：内置引擎无能为力，必须明确提示需要
             # 7-Zip，而不是让 zipfile 抛 BadZipFile 后误报"不是有效的 ZIP 文件"。
-            return {"success": False, "used_password": None,
+            return {"success": False, "used_password": None, "encrypted": False,
                     "error": f"该格式需要 7-Zip（当前不可用）：{fmt} 无法用内置引擎解压",
                     "logs": [f"检测到 {fmt} 格式，内置 zipfile 引擎无法解压，需要 7-Zip"]}
         out = Path(task["output_dir"])
@@ -808,23 +890,29 @@ class PythonZipEngine:
                 pauser.wait_if_paused()
             try:
                 with self._open(archive) as zf:
+                    # 「真的需要密码」的判据：归档里存在非目录的加密条目（bit 0）。
+                    # 未加密归档即使传了候选密码，也绝不能让该候选被记为「命中」，
+                    # 否则 GUI 把整本密码本当候选时，每个未加密包都会误报命中。
+                    encrypted = any(i.flag_bits & 0x1 for i in zf.infolist() if not i.is_dir())
                     if pwd:
                         pb = self._test_password_any(zf, self._password_bytes(pwd))
                         if pb is None:
                             raise RuntimeError("密码错误")
                         zf.extractall(out, pwd=pb)
                     else:
-                        if any(i.flag_bits & 0x1 for i in zf.infolist()):
+                        if encrypted:
                             raise RuntimeError("需要密码")
                         zf.extractall(out)
-                return {"success": True, "used_password": pwd or None,
+                return {"success": True,
+                        "used_password": (pwd or None) if encrypted else None,
+                        "encrypted": bool(encrypted),
                         "error": None, "logs": [f"使用 {self.name} 引擎解压 ZIP"]}
             except zipfile.BadZipFile as e:
-                return {"success": False, "used_password": None,
+                return {"success": False, "used_password": None, "encrypted": False,
                         "error": f"不是有效的 ZIP 文件: {e}", "logs": []}
             except (RuntimeError, OSError, ValueError) as e:
                 last_error = str(e)
-        return {"success": False, "used_password": None,
+        return {"success": False, "used_password": None, "encrypted": False,
                 "error": last_error or "解压失败", "logs": []}
 
     @staticmethod
@@ -865,37 +953,47 @@ class SevenZipEngine:
     def __init__(self, path):
         self.path = Path(path)
 
-    def _listing_total(self, archive, password=None):
-        """7z l -slt 列出当前压缩包全部条目未压缩字节总和（进度条基准）。
+    def _listing_info(self, archive, password=None):
+        """7z l -slt 列出当前压缩包的 (未压缩字节总和, 是否含加密条目)。
 
-        分卷给首卷路径即可。失败/无法列出返回 None（调用方显示忙碌进度）。
-        注意 -slt 每条的 Folder = + 表示目录，目录不计入文件总量。
+        分卷给首卷路径即可。失败/无法列出返回 (None, False)。
+        注意 -slt 每条的 Folder = + 表示目录，目录不计入文件总量；
+        Encrypted = + 表示该条目加密（ZipCrypto / WPAES(AES) / 7zAES 均会置位），
+        这是判断「归档是否真的需要密码」的可靠信号。
 
         password: 头部加密的归档（RAR/7z 加密文件名）空密码列不出，需逐个
         用候选密码尝试；成功拿到总量后进度条才能从忙碌变为百分比进度。
         注意：绝不能带 -p 参数（裸 -p 会走控制台读密码，管道读不到），
-        密码一律经 stdin 传递。"""
-        try:
-            args = [str(self.path), "l", "-slt", str(archive)]
-            r = run_silent(args, password=password)
-            if r.returncode != 0:
-                return None
-            total = 0
-            is_dir = False
-            for line in r.stdout.splitlines():
-                s = line.strip()
-                if s.startswith("Path = "):
-                    is_dir = False
-                elif s.startswith("Folder = "):
-                    is_dir = (s[9:].strip() == "+")
-                elif s.startswith("Size = ") and not is_dir:
-                    try:
-                        total += int(s[7:].strip())
-                    except Exception:
-                        pass
-            return total or None
-        except Exception:
-            return None
+        密码一律经 stdin 传递。
+
+        这里刻意不套宽泛的 try/except：run_silent 已把所有子进程失败
+        （超时/OSError/参数误用）转成 returncode=-1 的显式结果，若再吞异常
+        会把「清单拿不到」伪装成「正常无加密」，正是旧 bug 被静默吞掉的根源。"""
+        total = 0
+        is_dir = False
+        encrypted = False
+        args = [str(self.path), "l", "-slt", str(archive)]
+        r = run_silent(args, password=password)
+        if r.returncode != 0:
+            return None, False
+        for line in r.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("Path = "):
+                is_dir = False
+            elif s.startswith("Folder = "):
+                is_dir = (s[9:].strip() == "+")
+            elif s == "Encrypted = +":
+                encrypted = True
+            elif s.startswith("Size = ") and not is_dir:
+                try:
+                    total += int(s[7:].strip())
+                except ValueError:
+                    pass
+        return (total or None), encrypted
+
+    def _listing_total(self, archive, password=None):
+        """兼容旧签名：只返回未压缩字节总和（进度条基准）。"""
+        return self._listing_info(archive, password)[0]
 
     def extract(self, task, options, layer):
         archive = Path(task["source_path"])
@@ -903,19 +1001,22 @@ class SevenZipEngine:
         out.mkdir(parents=True, exist_ok=True)
         pauser = task.get("pauser")
         progress_cb = task.get("progress_cb")
-        total = self._listing_total(archive)
+        total, encrypted = self._listing_info(archive)
         if progress_cb is not None:
             progress_cb(None if total is None else 0.0, layer, archive.name)
         last_error = None
+        last_rc = None
+        last_raw = ""
         for pwd in task["passwords"]:
             if pauser is not None:
                 pauser.wait_if_paused()
             # 头部加密（RAR/7z 加密文件名）空密码列不出总量：用候选密码逐个试，
-            # 一旦列出即把进度条从忙碌切换为真实百分比。
+            # 一旦列出即把进度条从忙碌切换为真实百分比；顺带确认加密标记。
             if total is None and pwd:
-                t = self._listing_total(archive, pwd)
+                t, enc = self._listing_info(archive, pwd)
                 if t:
                     total = t
+                    encrypted = encrypted or enc
                     if progress_cb is not None:
                         progress_cb(0.0, layer, archive.name)
             # 密码经 stdin 管道传递：7z 不带 -p（裸 -p 会走控制台读密码，
@@ -931,6 +1032,7 @@ class SevenZipEngine:
                     creationflags=CREATE_NO_WINDOW)
             except Exception as e:
                 last_error = str(e)
+                last_raw = str(e)
                 break
             try:
                 proc.stdin.write(_pwd_stdin_bytes(pwd))
@@ -985,18 +1087,34 @@ class SevenZipEngine:
             if rc == 0:
                 if progress_cb is not None:
                     progress_cb(1.0, layer, archive.name)
-                return {"success": True, "used_password": pwd or None,
+                # 只有归档真的含加密条目、且此密码通过了 7-Zip 校验，才算「用到了密码」；
+                # 未加密归档即使 stdin 喂了候选密码也是 rc==0，绝不能记为命中。
+                return {"success": True,
+                        "used_password": (pwd or None) if encrypted else None,
+                        "encrypted": bool(encrypted),
                         "error": None,
                         "logs": [f"使用 {self.name} 引擎解压", f"命令: {cmd}"]}
             if "Wrong password" in err:
                 last_error = "密码错误"
+                last_rc = rc
+                last_raw = err
                 continue
             last_error = (err or f"7z 退出码 {rc}").strip()
+            last_rc = rc
+            last_raw = err
             break
         if progress_cb is not None:
             progress_cb(None if total is None else 0.0, layer, archive.name)
-        return {"success": False, "used_password": None,
-                "error": last_error or "解压失败", "logs": []}
+        # 面向用户的 error 只放一句简短中文原因（供托盘通知/队列错误单元格）；
+        # 完整原始 7z 输出放 logs（诊断细节一律保留，绝不丢弃）。
+        concise = concise_error(last_raw if last_raw else last_error, last_rc)
+        raw_logs = [f"使用 {self.name} 引擎解压失败"]
+        if last_raw:
+            raw_logs.append("--- 7-Zip 原始输出 ---")
+            raw_logs.extend(str(last_raw).splitlines())
+        return {"success": False, "used_password": None, "encrypted": bool(encrypted),
+                "error": concise, "raw_error": last_raw or last_error,
+                "logs": raw_logs}
 
 
 def create_engine(kind, custom_path=None):
@@ -1229,6 +1347,24 @@ def _stage_fake_volume(source, fmt):
         return None
 
 
+def unique_dest_path(dest):
+    """返回不覆盖已有文件的落点路径：已存在时按 `name (1).ext` 递增找空位。
+
+    与提升内容（promote_extracted_content）用的 name(N) 约定一致（文件带空格
+    的形式，避免与目录提升的 name(N) 混淆）。已存在同名文件时绝不 shutil.move
+    覆盖——用户放在输出目录里的同名文件必须原样保留。"""
+    dest = Path(dest)
+    if not dest.exists():
+        return dest
+    parent, stem, suffix = dest.parent, dest.stem, dest.suffix
+    i = 1
+    while True:
+        cand = parent / f"{stem} ({i}){suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
 class ExtractService:
     def __init__(self, engine, options):
         self.engine = engine
@@ -1388,7 +1524,7 @@ class ExtractService:
             if (not result["success"]
                     and info["detected_format"] == "zip"
                     and isinstance(self.engine, SevenZipEngine)
-                    and is_zip_open_error(result["error"])):
+                    and is_zip_open_error(result_raw_error(result))):
                 fallback_attempts = []
                 if info.get("is_polyglot"):
                     stripped = strip_embedded_zip(item["archive"], self.temp_root)
@@ -1419,6 +1555,7 @@ class ExtractService:
                     best = fallback_attempts[0] if fallback_attempts else result
                     result = {"success": True,
                               "used_password": best.get("used_password"),
+                              "encrypted": best.get("encrypted", False),
                               "error": None,
                               "logs": list(best.get("logs") or [])
                                        + ["[警告] 7-Zip 返回非零退出码，但校验文件数量与大小后确认全部解出"]}
@@ -1441,7 +1578,7 @@ class ExtractService:
                     self.emit(f"[第{depth}层] 解压失败: {result['error']}")
                     # 首卷打不开/被截断 ⇒ 分卷链不完整（缺兄弟分卷），不是终态失败
                     split_incomplete = (root_is_first_volume
-                                        and is_archive_open_error(result["error"]))
+                                        and is_archive_open_error(result_raw_error(result)))
                     if split_incomplete:
                         self.emit(f"[第{depth}层] 分卷链不完整（缺少兄弟分卷，"
                                   f"首卷拼出的载荷不是有效归档），保留源文件等待到齐")
@@ -1479,7 +1616,7 @@ class ExtractService:
                 # volume / Cannot open）时，说明分卷未到齐或兄弟卷未归拢，
                 # 不应当作"已完成"吞掉失败——整体标记为失败，让监听层 defer
                 # 重试（等分卷到齐 / 修复归拢后再解），避免把半成品当成品。
-                err_text = result.get("error") or ""
+                err_text = result_raw_error(result)
                 # 末卷 base.zip / base.rar 不带编号，不在 is_volume_name 内；但 7-Zip
                 # 报 "Missing volume" 说明归档自身元数据已声明是多卷（缺 .z01/.r00
                 # 兄弟卷）。因此把 "Missing volume" 作为独立的判定依据。截断的独立
@@ -1546,18 +1683,22 @@ class ExtractService:
                 # 首卷拼出的直接载荷（第 2 层）打不开 ⇒ 分卷链被截断（缺兄弟
                 # 分卷），不能当「嵌套失败可跳过」吞掉：整体判失败等分卷补齐。
                 if (depth == 2 and root_is_first_volume
-                        and is_archive_open_error(result["error"])):
+                        and is_archive_open_error(result_raw_error(result))):
                     split_incomplete = True
                     self.emit(f"[第{depth}层] 分卷链不完整（缺少兄弟分卷，"
                               f"首卷拼出的载荷不是有效归档），整体判失败待重试")
                 continue
 
             used_password = result["used_password"]
+            # 加密信号与 used_password 同源：老测试桩/老引擎结果没有该键时，退回
+            # 「used_password 非空即视为用到密码」，保持既有语义不回归。
+            encrypted = bool(result.get("encrypted", used_password is not None))
             self.emit(f"[第{depth}层] 使用密码: {used_password or '无密码'}")
             self.layer_records.append({
                 "layer": depth,
                 "archive_name": item["archive"].name,
                 "used_password": used_password,
+                "encrypted": encrypted,
                 "success": True,
             })
 
@@ -1678,11 +1819,15 @@ class ExtractService:
                 "logs": self.logs, "error": err,
             }
         final_files = [p for p in output_dir.rglob("*") if p.is_file()] if output_dir.exists() else []
+        _first = self.layer_records[0] if self.layer_records else {}
         return {
             "task_id": task_id, "success": True,
             "depth_reached": len(self.layer_records),
             "extracted_files": final_files,
-            "used_password": self.layer_records[0]["used_password"] if self.layer_records else None,
+            "used_password": _first.get("used_password"),
+            # 顶层「是否真的用到密码」取自与 used_password 同一层（第 1 层），
+            # 供 extract_one 据此只记录真实命中，杜绝未加密包误报。
+            "encrypted": bool(_first.get("encrypted", False)) if self.layer_records else False,
             "layer_records": self.layer_records,
             "logs": self.logs, "error": None,
         }
@@ -1696,7 +1841,10 @@ class ExtractService:
         rel = src_file.relative_to(src_dir)
         dest = dst_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_file), str(dest))
+        final = unique_dest_path(dest)
+        if final != dest:
+            self.emit(f"[输出] 目标同名已存在，另存为: {final.name}")
+        shutil.move(str(src_file), str(final))
 
     def _check_size(self, dir_path, original_size):
         total = sum(p.stat().st_size for p in dir_path.rglob("*") if p.is_file())
@@ -1706,17 +1854,26 @@ class ExtractService:
                 self.emit(f"[安全警告] 解压后大小膨胀 {ratio:.1f} 倍，可能存在 zip bomb")
 
     def _all_entries_extracted(self, extract_dir, archive):
-        """7-Zip 返回非零退出码后，用 Python 核对输出目录是否已包含归档的全部文件
-        （数量与大小完全一致才算完整，防止把半成品当成功）。"""
+        """7-Zip 返回非零退出码后，用 Python 核对输出目录是否已包含归档的全部文件。
+
+        必须比较 (相对路径, 大小) 对而非仅大小多重集：只比大小的话，一个把
+        a.bin(1024B) 解出、b.bin(1024B) 漏掉（或改名）的半成品会因大小多重集
+        相同被误判为「全部解出」而报成功。路径按 as_posix().lower() 归一化
+        （与 _dirs_conflict 的路径比较口径一致），兼容分隔符与 Windows 大小写。"""
         try:
             with zipfile.ZipFile(archive) as zf:
-                expected = sorted(i.file_size for i in zf.infolist() if not i.is_dir())
+                expected = sorted(
+                    (i.filename.replace("\\", "/").lower(), i.file_size)
+                    for i in zf.infolist() if not i.is_dir())
         except Exception:
             return False
         if not expected:
             return False
         try:
-            actual = sorted(p.stat().st_size for p in Path(extract_dir).rglob("*") if p.is_file())
+            root = Path(extract_dir)
+            actual = sorted(
+                (p.relative_to(root).as_posix().lower(), p.stat().st_size)
+                for p in root.rglob("*") if p.is_file())
         except OSError:
             return False
         return actual == expected
@@ -1730,7 +1887,10 @@ class ExtractService:
                 dest.mkdir(parents=True, exist_ok=True)
             elif src.is_file():
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dest))
+                final = unique_dest_path(dest)
+                if final != dest:
+                    self.emit(f"[输出] 目标同名已存在，另存为: {final.name}")
+                shutil.move(str(src), str(final))
 
 
 def default_output_dir(archive):
@@ -1824,8 +1984,9 @@ def move_result_dir(output_dir, target_dir):
             dest.mkdir(parents=True, exist_ok=True)
         elif src.is_file():
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dest))
-            moved.append(dest)
+            final = unique_dest_path(dest)
+            shutil.move(str(src), str(final))
+            moved.append(final)
     remove_empty_dirs(output_dir)
     return moved
 
@@ -2486,7 +2647,16 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
             else:
                 shutil.rmtree(staged, ignore_errors=True)
 
-    if result["success"] and result["used_password"] and options["use_dict"]:
+    # 命中统计与「是否用字典解压」解耦：成功用到的口令一律计入密码字典，
+    # 这样 GUI（use_dict=False，字典口令从不被尝试）也能按真实命中次数排序。
+    # 写入只影响 password_dict 的 used_count/last_used_at；字典内容仍只在
+    # options["use_dict"] 打开时才作为候选（见 get_password_for_layer 调用点），
+    # 因此关字典的运行行为完全不变。
+    # 关键：只有归档「真的有加密内容」、且该口令确实把它解开了（engine 结果里的
+    # encrypted=True、used_password 非空），才记一次命中。未加密归档即使把候选
+    # 密码喂进引擎也会成功，绝不能把第一个候选误记为命中（否则 62 条密码本的
+    # 每次都让每个未加密包虚增一次）。每次成功只记一次；空/空白口令不记。
+    if result["success"] and result.get("encrypted") and result["used_password"]:
         add_dict_password(result["used_password"])
 
     # 只有「干净的整体成功」才允许后处理（提升内容 / 删除源文件）。

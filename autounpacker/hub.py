@@ -290,6 +290,17 @@ class Hub:
         except Exception:
             pass
 
+    def tasks_changed(self):
+        """任务生命周期变化事件（新增 / 状态迁移）。
+
+        后台监听线程每次写 tasks 表后调用；GUI 的 _drain 收到后合并为一次任务表
+        刷新（见 MainWindow 的防抖定时器），因此这里只投一个轻量标记，不做查询。
+        """
+        try:
+            self.q.put({"type": "task"})
+        except Exception:
+            pass
+
 
 class StdoutCapture:
     """把 print 转发到 Hub 的进程级 stdout 包装。

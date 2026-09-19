@@ -73,20 +73,38 @@ def send_to_recycle_bin(paths):
 
 # ---- 记录持久化 ----
 def load_records():
+    """读取回溯记录：文件不存在 / 为空 / 半截 / 非列表一律返回 []，绝不抛进 UI。
+
+    旧实现遇空文件或半截 JSON 时 json.loads 抛异常，由 except 吞掉后返回 []，
+    已经能做到「不崩」；这里显式跳过空白内容，语义更清晰也只是加固。
+    """
     try:
         if TRAIL_FILE.exists():
-            data = json.loads(TRAIL_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                return data
+            raw = TRAIL_FILE.read_text(encoding="utf-8").strip()
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return data
     except Exception:
         pass
     return []
 
 
 def save_records(records):
+    """原子写回溯记录：先写同目录临时文件再 os.replace，绝不截断原文件。
+
+    旧实现直接 Path.write_text 覆盖 deletion_trail.json：该调用会先截断文件，
+    若进程在截断后、写完整前崩溃/断电/被杀，文件会留下空内容或半截 JSON，
+    于是**整个还原回溯丢失**，already_handled 对所有文件都返回 False（重复
+    处理、已删除的文件也失去可还原记录）。改为与 state._save_temp_passwords /
+    config.save_config 相同的模式：先把完整 JSON 写进同目录 .tmp，再原子替换；
+    序列化或写入任一步失败都会保留原文件原样。
+    """
     try:
-        TRAIL_FILE.write_text(
-            json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = json.dumps(records, ensure_ascii=False, indent=2)
+        tmp = TRAIL_FILE.with_name(TRAIL_FILE.name + ".tmp")
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, TRAIL_FILE)
     except Exception:
         pass
 

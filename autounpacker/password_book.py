@@ -5,8 +5,13 @@
 - 编辑特殊用户固定提取码（share_uk → 提取码 + 是否「需要挑选」，每行一条）
 - 只读展示运行期临时密码，QTimer 轮询实时同步（不打断用户选中/滚动）
 - 保存时写入 state（长期密码/固定提取码存 toolbox.db）
+- 行级 helper（list_password_rows / add_password_row / update_password_row /
+  delete_password_row）：薄封装 db.py 的行级 API，供密码本页按行读写（含备注）
+- 固定提取码行级 helper（list_share_code_rows / add_share_code_row /
+  update_share_code_row / delete_share_code_row / set_share_code_rows）：
+  同样薄封装 db.py，供密码本页的固定提取码视图按 share_uk 读写（含备注 / pick）
 关键入口：PasswordBookDialog / parse_password_text() / parse_share_code_text() / format_share_code_text()
-依赖：PyQt5、state.AppState
+依赖：PyQt5、state.AppState、db
 注意：密码按换行分隔（不再用逗号）；临时密码由后台剪贴板线程写入 state，此处只展示
 """
 from PyQt5.QtCore import Qt, QTimer
@@ -17,7 +22,87 @@ from PyQt5.QtWidgets import (
     QSplitter, QWidget,
 )
 
+from . import db
 from .ui.style import PALETTE
+
+
+# ---------- 长期密码本行级 helper（薄封装 db 行级 API，供密码本页使用） ----------
+def list_password_rows():
+    """行级读取长期密码本：[{"id","password","source","created_at","note"}, ...]。
+
+    与 db.list_passwords() 同源同序（id 升序 = 解压尝试顺序）；任何异常返回 []。
+    """
+    try:
+        return db.list_passwords()
+    except Exception:
+        return []
+
+
+def add_password_row(password, source="manual", note=""):
+    """行级新增一条长期口令（重复口令被忽略），返回行 id；失败返回 0。"""
+    try:
+        return db.add_password(password, source=source, note=note)
+    except Exception:
+        return 0
+
+
+def update_password_row(pid, password=None, note=None, source=None):
+    """行级更新长期口令（只写显式提供的字段），返回是否命中该行；失败返回 False。"""
+    try:
+        return db.update_password(pid, password=password, note=note, source=source)
+    except Exception:
+        return False
+
+
+def delete_password_row(pid):
+    """行级按 id 精确删除一条长期口令，返回是否命中；失败返回 False。"""
+    try:
+        return db.delete_password(pid)
+    except Exception:
+        return False
+
+
+# ---------- 固定提取码行级 helper（薄封装 db 行级 API，供密码本页使用） ----------
+def list_share_code_rows():
+    """行级读取固定提取码：[{"share_uk","code","note","pick","updated_at"}, ...]；异常返回 []。"""
+    try:
+        return db.get_share_code_map()
+    except Exception:
+        return []
+
+
+def add_share_code_row(share_uk, code, note="", pick=0):
+    """行级新增一条固定提取码（同 UK UPSERT 覆盖），返回是否成功；失败返回 False。"""
+    try:
+        return db.add_share_code(share_uk, code, note, pick)
+    except Exception:
+        return False
+
+
+def update_share_code_row(share_uk, new_share_uk=None, code=None, note=None, pick=None):
+    """行级更新固定提取码（只写显式提供的字段，可为分享者 UK 改名），返回是否命中；失败返回 False。"""
+    try:
+        return db.update_share_code(share_uk, new_share_uk=new_share_uk,
+                                    code=code, note=note, pick=pick)
+    except Exception:
+        return False
+
+
+def delete_share_code_row(share_uk):
+    """行级按 share_uk 精确删除一条固定提取码，返回是否命中；失败返回 False。"""
+    try:
+        return db.delete_share_code(share_uk)
+    except Exception:
+        return False
+
+
+def set_share_code_rows(items):
+    """整表覆盖固定提取码（批量文本编辑保存），返回是否成功；失败返回 False。"""
+    try:
+        return db.set_share_code_map(items)
+    except Exception:
+        return False
+
 
 def parse_password_text(text):
     """按行解析密码文本（换行分隔），去掉空行并去重，保持顺序"""
@@ -317,6 +402,8 @@ class PasswordBookDialog(QDialog):
             QMessageBox.information(self, "查重", f"共 {before} 条，未发现重复。")
 
     def accept(self):
+        # 长期密码：仍走整体覆盖（与旧行为一致），但 db.set_passwords 会按口令
+        # 原样保留已有行的 note / source——排序 / 删除 / 新增都不会再静默清掉备注。
         self.state.set_passwords(parse_password_text(self.edit.toPlainText()))
         self.state.set_auto_add(self.auto_cb.isChecked())
         try:

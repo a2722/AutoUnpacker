@@ -16,7 +16,7 @@ import threading
 import time
 import types
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QSystemTrayIcon, QMenu, QProgressBar, QShortcut, QMessageBox, QStackedWidget, QDialog, QScrollArea, QFrame)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QSystemTrayIcon, QMenu, QShortcut, QMessageBox, QStackedWidget, QDialog, QScrollArea, QFrame)
 from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QKeySequence, QTextCursor, QTextCharFormat, QColor, QCursor
 
@@ -83,6 +83,19 @@ PENDING_SHARE_TEXT = {
 }
 # kind → 手势标签（仅用于「已刷新」等需要说明是哪一路的日志）。
 PENDING_SHARE_TAG = {"share": "Alt+2", "share_code": "Alt+3"}
+
+# ---------------------------------------------------------------------------
+# 拖放二维码图片：只对以下扩展名做「魔数 → 二维码」识别。先看扩展名（廉价），
+# 再看前 32 字节魔数；绝不为「一眼就是图片」的文件跑昂贵的多格式归档扫描。
+# 伪装成图片扩展名的压缩包（PK/7z/Rar 魔数）仍回落到归档路径，既有能力不破。
+# ---------------------------------------------------------------------------
+IMAGE_EXTS = {"png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "ico"}
+# 拖放二维码图片识别的大小上限：与 extract.POLYGLOT_FRONT_SCAN_LIMIT /
+# TRANSLATION_MAX_SIZE 同量级（16MB），超过只如实记一行日志、不做识别。
+_QR_DROP_MAX_BYTES = 16 * 1024 * 1024
+# 伪装成图片扩展名的压缩包魔数：命中即回落归档路径（含空归档 PK\x05\x06）。
+_QR_ARCHIVE_MAGICS = (b"PK\x03\x04", b"PK\x05\x06",
+                      b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07")
 
 # ---------------------------------------------------------------------------
 # 日志里的网址：渲染成可点 <a>，单击静默复制一次后降级为普通文本。
@@ -644,6 +657,69 @@ def _share_code_in_window(win, surl, share_uk):
     return code, dlg
 
 
+def _close_share_ask_dlg(win, surl=None, uk=None, url=None):
+    """成功提取后关闭「属于同一分享」的缺提取码小窗（只关闭、绝不回调）。
+
+    小窗的唯一职责是收集提取码；一旦该分享被成功拉起（客户端已确认）或挑选提交
+    成功，它的任务即告完成，必须立刻消失，绝不赖到 120s 超时。
+
+    归属判定（复用 `_share_dlg_target`）：小窗 target_surl 等于 surl、或 target_uk
+    等于 uk、或小窗记录的原链接等于 url——三者任一命中才算「同一分享」，绝不动别
+    的分享的窗。关闭前把 `on_decision` 置 None：closeEvent 会走 `_finish("ignore")`，
+    摘掉回调保证成功路径绝不产生第二次 decision（`_finish` 只回调一次）。同时显式
+    停掉倒计时，并清空 `win._share_ask_dlg`。最后记一行**不含明文提取码**的日志。
+
+    Qt 主线程调用；返回是否真的关掉了某扇窗。绝不抛异常。"""
+    dlg = getattr(win, "_share_ask_dlg", None)
+    if dlg is None:
+        return False
+    t_surl, t_uk = _share_dlg_target(dlg)
+    surl_s = str(surl or "").strip()
+    uk_s = str(uk or "").strip()
+    url_s = str(url or "").strip()
+    same = bool((surl_s and t_surl and surl_s == t_surl)
+                or (uk_s and t_uk and uk_s == t_uk))
+    if not same and url_s:
+        try:
+            same = bool(str(getattr(dlg, "url", "") or "").strip() == url_s)
+        except Exception:
+            same = False
+    if not same:
+        return False
+    try:
+        dlg.on_decision = None
+    except Exception:
+        pass
+    try:
+        timer = getattr(dlg, "_timer", None)
+        if timer is not None:
+            timer.stop()
+    except Exception:
+        pass
+    try:
+        dlg.close()
+    except Exception:
+        pass
+    try:
+        win._share_ask_dlg = None
+    except Exception:
+        pass
+    _share_log(win, "[分享] 已成功提取，提取码小窗已关闭（填写任务完成）")
+    return True
+
+
+def _notify_share_used(win, surl=None, uk=None, url=None):
+    """线程安全：把「该分享已成功拉起」回执投回 Qt 线程，由 `_drain` 关闭同分享小窗。
+
+    worker 线程（`_invoke_share_worker` / `_pick_share_worker`）绝不能碰控件，只能
+    经 hub.q 转交；`_drain` 收到 `share_used` 后在 Qt 线程调用 `_close_share_ask_dlg`。
+    异常一律吞掉，绝不影响拉起本身。"""
+    try:
+        win.hub.q.put({"type": "share_used", "surl": surl, "uk": uk, "url": url})
+    except Exception:
+        pass
+
+
 def _effective_share_code(win, surl, share_uk, rec_pwd, code_source):
     """唯一的分享提取码取值助手（优先级冻结），返回 `(code, source)`。
 
@@ -935,7 +1011,8 @@ def _announce_ask_code_hidden(win, url):
                     "（打开主界面后可填写，或稍后按 Alt+2/Alt+3）")
     _share_notify_via(
         win, "分享缺少提取码",
-        "该分享缺少提取码。打开主界面后可弹出提取码小窗，或按 Alt+2 用临时码。\n"
+        "该分享缺少提取码。三种方式：打开主界面即会弹出小窗填写；"
+        "或按 Alt+2 用临时码；或把「链接 + 提取码」整段复制到剪贴板。\n"
         + str(url or ""))
     try:
         setattr(win, _SHARE_ASK_NOTIFIED, True)
@@ -979,8 +1056,9 @@ def _show_share_code_window(win, surl, url, share_uk, mapped_code="",
             _share_log(win, "[分享] 主窗口未显示，提取码小窗不弹出（可稍后按 Alt+2/Alt+3）")
             _share_notify_via(
                 win, "分享缺少提取码",
-                "该分享缺少提取码。打开主界面后可弹出提取码小窗，"
-                "或按 Alt+2 用临时码。\n" + str(url or ""))
+                "该分享缺少提取码。三种方式：打开主界面即会弹出小窗填写；"
+                "或按 Alt+2 用临时码；或把「链接 + 提取码」整段复制到剪贴板。\n"
+                + str(url or ""))
         return None
     dlg = getattr(win, "_share_ask_dlg", None)
     if dlg is not None and not _share_window_alive(dlg):
@@ -1088,6 +1166,13 @@ class MainWindow(QMainWindow):
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain)
         self._drain_timer.start(200)
+        # 任务生命周期刷新（防抖）：后台每次写 tasks 表投一条 {"type":"task"}，这里用
+        # 单次定时器合并——首个事件后 250ms 内到达的事件不再各自触发，整表重建被
+        # 限制在 ≤4 次/秒（解压时哪怕日志刷屏也不会引发刷新风暴）。
+        self._tasks_refresh_timer = QTimer(self)
+        self._tasks_refresh_timer.setSingleShot(True)
+        self._tasks_refresh_timer.setInterval(250)
+        self._tasks_refresh_timer.timeout.connect(self._on_tasks_refresh_timer)
         self.rebuild_cards()
         self._refresh_all()
         # 先按当前（已被屏幕收敛的）宽度做紧凑化，再算最小尺寸：装饰收起后
@@ -1111,6 +1196,9 @@ class MainWindow(QMainWindow):
         # 全局快捷键：**等窗口显示后再注册**。在 __init__ 里立刻注册时，winId()
         # 拿到的原生窗口句柄可能尚未“坐实”，偶发 RegisterHotKey 失败(1400 无效句柄)；
         # 延后注册 + 失败重试可彻底消除这个启动偶发。
+        # 全局热键的**真实注册结果**（None=未尝试/不适用，True=已注册，False=失败）。
+        # 底栏据此诚实标注「（未生效）」，不再拿配置值冒充已生效（见 _sync_hotkey_display）。
+        self._hotkey_ok = {"main": None, "share": None, "share_code": None}
         QTimer.singleShot(600, self._register_hotkey)
         # 主界面快捷键：Esc / Ctrl+W 触发关闭（走 close_action 逻辑：
         # 询问弹窗 / 隐藏到托盘 / 关闭程序）。仅主界面激活时生效，
@@ -1149,6 +1237,11 @@ class MainWindow(QMainWindow):
         # 通过 hub 队列请求，控件一律在 Qt 线程构造。
         self._share_ask_dlg = None
         self._share_pick_dlg = None
+        # 拖放在途文件去重：同一文件的真实身份（绝对路径 + 大小 + mtime）为键，
+        # 防止同一文件被拖入两次（或 重试 连点）而并发解压进同一输出目录、互相
+        # 抢占任务行终态。键在起线程前置位、worker 的 finally 里必定移除（异常也不漏）。
+        self._drop_inflight = {}
+        self._drop_inflight_lock = threading.Lock()
 
     def _build_ui(self):
         """M3 工作台：NavTabs + DirChipStrip + 页面栈（任务/日志/密码本/回溯/设置）+ StatusBar。
@@ -1266,11 +1359,9 @@ class MainWindow(QMainWindow):
         self.statusbar.failRequested.connect(self._on_fail_requested)
         root.addWidget(self.statusbar)
 
-        # 传统进度条兼容垫：不可见（视觉进度在 StatusBar），仅保留旧 _drain 分支的落点
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.hide()
+        # 进度一律走 StatusBar（细进度 + 百分比）与目录胶囊，不再保留无父级的
+        # 兼容进度条：父级为空的 QWidget 一旦 show() 就会变成独立浮窗（旧 _drain
+        # 分支曾如此，用户可见）。此处已彻底移除，杜绝浮窗复现。
 
         # 初始显示（设置弹窗可能改配置，打开时再同步）
         try:
@@ -1344,15 +1435,111 @@ class MainWindow(QMainWindow):
             self.hub.log(f"拖放: 移动安装包/交付物，保持原样: {path.name}")
             return
 
+        # 二维码图片：拖入即识别。廉价前置过滤——先只认图片扩展名，再读前 32 字节
+        # 魔数；这样「一眼就是图片」的文件绝不进入昂贵的多格式归档扫描。
+        if path.suffix.lower().lstrip(".") in IMAGE_EXTS:
+            header = b""
+            try:
+                with open(path, "rb") as _fh:
+                    header = _fh.read(32)
+            except OSError:
+                header = b""
+            # 伪装成图片扩展名的压缩包：回落既有归档路径，既有能力不破。
+            if not any(header.startswith(m) for m in _QR_ARCHIVE_MAGICS):
+                try:
+                    _size = path.stat().st_size
+                except OSError:
+                    _size = 0
+                if _size > _QR_DROP_MAX_BYTES:
+                    self.hub.log(
+                        f"拖放: 图片过大，未做二维码识别（上限 16MB）: {path.name}")
+                    return
+                qr_monitor = getattr(self.hub, "qr_monitor", None)
+                try:
+                    from ..monitors import QRMonitor
+                    # 契约：QRMonitor.is_image_bytes 为公开静态方法；旧版本仅有
+                    # 私有同名实现，取其回落以免拖入真实二维码图片时崩溃。
+                    _img_check = (getattr(QRMonitor, "is_image_bytes", None)
+                                  or getattr(QRMonitor, "_is_image_bytes", None))
+                except Exception:
+                    _img_check = None
+                if callable(_img_check) and _img_check(header):
+                    if qr_monitor is None:
+                        self.hub.log(
+                            f"拖放: 二维码监控不可用，跳过图片识别: {path.name}")
+                        return
+                    # PIL 读盘 + PNG 编码可能阻塞：放入短命守护线程，绝不卡 UI。
+                    # 此路径绝不做解压、绝不建任务行（二维码解码不是解压任务，
+                    # 与剪贴板二维码路径同一语义）。
+                    def _feed_qr(p=path, m=qr_monitor):
+                        try:
+                            ok = m.feed_image_file(str(p))
+                        except Exception as e:
+                            self.hub.log(f"拖放: 二维码图片处理出错: {p.name}: {e}")
+                            return
+                        if ok:
+                            self.hub.notify("识别二维码图片", f"拖入的图片: {p.name}")
+                            self.hub.log(f"拖放: 已识别二维码图片: {p.name}")
+                    threading.Thread(target=_feed_qr, daemon=True).start()
+                    return
+
         # 非压缩包且不是分卷：跳过
         if not smart_extract.is_archive_file(path) and not smart_extract.is_volume_name(path.name):
             self.hub.log(f"拖放: 不是压缩包，跳过: {path.name}")
             return
 
+        # 在途去重：同一文件（真实身份 = 绝对路径 + 大小 + mtime）正在解压时忽略
+        # 重复拖入 / 连点重试，避免并发解压进同一输出目录、互相抢占任务行终态。
+        # 键在起线程前置位，worker 的 finally 必定移除（异常路径也不漏）。
+        try:
+            _st = path.stat()
+            inflight_key = f"{path.resolve()}|{_st.st_size}|{int(_st.st_mtime)}"
+        except Exception:
+            inflight_key = str(path)
+        with self._drop_inflight_lock:
+            if inflight_key in self._drop_inflight:
+                self.hub.log(f"拖放: 该文件正在解压中，忽略重复拖入: {path.name}")
+                return
+            self._drop_inflight[inflight_key] = int(time.time())
+
         self.hub.notify("发现压缩包", f"拖放解压: {path.name}")
 
+        # 与监听路径同一套任务行语义：拖入即建行（queued），让队列无需任何操作
+        # 就能立刻看到它；source_dir 取文件所在目录（与 find_open_task 的重试复用键
+        # 对齐），失败时 tid=0 也不影响解压本身。
+        tid = 0
+        try:
+            tid = (db.find_open_task(str(path.parent), path.name)
+                   or db.add_task(
+                       file_name=path.name,
+                       file_size=(path.stat().st_size if path.exists() else None),
+                       source_dir=str(path.parent), output_dir=None,
+                       mode="drop", state="queued"))
+        except Exception:
+            tid = 0
+        if tid:
+            self._emit_tasks_changed()
+
         def _run():
+            # 线程级日志上下文：拖放任务也挂到「该任务日志」下（与监听路径同一套
+            # set/clear 语义），否则解压全程日志无处归档、任务日志页空白。桩 hub
+            # 没有此能力时静默跳过，既有测试不受影响。
+            _set_ctx = getattr(self.hub, "set_log_context", None)
+            _clr_ctx = getattr(self.hub, "clear_log_context", None)
+            if callable(_set_ctx):
+                try:
+                    _set_ctx(source_dir=str(path.parent), task_id=tid)
+                except Exception:
+                    pass
             try:
+                # 跨名分卷链配对（与监听路径同一套）：验证通过即把改名兄弟卷改成首卷系列名，
+                # 让 7-Zip 能正确重拼；失败/无链则原样继续。
+                if smart_extract.is_volume_name(path.name):
+                    try:
+                        from ..monitors import FolderWatcher as _FolderWatcher
+                        _FolderWatcher(self.state, self.hub, self.pauser).pair_split_for_drop(path)
+                    except Exception:
+                        pass
                 try:
                     engine = smart_extract.create_engine("auto")
                 except BaseException as e:
@@ -1361,6 +1548,14 @@ class MainWindow(QMainWindow):
                     except BaseException:
                         self.hub.log(f"拖放: {path.name} 无法初始化解压引擎: {e}")
                         self.hub.notify("智能解压失败", f"{path.name}\n7-Zip 不可用")
+                        if tid:
+                            try:
+                                db.update_task_state(
+                                    tid, "failed", error="7-Zip 不可用",
+                                    finished_at=int(time.time()))
+                            except Exception:
+                                pass
+                            self._emit_tasks_changed()
                         return
                 passwords = self.state.all_passwords()
                 options = {
@@ -1379,6 +1574,13 @@ class MainWindow(QMainWindow):
                     promote_merge=bool(self.state.snapshot().get("promote_merge", True)),
                 )
                 self.hub.q.put({"type": "progress_start"})
+                if tid:
+                    try:
+                        db.update_task_state(tid, "extracting",
+                                             started_at=int(time.time()))
+                    except Exception:
+                        pass
+                    self._emit_tasks_changed()
                 try:
                     result = smart_extract.extract_one(
                         engine, str(path), None, passwords, options, args,
@@ -1391,13 +1593,51 @@ class MainWindow(QMainWindow):
                            f"{len(result['extracted_files'])} 个文件")
                     self.hub.log(msg)
                     self.hub.notify("智能解压完成", msg)
+                    if tid:
+                        try:
+                            db.update_task_state(
+                                tid, "done", finished_at=int(time.time()),
+                                output_dir=(result.get("promoted_dir") or None),
+                                layer=result.get("depth_reached"))
+                        except Exception:
+                            pass
+                        self._emit_tasks_changed()
                 else:
                     err = (result or {}).get("error") or "未知错误"
                     self.hub.log(f"拖放解压失败: {path.name} ({err})")
                     self.hub.notify("智能解压失败", f"{path.name}\n{err}")
+                    if tid:
+                        try:
+                            db.update_task_state(
+                                tid, ("need_password" if "密码" in err else "failed"),
+                                error=err, finished_at=int(time.time()))
+                        except Exception:
+                            pass
+                        self._emit_tasks_changed()
             except Exception as ex:
                 self.hub.log(f"拖放处理出错: {path.name}: {ex}")
                 self.hub.notify("智能解压出错", f"{path.name}\n{ex}")
+                if tid:
+                    try:
+                        db.update_task_state(
+                            tid, ("need_password" if "密码" in str(ex) else "failed"),
+                            error=str(ex), finished_at=int(time.time()))
+                    except Exception:
+                        pass
+                    self._emit_tasks_changed()
+            finally:
+                # 终态处理完毕才清上下文（成功/失败/差错/早退全覆盖），绝不让陈旧
+                # 上下文污染本线程后续日志；在途键同理必须移除，异常路径也不漏。
+                if callable(_clr_ctx):
+                    try:
+                        _clr_ctx()
+                    except Exception:
+                        pass
+                try:
+                    with self._drop_inflight_lock:
+                        self._drop_inflight.pop(inflight_key, None)
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1702,8 +1942,12 @@ class MainWindow(QMainWindow):
         self._reload_log_page(force=True)
         self._refill_task_log()
 
-    def _refresh_tasks(self):
-        """按「范围 + 失败过滤（唯一状态）」装载任务表，并同步底栏失败块。"""
+    def _refresh_tasks(self, preserve_view=False):
+        """按「范围 + 失败过滤（唯一状态）」装载任务表，并同步底栏失败块。
+
+        preserve_view=True：生命周期刷新（事件驱动）专用——保留用户选中与滚动位置；
+        默认 False 保持既有「显式刷新 / 换范围后回到顶部」的行为。
+        """
         try:
             counts = db.count_tasks() or {}
         except Exception:
@@ -1716,11 +1960,45 @@ class MainWindow(QMainWindow):
         except Exception:
             rows = []
         try:
-            self.task_page.set_tasks(rows, counts)
+            self.task_page.set_tasks(rows, counts, preserve_view=preserve_view)
         except Exception:
             pass
         try:
             self.statusbar.set_failed_count(int(counts.get("failed", 0) or 0))
+        except Exception:
+            pass
+
+    def _on_tasks_refresh_timer(self):
+        """防抖定时器到点：执行一次保留视图的任务表刷新。"""
+        try:
+            self._refresh_tasks(preserve_view=True)
+        except Exception:
+            pass
+
+    def _schedule_tasks_refresh(self):
+        """请求一次任务表刷新（合并突发事件）。
+
+        若定时器已在计时则不重启——保证连续事件流下刷新率有上界（约每 250ms 一次），
+        且首个事件后 250ms 必刷一次（不会因事件连绵而饿死）。
+        """
+        t = getattr(self, "_tasks_refresh_timer", None)
+        if t is None:
+            return
+        try:
+            if not t.isActive():
+                t.start()
+        except Exception:
+            pass
+
+    def _emit_tasks_changed(self):
+        """上报任务生命周期事件（尽力而为）：Hub 实现 tasks_changed 才投递。
+
+        供主窗口自身的任务写路径（拖放解压 / 忽略任务）复用；测试桩 Hub 未实现时静默跳过。
+        """
+        try:
+            cb = getattr(self.hub, "tasks_changed", None)
+            if cb is not None:
+                cb()
         except Exception:
             pass
 
@@ -1993,6 +2271,7 @@ class MainWindow(QMainWindow):
                                  finished_at=int(time.time()))
         except Exception:
             pass
+        self._emit_tasks_changed()
         self._append_log(f"[任务] 已忽略: {task.get('file_name') or task_id}")
         self._refresh_all()
 
@@ -2140,13 +2419,28 @@ class MainWindow(QMainWindow):
         return _accepts_in_task_view(self, record)
 
     def _sync_hotkey_display(self):
-        """把配置里的主热键同步到底栏「快捷键 <config>」与播报末句。"""
+        """把配置里的主热键同步到底栏「快捷键 <config>」与播报末句。
+
+        不谎报：配置了组合键但**注册失败**（如已被其他程序占用）时，追加
+        「（未生效）」标记，并把原因放进 tooltip；注册成功或尚未尝试时保持
+        原文案（只用配置值）。"""
         try:
             combo = str(self.state.snapshot().get("hotkey", "")).strip()
         except Exception:
             combo = ""
+        ok = getattr(self, "_hotkey_ok", {}).get("main")
+        display = combo
+        tip = ""
+        if combo and ok is False:
+            # 短标记优先：底栏横向空间有限，失败原因放 tooltip，避免长文案被挤压。
+            display = combo + "（未生效）"
+            tip = "快捷键 %s 注册失败（可能已被其他程序占用），当前不可用。" % combo
         try:
-            self.statusbar.set_hotkey(combo)
+            self.statusbar.set_hotkey(display)
+        except Exception:
+            pass
+        try:
+            self.statusbar.hotkey_label.setToolTip(tip)
         except Exception:
             pass
 
@@ -2690,35 +2984,25 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             elif item["type"] == "progress_start":
-                self.progress.setRange(0, 0)   # 忙碌模式（旧进度条兼容垫）
-                self.progress.setValue(0)
-                self.progress.show()
+                # 进度只在 StatusBar 呈现；不再有兼容进度条可 show()（防浮窗）
                 try:
                     self.statusbar.set_progress(None)
                 except Exception:
                     pass
             elif item["type"] == "progress":
-                if item.get("ratio") is None:
-                    self.progress.setRange(0, 0)
-                else:
-                    self.progress.setRange(0, 100)
-                    self.progress.setValue(
-                        max(0, min(100, int(round(item["ratio"] * 100)))))
-                self.progress.show()
-                if item.get("name"):
-                    self.progress.setToolTip(str(item["name"]))
                 try:
                     self.statusbar.set_progress(item.get("ratio"))
                 except Exception:
                     pass
             elif item["type"] == "progress_done":
-                self.progress.setRange(0, 100)
-                self.progress.setValue(0)
-                self.progress.hide()
                 try:
                     self.statusbar.clear_progress()
                 except Exception:
                     pass
+            elif item["type"] == "task":
+                # 任务生命周期变化（后台线程写 tasks 表后投递）：合并为一次任务表
+                # 刷新（防抖定时器），无需切页即可看到新增/状态迁移；刷新保选中/滚动。
+                self._schedule_tasks_refresh()
             elif item["type"] == "clip_done":
                 # 日志链接静默复制回执：成功什么都不做（点击时链接已降级、气泡已弹）；
                 # 失败则提示一句 + 弹「复制失败」气泡 + 尽力恢复可点样式，让用户能再点一次。
@@ -2809,6 +3093,11 @@ class MainWindow(QMainWindow):
                 # 后台探测发现该分享需要提取码：在 Qt 线程弹询问面板（worker 绝不碰控件）
                 self._share_ask_code(item.get("item") or {}, item.get("url"),
                                      item.get("surl"))
+            elif item["type"] == "share_used":
+                # 成功拉起回执（worker 线程投递）：该分享已成功提取，关闭同分享的
+                # 缺码小窗——它只为填写提取码而生，绝不让它赖到 120s 超时。
+                _close_share_ask_dlg(self, item.get("surl"), item.get("uk"),
+                                     item.get("url"))
 
     def _refresh_share_menu(self):
         """按「实验性功能」总开关刷新分享菜单项可见性（整条 2.F 属实验性）。"""
@@ -2914,9 +3203,15 @@ class MainWindow(QMainWindow):
             if not code:
                 self._append_log(
                     "[分享] 缺少可确认的提取码，已放弃拉起（避免拉错链接）")
-                self._share_notify(
-                    "分享缺少提取码",
-                    f"{url}\n该分享需要提取码：请在右侧小窗填写提取码。")
+                if _share_parent_usable(self):
+                    self._share_notify(
+                        "分享缺少提取码",
+                        f"{url}\n该分享需要提取码：请在右侧小窗填写提取码。")
+                else:
+                    # 主窗不可用：小窗弹不出来，绝不承诺「右侧小窗」——走统一诚实
+                    # 文案（三种方式）并置去重标记，随后 _show_share_code_window
+                    # 的兜底提示静默，一次用户动作只有一条气泡。
+                    _announce_ask_code_hidden(self, url)
                 _show_share_code_window(self, surl, url, None, mapped_code="")
                 return
             if _src == "recent":
@@ -2950,9 +3245,14 @@ class MainWindow(QMainWindow):
             if not code:
                 self._append_log(
                     "[分享] 缺少可确认的提取码，已放弃拉起（避免拉错链接）")
-                self._share_notify(
-                    "分享缺少提取码",
-                    f"{url}\n该分享需要提取码：请在右侧小窗填写提取码。")
+                if _share_parent_usable(self):
+                    self._share_notify(
+                        "分享缺少提取码",
+                        f"{url}\n该分享需要提取码：请在右侧小窗填写提取码。")
+                else:
+                    # 主窗不可用：与 Alt+2 快路径同一口径——诚实三方式文案 + 去重，
+                    # 绝不先发一条承诺「右侧小窗」的气泡。
+                    _announce_ask_code_hidden(self, url)
                 _show_share_code_window(self, surl, url, _uk or None, mapped_code="")
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
@@ -3268,6 +3568,8 @@ class MainWindow(QMainWindow):
             if ok:
                 # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）。
                 self.hub.log(f"[分享] 链路完成: {detail}")
+                # 已确认唤起客户端：该分享的缺码小窗任务完成，转交 Qt 线程关闭。
+                _notify_share_used(self, url=url)
             else:
                 self.hub.log(f"[分享] 拉起失败: {detail}")
                 # 失效判定优先：标记 + 「已失效」通知（用户手势后不该一片安静）。
@@ -3410,6 +3712,8 @@ class MainWindow(QMainWindow):
                     self.hub.log(f"[分享] 提交成功: 已请求客户端下载（{detail}）")
                     self.hub.q.put({"type": "notify", "title": "分享下载",
                                     "msg": str(url)})
+                    # 提交成功（已请求客户端下载）：该分享的小窗任务完成。
+                    _notify_share_used(self, surl=surl, uk=bind_code_uk, url=url)
                 except Exception:
                     pass
 
@@ -3507,6 +3811,8 @@ class MainWindow(QMainWindow):
                 # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）；
                 # 子集选择相关的既有日志信息一律保留。
                 self.hub.log(f"[分享] 链路完成: {detail}")
+                # 确认完成：关闭同分享小窗（on_wake 已投过一次，重复投递为幂等空操作）。
+                _notify_share_used(self, surl=surl, uk=bind_code_uk, url=url)
                 # 绑定只在**提交成功后**落库：失败（ok3 假）只本次生效，绝不写库。
                 # `_persist_share_code` 内的诊断日志已做线程安全分流（worker 线程走
                 # hub 队列，见 `_persist_log`），故可安全在 worker 中调用。
@@ -3928,6 +4234,7 @@ class MainWindow(QMainWindow):
         if not isinstance(_retry, int):
             _retry = 0
         self._unregister_hotkey()
+        self._hotkey_ok["main"] = None   # 本轮结果未知：未配置/未启用都按「不适用」处理
         if win32gui is None:
             return
         try:
@@ -3939,16 +4246,20 @@ class MainWindow(QMainWindow):
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"快捷键配置无效，未注册: {combo}")
+                self._hotkey_ok["main"] = False
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
+                self._hotkey_ok["main"] = False
                 return
             # pywin32 的 RegisterHotKey 成功时返回 None（不是 True），
             # 所以不依赖返回值：没有抛异常即注册成功。
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk)
+            self._hotkey_ok["main"] = True
             self.hub.log(f"全局快捷键已注册: {combo}")
         except Exception as e:
+            self._hotkey_ok["main"] = False
             # 启动瞬间偶发失败（例如窗口句柄尚未就绪，error 1400 "无效的窗口句柄"）。
             # 稍后重试：最多 3 次，避免「偶发注册不上」让热键长期失效。
             if _retry < 3:
@@ -3960,7 +4271,8 @@ class MainWindow(QMainWindow):
             # 主热键无论走哪条分支（含上面的提前 return），都顺带注册两个分享热键
             self._register_share_hotkey()
             self._register_share_code_hotkey()
-            # 底栏「快捷键 <config>」与播报末句始终显示配置值（不依赖注册成败）
+            # 底栏「快捷键 <config>」与播报末句按**真实注册结果**显示：
+            # 注册失败追加「（未生效）」，成功/未尝试保持原配置值文案。
             self._sync_hotkey_display()
 
     def _register_share_hotkey(self):
@@ -3970,6 +4282,7 @@ class MainWindow(QMainWindow):
         全局热键、未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
         if win32gui is None:
             return
+        self._hotkey_ok["share"] = None
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
                 return
@@ -3979,14 +4292,18 @@ class MainWindow(QMainWindow):
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"分享快捷键配置无效，未注册: {combo}")
+                self._hotkey_ok["share"] = False
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
+                self._hotkey_ok["share"] = False
                 return
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE, mods | MOD_NOREPEAT, vk)
+            self._hotkey_ok["share"] = True
             self.hub.log(f"分享快捷键已注册: {combo}")
         except Exception as e:
+            self._hotkey_ok["share"] = False
             self.hub.log(f"分享快捷键注册失败: {e}")
 
     def _register_share_code_hotkey(self):
@@ -3996,6 +4313,7 @@ class MainWindow(QMainWindow):
         未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
         if win32gui is None:
             return
+        self._hotkey_ok["share_code"] = None
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
                 return
@@ -4005,14 +4323,18 @@ class MainWindow(QMainWindow):
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"固定提取码快捷键配置无效，未注册: {combo}")
+                self._hotkey_ok["share_code"] = False
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
+                self._hotkey_ok["share_code"] = False
                 return
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE_CODE, mods | MOD_NOREPEAT, vk)
+            self._hotkey_ok["share_code"] = True
             self.hub.log(f"固定提取码快捷键已注册: {combo}")
         except Exception as e:
+            self._hotkey_ok["share_code"] = False
             self.hub.log(f"固定提取码快捷键注册失败: {e}")
 
     def _unregister_hotkey(self):

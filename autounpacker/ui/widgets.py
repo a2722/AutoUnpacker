@@ -1791,6 +1791,14 @@ class StatusTipTicker(QWidget):
 _NEED_ACTION_TEXT = {"retry": "重试", "open_dir": "打开目录",
                      "input_password": "输入密码", "ignore": "忽略"}
 
+# 行内操作 tooltip（文案用户定稿）：说明「输入密码」去哪补码，以及待密码行
+# 为什么「重试」仍可能失败。失败行的「重试」不挂此 tip，避免对非密码失败误导。
+_NEED_ACTION_TIP = {
+    "input_password": "到「密码本」页补充密码（固定密码本 / 临时密码 / 分享提取码）",
+    "retry": "已在所有来源（固定密码本 · 临时密码 · 分享提取码）中查找，均无匹配密码。"
+             "若刚复制过密码，请先到「密码本」页保存后再点「重试」。",
+}
+
 
 class _NeedRow(QFrame):
     """「需要处理」一行：3px 紧急度竖条 + 文件名/时间 + 说明 + 行内 ghost 按钮。"""
@@ -1848,17 +1856,22 @@ class _NeedRow(QFrame):
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(6)
         self.action_buttons = {}
-        for key in (item.get("actions") or []):
-            text = _NEED_ACTION_TEXT.get(str(key))
+        action_keys = [str(k) for k in (item.get("actions") or [])]
+        pwd_row = "input_password" in action_keys
+        for key in action_keys:
+            text = _NEED_ACTION_TEXT.get(key)
             if not text:
                 continue
             btn = QPushButton(text, self)
             btn.setObjectName("ghostSm")
             btn.setCursor(Qt.PointingHandCursor)
+            tip = _NEED_ACTION_TIP.get(key)
+            if tip and (key != "retry" or pwd_row):
+                btn.setToolTip(tip)
             btn.clicked.connect(
-                lambda _=False, k=str(key): self.actionTriggered.emit(self.task_id, k))
+                lambda _=False, k=key: self.actionTriggered.emit(self.task_id, k))
             actions.addWidget(btn)
-            self.action_buttons[str(key)] = btn
+            self.action_buttons[key] = btn
         actions.addStretch(1)
         col.addLayout(actions)
         lay.addLayout(col, 1)

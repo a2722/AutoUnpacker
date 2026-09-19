@@ -30,7 +30,8 @@ from ..config import (parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE,
                       HOTKEY_ID_SHARE_CODE, MOD_NOREPEAT)
 from ..trust import add_trust_entry
 from ..password_book import PasswordBookDialog
-from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url)
+from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,
+                     watch_path_conflict)
 from .widgets import (WatchCard,  # noqa: F401  （M3 起主界面不再创建，保留给目录弹窗/后续里程碑）
                       RainbowBorderButton,  # noqa: F401  （M3 起主界面不再使用，保留导入）
                       make_tray_icon, _HotkeyFilter, NavTabs, DirChipStrip,
@@ -1473,7 +1474,7 @@ class MainWindow(QMainWindow):
                     # 与剪贴板二维码路径同一语义）。
                     def _feed_qr(p=path, m=qr_monitor):
                         try:
-                            ok = m.feed_image_file(str(p))
+                            ok = m.feed_image_file(str(p), force=True)
                         except Exception as e:
                             self.hub.log(f"拖放: 二维码图片处理出错: {p.name}: {e}")
                             return
@@ -1778,7 +1779,7 @@ class MainWindow(QMainWindow):
         """「添加目录」：新建空条目并直接打开目录设置弹窗；取消/关闭则回收空条目。"""
         cfg = self.state.snapshot()
         entry = {"path": "", "enabled": True, "output_dir": "",
-                 "delete_source": False, "mode": "surface"}
+                 "delete_source": False, "delete_policy": "auto", "mode": "surface"}
         cfg["watch_paths"].append(entry)
         self.state.set("watch_paths", cfg["watch_paths"])
         idx = len(cfg["watch_paths"]) - 1
@@ -1815,15 +1816,19 @@ class MainWindow(QMainWindow):
                 "（确认网盘客户端有下载历史，或该库路径未被改动）")
             return
         try:
-            from ..utils import _norm_path_for_cfg
-            norm = _norm_path_for_cfg(str(root))
             entries = list(self.state.snapshot().get("watch_paths") or [])
-            if any(_norm_path_for_cfg(str(e.get("path", ""))) == norm for e in entries):
-                QMessageBox.information(self, "百度网盘下载目录",
-                                        f"该目录已在监听中：\n{root}")
+            # 实验性功能开启时统一走重叠检测：相等 / 祖先 / 子孙都拦截，避免
+            # 同一批下载文件被两条监听路径重复处理（旧代码只挡精确重复）。
+            conflict = watch_path_conflict(entries, str(root))
+            if conflict is not None:
+                QMessageBox.warning(
+                    self, "百度网盘下载目录",
+                    "该目录与已有监听路径重叠，可能重复处理同一批文件：\n"
+                    f"{root}\n↔ {conflict.get('path')}")
                 return
             entries.append({"path": str(root), "enabled": True,
                             "output_dir": "", "delete_source": False,
+                            "delete_policy": "auto",
                             "mode": "baidu"})
             self.state.set("watch_paths", entries)
             self.rebuild_cards()
@@ -2249,14 +2254,11 @@ class MainWindow(QMainWindow):
             self._append_log(f"[任务] 复制失败: {e}")
 
     def _input_password_for_task(self, task_id):
-        """待密码任务的「输入密码」：打开现有密码本弹窗（补码后用「重试」重新解压）。"""
-        try:
-            task = db.get_task(task_id) or {}
-        except Exception:
-            task = {}
-        name = str(task.get("file_name") or task_id)
-        self._append_log(f"[任务] {name} 需要密码：请在密码本中补充后点「重试」")
-        self._open_password_book()
+        """待密码任务的「输入密码」：跳到「密码本」页补码（不再弹旧密码本弹窗）。"""
+        self._append_log(
+            "缺少解压密码：已在所有来源（固定密码本 · 临时密码 · 分享提取码）中查找，"
+            "均无匹配密码；请到「密码本」页补充后点「重试」。")
+        self._goto_page("password")
 
     def _ignore_task(self, task_id):
         """忽略待密码/失败任务：标记为已取消（终态），从「需要处理」列表移除。"""

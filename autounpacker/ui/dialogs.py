@@ -22,12 +22,15 @@ from PyQt5.QtCore import (Qt, QTimer, pyqtSignal, QObject, QRect, QRegularExpres
 from PyQt5.QtGui import (QColor, QBrush, QKeySequence, QRegularExpressionValidator)
 
 from .. import trail as deletion_trail   # noqa: F401
+from .. import baidu_manifest
 from .. import sevenzip as sevenzip_manager  # noqa: F401
 from .widgets import (HotkeyEdit, TRAIL_STATUS_COLORS, Glyph, LayoutButton,
                       ModeSelector, DIR_STATE_TEXT, dir_state_key)
 from .style import PALETTE
 from . import style as ui_style
 from ..trust import trust_entry_categories
+from ..config import DELETE_POLICY_DEFAULT
+from ..utils import watch_path_conflict
 
 TRAIL_STATUS_TEXT = {
     "recorded": "已记录（处理中）",
@@ -41,6 +44,11 @@ TRAIL_STATUS_TEXT = {
 # 与主题同一对象，切换主题后就地更新），此处不再重复定义。
 
 TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
+
+# 「回收站说明」两种文案：有回收站的目录 vs 无回收站（删除按策略执行，可能是隔离区）
+TRASH_HINT_NORMAL = "删除是把源文件移入回收站，可在「删除回溯」标签页一键还原，不会永久丢失。"
+TRASH_HINT_NO_BIN = ("该磁盘没有可用回收站：删除源文件按下方「删除策略」执行，"
+                     "可在「删除回溯」标签页还原或彻底删除。")
 
 # 分享缺提取码取码小窗的超时（秒）：到点自动关闭并丢弃框内内容（不回调）。
 SHARE_ASK_TIMEOUT_SEC = 120
@@ -1974,6 +1982,80 @@ class ShareCodeAskDialog(QDialog):
         return super().eventFilter(obj, event)
 
 
+class DeletePolicyAskDialog(QDialog):
+    """卷无回收站时的源文件删除策略询问：一次性三选一（移入隔离区 / 保留源文件 /
+    永久删除）。
+
+    仅在「目录所在卷确定没有可用回收站」且用户开启「解压成功后删除源文件」时弹出
+    一次。与项目其它询问弹窗一致用普通 QDialog（QMessageBox 在 Windows 上会禁用
+    标题栏关闭键）。默认/首选项为「移入隔离区」（可还原，最安全）；按 X / Esc 关闭
+    返回 None，表示暂不选择（保持默认 auto，下次仍会询问，绝不静默永久删除）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._choice = None   # "quarantine" / "keep" / "permanent" / None=取消
+        self.setWindowTitle("删除源文件方式")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint
+                            | Qt.WindowSystemMenuHint | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(500, 290)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        title = QLabel("该目录所在磁盘没有可用的回收站")
+        title.setObjectName("appTitle")
+        lay.addWidget(title)
+
+        info = QLabel(
+            "你已开启「解压成功后删除源文件」，但该磁盘的回收站不可用，"
+            "删除将无法从回收站还原。\n\n"
+            "· 移入隔离区 —— 源文件移入目录下的 _已删除 文件夹，可随时还原或彻底删除（推荐）；\n"
+            "· 保留源文件 —— 解压成功后保留原文件，绝不删除；\n"
+            "· 永久删除 —— 解压成功后直接永久删除源文件，无法还原。\n\n"
+            "此选择只询问一次，之后可在「目录设置」里随时修改。"
+            "按 Esc / 标题栏 × 等同于暂不选择。")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {PALETTE['muted2']}; font-size: 13px;")
+        lay.addWidget(info)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        quar_btn = QPushButton("移入隔离区")
+        quar_btn.setObjectName("primary")
+        quar_btn.setDefault(True)
+        quar_btn.clicked.connect(self._choose_quarantine)
+        keep_btn = QPushButton("保留源文件")
+        keep_btn.clicked.connect(self._choose_keep)
+        perm_btn = QPushButton("永久删除")
+        perm_btn.setObjectName("danger")
+        perm_btn.clicked.connect(self._choose_permanent)
+        btns.addWidget(quar_btn)
+        btns.addWidget(keep_btn)
+        btns.addWidget(perm_btn)
+        lay.addLayout(btns)
+
+    def _choose_quarantine(self):
+        self._choice = "quarantine"
+        self.accept()
+
+    def _choose_keep(self):
+        self._choice = "keep"
+        self.accept()
+
+    def _choose_permanent(self):
+        self._choice = "permanent"
+        self.accept()
+
+    @staticmethod
+    def ask(parent=None):
+        dlg = DeletePolicyAskDialog(parent)
+        dlg.exec_()
+        return dlg._choice
+
+
 class WatchDirDialog(QDialog):
     """目录设置弹窗（对应原型 12）：宽 600、模态、居中于父窗口。
 
@@ -2010,6 +2092,12 @@ class WatchDirDialog(QDialog):
             self._progress = None
         self._current_name = ""
         self._current_layer = None
+        # 删除策略控件：仅当卷「确定没有回收站」时显示；路径变化后延迟重探。
+        self._policy_shown = False
+        self._policy_probe_timer = QTimer(self)
+        self._policy_probe_timer.setSingleShot(True)
+        self._policy_probe_timer.setInterval(250)
+        self._policy_probe_timer.timeout.connect(self._refresh_delete_policy)
 
         self.setWindowTitle("目录设置")
         self.setModal(True)
@@ -2028,6 +2116,7 @@ class WatchDirDialog(QDialog):
         root.addWidget(self._build_foot())
         self._refresh_state_badge()
         self._render_current()
+        self._refresh_delete_policy()
 
     # ---- 读取入口 ----
     def _load_entry(self):
@@ -2093,6 +2182,7 @@ class WatchDirDialog(QDialog):
         row1.addWidget(self._field_label("监听路径"))
         self.path_edit = QLineEdit(str(self._orig.get("path") or ""), self)
         self.path_edit.setPlaceholderText("监听目录路径")
+        self.path_edit.textChanged.connect(self._on_policy_path_changed)
         row1.addWidget(self.path_edit, 1)
         browse1 = QPushButton("浏览", self)
         browse1.clicked.connect(self._browse_path)
@@ -2138,21 +2228,62 @@ class WatchDirDialog(QDialog):
         row4.addSpacing(14)
         self.del_cb = QCheckBox("解压成功后删除源文件", self)
         self.del_cb.setChecked(bool(self._orig.get("delete_source", False)))
+        self.del_cb.stateChanged.connect(self._on_delete_toggled)
         row4.addWidget(self.del_cb)
         row4.addStretch(1)
         lay.addLayout(row4)
 
-        # 回收站说明
+        # 回收站说明（无回收站的目录下，文案随「删除策略」切换为隔离区语义）
         hint_row = QHBoxLayout()
         hint_row.setSpacing(7)
         hint_row.addWidget(Glyph("shield", self, 13, role="muted"))
-        hint = QLabel(
-            "删除是把源文件移入回收站，可在「删除回溯」标签页一键还原，不会永久丢失。",
-            self)
-        hint.setObjectName("dlgHint")
-        hint.setWordWrap(True)
-        hint_row.addWidget(hint, 1)
+        self.trash_hint = QLabel(TRASH_HINT_NORMAL, self)
+        self.trash_hint.setObjectName("dlgHint")
+        self.trash_hint.setWordWrap(True)
+        hint_row.addWidget(self.trash_hint, 1)
         lay.addLayout(hint_row)
+
+        # 删除策略：仅当该目录所在卷「确定没有回收站」时出现（正常目录完全隐藏，
+        # 不打扰）；正常有回收站的目录不显示任何多余选项。三选一，顺序与询问弹窗
+        # 一致：移入隔离区（推荐/默认，可还原）→ 保留源文件 → 永久删除（危险）。
+        self.policy_row = QWidget(self)
+        p_lay = QVBoxLayout(self.policy_row)
+        p_lay.setContentsMargins(0, 0, 0, 0)
+        p_lay.setSpacing(4)
+        p_top = QHBoxLayout()
+        p_top.setSpacing(9)
+        p_top.addWidget(self._field_label("删除策略"), 0, Qt.AlignTop)
+        p_col = QVBoxLayout()
+        p_col.setSpacing(4)
+        self.policy_group = QButtonGroup(self.policy_row)
+        self.policy_quar_rb = QRadioButton("移入隔离区（推荐）", self.policy_row)
+        self.policy_quar_rb.setToolTip(
+            "该卷没有可用回收站：删除源文件时移入目录下的 _已删除 文件夹，"
+            "可在「删除回溯」页随时还原或彻底删除。")
+        self.policy_keep_rb = QRadioButton("保留源文件", self.policy_row)
+        self.policy_keep_rb.setToolTip(
+            "该卷没有可用回收站：删除源文件时绝不永久删除，原文件保留在原位。")
+        self.policy_perm_rb = QRadioButton("永久删除", self.policy_row)
+        self.policy_perm_rb.setToolTip(
+            "该卷没有可用回收站：删除源文件时直接永久删除，无法从回收站还原。")
+        self.policy_group.addButton(self.policy_quar_rb)
+        self.policy_group.addButton(self.policy_keep_rb)
+        self.policy_group.addButton(self.policy_perm_rb)
+        self.policy_quar_rb.setChecked(True)
+        p_col.addWidget(self.policy_quar_rb)
+        p_col.addWidget(self.policy_keep_rb)
+        p_col.addWidget(self.policy_perm_rb)
+        p_top.addLayout(p_col, 1)
+        p_lay.addLayout(p_top)
+        p_hint = QLabel(
+            "该目录所在磁盘没有可用回收站，删除源文件无法从回收站还原；"
+            "推荐移入隔离区（可随时还原或彻底删除）。",
+            self.policy_row)
+        p_hint.setObjectName("dlgHint")
+        p_hint.setWordWrap(True)
+        p_lay.addWidget(p_hint)
+        self.policy_row.setVisible(False)
+        lay.addWidget(self.policy_row)
 
         # 当前正在处理
         self.current_card = QFrame(self)
@@ -2262,18 +2393,125 @@ class WatchDirDialog(QDialog):
 
     def entry(self):
         """当前面板上的值（保存前宿主可只读获取）。"""
-        return {
+        data = {
             "path": self.path_edit.text().strip(),
             "output_dir": self.out_edit.text().strip(),
             "mode": self.mode_sel.mode() or "surface",
             "enabled": bool(self.enabled_cb.isChecked()),
             "delete_source": bool(self.del_cb.isChecked()),
         }
+        if self._policy_editable():
+            data["delete_policy"] = self._policy_value()
+        return data
+
+    # ---- 删除策略（仅卷无回收站时可见） ----
+    def _policy_editable(self):
+        """策略控件可见、且该条目本就带 delete_policy 键时才参与读写。
+
+        真实配置经 config.load_config/_sanitize_cfg 后每条都带该键；此守卫只用于
+        兼容未经过净化、手工构造的旧条目，避免凭空写入未跟踪的字段。"""
+        return self._policy_shown and "delete_policy" in self._orig
+
+    def _policy_value(self):
+        if self.policy_perm_rb.isChecked():
+            return "permanent"
+        if self.policy_keep_rb.isChecked():
+            return "keep"
+        return "quarantine"
+
+    def _set_policy_value(self, value):
+        if str(value) == "permanent":
+            self.policy_perm_rb.setChecked(True)
+        elif str(value) == "keep":
+            self.policy_keep_rb.setChecked(True)
+        else:
+            # quarantine 与未选择（auto/未知）都预设为推荐项「移入隔离区」
+            self.policy_quar_rb.setChecked(True)
+
+    def _on_policy_path_changed(self, _text=""):
+        """路径变化 → 延迟重探（防抖），避免每个键击都查询卷回收站。"""
+        try:
+            self._policy_probe_timer.start()
+        except Exception:
+            self._refresh_delete_policy()
+
+    def _refresh_delete_policy(self):
+        """按当前输入路径所在卷实测回收站：仅「确定没有回收站」时显示策略控件。"""
+        try:
+            path = self.path_edit.text().strip()
+            has_bin = (deletion_trail.volume_has_recycle_bin(path)
+                       if path else None)
+        except Exception:
+            has_bin = None
+        self._policy_shown = (has_bin is False)
+        try:
+            if self._policy_shown:
+                stored = str(self._orig.get("delete_policy") or DELETE_POLICY_DEFAULT)
+                self._set_policy_value(
+                    stored if stored in ("quarantine", "keep", "permanent") else "")
+            self.trash_hint.setText(
+                TRASH_HINT_NO_BIN if self._policy_shown else TRASH_HINT_NORMAL)
+            self.policy_row.setVisible(self._policy_shown)
+        except Exception:
+            pass
+
+    def _on_delete_toggled(self, _state=0):
+        """用户开启「删除源文件」时（弹窗可见时）按需询问一次删除策略。"""
+        try:
+            if self.isVisible():
+                self._maybe_prompt_delete_policy()
+        except Exception:
+            pass
+
+    def _maybe_prompt_delete_policy(self):
+        """卷无回收站 + 已开启删除源文件 + 尚未明确选择策略时，仅询问一次。"""
+        try:
+            if "delete_policy" not in self._orig:
+                return              # 非标准条目（未带该字段）：不在此处新增
+            stored = str(self._orig.get("delete_policy") or DELETE_POLICY_DEFAULT)
+            if stored != DELETE_POLICY_DEFAULT:
+                return              # 已明确选择过，绝不再打扰
+            if not self.del_cb.isChecked():
+                return              # 未开启删除源文件，暂无需选择
+            path = self.path_edit.text().strip()
+            if not path:
+                return
+            if deletion_trail.volume_has_recycle_bin(path) is not False:
+                return              # 有回收站 / 不确定：不设置策略
+            choice = DeletePolicyAskDialog.ask(self)
+            if choice is None:
+                return              # 用户取消：保持默认，下次仍会询问
+            self._orig["delete_policy"] = choice
+            self._policy_shown = True
+            self._set_policy_value(choice)
+            self.policy_row.setVisible(True)
+            try:
+                self.state.update_path(self.idx, "delete_policy", choice)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ---- 交互 ----
     def _on_save(self):
         cur = self.entry()
-        for field in ("path", "output_dir", "mode", "enabled", "delete_source"):
+        # 实验性开启时：新的监听路径不得与其它条目嵌套/重叠（百度网盘那套会把
+        # 子目录也纳入监听，重叠路径会让同一批文件被两条监听路径重复处理）。
+        # 开关关闭时保持原行为：只依赖 update_path 的精确去重，不做重叠拦截。
+        new_path = str(cur.get("path") or "").strip()
+        old_path = str(self._orig.get("path") or "").strip()
+        if new_path != old_path and baidu_manifest.is_enabled(self.state):
+            conflict = watch_path_conflict(self._other_watch_entries(), new_path)
+            if conflict is not None:
+                QMessageBox.warning(
+                    self, "目录设置",
+                    "监听路径与已有路径重叠，可能重复处理同一批文件：\n"
+                    f"{new_path}\n↔ {conflict.get('path')}")
+                return
+        fields = ["path", "output_dir", "mode", "enabled", "delete_source"]
+        if self._policy_editable():
+            fields.append("delete_policy")
+        for field in fields:
             value = cur.get(field)
             if value != self._orig.get(field):
                 try:
@@ -2285,6 +2523,18 @@ class WatchDirDialog(QDialog):
         except Exception:
             pass
         self.accept()
+
+    def _other_watch_entries(self):
+        """除当前条目外的监听路径条目（供实验性「重叠监听目录」检测比对）。"""
+        for getter in (lambda: self.state.snapshot(),
+                       lambda: getattr(self.state, "cfg", {})):
+            try:
+                paths = list((getter() or {}).get("watch_paths") or [])
+            except Exception:
+                continue
+            return [e for i, e in enumerate(paths)
+                    if i != self.idx and isinstance(e, dict)]
+        return []
 
     def _on_remove(self):
         """只发信号：二次确认由宿主负责（本弹窗绝不弹确认框）。"""
@@ -2351,6 +2601,11 @@ class WatchDirDialog(QDialog):
         self._ensure_scrim()
         super().showEvent(event)
         self._center_on_parent()
+        # 弹窗打开时若已开启「删除源文件」且卷无回收站、策略未定，询问一次。
+        try:
+            self._maybe_prompt_delete_policy()
+        except Exception:
+            pass
 
     def hideEvent(self, event):
         self._destroy_scrim()

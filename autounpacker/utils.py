@@ -65,6 +65,39 @@ def _norm_path_for_cfg(path):
         return str(path)
 
 
+def watch_path_conflict(entries, new_path):
+    """在已有监听路径条目里找出与 new_path 冲突（相等 / 互为祖先子孙）的那一条。
+
+    用于「实验性功能开启」时拦截嵌套或重叠的监听目录：百度网盘那套会把下载
+    子目录也纳入监听，若再添加一条位于既有根内部（或反过来包住既有根）的路径，
+    同一批文件可能被两条监听路径重复处理。仅比对 path 字段，空路径一律跳过。
+
+    判定必须按**路径段**比较（拼尾分隔符后再 startswith），绝不能用裸
+    startswith：否则 C:\\a\\bc 会被误判为落在 C:\\a\\b 之内。规范化沿用与配置
+    去重同一个 _norm_path_for_cfg（忽略大小写与尾斜杠），保证口径一致。
+    返回命中的已有条目（dict），无冲突返回 None。
+    """
+    raw = str(new_path or "").strip()
+    if not raw:
+        return None
+    try:
+        new_key = _norm_path_for_cfg(raw)
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            old_raw = str(e.get("path") or "").strip()
+            if not old_raw:
+                continue
+            old_key = _norm_path_for_cfg(old_raw)
+            if (old_key == new_key
+                    or old_key.startswith(new_key + os.sep)
+                    or new_key.startswith(old_key + os.sep)):
+                return e
+    except Exception:
+        return None
+    return None
+
+
 def _can_open_append(path):
     """文件能否以追加写模式打开（False = 被其他进程独占锁定）。
 

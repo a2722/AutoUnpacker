@@ -13,6 +13,7 @@ import os
 import time
 import json
 import uuid
+import shutil
 import threading
 from pathlib import Path
 from ctypes import wintypes
@@ -27,6 +28,10 @@ FO_DELETE = 0x0003
 FOF_ALLOWUNDO = 0x0040
 FOF_NOCONFIRMATION = 0x0010
 FOF_SILENT = 0x0004
+
+# 隔离区目录名（回收站不可用时源文件的可还原落点）：<root>/_已删除/<YYYY-MM-DD>。
+# 监听扫描必须跳过该目录（见 monitors._in_quarantine），否则隔离文件会被当成新压缩包重解。
+QUARANTINE_DIRNAME = "_已删除"
 
 
 class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -69,6 +74,55 @@ def send_to_recycle_bin(paths):
         return False, [p for p in paths if Path(p).exists()]
     failed = [p for p in paths if Path(p).exists()]
     return (not failed), failed
+
+
+# ---- 卷回收站可用性探测（只读；绝不弹窗 / 绝不删除 / 绝不抛异常） ----
+DRIVE_REMOVABLE = 2   # 可移动盘（U 盘 / 移动硬盘）
+DRIVE_FIXED = 3       # 固定盘
+DRIVE_REMOTE = 4      # 网络盘
+DRIVE_RAMDISK = 6     # 内存盘
+
+
+def volume_has_recycle_bin(path):
+    """探测 path 所在卷是否有可用的回收站，返回 True / False / None（不确定）。
+
+    判定规则：
+    - UNC 路径（\\\\server\\share…）没有「本机回收站」概念 → False；
+    - 可移动盘 / 网络盘 / 内存盘 → False（这类卷默认不带回收站）；
+    - 固定盘 → 用 SHQueryRecycleBinW 实测该卷根的回收站是否可用：
+      调用成功(0) → True，明确失败 → False；
+    - 其它盘型 / 非 Windows / 探测过程任何异常 → None（不确定，调用方保守处理）。
+
+    只做只读探测：绝不弹窗、绝不删除、绝不抛异常。"""
+    if os.name != "nt":
+        return None
+    try:
+        p = str(path or "")
+        if p.startswith("\\\\") or p.startswith("//"):
+            return False
+        drive = os.path.splitdrive(os.path.abspath(p))[0]
+        if not drive:
+            return False
+        root = drive + "\\"
+        dtype = int(ctypes.windll.kernel32.GetDriveTypeW(root))
+        if dtype in (DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_RAMDISK):
+            return False
+        if dtype != DRIVE_FIXED:
+            return None
+
+        class SHQUERYRBINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("i64Size", ctypes.c_longlong),
+                ("i64NumItems", ctypes.c_longlong),
+            ]
+
+        info = SHQUERYRBINFO()
+        info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+        ret = ctypes.windll.shell32.SHQueryRecycleBinW(root, ctypes.byref(info))
+        return ret == 0
+    except Exception:
+        return None
 
 
 # ---- 记录持久化 ----
@@ -128,6 +182,8 @@ def new_record(original_path, watch_dir):
         "file_mtime": fmtime,
         "deleted_paths": [],       # 已移入回收站、可还原的路径
         "failed_paths": [],        # 永久删除、无法还原的路径
+        "quarantine_map": [],      # 回收站不可用时移入隔离区、可还原的文件地图
+                                   # [{"from": 原路径, "to": 隔离区路径}, ...]
         "deleted_at": "",
         "note": "",
     }
@@ -238,16 +294,56 @@ def mark_failed(rec_id, err):
     update_record(rec_id, status="failed", note=f"解压失败: {err}")
 
 
-def mark_deleted(rec_id, recycled, failed):
-    """解压后删除源文件：recycled=已移入回收站(可还原)，failed=永久删除(不可还原)"""
+def mark_deleted(rec_id, recycled, failed, quarantine_map=None):
+    """解压后删除源文件：recycled=已移入回收站(可还原)，failed=回收站不可用时的残留。
+
+    quarantine_map 非空（quarantine 策略且回收站不可用）时：文件已移入隔离区、可还原，
+    记入 quarantine_map，failed_paths 保持空（没有永久删除，绝不让 UI 谎称「无法还原」），
+    备注写隔离目录。
+
+    否则 failed 的最终归属取决于调用方的回退策略：可能已被永久删除（auto / permanent），
+    也可能按「保留源文件」策略原样留在原位（keep）。这里按文件是否仍存在如实区分：
+    仍存在=保留未删，已不存在=永久删除——绝不把「保留」写成「已永久删除」。"""
+    recycled = [str(p) for p in (recycled or [])]
+    failed = [str(p) for p in (failed or [])]
+    qmap = []
+    for e in (quarantine_map or []):
+        if not isinstance(e, dict):
+            continue
+        frm, to = str(e.get("from") or ""), str(e.get("to") or "")
+        if frm and to:
+            qmap.append({"from": frm, "to": to})
+    if qmap:
+        fields = {
+            "status": "deleted",
+            "deleted_paths": recycled,
+            "quarantine_map": qmap,
+            "failed_paths": [],     # 隔离区无永久删除
+            "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "回收站不可用，已移入隔离区（可还原）：" + _quarantine_note_dir(qmap),
+        }
+        update_record(rec_id, **fields)
+        return
+    still_here, gone = [], []
+    for p in failed:
+        try:
+            (still_here if Path(p).exists() else gone).append(p)
+        except Exception:
+            gone.append(p)
     fields = {
         "status": "deleted",
-        "deleted_paths": [str(p) for p in (recycled or [])],
-        "failed_paths": [str(p) for p in (failed or [])],
+        "deleted_paths": recycled,
+        "quarantine_map": [],
+        "failed_paths": gone,       # 仅真正永久删除、不可还原的路径
         "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    if failed:
+    if gone:
         fields["note"] = "部分文件未能移入回收站，已永久删除，无法还原"
+    elif still_here:
+        # 回收站不可用且策略为「保留源文件」：原文件留在原位，并未删除
+        if not recycled:
+            fields["status"] = "kept"
+        fields["note"] = "回收站不可用，已按「保留源文件」策略保留，未删除源文件"
     update_record(rec_id, **fields)
 
 
@@ -343,3 +439,204 @@ def restore_record(rec_id):
             return True, f"已还原 {len(restored)} 个文件"
         return True, f"还原 {len(restored)}/{len(targets)}，部分失败：{os.path.basename(failed[0])}"
     return False, "还原失败：回收站中找不到对应文件，或已被永久删除"
+
+
+# ---- 隔离区（回收站不可用时源文件的可还原落点） ----
+def quarantine_target_dir(root, when=None):
+    """隔离区目标目录：<root>/_已删除/<YYYY-MM-DD>。"""
+    base = Path(str(root)) if str(root or "").strip() else Path(".")
+    day = time.strftime("%Y-%m-%d",
+                        when if when is not None else time.localtime())
+    return base / QUARANTINE_DIRNAME / day
+
+
+def _unique_quarantine_dest(dest):
+    """不覆盖已有文件的落点：同名冲突时在扩展名前追加 " (2)"、" (3)"…"""
+    dest = Path(dest)
+    if not dest.exists():
+        return dest
+    parent, stem, suffix = dest.parent, dest.stem, dest.suffix
+    i = 2
+    while True:
+        cand = parent / f"{stem} ({i}){suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _same_volume(src, dest_root):
+    """src 与 dest_root 是否同一卷：优先 st_dev，取不到退回盘符比较。"""
+    try:
+        return os.stat(str(src)).st_dev == os.stat(str(dest_root)).st_dev
+    except OSError:
+        pass
+    try:
+        a = os.path.splitdrive(os.path.abspath(str(src)))[0].lower()
+        b = os.path.splitdrive(os.path.abspath(str(dest_root)))[0].lower()
+        return bool(a) and a == b
+    except Exception:
+        return False
+
+
+def _quarantine_note_dir(qmap):
+    """取隔离区地图里公共的隔离目录，供回溯备注展示。"""
+    dirs = []
+    for e in qmap or []:
+        to = str(e.get("to") or "")
+        if to:
+            dirs.append(str(Path(to).parent))
+    if not dirs:
+        return ""
+    if len(dirs) == 1:
+        return dirs[0]
+    try:
+        return os.path.commonpath(dirs)
+    except Exception:
+        return dirs[0]
+
+
+def move_to_quarantine(paths, root):
+    """把一组文件移入隔离区，返回 (moved, failed)。
+
+    moved 每项为 {"from": 原绝对路径, "to": 隔离区绝对路径}；failed 为仍未能移走、
+    原样留在原位的路径。同卷走 os.replace 秒改名，跨卷走 shutil.move 复制+删除；
+    目标已存在同名文件时在扩展名前追加 " (2)"、" (3)"… 绝不覆盖。root 为空时按每个
+    文件自身所在目录补 _已删除（无 output_dir 时的兜底）。**绝不抛异常**。
+    """
+    moved, failed = [], []
+    for raw in (paths or []):
+        src = Path(str(raw))
+        orig = os.path.abspath(str(raw))
+        try:
+            if not src.exists():
+                continue
+            base = str(root).strip()
+            root_dir = Path(base) if base else src.parent
+            dest_dir = quarantine_target_dir(root_dir)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = _unique_quarantine_dest(dest_dir / src.name)
+            if _same_volume(src, dest_dir):
+                # 同卷：瞬间改名。dest 已是唯一落点，os.replace 不会覆盖他人文件。
+                os.replace(str(src), str(dest))
+            else:
+                # 跨卷：shutil.move 复制后删除源；失败时源仍在，绝不删用户数据。
+                shutil.move(str(src), str(dest))
+            if src.exists():
+                # 源仍在（如跨卷复制成功但删除失败）：如实算失败，源与隔离副本都保留。
+                failed.append(orig)
+                continue
+            moved.append({"from": orig, "to": os.path.abspath(str(dest))})
+        except Exception:
+            failed.append(orig)
+    return moved, failed
+
+
+def _quarantine_entries(rec):
+    out = []
+    for e in (rec.get("quarantine_map") or []):
+        if isinstance(e, dict) and e.get("from") and e.get("to"):
+            out.append({"from": str(e["from"]), "to": str(e["to"])})
+    return out
+
+
+def quarantine_restore(rec_id):
+    """把隔离区里的文件移回原位置，返回 (ok, skipped, failed)。
+
+    - 原位置已有文件 / 隔离文件缺失 → 跳过（绝不覆盖，也不报失败）；
+    - 成功移回 → 从 quarantine_map 移除；全部清空时 status="restored"；
+    - 跳过（原位置已占用）的条目仍留在隔离区与地图里，等待用户处理；
+    - 备注如实写明还原 / 跳过 / 失败数量。
+    """
+    rec = get_record(rec_id)
+    if rec is None:
+        return False, [], []
+    entries = _quarantine_entries(rec)
+    if not entries:
+        return False, [], []
+    restored, skipped, failed, left = [], [], [], []
+    for e in entries:
+        src = Path(e["to"])
+        dst = Path(e["from"])
+        if dst.exists():
+            skipped.append(e["from"])
+            left.append(e)          # 原位置已有文件：隔离副本保留，不覆盖
+            continue
+        if not src.exists():
+            skipped.append(e["to"])  # 隔离文件已不在：视为无需还原，丢弃该条目
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if _same_volume(src, dst.parent):
+                os.replace(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+            if dst.exists() and not src.exists():
+                restored.append(e["from"])
+            else:
+                failed.append(e["from"])
+                left.append(e)
+        except Exception:
+            failed.append(e["from"])
+            left.append(e)
+    parts = []
+    if restored:
+        parts.append(f"已还原 {len(restored)} 个")
+    if skipped:
+        parts.append(f"跳过 {len(skipped)} 个（原位置已存在或隔离文件缺失）")
+    if failed:
+        parts.append(f"失败 {len(failed)} 个")
+    if not parts:
+        parts.append("无可还原文件")
+    fields = {"quarantine_map": left,
+              "note": "隔离区还原：" + "；".join(parts)}
+    if not left:
+        fields["status"] = "restored"
+    update_record(rec_id, **fields)
+    return (bool(restored) and not failed), skipped, failed
+
+
+def quarantine_purge(rec_id):
+    """永久删除该记录隔离区里的文件，返回 (ok, failed)。
+
+    只删 quarantine_map 里仍存在的隔离副本；失败的原样保留在地图里。绝不抛异常。
+    """
+    rec = get_record(rec_id)
+    if rec is None:
+        return False, []
+    entries = _quarantine_entries(rec)
+    if not entries:
+        return False, []
+    failed, left, purged = [], [], 0
+    for e in entries:
+        src = Path(e["to"])
+        try:
+            if src.is_dir():
+                shutil.rmtree(str(src))
+                purged += 1
+            elif src.exists():
+                src.unlink()
+                purged += 1
+            # 不存在 = 已被清空，直接丢弃条目
+        except Exception:
+            failed.append(e["to"])
+            left.append(e)
+    note = f"隔离区已永久删除 {purged} 个文件"
+    if failed:
+        note += f"；失败 {len(failed)} 个"
+    update_record(rec_id, quarantine_map=left, note=note)
+    return (not failed), failed
+
+
+def quarantine_stats():
+    """统计所有记录隔离区里「此刻仍存在」的文件数与总字节数，返回 (files, bytes)。"""
+    files, total = 0, 0
+    for r in load_records():
+        for e in _quarantine_entries(r):
+            try:
+                p = Path(e["to"])
+                if p.is_file():
+                    total += p.stat().st_size
+                    files += 1
+            except Exception:
+                continue
+    return files, total

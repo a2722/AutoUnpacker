@@ -33,8 +33,9 @@
 注意：排序只重排视图（点列头升 / 降序，默认命中次数降序），绝不改写密码本顺序——
       解压尝试顺序只由库内 id 顺序决定，任何表头点击都不会改变它；「查重」仍会清理
       重复行（整表覆盖时按口令保留备注与来源）。
-注意：表格复用 #taskTable 的既有 QSS（style.py 的表头 padding 已与单元格 padding
-      对齐，属共享样式的最小改动）；自绘取色一律走 PALETTE / widgets 的 token 机制。
+注意：表格复用 #taskTable 的既有 QSS；口令表列头只在本地修正（_PwHeader 自绘排序
+      指示器 + 本地右侧 11px padding，不改 style.py）；自绘取色一律走 PALETTE /
+      widgets 的 token 机制。
 """
 # allow: SIZE_OK — 交付约束只允许新建本模块与测试两个文件；本模块 = 页面 + 私有模型 /
 # 表格 / 编辑对话框 / 数据门面（常规应拆 3~4 个文件，此处按单文件约束合并在一个页面单元）。
@@ -42,7 +43,8 @@ import time
 
 from PyQt5.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel,
                           QTimer, Qt, pyqtSignal)
-from PyQt5.QtGui import QFont, QFontMetrics, QKeySequence
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QKeySequence, QPainter,
+                         QPainterPath)
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QMessageBox, QPlainTextEdit, QPushButton, QShortcut,
@@ -57,7 +59,7 @@ from ..password_book import (add_password_row, add_share_code_row,
                              list_share_code_rows, parse_share_code_text,
                              set_share_code_rows, update_password_row,
                              update_share_code_row)
-from .style import PALETTE
+from .style import PALETTE, tokens
 from .widgets import Glyph, SegControl, show_toast
 
 # 空态文案（与 pages.py 的空态语气一致）
@@ -671,6 +673,69 @@ class _PwDelegate(QStyledItemDelegate):
         super().paint(painter, opt, index)
 
 
+class _PwHeader(QHeaderView):
+    """口令表专用列头：自绘排序指示器（▼/▲），保证不压住表头文字。
+
+    复用 #taskTable 的共享 QSS 时，QStyleSheetStyle 不会为指示器预留表头文字
+    宽度（Qt 已知行为）：原生指示器会压到右对齐的「命中次数」最后一个字形上，
+    且在深色主题下几乎不可见。本类配合 _PwTable 的局部 QSS（把原生指示器收成
+    0 尺寸）在表头右侧 padding 留白里自绘：
+
+      · 底边宽 7px、高 4px、右缘距 section 右缘 2px；
+      · 与表头文字保持 2px 间隙（右侧 padding 11px = 2 + 7 + 2，见 _PwTable）；
+      · 取色用当前主题的 QSS token head_fg（浅色 #616161 / 深色 #cccccc），
+        主题切换由 tokens() 自动跟随。
+
+    仅 _PwTable 使用：另外三张复用 #taskTable 的表（任务表 / 提取码表 / 回溯表）
+    不换成此类，表头外观保持不变。
+    """
+
+    _W = 7        # 指示器底边宽（逻辑 px）
+    _H = 4        # 指示器高（逻辑 px）
+    _RIGHT = 2    # 指示器右缘距 section 右缘（逻辑 px）
+
+    def paintEvent(self, event):
+        """先按常规画列头（底 + 文字），再在右侧留白里自绘 ▼/▲。
+
+        不用 paintSection 覆写：PyQt5 不会把 C++ 对 paintSection 的调用派发到
+        Python 覆写（已实测），paintEvent 是可靠的虚函数入口。
+        """
+        super().paintEvent(event)
+        if not self.isSortIndicatorShown():
+            return
+        logical = int(self.sortIndicatorSection())
+        if not (0 <= logical < self.count()):
+            return
+        width = int(self.sectionSize(logical))
+        if width <= 0:
+            return
+        try:
+            color = QColor(str(tokens().get("head_fg") or "#616161"))
+        except Exception:
+            color = QColor("#616161")
+        right = float(self.sectionViewportPosition(logical) + width - self._RIGHT)
+        cx = right - self._W / 2.0
+        top = float(self.viewport().height()) / 2.0 - self._H / 2.0
+        path = QPainterPath()
+        if self.sortIndicatorOrder() == Qt.DescendingOrder:
+            path.moveTo(cx - self._W / 2.0, top)
+            path.lineTo(cx + self._W / 2.0, top)
+            path.lineTo(cx, top + self._H)
+        else:
+            path.moveTo(cx - self._W / 2.0, top + self._H)
+            path.lineTo(cx + self._W / 2.0, top + self._H)
+            path.lineTo(cx, top)
+        path.closeSubpath()
+        painter = QPainter(self.viewport())
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawPath(path)
+        finally:
+            painter.end()
+
+
 class _PwTable(QTableView):
     """口令表：掩码列 + 行内 复制 / 编辑 / 删除；Delete 键发 deleteKeyPressed。
 
@@ -701,7 +766,16 @@ class _PwTable(QTableView):
         self.setMinimumHeight(160)
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(44)
-        hh = self.horizontalHeader()
+        # 列头换成 _PwHeader（自绘排序指示器）；局部 QSS 只作用于本表列头
+        # （style.py 是 4 张表共享的，禁改）：右侧 padding 8→11px 给自绘 ▼/▲
+        # 留出「2px 间隙 + 7px 底边 + 2px 右缘」；Qt 原生指示器收成 0 尺寸，
+        # 否则它会压在本表右对齐的「命中次数」文字上（且深色下几乎不可见）。
+        hh = _PwHeader(Qt.Horizontal, self)
+        self.setHorizontalHeader(hh)
+        hh.setStyleSheet(
+            "QHeaderView::section { padding: 7px 11px 7px 8px; }"
+            "QHeaderView::down-arrow { width: 0px; height: 0px; }"
+            "QHeaderView::up-arrow { width: 0px; height: 0px; }")
         hh.setHighlightSections(False)
         hh.setStretchLastSection(False)
         hh.setSectionsClickable(True)

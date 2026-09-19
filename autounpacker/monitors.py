@@ -26,11 +26,24 @@ from . import extract as smart_extract   # noqa: F401  保留原名引用
 from . import trail as deletion_trail     # noqa: F401
 from . import db                          # noqa: F401
 from . import volume_pair
+from . import baidu_manifest             # 实验性开关判定（子目录监听/分卷递归的唯一闸门）
 from .trust import (_host_of, decide_host, remember_auto_domain)
 # 网址边界识别统一走 utils（正向字符集 + 尾部标点规则只有一份）：剪贴板文本
 # 「网址 + 中文说明/提取码」的截断见 utils.split_urls 的文档。
 from .utils import (_can_open_append, split_urls, is_url_like,
                     is_baidu_pan_url)
+
+
+def _in_quarantine(path):
+    """路径是否位于隔离区（_已删除）之内：任一路径段等于 QUARANTINE_DIRNAME 即命中。
+
+    隔离区里的文件是「已删除源文件的可还原副本」，绝不能再被当成新压缩包扫描/重解，
+    否则会被反复处理甚至再次删除。所有枚举监听/输出根的地方都必须先过这一关。
+    """
+    try:
+        return deletion_trail.QUARANTINE_DIRNAME in Path(path).parts
+    except Exception:
+        return False
 
 
 def _tasks_changed(hub):
@@ -380,7 +393,10 @@ class FolderWatcher(threading.Thread):
         self._translation_check(watch)
         # 百度清单模式（Tier-2）：额外处理下载到子目录里的压缩包/分卷。
         # 只增强、不阻断：清单不可用就什么都不做，等于退回表层模式。
-        if str(wc.get("mode") or "") == "baidu":
+        # 调用点也显式要求实验性开关（_baidu_poll 内部另有同名自检，双保险）：
+        # 开关关掉时绝不进入会「摸子文件夹」的百度清单链路。
+        if (str(wc.get("mode") or "") == "baidu"
+                and baidu_manifest.is_enabled(self.state)):
             try:
                 self._baidu_poll(watch, wc)
             except Exception as e:
@@ -710,6 +726,9 @@ class FolderWatcher(threading.Thread):
                 if it.get("state") != "done" and key not in sticky:
                     continue
                 p = Path(lp)
+                # 隔离区路径绝不在百度清单处理范围内（待还原副本，非下载产物）
+                if _in_quarantine(p):
+                    continue
                 try:
                     if not p.is_file():
                         continue
@@ -786,7 +805,8 @@ class FolderWatcher(threading.Thread):
         if not cfg.get("translation_move_enabled", True):
             return
         try:
-            dirs = [d for d in watch.iterdir() if d.is_dir()]
+            dirs = [d for d in watch.iterdir()
+                    if d.is_dir() and not _in_quarantine(d)]
         except OSError:
             return
         candidates = {}
@@ -859,7 +879,7 @@ class FolderWatcher(threading.Thread):
         best = None
         try:
             for d in watch.iterdir():
-                if not d.is_dir() or d == exclude:
+                if not d.is_dir() or d == exclude or _in_quarantine(d):
                     continue
                 if stem in d.name:
                     if best is None or len(d.name) > len(best.name):
@@ -1516,14 +1536,23 @@ class FolderWatcher(threading.Thread):
             args = types.SimpleNamespace(
                 move_to=None,
                 delete_source=bool(wc.get("delete_source")),
+                # 源文件删除策略（auto/permanent/keep/quarantine）：随监听目录条目下传，
+                # 决定回收站不可用时是否永久删除源文件（见 extract.delete_source）。
+                delete_policy=str(wc.get("delete_policy") or "auto"),
+                # 仅 quarantine 策略启用隔离区；auto/permanent/keep 保持原语义。
+                # 空 output_dir 由引擎按「源文件所在目录」补 _已删除。
+                quarantine_root=(str(wc.get("output_dir") or "")
+                                 if (str(wc.get("delete_policy") or "").strip().lower()
+                                     == "quarantine")
+                                 else None),
                 run_script=None, script_args=[],
                 promote_to=promote_to,
                 promote_merge=bool(self.state.snapshot().get("promote_merge", True)),
             )
             if record is not None:
                 args.delete_hook = (
-                    lambda recycled, failed, rid=record["id"]:
-                    deletion_trail.mark_deleted(rid, recycled, failed))
+                    lambda recycled, failed, quarantine_map, rid=record["id"]:
+                    deletion_trail.mark_deleted(rid, recycled, failed, quarantine_map))
             self.hub.q.put({"type": "progress_start"})
             self._set_dir_state(wc.get("path"), "extracting", 0, name)
             # 任务行只在「所有 defer 闸门都过、真正要解压」时创建；重试路径先复用同目录
@@ -1731,12 +1760,20 @@ class FolderWatcher(threading.Thread):
             if p:
                 roots.append(Path(p))
         moved = 0
+        # 实验性关闭：只扫各根目录**表层**（与 _poll 能看到的范围一致），绝不往
+        # 子文件夹里摸；实验性开启（百度网盘那套）才递归 rglob 找散落在子目录里
+        # 的分卷兄弟。开关读取与其它实验性功能共用 baidu_manifest.is_enabled。
+        recursive = baidu_manifest.is_enabled(self.state)
         for root in roots:
             if not root.exists():
                 continue
             try:
-                for cand in root.rglob("*"):
+                candidates = root.rglob("*") if recursive else root.iterdir()
+                for cand in candidates:
                     try:
+                        # 隔离区（_已删除）里的文件是待还原的副本，绝不参与分卷归拢
+                        if _in_quarantine(cand):
+                            continue
                         if (cand.is_file()
                                 and cand.parent != anchor.parent
                                 and not smart_extract.is_incomplete_download(cand)
@@ -1812,10 +1849,19 @@ class FolderWatcher(threading.Thread):
     def _recover_finish(self, fp, wc):
         """跨目录分卷恢复成功：源文件的载荷已由锚点解出，回收已消费的源文件并记档。"""
         try:
+            # 与 _handle 一致地遵守本目录的删除策略：quarantine 时回收站不可用走隔离区
+            delete_policy = str(wc.get("delete_policy") or "auto")
+            qroot = (str(wc.get("output_dir") or "")
+                     if delete_policy.strip().lower() == "quarantine" else None)
             rec = deletion_trail.new_record(fp, wc.get("path"))
             deletion_trail.add_record(rec)
-            recycled, failed = smart_extract._recycle_paths([str(fp)])
-            deletion_trail.mark_deleted(rec["id"], recycled, failed)
+            qmap = []
+            recycled, failed = smart_extract._recycle_paths(
+                [str(fp)],
+                permanent_fallback=smart_extract.delete_policy_permanent_fallback(
+                    delete_policy),
+                quarantine_root=qroot, quarantine_out=qmap)
+            deletion_trail.mark_deleted(rec["id"], recycled, failed, qmap or None)
             self.hub.log(f"跨目录分卷恢复成功，已回收源文件: {fp.name}")
         except Exception as e:
             self.hub.log(f"回收源文件出错（保留原文件）: {fp.name}: {e}")
@@ -2319,18 +2365,20 @@ class QRMonitor(threading.Thread):
         self.last_hash = h
         self._enqueue(("image", image))
 
-    def feed_image_file(self, path):
+    def feed_image_file(self, path, force=False):
         """把磁盘上的图片文件按「剪贴板图片」同款链路送入二维码识别（公共接口）。
 
         供外部（主窗口的二维码图片拖放 / 文件投放）调用：只做「读配置 → PIL 打开
         → 复用 _process（md5 去重 + _enqueue(("image", image))）」，不触碰 UI，可在
-        非 UI 线程安全调用。受 qr_enabled 总开关约束；路径缺失 / 不可读 / PIL 打不
-        开时记一行日志并返回 False。返回值只表示「已受理并交给解码链路」，不代表
-        一定解码出内容。任何异常都吞成一行日志，绝不抛出。
+        非 UI 线程安全调用。默认受 qr_enabled 总开关约束；force=True 时**豁免**该
+        总开关（拖入二维码图片专用：用户主动拖进图片即视为明确意图，不受仅针对
+        剪贴板/链接识别的开关限制）。路径缺失 / 不可读 / PIL 打不开时记一行日志并
+        返回 False。返回值只表示「已受理并交给解码链路」，不代表一定解码出内容。
+        任何异常都吞成一行日志，绝不抛出。
         """
         try:
             cfg = self.state.snapshot()
-            if not cfg.get("qr_enabled"):
+            if not force and not cfg.get("qr_enabled"):
                 self.hub.log(
                     "二维码图片投放已忽略：二维码识别开关未开启（qr_enabled=False）")
                 return False

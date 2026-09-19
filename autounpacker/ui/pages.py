@@ -16,10 +16,11 @@
 import time
 
 from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPalette
 from PyQt5.QtWidgets import (QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QSizePolicy, QVBoxLayout,
-                             QWidget)
+                             QProgressBar, QPushButton, QSizePolicy, QSplitter,
+                             QSplitterHandle, QVBoxLayout, QWidget)
 
 from .. import db
 from .. import trail as deletion_trail
@@ -168,7 +169,7 @@ def needs_item(task):
                 "name": str(task.get("file_name") or ""), "ts": when,
                 "urgency": "warn",
                 "note": err[:80] or "密码未命中 · 可在密码本补充后重试",
-                "actions": ["input_password", "ignore"]}
+                "actions": ["input_password", "retry", "ignore"]}
     return {"task_id": int(task.get("id") or 0),
             "name": str(task.get("file_name") or ""), "ts": when,
             "urgency": "err",
@@ -254,6 +255,42 @@ def _ghost_button(text, parent=None):
 # 任务页（原型 11 主区）
 # ---------------------------------------------------------------------------
 
+class _QueueLogSplitHandle(QSplitterHandle):
+    """队列/日志分隔条手柄：居中一条 1px 细线（卡片描边色，悬停转主题强调色）。
+
+    分隔条没有 QSS 规则（style.py 不含 QSplitter 段），默认绘制在深/浅两套
+    主题下都接近「空白间隙」；这里按当前主题 token 自绘，切主题自动跟随。
+    """
+
+    def paintEvent(self, event):
+        key = "ctl_focus" if self.underMouse() else "card_border"
+        try:
+            color = QColor(tokens().get(key))
+        except Exception:
+            color = self.palette().color(QPalette.Mid)
+        painter = QPainter(self)
+        try:
+            painter.fillRect(0, max(0, (self.height() - 1) // 2),
+                             self.width(), 1, color)
+        finally:
+            painter.end()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+
+class _QueueLogSplitter(QSplitter):
+    """队列 ⇄ 该任务日志的垂直分隔条（拖动改变两区高度）。"""
+
+    def createHandle(self):
+        return _QueueLogSplitHandle(self.orientation(), self)
+
+
 class TaskPage(QWidget):
     """任务页：队列/历史表 + 失败过滤 + 「该任务日志」（当前任务 / 全部）。
 
@@ -322,7 +359,6 @@ class TaskPage(QWidget):
         self.table = TaskTable(self)
         self.table.taskActivated.connect(self.taskActivated)
         self.table.actionTriggered.connect(self.actionTriggered)
-        root.addWidget(self.table, 1)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_TASKS)
 
         # 该任务日志头部
@@ -351,15 +387,61 @@ class TaskPage(QWidget):
         self.copy_btn = _ghost_button("复制", self)
         self.copy_btn.clicked.connect(self.copyRequested.emit)
         head.addWidget(self.copy_btn)
-        root.addLayout(head)
+
+        # 日志区 = 头部行 + 日志视图，整体作为分隔条下半区
+        self.log_pane = QWidget(self)
+        log_lay = QVBoxLayout(self.log_pane)
+        log_lay.setContentsMargins(0, 0, 0, 0)
+        log_lay.setSpacing(10)              # 与原 root 间距一致（头部 → 日志）
+        log_lay.addLayout(head)
 
         if self.log_view is None:
             self.log_view = QPlainTextEdit(self)
             self.log_view.setReadOnly(True)
-        root.addWidget(self.log_view, 2)
+        log_lay.addWidget(self.log_view, 1)
         self.log_empty = _EmptyOverlay(self.log_view, EMPTY_TASK_LOG)
+        self.log_pane.setMinimumHeight(130)  # 头部 + 最小可读日志高度
+
+        # 队列 ⇄ 日志：垂直分隔条，拖动改变两区高度（初始 1:2，同原布局）
+        self.splitter = _QueueLogSplitter(Qt.Vertical, self)
+        self.splitter.setObjectName("queueSplit")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(10)     # 与原布局 10px 行距同宽，细线居中
+        self.table.setMinimumHeight(120)
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.log_pane)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setSizes([1, 2])
+        root.addWidget(self.splitter, 1)
+        self._split_sized = False
 
         self._set_task_buttons(False)
+
+    def showEvent(self, event):
+        """首次显示后按原布局比例设定初始高度（表 1 : 日志 2）。"""
+        super().showEvent(event)
+        if not self._split_sized:
+            QTimer.singleShot(0, self._apply_initial_split)
+
+    def _apply_initial_split(self):
+        """QSplitter.setSizes 只认像素：显示后按实际高度换算一次。
+
+        日志头部行 + 其间距是固定开销，不参与 1:2 分配（与原 QVBoxLayout 的
+        stretch 1/2 算法一致）；之后高度一律由用户拖动决定，不再自动改写。
+        """
+        if self._split_sized:
+            return
+        h = int(self.splitter.height())
+        handle = int(self.splitter.handleWidth())
+        chrome = max(0, self.log_pane.sizeHint().height()
+                     - self.log_view.sizeHint().height())
+        content = h - handle - chrome
+        if content < 60:                      # 布局尚未定型：下次显示再试
+            return
+        self._split_sized = True
+        table_h = max(1, content // 3)
+        self.splitter.setSizes([table_h, h - handle - table_h])
 
     # ---- 状态读取 ----
     def scope(self):

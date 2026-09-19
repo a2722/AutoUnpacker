@@ -16,6 +16,35 @@ import time
 from . import paths
 from .utils import _norm_path_for_cfg
 
+# 源文件删除策略（每监听目录一项）。取值只在此处定义一处，新增取值（如未来的
+# quarantine）只需往下面这张表加一条，合法值校验与回退映射会自动跟随。
+#   auto       —— 默认：优先回收站，回收站不可用时永久删除（历史行为）
+#   permanent  —— 回收站不可用时永久删除（用户已显式同意）
+#   keep       —— 回收站不可用时保留源文件，绝不永久删除
+#   quarantine —— 回收站不可用时移入监听目录内的隔离区 _已删除（可还原），绝不永久删除
+# 表值 = 「回收站不可用时的回退」：True=永久删除 / False=保留源文件。
+DELETE_POLICY_FALLBACK = {
+    "auto": True,
+    "permanent": True,
+    "keep": False,
+    "quarantine": False,
+}
+DELETE_POLICIES = tuple(DELETE_POLICY_FALLBACK)
+DELETE_POLICY_DEFAULT = "auto"
+
+
+def normalize_delete_policy(value):
+    """把任意输入钳到合法删除策略；未知 / 空值一律回退 auto。"""
+    v = str(value or "").strip().lower()
+    return v if v in DELETE_POLICY_FALLBACK else DELETE_POLICY_DEFAULT
+
+
+def delete_policy_permanent_fallback(policy):
+    """删除策略 -> 回收站不可用时的回退：True=永久删除，False=保留源文件。"""
+    return bool(DELETE_POLICY_FALLBACK.get(
+        normalize_delete_policy(policy), True))
+
+
 DEFAULT_CONFIG = {
     "qr_enabled": True,
     "notify_enabled": True,
@@ -54,7 +83,7 @@ DEFAULT_CONFIG = {
     "auto_add_clipboard_password": False,
     "watch_paths": [
         {"path": "", "enabled": True, "output_dir": "",
-         "delete_source": False},
+         "delete_source": False, "delete_policy": DELETE_POLICY_DEFAULT},
     ],
     "close_action": "ask",   # 点右上角关闭时的行为：ask=每次询问 / tray=隐藏到托盘 / exit=关闭程序
     # 网址信任机制：按用途拆两套，各自独立的新域名默认行为 + 白/黑名单
@@ -118,6 +147,8 @@ def _sanitize_cfg(cfg):
                 "enabled": bool(p.get("enabled", True)),
                 "output_dir": str(p.get("output_dir") or ""),
                 "delete_source": bool(p.get("delete_source", False)),
+                # 回收站不可用时的源文件删除策略（未知值一律钳回 auto）
+                "delete_policy": normalize_delete_policy(p.get("delete_policy")),
                 # 监听模式：surface=只扫表层（原有，安全）
                 #          baidu  =额外按百度网盘任务清单处理子目录里的压缩包/分卷
                 "mode": ("baidu" if str(p.get("mode") or "").lower() == "baidu"

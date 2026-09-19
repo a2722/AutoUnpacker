@@ -732,7 +732,7 @@ class SettingsPage(QWidget):
     def _build_qr_section(self):
         box = self._section(
             "search", "二维码与剪贴板", "剪贴板二维码识别、链接识别与临时密码过滤。")
-        self.qr_cb = self._check_row(box, "qr_enabled", "启用二维码识别（剪贴板图片 / 拖入图片）",
+        self.qr_cb = self._check_row(box, "qr_enabled", "启用二维码识别（剪贴板图片；拖入的图片不受此开关限制）",
                                      TAG_LIVE)
         self.qr_redirect_cb = self._check_row(
             box, "qr_url_redirect", "二维码链接域名重定向", TAG_LIVE,

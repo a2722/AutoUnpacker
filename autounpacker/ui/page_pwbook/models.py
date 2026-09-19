@@ -4,6 +4,22 @@ from PyQt5.QtCore import QAbstractTableModel, Qt
 
 from .data import _fmt_hit_time, _hit_count, _pick_on
 
+# 「口令」列 tooltip 的明文显示上限（字符数）：口令超过上限才中间省略
+# （头 60 + "…" + 尾 59，恰好等于上限），既保证正常口令（含 100+ 字符的随机串 /
+# 短语）完整可读，又不让异常超长内容把 tooltip 撑爆。
+# 注意：用户已刻意放宽旧的「tooltip 不含明文」约束——口令列 hover 明文展示。
+_PWD_TOOLTIP_MAX = 120
+
+
+def _pwd_tooltip(password):
+    """「口令」列 tooltip：口令明文 + 双击复制提示；仅超长时中间省略（纯函数）。"""
+    text = str(password or "")
+    if len(text) > _PWD_TOOLTIP_MAX:
+        head = _PWD_TOOLTIP_MAX // 2            # 60：保留头部
+        tail = _PWD_TOOLTIP_MAX - head - 1      # 59：保留尾部（连同 "…" 恰好等于上限）
+        text = text[:head] + "…" + text[-tail:]
+    return "口令：%s  ·  双击可复制" % text
+
 
 # ---------------------------------------------------------------------------
 # 口令表：模型 / 委托 / 视图
@@ -13,6 +29,8 @@ class _PwModel(QAbstractTableModel):
     """口令表数据模型：列 口令 / 来源 / 命中次数 / 最近命中 / 备注 / 行操作。
 
     口令列直接显示原文（不遮蔽）；UserRole = 口令（显示 / 复制用），行身份取行字典的 id。
+    口令列 hover tooltip 同样明文展示（「口令：<明文>  ·  双击可复制」，仅超长时按
+    _PWD_TOOLTIP_MAX 中间省略）；其余列的 tooltip 仍是说明性文案。
     """
 
     HEADERS = ("口令", "来源", "命中次数", "最近命中", "备注", "")
@@ -99,7 +117,7 @@ class _PwModel(QAbstractTableModel):
             return self._display(row, col)
         if role == Qt.ToolTipRole:
             if col == self.COL_PWD:
-                return "口令：明文显示（过长时中间省略）· 双击行可复制"
+                return _pwd_tooltip(row.get("password"))
             if col == self.COL_SRC:
                 return "来源：%s" % (row.get("source") or "仅解压字典收录（无主动来源）")
             if col == self.COL_HITS:

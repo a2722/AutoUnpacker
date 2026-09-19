@@ -2,10 +2,9 @@
 """设置页（正式页面）：把全部配置项做成页内分区表单，替代过渡占位页。
 
 职责：
-- SettingsPage：9 个分区覆盖 config.DEFAULT_CONFIG 的全部键；每个控件右侧
-  都带「立即生效 / 需重启」标签（常量 TAG_LIVE / TAG_RESTART），绝不虚标；
-- 「保存」：逐键走 AppState.set()（config.save_config 原子写）后再回读校验，
-  成功/失败如实回报（save_config 自身吞异常，不回读就会假报成功）；
+- SettingsPage：9 个分区覆盖 config.DEFAULT_CONFIG 的全部键；
+- 「改即存」：每个控件变更即走 AppState.set()（config.save_config 原子写），
+  文本 / 多行编辑 400ms 防抖、失焦立即落盘；写后回读磁盘校验，失败如实回报；
 - 「恢复默认」：二次确认后写回 config._sanitize_cfg(DEFAULT_CONFIG)（与
   load_config 的口径一致），再回填控件；
 - 目录（分区索引）：左侧 QListWidget#settingsCat 列在滚动区之外，点击滚动
@@ -18,24 +17,25 @@
 - 主题：走既有 ui_style.resolve_theme + apply_theme + ui_theme_cached + 回调
   路径，绝不手写 QSS、绝不新增主题 token。
 
-关键入口：SettingsPage；常量 TAG_LIVE / TAG_RESTART
+关键入口：SettingsPage
 依赖：PyQt5、config（DEFAULT_CONFIG/_sanitize_cfg/load_config）、style（PALETTE）、
       widgets（Glyph/HotkeyEdit）
-注意：本页是「表单 + 保存」模型：所有控件只在点「保存」时统一写入。
+注意：本页是「改即存」模型：没有底部「保存」按钮，任何控件变更都立即写入配置；
+      文本类编辑 400ms 防抖（失焦立即落盘），写后回读磁盘校验、失败如实提示。
 注意：集成（把本页装进主窗口标签壳）由集成步骤完成；本模块只提供页面与信号：
       settingsSaved / settingsReset / watchPathsChanged / hotkeyChanged(str) /
       themeChanged(str) / notice(str)。
 注意：本模块不联网、不起线程、不重启应用；所有异常都转成页内 notice 提示。
 注意（allow: SIZE_OK）：按任务要求「单文件承载全部设置表单、不得新建兄弟模块」，
       9 个分区 + 全部顶层键覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
-      「键 -> 控件 -> 生效标签」的覆盖契约在一个文件里可直接审计。
+      「键 -> 控件 -> 即时保存」的覆盖契约在一个文件里可直接审计。
 """
 import json
 
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
-from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QFileDialog, QFrame, QHBoxLayout, QLabel,
-                             QLineEdit, QListWidget,
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
+                             QCheckBox, QComboBox, QFileDialog, QFrame,
+                             QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QMessageBox, QPlainTextEdit, QPushButton,
                              QRadioButton, QScrollArea, QSizePolicy, QSpinBox,
                              QVBoxLayout, QWidget)
@@ -46,11 +46,6 @@ from . import style as ui_style
 from .style import PALETTE
 from .widgets import Glyph, HotkeyEdit
 
-# 生效方式标签：每个控件都必须挂其中之一（测试会逐键断言）
-TAG_LIVE = "立即生效"
-TAG_RESTART = "需重启"
-_RESTART_TIP = "该设置需要重启程序后才会完全生效（保存会立即写入配置，下次启动时应用）。"
-
 # 主题偏好与显示名（与 dialogs.SettingsDialog 的选项一一对应）
 _THEME_ITEMS = (("跟随系统", "auto"), ("浅色", "fluent"), ("深色", "devtool"))
 _THEME_NAMES = {"auto": "跟随系统", "fluent": "浅色（Fluent）",
@@ -59,8 +54,11 @@ _THEME_NAMES = {"auto": "跟随系统", "fluent": "浅色（Fluent）",
 # 二维码打开网页后的剪贴板联动（group id 必须与 state 的取值顺序一致）
 _CLIP_ACTIONS = ((0, "none"), (1, "code"), (2, "url"))
 
-# 「保存」回读校验时跳过的复合键（列表/字典无法逐值比对，另有专门断言）
+# 落盘回读校验时跳过的复合键（列表/字典无法逐值比对，另有专门断言）
 _VERIFY_SKIP = ("watch_paths", "url_trust", "url_redirect_rules")
+
+# 文本 / 多行编辑的防抖间隔（停止输入多久后落盘；失焦立即落盘）
+_TEXT_DEBOUNCE_MS = 400
 
 
 def _deepcopy(value):
@@ -108,7 +106,7 @@ def _parse_redirect_rules(text):
 
 
 def _format_redirect_rules(rules):
-    """[{'from','to'}] -> 编辑框文本（保存与回填的互逆表示）。"""
+    """[{'from','to'}] -> 编辑框文本（落盘与回填的互逆表示）。"""
     lines = []
     for r in rules or []:
         if isinstance(r, dict) and r.get("from") and r.get("to"):
@@ -117,7 +115,7 @@ def _format_redirect_rules(rules):
 
 
 class SettingsPage(QWidget):
-    """设置页：分区表单 + 保存 / 恢复默认；覆盖 DEFAULT_CONFIG 全部键。
+    """设置页：分区表单 + 改即存 / 恢复默认；覆盖 DEFAULT_CONFIG 全部键。
 
     宿主接入（集成步骤）：`SettingsPage(state, hub, parent,
     on_hotkey_change=..., on_theme_change=...)`——两个回调与旧 SettingsDialog
@@ -143,15 +141,15 @@ class SettingsPage(QWidget):
         self._hotkey_cb = on_hotkey_change
         self._theme_cb = on_theme_change
         self._controls = {}        # 配置键 -> [控件]（含 url_trust.* / watch_paths.* 点号路径）
-        self._tags = {}            # 配置键 -> TAG_LIVE / TAG_RESTART
-        self._tag_labels = {}      # 配置键 -> [标签控件]
         self._sections = []        # 分区标题（保持插入顺序，与目录一一对应）
         self._section_cards = {}   # 分区标题 -> 卡片 QFrame（目录跳转 / 滚动同步用）
         self._cat_syncing = False  # 目录 <-> 滚动条 同步重入保护
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
-        self._delete_dirty = False     # 用户是否改过「删除源文件」主控
         self._theme_pref = "auto"
         self._notice_failed = False
+        self._loading = True       # 回填 / 构造期间抑制「改即存」监听
+        self._text_timers = {}     # 文本控件 -> (单发 QTimer, flush 可调用)
+        self._hotkeys_at_load = (None, None, None, None)  # 热键变更检测基线
 
         self._build_ui()
         self._load_from_cfg()
@@ -205,22 +203,23 @@ class SettingsPage(QWidget):
         head.addStretch(1)
         self._lay.addLayout(head)
         self._lay.addWidget(self._hint(
-            "所有修改点「保存」后写入配置；带「需重启」标签的项在下次启动生效。", inner))
+            "所有修改即时保存并写入配置；写入失败时下方会给出提示。", inner))
 
         # 分区顺序 = 目录顺序；每条 _build_*_section 内部调用 _section() 建卡。
+        # 「全局快捷键」紧随「界面」之后、正好在「分享与手势」正上方。
         self._build_extract_section()      # 解压行为
         self._build_general_section()      # 常规
         self._build_ui_section()           # 界面
+        self._build_hotkey_section()       # 全局快捷键
         self._build_share_section()        # 分享与手势
         self._build_qr_section()           # 二维码与剪贴板
         self._build_notify_section()       # 通知与实验性
         self._build_trust_section()        # 网址信任
-        self._build_hotkey_section()       # 全局快捷键
         self._build_close_section()        # 托盘与关闭
         self._lay.addStretch(1)
         self._refresh_catalog()
 
-        # 底部动作条（固定在滚动区之外）
+        # 底部动作条（固定在滚动区之外）：只剩「恢复默认」与即时保存提示。
         foot = QFrame(self)
         foot.setObjectName("dlgFoot")
         f = QHBoxLayout(foot)
@@ -237,12 +236,6 @@ class SettingsPage(QWidget):
         self.notice_label.setObjectName("stripHint")
         self.notice_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         f.addWidget(self.notice_label)
-        self.save_btn = QPushButton("保存", foot)
-        self.save_btn.setObjectName("primary")
-        self.save_btn.setCursor(Qt.PointingHandCursor)
-        self.save_btn.setDefault(True)
-        self.save_btn.clicked.connect(self._on_save)
-        f.addWidget(self.save_btn)
         root.addWidget(foot)
 
     # ---- 分区骨架 / 行骨架 ----
@@ -272,20 +265,6 @@ class SettingsPage(QWidget):
         """登记某配置键对应的控件（同一键可多个控件）。"""
         self._controls.setdefault(str(key), []).append(widget)
         return widget
-
-    def _tagged(self, row, keys, tag):
-        """给一行加右侧生效方式标签，并把标签登记到这些键上。"""
-        row.addStretch(1)
-        lbl = QLabel(tag, self)
-        lbl.setObjectName("stripHint")
-        if tag == TAG_RESTART:
-            lbl.setToolTip(_RESTART_TIP)
-        row.addWidget(lbl)
-        self._watch_hint(lbl)
-        for k in (keys if isinstance(keys, (list, tuple)) else [keys]):
-            self._tags.setdefault(str(k), tag)
-            self._tag_labels.setdefault(str(k), []).append(lbl)
-        return lbl
 
     def _hint(self, text, parent=None, warn=False):
         lbl = QLabel(str(text), parent if parent is not None else self)
@@ -337,9 +316,12 @@ class SettingsPage(QWidget):
 
     def eventFilter(self, obj, event):
         try:
+            etype = event.type()
             if (obj.objectName() == "stripHint"
-                    and event.type() in (QEvent.Polish, QEvent.StyleChange)):
+                    and etype in (QEvent.Polish, QEvent.StyleChange)):
                 self._fit_hint(obj)
+            if etype == QEvent.FocusOut and obj in self._text_timers:
+                self._flush_text(obj)   # 失焦立即落盘（不等防抖）
         except Exception:
             pass
         return super().eventFilter(obj, event)
@@ -395,19 +377,33 @@ class SettingsPage(QWidget):
         finally:
             self._cat_syncing = False
 
-    def _check_row(self, lay, key, text, tag=TAG_LIVE, tip=None, extra_keys=None):
+    # ---- 行骨架（全部变更即时保存） ----
+    def _check_row(self, lay, key, text, tip=None, extra_keys=None, commit=None):
+        """一行复选框；勾选变更即存到 key（commit 可覆盖为复合键提交）。"""
         cb = QCheckBox(text, self)
         if tip:
             cb.setToolTip(tip)
         row = QHBoxLayout()
         row.setSpacing(8)
         row.addWidget(cb)
+        row.addStretch(1)
         self._reg(key, cb)
-        self._tagged(row, [key] + list(extra_keys or []), tag)
+        for k in (extra_keys or []):
+            self._reg(k, cb)
+        cb.toggled.connect(
+            commit or (lambda checked, k=key: self._commit(k, bool(checked))))
         lay.addLayout(row)
         return cb
 
-    def _spin_row(self, lay, keys, label, spin, tag=TAG_LIVE, tip=None):
+    def _spin(self, minimum, maximum):
+        """建一个无上下箭头按钮的 QSpinBox（鼠标滚轮悬停其上仍可调值）。"""
+        spin = QSpinBox(self)
+        spin.setRange(int(minimum), int(maximum))
+        spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        return spin
+
+    def _spin_row(self, lay, keys, label, spin, unit=None, tip=None):
+        """一行「标签 + 数值框 [+ 外部单位]」；数值变更即存。"""
         if tip:
             spin.setToolTip(tip)
         row = QHBoxLayout()
@@ -417,14 +413,21 @@ class SettingsPage(QWidget):
         lbl.setFixedWidth(96)
         row.addWidget(lbl)
         row.addWidget(spin)
+        if unit:
+            unit_lbl = QLabel(unit, self)
+            unit_lbl.setObjectName("fLabel")
+            row.addWidget(unit_lbl)
+        row.addStretch(1)
         for k in keys:
             self._reg(k, spin)
-        self._tagged(row, list(keys), tag)
+            spin.valueChanged.connect(lambda v, kk=k: self._commit(kk, int(v)))
         lay.addLayout(row)
         return spin
 
-    def _radio_col(self, lay, keys, options, tag=TAG_LIVE):
-        """竖排单选组（options=[(value,label,tip)]），返回 {value: radio} 与容器。"""
+    def _radio_col(self, lay, keys, options, on_change=None):
+        """竖排单选组（options=[(value,label,tip)]）；选中变更即调用 on_change。
+
+        返回 {value: radio} 与 QButtonGroup。"""
         host = QWidget(self)
         box = QVBoxLayout(host)
         box.setContentsMargins(0, 0, 0, 0)
@@ -437,12 +440,15 @@ class SettingsPage(QWidget):
                 rb.setToolTip(tip)
             grp.addButton(rb)
             radios[value] = rb
+            if on_change is not None:
+                rb.toggled.connect(
+                    lambda checked, cb=on_change: cb() if checked else None)
             box.addWidget(rb)
         row = QHBoxLayout()
         row.addWidget(host)
+        row.addStretch(1)
         for k in keys:
             self._reg(k, host)
-        self._tagged(row, list(keys), tag)
         lay.addLayout(row)
         return radios, grp
 
@@ -457,41 +463,74 @@ class SettingsPage(QWidget):
         self.delete_master_cb.setToolTip(
             "对所有监听目录统一设置 delete_source；删除是把源文件移入回收站，"
             "可在「删除回溯」页一键还原。各目录单独设置可在「目录设置」弹窗里改。")
-        self.delete_master_cb.clicked.connect(lambda _s: self._set_delete_dirty())
         drow = QHBoxLayout()
         drow.setSpacing(8)
         drow.addWidget(self.delete_master_cb)
-        self._reg("watch_paths.delete_source", self.delete_master_cb)
+        drow.addStretch(1)
         # 本页不再持有监听目录的增删改控件（页头胶囊条 → WatchDirDialog 负责），
         # 但删除源文件总控仍写回 watch_paths 的 delete_source 字段；为保持
         # 「DEFAULT_CONFIG 顶层键都有归属控件」的契约，把顶层 watch_paths 也归到
         # 这个总控上（它是本页唯一触及 watch_paths 的控件）。
+        self._reg("watch_paths.delete_source", self.delete_master_cb)
         self._reg("watch_paths", self.delete_master_cb)
-        self._tagged(drow, ["watch_paths", "watch_paths.delete_source"], TAG_LIVE)
+        self.delete_master_cb.toggled.connect(self._on_delete_master)
         box.addLayout(drow)
         self.delete_state_label = self._hint("", self)
         box.addWidget(self.delete_state_label)
 
         self.output_time_cb = self._check_row(
             box, "output_time_now", "解压成功后把产物顶层时间戳校准为现在",
-            TAG_LIVE, "避免旧日期的大文件夹在大目录里沉底。")
+            "避免旧日期的大文件夹在大目录里沉底。")
         self.pair_split_cb = self._check_row(
             box, "pair_split_enabled", "跨名分卷链配对（唯一总闸 · 默认开）",
-            TAG_LIVE,
             "「7z 验证通过即配对」现已并入基础解压逻辑、默认强制开启；本开关是唯一总闸："
             "关闭后不再把疑似改名的兄弟尾卷自动改名为首卷系列。"
             "断号 / 模糊 / 未通过验证本来就只提示、不动作。")
         self.promote_merge_cb = self._check_row(
             box, "promote_merge", "同名文件夹无文件冲突则合并",
-            TAG_LIVE, "解压提升时，同名文件夹内无文件冲突则合并；有同名文件仍重命名为 (N)。")
+            "解压提升时，同名文件夹内无文件冲突则合并；有同名文件仍重命名为 (N)。")
         self.translate_cb = self._check_row(
             box, "translation_move_enabled", "翻译 JSON 自动归位",
-            TAG_LIVE,
             "小于 10MB 的单 json 文件夹，若文件名命中某大文件夹名则移入该文件夹；"
             "小文件夹先出现时监控 5 分钟等待目标。")
 
-    def _set_delete_dirty(self):
-        self._delete_dirty = True
+    def _on_delete_master(self, checked):
+        """删源总控：点击即把 delete_source 统一写入全部监听目录。
+
+        空路径保护：与旧「保存」同口径——写前若存在空路径条目，先确认是否移除；
+        拒绝则回退勾选状态、不写配置，绝不静默丢条目。"""
+        if self._loading:
+            return
+        want = bool(checked)
+        cfg = self._snapshot()
+        entries = [dict(e) for e in (cfg.get("watch_paths") or [])
+                   if isinstance(e, dict)]
+        empties = self._empty_indices(entries)
+        if empties:
+            ret = QMessageBox.question(
+                self, "路径校验",
+                "有 %d 条监听目录路径为空；继续会移除这些空条目（其余设置不受影响）。\n"
+                "继续保存？" % len(empties),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                self._notice("保存已取消：请先处理空路径条目", ok=False)
+                self._revert_delete_master(not want)
+                return
+            entries = [e for n, e in enumerate(entries) if n not in empties]
+        for e in entries:
+            e["delete_source"] = want
+        if self._commit("watch_paths", entries):
+            self._refresh_delete_state()
+        else:
+            self._revert_delete_master(not want)
+
+    def _revert_delete_master(self, previous):
+        """回退删源总控的勾选状态（不触发写入），并刷新状态说明行。"""
+        self._loading = True
+        try:
+            self.delete_master_cb.setChecked(bool(previous))
+        finally:
+            self._loading = False
         self._refresh_delete_state()
 
     # ------------------------------------------------------------------
@@ -501,16 +540,14 @@ class SettingsPage(QWidget):
         box = self._section(
             "bolt", "分享与手势",
             "全局快捷键触发「用客户端下载最近分享」的等待策略；留空 = 不设置该快捷键。")
-        self.share_wait_spin = QSpinBox(self)
-        self.share_wait_spin.setRange(5, 600)
-        self.share_wait_spin.setSuffix(" 秒")
+        self.share_wait_spin = self._spin(5, 600)
         self.share_wait_spin.setToolTip(
             "分享手势最多等待「解析中链接」多少秒；超时取消、绝不回退旧链接。\n"
             "有效范围 5~600 秒：低于 5 按 5、高于 600 按 600 保存。")
-        self._spin_row(box, ["share_gesture_wait_sec"], "分享等待", self.share_wait_spin,
-                       TAG_LIVE,
-                       "分享手势最多等待「解析中链接」多少秒（超时取消、绝不回退旧链接）。"
-                       "有效范围 5~600 秒，超出按边界保存。")
+        self._spin_row(box, ["share_gesture_wait_sec"], "分享等待",
+                       self.share_wait_spin, unit="秒",
+                       tip="分享手势最多等待「解析中链接」多少秒（超时取消、绝不回退旧链接）。"
+                           "有效范围 5~600 秒，超出按边界保存。")
         self.share_wait_hint = self._hint(
             "范围 5~600 秒：低于 5 按 5、高于 600 按 600 保存（config 净化同口径）。", self)
         box.addWidget(self.share_wait_hint)
@@ -519,7 +556,8 @@ class SettingsPage(QWidget):
         self.hotkey_share_clear = QPushButton("清除", self)
         self.hotkey_share_clear.setObjectName("ghostSm")
         self.hotkey_share_clear.setCursor(Qt.PointingHandCursor)
-        self.hotkey_share_clear.clicked.connect(self.hotkey_share_edit.clear)
+        self.hotkey_share_clear.clicked.connect(
+            lambda: self._clear_hotkey(self.hotkey_share_edit, "hotkey_share"))
         row = QHBoxLayout()
         row.setSpacing(8)
         lbl = QLabel("分享下载", self)
@@ -529,14 +567,16 @@ class SettingsPage(QWidget):
         row.addWidget(self.hotkey_share_edit, 1)
         row.addWidget(self.hotkey_share_clear)
         self._reg("hotkey_share", self.hotkey_share_edit)
-        self._tagged(row, ["hotkey_share"], TAG_LIVE)
+        self.hotkey_share_edit.comboChanged.connect(
+            lambda combo: self._commit("hotkey_share", str(combo).strip()))
         box.addLayout(row)
 
         self.hotkey_share_code_edit = HotkeyEdit(self)
         self.hotkey_share_code_clear = QPushButton("清除", self)
         self.hotkey_share_code_clear.setObjectName("ghostSm")
         self.hotkey_share_code_clear.setCursor(Qt.PointingHandCursor)
-        self.hotkey_share_code_clear.clicked.connect(self.hotkey_share_code_edit.clear)
+        self.hotkey_share_code_clear.clicked.connect(
+            lambda: self._clear_hotkey(self.hotkey_share_code_edit, "hotkey_share_code"))
         row2 = QHBoxLayout()
         row2.setSpacing(8)
         lbl2 = QLabel("固定提取码", self)
@@ -546,7 +586,8 @@ class SettingsPage(QWidget):
         row2.addWidget(self.hotkey_share_code_edit, 1)
         row2.addWidget(self.hotkey_share_code_clear)
         self._reg("hotkey_share_code", self.hotkey_share_code_edit)
-        self._tagged(row2, ["hotkey_share_code"], TAG_LIVE)
+        self.hotkey_share_code_edit.comboChanged.connect(
+            lambda combo: self._commit("hotkey_share_code", str(combo).strip()))
         box.addLayout(row2)
 
         self.hotkey_display_label = self._hint("", self)
@@ -563,7 +604,7 @@ class SettingsPage(QWidget):
         self.theme_combo.setMinimumWidth(150)
         self.theme_combo.setToolTip(
             "跟随系统：按 Windows 的「应用」深浅色自动选择（启动不做检测、显示后纠正）。\n"
-            "浅色 = Fluent 方案；深色 = DevTool 方案。保存后立即应用。")
+            "浅色 = Fluent 方案；深色 = DevTool 方案。切换后立即应用。")
         row = QHBoxLayout()
         row.setSpacing(8)
         lbl = QLabel("主题", self)
@@ -571,8 +612,9 @@ class SettingsPage(QWidget):
         lbl.setFixedWidth(96)
         row.addWidget(lbl)
         row.addWidget(self.theme_combo)
+        row.addStretch(1)
         self._reg("ui_theme", self.theme_combo)
-        self._tagged(row, ["ui_theme"], TAG_LIVE)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
         box.addLayout(row)
 
         self.theme_cached_label = self._hint("", self)
@@ -582,37 +624,33 @@ class SettingsPage(QWidget):
         crow = QHBoxLayout()
         crow.setSpacing(8)
         crow.addWidget(self.theme_cached_label, 1)
-        self._tagged(crow, ["ui_theme_cached"], TAG_LIVE)
         box.addLayout(crow)
 
-        self.task_limit_spin = QSpinBox(self)
-        self.task_limit_spin.setRange(1, 100000)
-        self._spin_row(box, ["task_history_limit"], "任务历史上限", self.task_limit_spin,
-                       TAG_LIVE,
-                       "只清理终态任务，非终态永不删除；磁盘上的旧数据在下次启动时清理，"
-                       "列表立即按新上限查询（界面最多显示 5000 条）。")
+        self.task_limit_spin = self._spin(1, 100000)
+        self._spin_row(box, ["task_history_limit"], "任务历史上限",
+                       self.task_limit_spin, unit="条",
+                       tip="只清理终态任务，非终态永不删除；磁盘上的旧数据在下次启动时清理，"
+                           "列表立即按新上限查询（界面最多显示 5000 条）。")
         self.logcolor_cb = self._check_row(
             box, "log_colors_enabled", "日志按事件着色",
-            TAG_LIVE, "运行日志按成功 / 失败 / 等待等类型着色。")
+            "运行日志按成功 / 失败 / 等待等类型着色。")
 
     # ------------------------------------------------------------------
     # 分区：常规
     # ------------------------------------------------------------------
     def _build_general_section(self):
         box = self._section("gear", "常规", "轮询、7-Zip 检测与密码本相关。")
-        self.interval_spin = QSpinBox(self)
-        self.interval_spin.setRange(1, 30)
-        self._spin_row(box, ["poll_interval"], "轮询间隔(s)", self.interval_spin,
-                       TAG_LIVE, "监听目录扫描间隔（秒），保存后下一轮轮询即生效。")
+        self.interval_spin = self._spin(1, 30)
+        self._spin_row(box, ["poll_interval"], "轮询间隔", self.interval_spin, unit="秒",
+                       tip="监听目录扫描间隔（秒），修改后下一轮轮询即生效。")
         self.sevenzip_cb = self._check_row(
             box, "sevenzip_check_done",
             "首次 7-Zip 检测已完成（取消勾选 = 下次启动重新检测）",
-            TAG_RESTART,
             "程序只在首次启动时检测 7-Zip；取消勾选后，下次启动会重新检测，"
             "缺失或版本过低时弹出安装引导。")
         self.auto_add_cb = self._check_row(
             box, "auto_add_clipboard_password", "捕获到新密码时自动加入长期密码本",
-            TAG_LIVE, "与「密码本」页里的同名开关是同一项配置。")
+            "与「密码本」页里的同名开关是同一项配置。")
         prow = QHBoxLayout()
         prow.setSpacing(8)
         plbl = QLabel("密码本条目", self)
@@ -622,8 +660,8 @@ class SettingsPage(QWidget):
         self.passwords_label = QLabel("", self)
         self.passwords_label.setObjectName("stripHint")
         prow.addWidget(self.passwords_label)
+        prow.addStretch(1)
         self._reg("passwords", self.passwords_label)
-        self._tagged(prow, ["passwords"], TAG_LIVE)
         box.addLayout(prow)
         box.addWidget(self._hint("长期密码本在「密码本」页管理；此处只读显示条目数。"))
 
@@ -635,7 +673,7 @@ class SettingsPage(QWidget):
             "alert", "通知与实验性",
             "通知总开关关闭后不弹任何提示（运行日志仍记录）；实验性功能默认关闭。")
         self.notify_cb = self._check_row(
-            box, "notify_enabled", "通知总开关", TAG_LIVE,
+            box, "notify_enabled", "通知总开关",
             "关闭后不弹出任何通知（运行日志仍会记录）。")
         self._sub_label(box, "解压事件")
         self.notify_archive_cb = self._check_row(box, "notify_archive", "发现压缩包")
@@ -646,33 +684,31 @@ class SettingsPage(QWidget):
         self.notify_trayed_cb = self._check_row(box, "notify_trayed", "已最小化到托盘")
         self.notify_running_cb = self._check_row(
             box, "notify_already_running", "程序已在运行时提示",
-            TAG_LIVE, "再次启动程序时，提示已在运行并打开主界面。")
+            "再次启动程序时，提示已在运行并打开主界面。")
         self.notify_trust_cb = self._check_row(
             box, "notify_trust_pending", "有新的网址等待确认")
         self._sub_label(box, "网盘任务（实验性）")
         self.notify_baidu_done_cb = self._check_row(
             box, "notify_baidu_done", "网盘下载批次完成",
-            TAG_LIVE, "实验性功能开启时：一个下载批次全部任务完成时通知。")
+            "实验性功能开启时：一个下载批次全部任务完成时通知。")
         self.notify_baidu_leftover_cb = self._check_row(
             box, "notify_baidu_leftover", "启动时有未完成的网盘任务",
-            TAG_LIVE, "实验性功能开启时：启动发现仍有未完成的网盘任务时通知。")
+            "实验性功能开启时：启动发现仍有未完成的网盘任务时通知。")
         self.notify_baidu_dup_cb = self._check_row(
             box, "notify_baidu_dup", "新任务与历史下载重复",
-            TAG_LIVE, "实验性功能开启时：新任务在下载历史里已存在（同名同大小）时通知。")
+            "实验性功能开启时：新任务在下载历史里已存在（同名同大小）时通知。")
 
         self.experimental_cb = self._check_row(
             box, "experimental_enabled", "开启实验性功能（默认关）",
-            TAG_LIVE,
             "实验性、默认关闭。当前用途：只读探测百度网盘客户端的本地任务库，"
             "用于还原下载批次、目录结构与分卷；只读打开、短连接、不写不锁。")
         self.baidu_auto_invoke_cb = self._check_row(
             box, "baidu_auto_invoke", "检测到分享链接时自动拉起客户端下载",
-            TAG_LIVE,
             "开启后：复制到百度网盘分享链接时，程序自动把它交给网盘客户端下载（整包）。"
             "会自动触发下载，请确认来源可信；也可随时用托盘菜单手动触发。")
         self.baidu_pick_cb = self._check_row(
             box, "baidu_pick_before_download", "分享下载前先让我挑选文件",
-            TAG_LIVE, "分享里文件很多、只想下载其中一部分时使用。")
+            "分享里文件很多、只想下载其中一部分时使用。")
         brow = QHBoxLayout()
         brow.setSpacing(8)
         blbl = QLabel("任务库路径", self)
@@ -688,7 +724,8 @@ class SettingsPage(QWidget):
         self.baidu_db_browse_btn.clicked.connect(self._browse_baidu_db)
         brow.addWidget(self.baidu_db_browse_btn)
         self._reg("baidu_task_db", self.baidu_db_edit)
-        self._tagged(brow, ["baidu_task_db"], TAG_LIVE)
+        self._bind_text(self.baidu_db_edit, "baidu_task_db",
+                        lambda: str(self.baidu_db_edit.text()).strip())
         box.addLayout(brow)
         self.share_nologin_hint = self._hint(
             "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
@@ -732,13 +769,13 @@ class SettingsPage(QWidget):
     def _build_qr_section(self):
         box = self._section(
             "search", "二维码与剪贴板", "剪贴板二维码识别、链接识别与临时密码过滤。")
-        self.qr_cb = self._check_row(box, "qr_enabled", "启用二维码识别（剪贴板图片；拖入的图片不受此开关限制）",
-                                     TAG_LIVE)
+        self.qr_cb = self._check_row(
+            box, "qr_enabled", "启用二维码识别（剪贴板图片；拖入的图片不受此开关限制）")
         self.qr_redirect_cb = self._check_row(
-            box, "qr_url_redirect", "二维码链接域名重定向", TAG_LIVE,
+            box, "qr_url_redirect", "二维码链接域名重定向",
             "打开前重写链接域名，例如 drive.uc.cn → fast.uc.cn。")
         self.qr_url_cb = self._check_row(
-            box, "qr_url_enabled", "复制网址时识别二维码图片并打开", TAG_LIVE,
+            box, "qr_url_enabled", "复制网址时识别二维码图片并打开",
             "复制 http(s) 网址时自动访问；若返回的是二维码图片，则解码后按设置打开。")
         self._sub_label(box, "二维码打开网页后剪贴板联动")
         self.clip_radios, self._clip_group = self._radio_col(
@@ -747,36 +784,45 @@ class SettingsPage(QWidget):
              ("code", "恢复最近复制的提取码",
               "把最近一次复制的非图片内容（如提取码）写回剪贴板，方便直接粘贴。"),
              ("url", "写回二维码内容", "把二维码解码出来的整段内容写回剪贴板。")),
-            TAG_LIVE)
+            on_change=self._commit_clip)
         self._sub_label(box, "临时密码")
         self.url_exclude_cb = self._check_row(
-            box, "url_exclude_temp_password", "网址排除", TAG_LIVE,
+            box, "url_exclude_temp_password", "网址排除",
             "带 :// 的网址不记为临时密码；xxxx.com 这类无协议头的域名形式仍会记录。"
             "关闭则照单全收（连网址也收）。")
         self.temp_filter_cb = self._check_row(
             box, "temp_password_filter", "智能过滤（在「网址排除」基础上更严格）",
-            TAG_LIVE,
-            "再排除多行文本、文件路径/UNC、带常见扩展名的文件名、含句读标点的句子"
-            "（且只收 <60 字符）。")
+            "再排除多行文本、文件路径/UNC、带常见扩展名的文件名、含句读标点的句子、"
+            "≥8 个空白分词的长句（超过 128 字符的也排除）。中文/全角口令、含小数"
+            "点的串（如 pass1.2）、纯字母串（如 MyPassword）都能正常捕获。")
         self.url_exclude_cb.toggled.connect(
             lambda s: self.temp_filter_cb.setEnabled(bool(s)))
-        self.ttl_spin = QSpinBox(self)
-        self.ttl_spin.setRange(1, 24 * 365)
-        self.temp_max_spin = QSpinBox(self)
-        self.temp_max_spin.setRange(1, 100000)
+        self.ttl_spin = self._spin(1, 24 * 365)
+        self.temp_max_spin = self._spin(1, 100000)
         trow = QHBoxLayout()
         trow.setSpacing(6)
-        t1 = QLabel("有效期(h)", self)
+        t1 = QLabel("有效期", self)
         t1.setObjectName("fLabel")
         trow.addWidget(t1)
         trow.addWidget(self.ttl_spin)
-        t2 = QLabel("保留上限(条)", self)
+        u1 = QLabel("小时", self)
+        u1.setObjectName("fLabel")
+        trow.addWidget(u1)
+        trow.addSpacing(16)
+        t2 = QLabel("保留上限", self)
         t2.setObjectName("fLabel")
         trow.addWidget(t2)
         trow.addWidget(self.temp_max_spin)
+        u2 = QLabel("条", self)
+        u2.setObjectName("fLabel")
+        trow.addWidget(u2)
+        trow.addStretch(1)
         self._reg("temp_password_ttl_hours", self.ttl_spin)
         self._reg("temp_password_max", self.temp_max_spin)
-        self._tagged(trow, ["temp_password_ttl_hours", "temp_password_max"], TAG_LIVE)
+        self.ttl_spin.valueChanged.connect(
+            lambda v: self._commit("temp_password_ttl_hours", int(v)))
+        self.temp_max_spin.valueChanged.connect(
+            lambda v: self._commit("temp_password_max", int(v)))
         box.addLayout(trow)
         box.addWidget(self._hint(
             "临时密码生命周期 = 本次系统启动（程序重启不丢，系统重启失效），"
@@ -792,11 +838,12 @@ class SettingsPage(QWidget):
         self.trust_card = box.parentWidget()
         self._reg("url_trust", self.trust_card)
         self.trust_builtin_cb = self._check_row(
-            box, "url_trust.builtin_blacklist", "拦截内置敏感地址", TAG_LIVE,
+            box, "url_trust.builtin_blacklist", "拦截内置敏感地址",
             "私网 / 回环 / 链路本地 / 元数据 / 保留地址默认拒绝（防 SSRF）。两用途共享。",
-            extra_keys=["url_trust"])
+            extra_keys=["url_trust"],
+            commit=lambda _checked: self._commit_trust())
         self.tls_cb = self._check_row(
-            box, "tls_skip_verify", "允许不验证 HTTPS 证书", TAG_LIVE,
+            box, "tls_skip_verify", "允许不验证 HTTPS 证书",
             "不推荐；仅当站点证书有问题时才需要，开启有中间人攻击风险。")
         self._trust_radios = {}
         self.trust_editors = {}
@@ -815,10 +862,8 @@ class SettingsPage(QWidget):
         self._sub_label(box, "域名重定向规则")
         box.addWidget(self.rules_edit)
         self._reg("url_redirect_rules", self.rules_edit)
-        trow = QHBoxLayout()
-        trow.addStretch(1)
-        self._tagged(trow, ["url_redirect_rules"], TAG_LIVE)
-        box.addLayout(trow)
+        self._bind_text(self.rules_edit, "url_redirect_rules",
+                        lambda: _parse_redirect_rules(self.rules_edit.toPlainText()))
         self.trust_note = self._hint(
             "说明：私网 / 回环 / 链路本地 / 元数据等内置敏感地址默认拒绝，"
             "即使选择「自动信任」也不会放行，只有手动加入白名单才会信任。"
@@ -841,7 +886,7 @@ class SettingsPage(QWidget):
              ("ask", "弹窗询问", "每次遇到本用途下未信任的新域名都弹窗询问。"),
              ("auto_whitelist", "自动信任", "公网新域名自动放行并加入本用途白名单。"),
              ("auto_blacklist", "自动拒绝", "公网新域名自动拒绝并加入本用途黑名单。")),
-            TAG_LIVE)
+            on_change=self._commit_trust)
         self._trust_radios[purpose] = radios
         hosts = {}
         for key, label, hint in (
@@ -854,10 +899,7 @@ class SettingsPage(QWidget):
             self._sub_label(lay, label)
             lay.addWidget(edit)
             self._reg("url_trust.%s.%s" % (purpose, key), edit)
-            rows = QHBoxLayout()
-            rows.addStretch(1)
-            self._tagged(rows, ["url_trust.%s.%s" % (purpose, key)], TAG_LIVE)
-            lay.addLayout(rows)
+            self._bind_text(edit, "url_trust", self._collect_trust)
             hosts[key] = edit
         self.trust_editors[purpose] = hosts
 
@@ -865,15 +907,16 @@ class SettingsPage(QWidget):
     # 分区：全局快捷键
     # ------------------------------------------------------------------
     def _build_hotkey_section(self):
-        box = self._section("terminal", "全局快捷键", "用于唤起主界面；保存后立即重新注册。")
+        box = self._section("terminal", "全局快捷键", "用于唤起主界面；修改后立即重新注册。")
         self.hotkey_enable_cb = self._check_row(
-            box, "hotkey_enabled", "启用全局快捷键", TAG_LIVE,
+            box, "hotkey_enabled", "启用全局快捷键",
             "主界面隐藏到托盘时也能用它唤起。")
         self.hotkey_edit = HotkeyEdit(self)
         self.hotkey_clear_btn = QPushButton("清除", self)
         self.hotkey_clear_btn.setObjectName("ghostSm")
         self.hotkey_clear_btn.setCursor(Qt.PointingHandCursor)
-        self.hotkey_clear_btn.clicked.connect(self.hotkey_edit.clear)
+        self.hotkey_clear_btn.clicked.connect(
+            lambda: self._clear_hotkey(self.hotkey_edit, "hotkey"))
         row = QHBoxLayout()
         row.setSpacing(8)
         lbl = QLabel("唤起主界面", self)
@@ -883,10 +926,11 @@ class SettingsPage(QWidget):
         row.addWidget(self.hotkey_edit, 1)
         row.addWidget(self.hotkey_clear_btn)
         self._reg("hotkey", self.hotkey_edit)
-        self._tagged(row, ["hotkey"], TAG_LIVE)
+        self.hotkey_edit.comboChanged.connect(
+            lambda combo: self._commit("hotkey", str(combo).strip()))
         box.addLayout(row)
         box.addWidget(self._hint(
-            "点击输入框后按下组合键（需含 Ctrl/Alt/Win 之一）；清空后保存 = 不设置。"))
+            "点击输入框后按下组合键（需含 Ctrl/Alt/Win 之一）；清空 = 不设置。"))
 
     # ------------------------------------------------------------------
     # 分区：托盘与关闭
@@ -899,12 +943,12 @@ class SettingsPage(QWidget):
             (("ask", "每次询问", "每次关闭都弹出选择。"),
              ("tray", "隐藏到托盘", "程序继续在后台运行。"),
              ("exit", "关闭程序", "停止所有监听与剪贴板监控。")),
-            TAG_LIVE)
+            on_change=self._commit_close)
         box.addWidget(self._hint(
             "选择「关闭程序」会停止全部监听；如只想暂时收起界面，请选「隐藏到托盘」。"))
 
     # ------------------------------------------------------------------
-    # 回填（构造 / 保存 / 恢复默认共用）
+    # 回填（构造 / 恢复默认共用）
     # ------------------------------------------------------------------
     def _snapshot(self):
         try:
@@ -913,124 +957,128 @@ class SettingsPage(QWidget):
             return {}
 
     def _load_from_cfg(self):
-        """把 state.snapshot() 的当前配置回填到所有控件（并重置主控脏标记）。"""
-        cfg = self._snapshot()
+        """把 state.snapshot() 的当前配置回填到所有控件（回填期间不触发即时保存）。"""
+        self._loading = True
+        try:
+            self._cancel_text_timers()
+            cfg = self._snapshot()
 
-        def b(key, default=False):
-            return bool(cfg.get(key, default))
+            def b(key, default=False):
+                return bool(cfg.get(key, default))
 
-        def s(key, default=""):
-            v = cfg.get(key, default)
-            return str(v if v is not None else default)
+            def s(key, default=""):
+                v = cfg.get(key, default)
+                return str(v if v is not None else default)
 
-        def i(key, default=0):
-            try:
-                return int(cfg.get(key, default))
-            except Exception:
-                return default
+            def i(key, default=0):
+                try:
+                    return int(cfg.get(key, default))
+                except Exception:
+                    return default
 
-        # 通知
-        self.notify_cb.setChecked(b("notify_enabled", True))
-        self.notify_archive_cb.setChecked(b("notify_archive", True))
-        self.notify_success_cb.setChecked(b("notify_success", True))
-        self.notify_failure_cb.setChecked(b("notify_failure", True))
-        self.notify_error_cb.setChecked(b("notify_error", True))
-        self.notify_trayed_cb.setChecked(b("notify_trayed", True))
-        self.notify_running_cb.setChecked(b("notify_already_running", True))
-        self.notify_trust_cb.setChecked(b("notify_trust_pending", True))
-        self.notify_baidu_done_cb.setChecked(b("notify_baidu_done", True))
-        self.notify_baidu_leftover_cb.setChecked(b("notify_baidu_leftover", True))
-        self.notify_baidu_dup_cb.setChecked(b("notify_baidu_dup", False))
-        self._sync_notify_enabled()
+            # 通知
+            self.notify_cb.setChecked(b("notify_enabled", True))
+            self.notify_archive_cb.setChecked(b("notify_archive", True))
+            self.notify_success_cb.setChecked(b("notify_success", True))
+            self.notify_failure_cb.setChecked(b("notify_failure", True))
+            self.notify_error_cb.setChecked(b("notify_error", True))
+            self.notify_trayed_cb.setChecked(b("notify_trayed", True))
+            self.notify_running_cb.setChecked(b("notify_already_running", True))
+            self.notify_trust_cb.setChecked(b("notify_trust_pending", True))
+            self.notify_baidu_done_cb.setChecked(b("notify_baidu_done", True))
+            self.notify_baidu_leftover_cb.setChecked(b("notify_baidu_leftover", True))
+            self.notify_baidu_dup_cb.setChecked(b("notify_baidu_dup", False))
+            self._sync_notify_enabled()
 
-        # 实验性
-        self.experimental_cb.setChecked(b("experimental_enabled", False))
-        self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
-        self.baidu_pick_cb.setChecked(b("baidu_pick_before_download", False))
-        self.baidu_db_edit.setText(s("baidu_task_db"))
-        self._sync_experimental()
+            # 实验性
+            self.experimental_cb.setChecked(b("experimental_enabled", False))
+            self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
+            self.baidu_pick_cb.setChecked(b("baidu_pick_before_download", False))
+            self.baidu_db_edit.setText(s("baidu_task_db"))
+            self._sync_experimental()
 
-        # 二维码与剪贴板
-        self.qr_cb.setChecked(b("qr_enabled", True))
-        self.qr_redirect_cb.setChecked(b("qr_url_redirect", True))
-        self.qr_url_cb.setChecked(b("qr_url_enabled", True))
-        cur_clip = s("qr_clipboard_action", "none") or "none"
-        for gid, value in _CLIP_ACTIONS:
-            if value == cur_clip and value in self.clip_radios:
-                self.clip_radios[value].setChecked(True)
-                break
-        self.url_exclude_cb.setChecked(b("url_exclude_temp_password", True))
-        self.temp_filter_cb.setChecked(b("temp_password_filter", True))
-        self.temp_filter_cb.setEnabled(self.url_exclude_cb.isChecked())
-        self.ttl_spin.setValue(max(1, min(24 * 365, i("temp_password_ttl_hours", 24))))
-        self.temp_max_spin.setValue(
-            max(1, min(100000, i("temp_password_max", 200))))
+            # 二维码与剪贴板
+            self.qr_cb.setChecked(b("qr_enabled", True))
+            self.qr_redirect_cb.setChecked(b("qr_url_redirect", True))
+            self.qr_url_cb.setChecked(b("qr_url_enabled", True))
+            cur_clip = s("qr_clipboard_action", "none") or "none"
+            for gid, value in _CLIP_ACTIONS:
+                if value == cur_clip and value in self.clip_radios:
+                    self.clip_radios[value].setChecked(True)
+                    break
+            self.url_exclude_cb.setChecked(b("url_exclude_temp_password", True))
+            self.temp_filter_cb.setChecked(b("temp_password_filter", True))
+            self.temp_filter_cb.setEnabled(self.url_exclude_cb.isChecked())
+            self.ttl_spin.setValue(max(1, min(24 * 365, i("temp_password_ttl_hours", 24))))
+            self.temp_max_spin.setValue(
+                max(1, min(100000, i("temp_password_max", 200))))
 
-        # 网址信任
-        self._load_trust(cfg)
-        self.tls_cb.setChecked(b("tls_skip_verify", False))
-        self.rules_edit.setPlainText(
-            _format_redirect_rules(cfg.get("url_redirect_rules")))
+            # 网址信任
+            self._load_trust(cfg)
+            self.tls_cb.setChecked(b("tls_skip_verify", False))
+            self.rules_edit.setPlainText(
+                _format_redirect_rules(cfg.get("url_redirect_rules")))
 
-        # 解压
-        self.output_time_cb.setChecked(b("output_time_now", True))
-        self.pair_split_cb.setChecked(b("pair_split_enabled", True))
-        self.promote_merge_cb.setChecked(b("promote_merge", True))
-        self.translate_cb.setChecked(b("translation_move_enabled", True))
+            # 解压
+            self.output_time_cb.setChecked(b("output_time_now", True))
+            self.pair_split_cb.setChecked(b("pair_split_enabled", True))
+            self.promote_merge_cb.setChecked(b("promote_merge", True))
+            self.translate_cb.setChecked(b("translation_move_enabled", True))
 
-        # 分享与手势
-        self.share_wait_spin.setValue(
-            max(5, min(600, i("share_gesture_wait_sec", 60))))
-        self.hotkey_share_edit.setText(s("hotkey_share"))
-        self.hotkey_share_code_edit.setText(s("hotkey_share_code"))
-        self._refresh_hotkey_display(cfg)
+            # 分享与手势
+            self.share_wait_spin.setValue(
+                max(5, min(600, i("share_gesture_wait_sec", 60))))
+            self.hotkey_share_edit.setText(s("hotkey_share"))
+            self.hotkey_share_code_edit.setText(s("hotkey_share_code"))
+            self._refresh_hotkey_display(cfg)
 
-        # 界面
-        pref = s("ui_theme", "auto").lower()
-        index = 0
-        for n, (_label, value) in enumerate(_THEME_ITEMS):
-            if value == pref:
-                index = n
-                break
-        self.theme_combo.setCurrentIndex(index)
-        self._theme_pref = pref if pref in ("auto", "fluent", "devtool") else "auto"
-        cached = s("ui_theme_cached").lower()
-        self.theme_cached_label.setText(
-            "上次实际应用：%s" % _THEME_NAMES.get(cached, "（未记录）"))
-        self.task_limit_spin.setValue(
-            max(1, min(100000, i("task_history_limit", 500))))
-        self.logcolor_cb.setChecked(b("log_colors_enabled", True))
+            # 界面
+            pref = s("ui_theme", "auto").lower()
+            index = 0
+            for n, (_label, value) in enumerate(_THEME_ITEMS):
+                if value == pref:
+                    index = n
+                    break
+            self.theme_combo.setCurrentIndex(index)
+            self._theme_pref = pref if pref in ("auto", "fluent", "devtool") else "auto"
+            cached = s("ui_theme_cached").lower()
+            self.theme_cached_label.setText(
+                "上次实际应用：%s" % _THEME_NAMES.get(cached, "（未记录）"))
+            self.task_limit_spin.setValue(
+                max(1, min(100000, i("task_history_limit", 500))))
+            self.logcolor_cb.setChecked(b("log_colors_enabled", True))
 
-        # 常规
-        self.interval_spin.setValue(max(1, min(30, i("poll_interval", 2))))
-        self.sevenzip_cb.setChecked(b("sevenzip_check_done", False))
-        self.auto_add_cb.setChecked(b("auto_add_clipboard_password", False))
-        self._refresh_passwords_label()
+            # 常规
+            self.interval_spin.setValue(max(1, min(30, i("poll_interval", 2))))
+            self.sevenzip_cb.setChecked(b("sevenzip_check_done", False))
+            self.auto_add_cb.setChecked(b("auto_add_clipboard_password", False))
+            self._refresh_passwords_label()
 
-        # 全局快捷键
-        self.hotkey_enable_cb.setChecked(b("hotkey_enabled", True))
-        self.hotkey_edit.setText(s("hotkey"))
-        self._hotkeys_at_load = (s("hotkey").strip(),
-                                 s("hotkey_share").strip(),
-                                 s("hotkey_share_code").strip(),
-                                 b("hotkey_enabled", True))
+            # 全局快捷键
+            self.hotkey_enable_cb.setChecked(b("hotkey_enabled", True))
+            self.hotkey_edit.setText(s("hotkey"))
+            self._hotkeys_at_load = (s("hotkey").strip(),
+                                     s("hotkey_share").strip(),
+                                     s("hotkey_share_code").strip(),
+                                     b("hotkey_enabled", True))
 
-        # 托盘与关闭
-        cur_close = s("close_action", "ask") or "ask"
-        if cur_close not in self._close_rbs:
-            cur_close = "ask"
-        self._close_rbs[cur_close].setChecked(True)
+            # 托盘与关闭
+            cur_close = s("close_action", "ask") or "ask"
+            if cur_close not in self._close_rbs:
+                cur_close = "ask"
+            self._close_rbs[cur_close].setChecked(True)
 
-        # 删除源文件主控（各目录可单独覆盖；只有用户真的改过才统一覆盖）
-        entries = [e for e in (cfg.get("watch_paths") or []) if isinstance(e, dict)]
-        del_val, del_same = _common(entries, "delete_source")
-        self._delete_dirty = False
-        if del_same:
-            self.delete_master_cb.setChecked(bool(del_val))
-        else:
-            self.delete_master_cb.setChecked(False)
-        self._refresh_delete_state()
-        self._clear_notice()
+            # 删除源文件主控（各目录可单独覆盖；勾选即统一覆盖全部）
+            entries = [e for e in (cfg.get("watch_paths") or []) if isinstance(e, dict)]
+            del_val, del_same = _common(entries, "delete_source")
+            if del_same:
+                self.delete_master_cb.setChecked(bool(del_val))
+            else:
+                self.delete_master_cb.setChecked(False)
+            self._refresh_delete_state()
+            self._clear_notice()
+        finally:
+            self._loading = False
 
     def _load_trust(self, cfg):
         ut = cfg.get("url_trust") or {}
@@ -1059,7 +1107,7 @@ class SettingsPage(QWidget):
         n = sum(1 for e in entries if e.get("delete_source"))
         if 0 < n < len(entries):
             self.delete_state_label.setText(
-                "当前：%d/%d 个目录已开启（勾选并保存 = 统一覆盖全部）" % (n, len(entries)))
+                "当前：%d/%d 个目录已开启（勾选即统一覆盖全部）" % (n, len(entries)))
         elif n:
             self.delete_state_label.setText("当前：全部 %d 个目录均已开启" % n)
         else:
@@ -1084,56 +1132,111 @@ class SettingsPage(QWidget):
             self.passwords_label.setText("（读取失败 · 在「密码本」页管理）")
 
     # ------------------------------------------------------------------
-    # 保存
+    # 改即存（唯一写入口）
     # ------------------------------------------------------------------
-    def _collect_values(self):
-        """把全部可编辑控件收成一个 {配置键: 新值} 字典（只读项不在内）。"""
+    def _commit(self, key, value):
+        """把单个配置键立即写入（改即存的唯一出口）：落盘 → 回读 → 副作用。
+
+        返回 True 表示写入并回读校验通过。所有监听器都必须经由本方法：
+        它负责旧「保存」按钮的全部收尾（热键重注册 / 主题 / 信号 / 提示）。"""
+        if self._loading:
+            return False
+        if key == "ui_theme":
+            err = self._apply_theme_path(value)
+            if err:
+                self._notice("已保存，但%s" % err, ok=False)
+                self.settingsSaved.emit()
+                return False
+            value = self._theme_pref
+        else:
+            try:
+                self.state.set(key, value)
+            except Exception as e:
+                self._notice("保存失败：%s" % e, ok=False)
+                return False
+        return self._after_commit(key, value)
+
+    def _after_commit(self, key, value):
+        """写入后的既有副作用：热键变更检测 → 回读校验 → 提示 / 信号。"""
+        hotkey_error = ""
+        if key in ("hotkey", "hotkey_share", "hotkey_share_code", "hotkey_enabled"):
+            hotkey_error = self._apply_hotkey_change()
+        if key in ("hotkey", "hotkey_share", "hotkey_share_code"):
+            self._refresh_hotkey_display()
+        if not self._verify_saved({key: value}):
+            self._notice("保存失败：配置写入未生效（config.json 是否可写？）", ok=False)
+            return False
+        if key == "watch_paths":
+            self.watchPathsChanged.emit()
+        if hotkey_error:
+            self._notice("已保存，但%s" % hotkey_error, ok=False)
+        else:
+            self._notice("已保存", announce=False)
+        self.settingsSaved.emit()
+        return True
+
+    def _apply_hotkey_change(self):
+        """快捷键相关键变更后：与载入基线比对，变了才重新注册并通知宿主。
+
+        返回错误文本（无错误为空串）；注册失败不抛出，由调用方并入页脚提示。"""
         cfg = self._snapshot()
-        v = {}
-        v["notify_enabled"] = bool(self.notify_cb.isChecked())
-        v["notify_archive"] = bool(self.notify_archive_cb.isChecked())
-        v["notify_success"] = bool(self.notify_success_cb.isChecked())
-        v["notify_failure"] = bool(self.notify_failure_cb.isChecked())
-        v["notify_error"] = bool(self.notify_error_cb.isChecked())
-        v["notify_trayed"] = bool(self.notify_trayed_cb.isChecked())
-        v["notify_already_running"] = bool(self.notify_running_cb.isChecked())
-        v["notify_trust_pending"] = bool(self.notify_trust_cb.isChecked())
-        v["notify_baidu_done"] = bool(self.notify_baidu_done_cb.isChecked())
-        v["notify_baidu_leftover"] = bool(self.notify_baidu_leftover_cb.isChecked())
-        v["notify_baidu_dup"] = bool(self.notify_baidu_dup_cb.isChecked())
-        v["qr_enabled"] = bool(self.qr_cb.isChecked())
-        v["qr_url_redirect"] = bool(self.qr_redirect_cb.isChecked())
-        v["qr_url_enabled"] = bool(self.qr_url_cb.isChecked())
-        v["qr_clipboard_action"] = self._clip_value()
-        v["url_exclude_temp_password"] = bool(self.url_exclude_cb.isChecked())
-        v["temp_password_filter"] = bool(self.temp_filter_cb.isChecked())
-        v["temp_password_ttl_hours"] = int(self.ttl_spin.value())
-        v["temp_password_max"] = int(self.temp_max_spin.value())
-        v["promote_merge"] = bool(self.promote_merge_cb.isChecked())
-        v["translation_move_enabled"] = bool(self.translate_cb.isChecked())
-        v["output_time_now"] = bool(self.output_time_cb.isChecked())
-        v["pair_split_enabled"] = bool(self.pair_split_cb.isChecked())
-        v["log_colors_enabled"] = bool(self.logcolor_cb.isChecked())
-        v["hotkey_enabled"] = bool(self.hotkey_enable_cb.isChecked())
-        v["hotkey"] = str(self.hotkey_edit.text()).strip()
-        v["hotkey_share"] = str(self.hotkey_share_edit.text()).strip()
-        v["hotkey_share_code"] = str(self.hotkey_share_code_edit.text()).strip()
-        v["poll_interval"] = int(self.interval_spin.value())
-        v["task_history_limit"] = int(self.task_limit_spin.value())
-        v["sevenzip_check_done"] = bool(self.sevenzip_cb.isChecked())
-        v["auto_add_clipboard_password"] = bool(self.auto_add_cb.isChecked())
-        v["share_gesture_wait_sec"] = int(self.share_wait_spin.value())
-        v["ui_theme"] = self._theme_value()
-        v["close_action"] = self._close_value()
-        v["tls_skip_verify"] = bool(self.tls_cb.isChecked())
-        v["url_redirect_rules"] = _parse_redirect_rules(self.rules_edit.toPlainText())
-        v["experimental_enabled"] = bool(self.experimental_cb.isChecked())
-        v["baidu_task_db"] = str(self.baidu_db_edit.text()).strip()
-        v["baidu_auto_invoke"] = bool(self.baidu_auto_invoke_cb.isChecked())
-        v["baidu_pick_before_download"] = bool(self.baidu_pick_cb.isChecked())
-        v["url_trust"] = self._collect_trust()
-        v["watch_paths"] = self._collect_watch_paths(cfg)
-        return v
+        now = (str(cfg.get("hotkey") or "").strip(),
+               str(cfg.get("hotkey_share") or "").strip(),
+               str(cfg.get("hotkey_share_code") or "").strip(),
+               bool(cfg.get("hotkey_enabled", True)))
+        if now == self._hotkeys_at_load:
+            return ""
+        self._hotkeys_at_load = now
+        error = ""
+        if self._hotkey_cb is not None:
+            try:
+                self._hotkey_cb()
+            except Exception as e:
+                error = "快捷键重新注册失败：%s" % e
+        self.hotkeyChanged.emit(now[0])
+        return error
+
+    def _verify_saved(self, values):
+        """回读校验：save_config 自己吞异常，必须读回磁盘才能确认真的写成功。"""
+        try:
+            disk = load_config()
+        except Exception:
+            return False
+        for key, want in values.items():
+            if key in _VERIFY_SKIP:
+                continue
+            got = disk.get(key, "<缺失>")
+            if isinstance(want, bool):
+                if bool(got) != want:
+                    return False
+            elif isinstance(want, int):
+                try:
+                    if int(got) != want:
+                        return False
+                except Exception:
+                    return False
+            elif str(got) != str(want):
+                return False
+        return True
+
+    # ---- 复合键的即时提交（信任 / 单选组 / 热键清空 / 主题 / 文本防抖） ----
+    def _commit_trust(self):
+        self._commit("url_trust", self._collect_trust())
+
+    def _commit_clip(self):
+        self._commit("qr_clipboard_action", self._clip_value())
+
+    def _commit_close(self):
+        self._commit("close_action", self._close_value())
+
+    def _on_theme_selected(self, _index):
+        """主题下拉变更：立即走既有主题应用路径并落盘。"""
+        self._commit("ui_theme", self._theme_value())
+
+    def _clear_hotkey(self, edit, key):
+        """清空快捷键输入框并立即落盘（HotkeyEdit 清空不发 comboChanged）。"""
+        edit.clear()
+        self._commit(key, "")
 
     def _clip_value(self):
         for gid, value in _CLIP_ACTIONS:
@@ -1172,97 +1275,49 @@ class SettingsPage(QWidget):
             }
         return ut
 
-    def _collect_watch_paths(self, cfg):
-        """监听目录条目（逐条原样写回；只在删源主控被改过时才统一覆盖）。
-
-        每个目录的字段（path/enabled/output_dir/delete_source/mode）都从配置快照
-        深拷贝后原样返回——绝不丢键、绝不误改未动过的字段。"""
-        entries = [dict(e) for e in (cfg.get("watch_paths") or [])
-                   if isinstance(e, dict)]
-        if self._delete_dirty:
-            val = bool(self.delete_master_cb.isChecked())
-            for e in entries:
-                e["delete_source"] = val
-        return entries
-
     @staticmethod
     def _empty_indices(entries):
         return [n for n, e in enumerate(entries or [])
                 if not str(e.get("path") or "").strip()]
 
-    def _on_save(self):
-        """保存：逐键走 state.set（既有保存路径）→ 回读校验 → 如实回报。"""
-        try:
-            values = self._collect_values()
-        except Exception as e:
-            self._notice("保存失败：%s" % e, ok=False)
-            return
-        empties = self._empty_indices(values.get("watch_paths"))
-        if empties:
-            ret = QMessageBox.question(
-                self, "路径校验",
-                "有 %d 条监听目录路径为空；保存会移除这些空条目（其余设置照常保存）。\n"
-                "继续保存？" % len(empties),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ret != QMessageBox.Yes:
-                self._notice("保存已取消：请先处理空路径条目", ok=False)
-                return
-            entries = values["watch_paths"]
-            values["watch_paths"] = [e for n, e in enumerate(entries)
-                                     if n not in empties]
-        try:
-            for key, value in values.items():
-                self.state.set(key, value)
-        except Exception as e:
-            self._notice("保存失败：%s" % e, ok=False)
-            return
-        # 快捷键：仅当相关值变了才重新注册（与旧设置对话框同义）
-        changed_hotkeys = self._hotkeys_at_load != (
-            values["hotkey"], values["hotkey_share"],
-            values["hotkey_share_code"], values["hotkey_enabled"])
-        # 主题：走既有应用路径（resolve_theme + apply_theme + ui_theme_cached + 回调）
-        theme_error = ""
-        if str(values.get("ui_theme")) != self._theme_pref:
-            theme_error = self._apply_theme_path(values.get("ui_theme"))
-        if changed_hotkeys and self._hotkey_cb is not None:
-            try:
-                self._hotkey_cb()
-            except Exception as e:
-                theme_error = theme_error or ("快捷键重新注册失败：%s" % e)
-        self._load_from_cfg()
-        if theme_error:
-            self._notice("设置已保存，但%s" % theme_error, ok=False)
-        elif not self._verify_saved(values):
-            self._notice("保存失败：配置写入未生效（config.json 是否可写？）", ok=False)
-            return
-        else:
-            self._notice("已保存 · 立即生效（需重启项见各行标签）")
-        self.settingsSaved.emit()
-        if changed_hotkeys:
-            self.hotkeyChanged.emit(values["hotkey"])
+    # ---- 文本编辑防抖（停止输入 _TEXT_DEBOUNCE_MS 后落盘；失焦立即落盘） ----
+    def _bind_text(self, widget, key, compose):
+        """文本 / 多行编辑：400ms 单发防抖提交；焦点离开时立即提交。
 
-    def _verify_saved(self, values):
-        """回读校验：save_config 自己吞异常，必须读回磁盘才能确认真的写成功。"""
-        try:
-            disk = load_config()
-        except Exception:
-            return False
-        for key, want in values.items():
-            if key in _VERIFY_SKIP:
-                continue
-            got = disk.get(key, "<缺失>")
-            if isinstance(want, bool):
-                if bool(got) != want:
-                    return False
-            elif isinstance(want, int):
-                try:
-                    if int(got) != want:
-                        return False
-                except Exception:
-                    return False
-            elif str(got) != str(want):
-                return False
-        return True
+        compose() 返回要写入的即时值（复合键如 url_trust 由 compose 汇总）。"""
+        def _commit_now():
+            if self._loading:
+                return
+            self._commit(key, compose())
+
+        def _flush():
+            timer.stop()
+            _commit_now()
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(_TEXT_DEBOUNCE_MS)
+        timer.timeout.connect(_commit_now)
+        widget.textChanged.connect(lambda *_a: self._arm_text_timer(widget))
+        widget.installEventFilter(self)
+        self._text_timers[widget] = (timer, _flush)
+
+    def _arm_text_timer(self, widget):
+        if self._loading:
+            return
+        item = self._text_timers.get(widget)
+        if item is not None:
+            item[0].start()
+
+    def _flush_text(self, widget):
+        item = self._text_timers.get(widget)
+        if item is not None:
+            item[0].stop()
+            item[1]()
+
+    def _cancel_text_timers(self):
+        for timer, _flush in self._text_timers.values():
+            timer.stop()
 
     # ------------------------------------------------------------------
     # 恢复默认
@@ -1341,7 +1396,11 @@ class SettingsPage(QWidget):
         except Exception:
             pass
 
-    def _notice(self, text, ok=True):
+    def _notice(self, text, ok=True, announce=True):
+        """页脚提示；announce=False 只更新标签与配色，不向宿主发 notice 信号。
+
+        改即存的日常成功提示（"已保存"）不进运行日志，避免滚轮/输入刷屏；
+        失败提示与恢复默认等显式动作照常 announce。"""
         text = str(text)
         self._notice_failed = not ok
         self.notice_label.setText(text)
@@ -1351,7 +1410,8 @@ class SettingsPage(QWidget):
                 "" if ok else "color: %s;" % PALETTE["danger"])
         except Exception:
             pass
-        self.notice.emit(text)
+        if announce:
+            self.notice.emit(text)
 
     def refresh_theme(self):
         """主题切换后重贴内联色（warn 说明 / 失败提示）；图标自行重绘。"""
@@ -1392,14 +1452,6 @@ class SettingsPage(QWidget):
 
     def control_for(self, key):
         return list(self._controls.get(str(key)) or [])
-
-    def apply_mode(self, key):
-        """该键的生效方式标签文本（TAG_LIVE / TAG_RESTART，未登记返回 None）。"""
-        return self._tags.get(str(key))
-
-    def tag_label_for(self, key):
-        labels = self._tag_labels.get(str(key)) or []
-        return labels[0] if labels else None
 
     def section_titles(self):
         return list(self._sections)

@@ -570,8 +570,67 @@ def _capture_base(app):
             _BASE["palette"] = None
 
 
-# 运行时生成的主题图标对应的 QSS 片段缓存（见 _theme_extra_qss）
+# 运行时生成的主题图标对应的 QSS 片段缓存（见 _theme_extra_qss）。
+# 键 = (theme, dpr 键)：同一主题在不同 devicePixelRatio 下的图标物理尺寸不同，
+# 必须分别生成——DPI 变化后绝不能复用低 DPR 的旧图 / 旧 QSS。
 _EXTRA_QSS = {}
+
+
+def _device_pixel_ratio():
+    """当前主屏 devicePixelRatio（1.25 / 1.5 / 1.75 等小数原样返回；取不到回退 1.0）。
+
+    运行时图标按「逻辑尺寸 × dpr」的物理像素生成，而 QSS 的 width/height 仍写
+    逻辑像素：Qt 的 QIcon::paint 恰好按「逻辑尺寸 × 屏幕 dpr」请求物理尺寸，
+    两边一致时是 1:1 贴图，不会被放大重采样（放大重采样正是模糊/像素化的根源）。
+    """
+    try:
+        from PyQt5.QtWidgets import QApplication
+        screen = None
+        app = QApplication.instance()
+        if app is not None:
+            screen = app.primaryScreen()
+        if screen is None:
+            from PyQt5.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            dpr = float(screen.devicePixelRatio())
+            if dpr > 0:
+                return dpr
+    except Exception:
+        pass
+    return 1.0
+
+
+def _dpr_key(dpr):
+    """把 devicePixelRatio 规范成文件名 / 缓存键片段：1 / 1.25 / 1.5 / 1.75 / 2。"""
+    key = ("%.2f" % float(dpr)).rstrip("0").rstrip(".")
+    return key or "1"
+
+
+def _raster_px(logical, dpr):
+    """逻辑像素 -> 物理像素（四舍五入，与 Qt 的 QSize*dpr 取整口径一致）。"""
+    return max(1, int(float(logical) * float(dpr) + 0.5))
+
+
+def _glyph_pixmap(logical_w, logical_h, dpr, draw):
+    """在 round(逻辑尺寸 × dpr) 的物理画布上按 dpr 缩放画笔绘制矢量字形。
+
+    画完 setDevicePixelRatio(dpr)，QSS 里 width/height 写逻辑值即可。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPainter, QPixmap
+
+    pm = QPixmap(_raster_px(logical_w, dpr), _raster_px(logical_h, dpr))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    try:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.scale(dpr, dpr)
+        draw(p)
+    finally:
+        p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
 
 
 def _theme_extra_qss(theme):
@@ -587,82 +646,101 @@ def _theme_extra_qss(theme):
 
     2. 「已选中」的勾选框/单选圈 —— 用 QSS 补成**主题主色填充 + 白色对勾/圆点**，
        避免原生渲染在深色下调色板取色偏暗、选中态反而不如未选中醒目（未选中的
-       描边由样式表补，选中态见下）。对勾/圆点同样运行时画成 PNG。
+       描边由样式表补，选中态见下）。
+
+    HiDPI（本函数的核心约束）：三张图标一律按当前主屏 devicePixelRatio 以
+    **物理像素**生成——画布取 round(逻辑尺寸 × dpr)，画笔先 scale(dpr) 再画矢量。
+    文件名带 DPR（如 check_fluent_1.25.png），QSS 的 width/height 仍是逻辑像素；
+    Qt 的 QIcon::paint 会按「逻辑尺寸 × 屏幕 dpr」请求物理尺寸，与生成尺寸一致
+    时 1:1 贴图。旧实现把 11x8 / 8x8 的小图塞进 15x15 逻辑框，在 125%~200% 下
+    被 1.25~2 倍拉伸成灰糊；选中态现在把主色底 + 白色字形合成**同一张**图
+    （QSS 只留 image，不留 border/background），圆角与字形不再分两路绘制。
     """
-    if theme in _EXTRA_QSS:
-        return _EXTRA_QSS[theme]
+    dpr = _device_pixel_ratio()
+    cache_key = (theme, _dpr_key(dpr))
+    if cache_key in _EXTRA_QSS:
+        return _EXTRA_QSS[cache_key]
     rule = ""
     try:
-        from PyQt5.QtCore import QPoint, QPointF, Qt
-        from PyQt5.QtGui import (QColor, QPainter, QPen, QPixmap,
-                                 QPolygon, QPolygonF)
+        from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt
+        from PyQt5.QtGui import (QColor, QPainter, QPainterPath, QPen, QPixmap,
+                                 QPolygon)
         from .. import paths
         tk = _TOKENS.get(theme, _FLUENT)
         base = paths.CACHE_DIR
         base.mkdir(parents=True, exist_ok=True)
 
-        def _url(pm, name):
-            path = base / f"{name}_{theme}.png"
-            if pm.save(str(path), "PNG"):
-                return str(path).replace("\\", "/")
+        def _save(pm, name):
+            """存 PNG：文件名带 DPR，并把 DPR 写进 PNG 文本元数据。
+
+            注意：Qt 5.15 的 PNG 读写**不保留** QPixmap.devicePixelRatio()
+            （读回恒为 1.0，实测 dotsPerMeter 也只是默认 100dpi），所以 QSS
+            侧只按物理尺寸取用；元数据供校验脚本自述其 DPR。
+            """
+            path = base / ("%s_%s_%s.png" % (name, theme, _dpr_key(dpr)))
+            try:
+                img = pm.toImage()
+                img.setText("AutoUnpacker-DPR", _dpr_key(dpr))
+                if img.save(str(path), "PNG"):
+                    return str(path).replace("\\", "/")
+            except Exception:
+                pass
             return ""
 
         # --- 下拉箭头（V 形，取控件前景色）---
-        arrow = QPixmap(12, 7)
-        arrow.fill(Qt.transparent)
-        p = QPainter(arrow)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor(tk["ctl_fg"]))
-        pen.setWidthF(1.7)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        p.setPen(pen)
-        p.drawPolyline(QPolygon([QPoint(2, 2), QPoint(6, 6), QPoint(10, 2)]))
-        p.end()
-        arrow_url = _url(arrow, "combo_arrow")
+        def _draw_arrow(p):
+            pen = QPen(QColor(tk["ctl_fg"]))
+            pen.setWidthF(1.7)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawPolyline(QPolygon([QPoint(2, 2), QPoint(6, 6), QPoint(10, 2)]))
 
-        # --- 对勾（白色，压在主题主色底上）---
-        check = QPixmap(11, 8)
-        check.fill(Qt.transparent)
-        p = QPainter(check)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor("#ffffff"))
-        pen.setWidthF(1.9)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        p.setPen(pen)
-        p.drawPolyline(QPolygon([QPoint(1, 4), QPoint(4, 6), QPoint(10, 1)]))
-        p.end()
-        check_url = _url(check, "check")
+        arrow_url = _save(_glyph_pixmap(12, 7, dpr, _draw_arrow), "combo_arrow")
 
-        # --- 圆点（白色，单选选中）---
-        dot = QPixmap(8, 8)
-        dot.fill(Qt.transparent)
-        p = QPainter(dot)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#ffffff"))
-        p.drawEllipse(QPointF(4, 4), 3.0, 3.0)
-        p.end()
-        dot_url = _url(dot, "dot")
+        # --- 选中勾选框：主色圆角方块 + 白勾合成一张 15x15 逻辑图 ---
+        # （旧实现把主色底/边留给 QSS、白勾另存 11x8 小图，两路绘制互相牵制，
+        #   且小图在非 100% 缩放下被拉伸；合成后 QSS 只留 image 一条路径。）
+        def _draw_check(p):
+            pill = QPainterPath()
+            pill.addRoundedRect(QRectF(0.0, 0.0, 15.0, 15.0), 3.0, 3.0)
+            p.fillPath(pill, QColor(tk["sel_bg"]))
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidthF(2.0)          # 2px 逻辑宽：在 100%/200% 下恰为整数物理像素
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            # 与旧 11x8 资产等墨迹位置（旧资产居中偏移 (2,3)）——只变清晰度，不变形
+            p.drawPolyline(QPolygon([QPoint(3, 7), QPoint(6, 9), QPoint(12, 4)]))
 
-        sel = tk["sel_bg"]
+        check_url = _save(_glyph_pixmap(15, 15, dpr, _draw_check), "check")
+
+        # --- 选中单选圈：主色圆 + 白点（同样合成一张 15x15 逻辑图）---
+        def _draw_dot(p):
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(tk["sel_bg"]))
+            p.drawEllipse(QPointF(7.5, 7.5), 7.5, 7.5)
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(7.5, 7.5), 3.0, 3.0)   # 白点直径与旧 8x8 图一致（6 逻辑像素）
+
+        dot_url = _save(_glyph_pixmap(15, 15, dpr, _draw_dot), "dot")
+
         if arrow_url:
             rule += ("QComboBox::down-arrow { image: url(\"%s\");"
                      " width: 12px; height: 7px; }\n" % arrow_url)
         if check_url:
+            # padding 1px：未选中态是「15px 内容 + 1px 边框」（总盒 17x17），
+            # 选中态用 1px padding 占住同样的盒模型——勾选切换时文本不会跳 2px。
             rule += ("QCheckBox::indicator:checked { image: url(\"%s\");"
-                     " width: 15px; height: 15px; border: 1px solid %s;"
-                     " background: %s; border-radius: 3px; }\n"
-                     % (check_url, sel, sel))
+                     " width: 15px; height: 15px; padding: 1px;"
+                     " border: none; background: transparent; }\n" % check_url)
         if dot_url:
             rule += ("QRadioButton::indicator:checked { image: url(\"%s\");"
-                     " width: 15px; height: 15px; border: 1px solid %s;"
-                     " background: %s; border-radius: 8px; }\n"
-                     % (dot_url, sel, sel))
+                     " width: 15px; height: 15px; padding: 1px;"
+                     " border: none; background: transparent; }\n" % dot_url)
     except Exception:
         rule = ""
-    _EXTRA_QSS[theme] = rule
+    _EXTRA_QSS[cache_key] = rule
     return rule
 
 

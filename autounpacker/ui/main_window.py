@@ -44,7 +44,8 @@ from .page_pwbook import PasswordBookPage
 from .page_trail import TrailPage
 from .page_settings import SettingsPage
 from .dialogs import (SettingsDialog, DeleteTrailDialog, SevenZipSetupDialog,
-                      CloseActionDialog, TrustAskDialog, WatchDirDialog)
+                      CloseActionDialog, TrustAskDialog, WatchDirDialog,
+                      TaskDetailsDialog)
 
 # ---------------------------------------------------------------------------
 # Stage 6f：模块级常量与助手已拆分到 .window 包（consts/logview/share_flow/chrome）。
@@ -252,6 +253,7 @@ class MainWindow(QMainWindow):
 
         self.task_page = TaskPage(self.log_box, self.pages)
         self.task_page.taskActivated.connect(self._on_task_activated)
+        self.task_page.taskDoubleClicked.connect(self._on_task_double_clicked)
         self.task_page.taskDeselected.connect(lambda: self._select_task(None))
         self.task_page.actionTriggered.connect(self._on_task_action)
         self.task_page.copyRequested.connect(self._copy_task_log)
@@ -1095,11 +1097,20 @@ class MainWindow(QMainWindow):
     def _on_task_activated(self, task_id):
         self._select_task(task_id)
 
+    def _on_task_double_clicked(self, task_id):
+        """双击队列行：打开任务详情弹窗（与行内「详细信息」按钮同一入口）。"""
+        self._open_task_details(task_id)
+
     def _on_task_action(self, task_id, kind):
-        if str(kind) == "retry":
-            self._retry_task(task_id)
-        elif str(kind) == "open_dir":
-            self._open_task_dir(task_id)
+        kind = str(kind)
+        if kind == "details":
+            self._open_task_details(task_id)
+        elif kind in ("retry", "open_dir", "input_password", "ignore"):
+            self._on_needs_action(task_id, kind)
+        elif kind == "delete":
+            self._delete_task(task_id)
+        elif kind == "view_log":
+            self._on_need_task_activated(task_id)
 
     def _on_need_task_activated(self, task_id):
         """「需要处理」整行点击：跳到任务页并选中该任务（只看它自己的日志）。"""
@@ -1121,6 +1132,23 @@ class MainWindow(QMainWindow):
             self._input_password_for_task(task_id)
         elif kind == "ignore":
             self._ignore_task(task_id)
+
+    def _open_task_details(self, task_id):
+        """打开任务详情弹窗：弹窗动作信号接回本窗动作路由器；关闭后统一刷新。
+
+        用原生模态（parent=self，exec_），遮罩由弹窗自身挂在父窗客户区上；
+        任何动作（含软取消/硬删除）后弹窗自行重读，宿主这里统一次刷新队列/徽标。"""
+        try:
+            dlg = TaskDetailsDialog(task_id, self)
+        except Exception as e:
+            self._append_log(f"[任务] 打开详情失败: {e}")
+            return
+        dlg.actionRequested.connect(self._on_task_action)
+        dlg.notice.connect(self._append_log)
+        try:
+            dlg.exec_()
+        finally:
+            self._refresh_all()
 
     def _retry_task(self, task_id):
         """重试 failed / need_password / canceled 任务。
@@ -1205,12 +1233,17 @@ class MainWindow(QMainWindow):
         self._goto_page("password")
 
     def _ignore_task(self, task_id):
-        """忽略待密码/失败任务：标记为已取消（终态），从「需要处理」列表移除。"""
+        """「从队列移除」（软取消）：标记为已取消（终态），任何状态都可执行。
+
+        这是队列行「从队列移除」的唯一实现：待密码/失败之外的状态
+        （queued/extracting/done/canceled）同样可被用户主动清出队列——卡在
+        need_password 且源文件已删除的任务因此不会永远留在队列里。"""
         try:
             task = db.get_task(task_id) or {}
         except Exception:
             task = {}
-        if str(task.get("state") or "") not in ("need_password", "failed"):
+        if not task:
+            self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
             return
         try:
             db.update_task_state(int(task_id), "canceled",
@@ -1219,6 +1252,24 @@ class MainWindow(QMainWindow):
             pass
         self._emit_tasks_changed()
         self._append_log(f"[任务] 已忽略: {task.get('file_name') or task_id}")
+        self._refresh_all()
+
+    def _delete_task(self, task_id):
+        """「删除记录」（硬删除）：删 tasks 行 + 该任务日志行，刷新队列/徽标。
+
+        与「从队列移除」的软取消不同：删除后该任务永久消失（含日志行），绝不
+        复活——这是「任务不可不朽」的最后保证。"""
+        try:
+            task = db.get_task(task_id) or {}
+        except Exception:
+            task = {}
+        name = str(task.get("file_name") or task_id)
+        ok = db.delete_task(task_id)
+        if ok:
+            self._emit_tasks_changed()
+            self._append_log(f"[任务] 已删除记录: {name}")
+        else:
+            self._append_log(f"[任务] 删除失败或记录已不存在: {name}")
         self._refresh_all()
 
     # ---------- 失败过滤（唯一状态，双向同步） ----------
@@ -1820,6 +1871,8 @@ class MainWindow(QMainWindow):
                 "[界面] 检测到窗口跨屏：可用区 %dx%d 逻辑像素、缩放 %.0f%%；"
                 "Qt5 跨屏不会自动重排缩放，若界面比例不对请重启程序"
                 % (g.width(), g.height(), dpr * 100.0))
+            # 新屏缩放可能与旧屏不同：运行时图标（勾/点/箭头 PNG）按新 DPR 重建
+            self._refresh_theme_assets()
             # 顺序：先按新屏放宽最小尺寸，否则超屏窗口 resize 不动
             self._apply_screen_limits(screen)
             w, h = fit_window_size(self.width(), self.height(),
@@ -1830,12 +1883,16 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_screen_dpi_changed(self, dpi):
-        """同一块屏上系统文本缩放变化（WM_DPICHANGED）：记日志并做防溢出。"""
+        """同一块屏上系统文本缩放变化（WM_DPICHANGED）：重建图标、记日志、防溢出。"""
         try:
             now = time.time()
             if now - float(getattr(self, "_dpi_log_ts", 0.0)) < 1.0:
                 return
             self._dpi_log_ts = now
+            # 缩放比例变了：勾选框/单选圈/下拉箭头的运行时 PNG 是按 devicePixelRatio
+            # 生成的，必须重套主题（apply_theme → _theme_extra_qss）按新 DPR 重建。
+            # 同 DPR 命中 (theme, dpr) 缓存，重复信号不会重复生成。
+            self._refresh_theme_assets()
             self._append_log(
                 "[界面] 检测到系统文本缩放变化（逻辑 DPI %.0f）；"
                 "Qt5 不会自动重排已有窗口，界面若有错位请重启程序" % float(dpi))
@@ -1845,6 +1902,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 scr = None
             self._apply_screen_limits(scr)
+        except Exception:
+            pass
+
+    def _refresh_theme_assets(self):
+        """按当前主屏 DPR 重建主题 QSS 的运行时图标（勾/点/箭头 PNG）。
+
+        幂等：`_theme_extra_qss` 以 (theme, dpr) 为缓存键，同 DPR 直接命中；
+        无 QApplication / 无屏幕时静默跳过。这里**只**调 apply_theme，不触碰
+        任何 QScreen/QWindow API，因此不会反过来再触发 DPI 变化信号（无回环）。
+        """
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                ui_style.apply_theme(app, ui_style.current_theme())
         except Exception:
             pass
 

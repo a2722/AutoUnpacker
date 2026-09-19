@@ -186,10 +186,11 @@ class _StatePillDelegate(QStyledItemDelegate):
 
 
 class TaskTable(QTableView):
-    """任务表：TaskModel + 状态胶囊 + 行内操作（打开输出目录 / 重试）。"""
+    """任务表：TaskModel + 状态胶囊 + 行内操作（详细信息 / 打开输出目录 / 重试）。"""
 
     taskActivated = pyqtSignal(int)
-    actionTriggered = pyqtSignal(int, str)   # task_id, 'open_dir'|'retry'
+    taskDoubleClicked = pyqtSignal(int)      # 双击行（详情入口）；与点击选中解耦
+    actionTriggered = pyqtSignal(int, str)   # task_id, 'details'|'open_dir'|'retry'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -213,7 +214,7 @@ class TaskTable(QTableView):
         hh.setSectionResizeMode(TaskModel.COL_OUT, QHeaderView.Stretch)
         for col, width in ((TaskModel.COL_STATE, 92), (TaskModel.COL_SIZE, 78),
                            (TaskModel.COL_PWD, 96), (TaskModel.COL_COST, 72),
-                           (TaskModel.COL_ACT, 72)):
+                           (TaskModel.COL_ACT, 106)):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self.setColumnWidth(col, width)
         self._action_widgets = []
@@ -283,7 +284,8 @@ class TaskTable(QTableView):
         lay.setContentsMargins(0, 0, 6, 0)
         lay.setSpacing(4)
         lay.addStretch(1)
-        for action, glyph, tip in (("open_dir", "external", "打开输出目录"),
+        for action, glyph, tip in (("details", "info", "详细信息"),
+                                   ("open_dir", "external", "打开输出目录"),
                                    ("retry", "refresh", "重试")):
             btn = QPushButton(w)
             btn.setObjectName("rowAct")
@@ -317,11 +319,24 @@ class TaskTable(QTableView):
             pass
 
     def _on_double_clicked(self, index):
+        """双击行：发 taskDoubleClicked（详情入口）。
+
+        taskActivated 保持旧行为照发（双击先经选中路径，选中未变时这里兜底），
+        详情弹窗只认 taskDoubleClicked，绝不复用 taskActivated（点击选中也会发）。
+        """
         if not index.isValid():
             return
         task_id = self._model.data(index, Qt.UserRole)
         try:
-            self.taskActivated.emit(int(task_id))
+            tid = int(task_id)
+        except Exception:
+            return
+        try:
+            self.taskActivated.emit(tid)
+        except Exception:
+            pass
+        try:
+            self.taskDoubleClicked.emit(tid)
         except Exception:
             pass
 

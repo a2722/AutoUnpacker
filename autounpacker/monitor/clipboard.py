@@ -78,39 +78,62 @@ _FILE_EXT_RE = re.compile(
     r"vmd|pmx|pmd|fx|fxsub|dds)$", re.I)
 
 # 一眼不是提取码的字符（用 \x22/\x27 写引号，避免转义地狱）：
-# 中英文引号/括号、CJK 标点与全角形式、CJK 表意文字。
-# 用户日志里的误捕串（"[18:56:42]"、引号中文句子）靠这条拦下。
+# 中英文引号/括号。引号/括号包着的整段文本（如「"自动在浏览器中打开（二维码解出
+# 的链接）"」）一律不是密码；CJK 表意文字与全角字符**不再**拦截——密码可以是
+# 中文（「中文密码」「ＡＢＣ１２３」），有无中文/全角不证明它不是密码。
 _NON_PASSWORD_CHARS_RE = re.compile(
-    r"[\x22\x27()\[\]{}<>“”‘’（）【】〔〕《》「」『』]"
-    r"|[\u3000-\u303f\uff00-\uffef]"
-    r"|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-# 域名样文本（可带路径/查询）：pan.baidu / pan.baidu.com/s/1abc
-_DOMAIN_LIKE_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+([/?#].*)?$")
+    r"[\x22\x27()\[\]{}<>“”‘’（）【】〔〕《》「」『』]")
+# 域名样文本（可带路径/查询）：pan.baidu / pan.baidu.com/s/1abc。
+# 末段必须是字母 TLD（或 punycode）才像域名，否则 pass1.2 / v1.2.3 这类
+# 「点号密码」会被误判成域名；另保留 IPv4 样文本（地址也不是密码）。
+_DOMAIN_LIKE_RE = re.compile(
+    r"^(?:[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*\.(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]+)"
+    r"|\d{1,3}(?:\.\d{1,3}){3})([/?#].*)?$")
 # 纯时间 / ISO-ish 日期：18:56:42 / 2026-09-18 / 2026/09/18
 _TIME_LIKE_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 _DATE_LIKE_RE = re.compile(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$")
-# 纯字母/下划线（无数字无符号）且 ≥8 位：像标识符/环境变量名（First_Project_）
+# 纯字母/下划线标识符形态（如 First_Project_）。
+# 注意：该规则自 2026-09-19 起**不再**参与 _looks_like_non_password 判定
+#（MyPassword 是合法密码）；常量保留只为兼容 monitors shim 的再导出面。
 _IDENTIFIER_LIKE_RE = re.compile(r"^[A-Za-z_]+$")
+# _extract_pwd_code 用：提取码在空白与句读标点处终止（「提取码：abcd。下一句」
+# 只取 abcd）；首尾/内侧的中英文引号括号会被剥掉（「提取码："abcd"」→ abcd）。
+_PWD_CODE_STOP = r"\s，。！？；：、…"
+_PWD_CODE_WRAP = "\"'()[]{}<>“”‘’（）【】〔〕《》「」『』"
+_PWD_CODE_RE = re.compile(
+    r"(?:提取码|访问码|密\s*码|pwd|passcode|password|pass)"
+    r"\s*[:：=]?\s*"
+    r"([^" + _PWD_CODE_STOP + r"]{1,32})", re.I)
+_PWD_CODE_WRAP_SPLIT_RE = re.compile("[" + re.escape(_PWD_CODE_WRAP) + "]")
 
 
 def _looks_like_non_password(text):
-    """严格过滤（对应「智能过滤」子项）：多行/路径/文件名/句子等明显不是提取码。
+    """宽松过滤（对应「智能过滤」子项）：只挡「明显不是密码」的文本。
 
     不含网址判断——网址由更宽松的父项「网址排除」负责。
-    既有规则（空/多行/句读标点/盘符路径/反斜杠/扩展名/版本号/≥4 分词）全部保留；
-    另按用户日志实据新增：
-    - 含 CJK 表意文字、中英文引号/括号、全角标点 → 非密码（引号中文句子）；
-    - 纯时间（18:56:42）/ ISO-ish 日期（2026-09-18、2026/09/18）→ 非密码；
-    - 域名样（pan.baidu、pan.baidu.com/s/1abc，含带路径）→ 非密码；
-    - 纯字母/下划线且 ≥8 位（First_Project_，像标识符）→ 非密码；
-    - 去空白后超过 64 字符 → 非密码。
+    保留的判据（每一条都只拦「看着就不像密码」的形态）：
+    - 空 / 多行（提取码都是单行）；
+    - 含句读标点（，。！？；：、…）→ 是句子不是密码：中文句子必有标点，
+      中文密码没有；
+    - 含中英文引号/括号 → 引号/括号包着的整段文本一律不是密码；
+    - 盘符 / UNC / // 网络路径、含反斜杠的路径样文本；
+    - 带常见扩展名的文件名；
+    - ≥8 个空白分词 → 标题/长句（真多词口令如「correct horse battery
+      staple」只有 4 个词，必须存活）；
+    - 去首尾空白后 >128 字符 → 超长文本（全模块唯一的长度上限）；
+    - 纯时间（18:56:42）/ ISO-ish 日期（2026-09-18、2026/09/18）；
+    - 域名样（pan.baidu、pan.baidu.com/s/1abc，含带路径）。
+
+    刻意**不再**拦截（旧策略会误杀真密码）：CJK 表意文字与全角字符
+    （「中文密码」「ＡＢＣ１２３」）、含点号样式（pass1.2）、纯字母下划线串
+    （MyPassword）。
 
     本函数绝不抛异常：任何内部错误一律返回 True（保守地按「不是密码」处理，
     宁可漏记也不把垃圾写进临时密码/密码本）。"""
     try:
         t = "" if text is None else str(text)
         t = t.strip()
-        # 引号/括号/CJK/全角在「去首尾引号」之前判：带引号的整段文本
+        # 引号/括号在「去首尾引号」之前判：带引号的整段文本
         #（如「"自动在浏览器中打开（二维码解出的链接）"」）一律不是密码。
         if _NON_PASSWORD_CHARS_RE.search(t):
             return True
@@ -128,21 +151,14 @@ def _looks_like_non_password(text):
             return True                                       # 含反斜杠的路径样文本
         if _FILE_EXT_RE.search(t):
             return True                                       # 带常见扩展名的文件名
-        # 标题/版本样式（如「PIXEL CALL GIRLS -REI- 1.30」）：多词 + 版本号一眼不是提取码。
-        # 只挡这两类窄形态，普通多词口令（「my pass」）与 4 位提取码不受影响；
-        # 用户若真要捕获这类串，可在设置里关掉「智能过滤」子项。
-        if re.search(r"\d+\.\d+", t):
-            return True                                       # 含版本号样式 x.y
-        if len([w for w in re.split(r"\s+", t) if w]) >= 4:
-            return True                                       # 4 个及以上空白分词 → 标题/句子
-        if len(t) > 64:
-            return True                                       # 超长文本不是提取码
+        if len([w for w in re.split(r"\s+", t) if w]) >= 8:
+            return True                                       # ≥8 个空白分词 → 标题/长句
+        if len(t) > 128:
+            return True                                       # 超长文本不是密码（统一上限 128）
         if _TIME_LIKE_RE.match(t) or _DATE_LIKE_RE.match(t):
             return True                                       # 纯时间 / ISO 日期
         if _DOMAIN_LIKE_RE.match(t):
             return True                                       # 域名样（含带路径的链接文本）
-        if len(t) >= 8 and _IDENTIFIER_LIKE_RE.match(t):
-            return True                                       # 纯字母下划线标识符
         return False
     except Exception:
         return True
@@ -152,9 +168,11 @@ def _should_capture_temp_password(text, cfg):
     """剪贴板文本是否记为临时密码（父子两级过滤）。
 
     - 父（宽松）url_exclude_temp_password：带 :// 的网址不记；关闭则照单全收。
-    - 子（更严格）temp_password_filter：在父级基础上再排除多行/路径/文件名/
-      句子/引号中文/时间日期/域名/标识符等，且只收 <60 字符（旧上限，比
-      「>64 才算长」更严，保留不动）。
+    - 子（宽松）temp_password_filter：在父级基础上再按 _looks_like_non_password
+      排除多行/句读/引号括号/路径/文件名/时间日期/域名/≥8 分词/超长等「明显不是
+      密码」的文本；长度上限只有 _looks_like_non_password 里那一处（去首尾空白
+      后 >128），不再另设 <60 的旧上限。
+    子项默认关（配置默认 False）：默认照单全收，只有用户显式开启才过滤。
     本函数绝不抛异常：内部错误按「不记」处理（宁可不捕获，也不污染密码本）。
     """
     try:
@@ -163,8 +181,8 @@ def _should_capture_temp_password(text, cfg):
             return True                                   # 父关 → 照单全收
         if "://" in t.strip():
             return False                                  # 父级：网址不记
-        if get_bool(cfg, "temp_password_filter", True):
-            return len(t) < 60 and not _looks_like_non_password(t)
+        if get_bool(cfg, "temp_password_filter", False):
+            return not _looks_like_non_password(t)        # 子开才过滤（长度上限在 looks 内）
         return True
     except Exception:
         return False
@@ -360,8 +378,11 @@ class QRMonitor(threading.Thread):
             pass
 
     def _capture_text_password(self):
-        """监控剪贴板文本：短文本(<60)存入临时密码；同时记录最近的非图片内容
+        """监控剪贴板文本：按过滤策略存入临时密码；同时记录最近的非图片内容
         到 _recent_texts（供二维码触发后恢复提取码到剪贴板用）。
+
+        长度策略：去首尾空白后 >128 字符一律不捕获（见 _looks_like_non_password）；
+        「智能过滤」默认关，开启后按 _should_capture_temp_password 判定。
 
         返回本次新出现的文本（供网址二维码识别用），无新文本返回 None。"""
         if not CLIPBOARD_AVAILABLE:
@@ -668,14 +689,20 @@ class QRMonitor(threading.Thread):
     def _extract_pwd_code(text):
         """从二维码解码文本里提取内嵌的提取码/密码（如「提取码：Zdjn」→ Zdjn）。
 
-        取不到返回 None。只认关键字后紧跟的短代码，避免误抓整段文本。"""
+        取不到返回 None。关键字后取一段连续文本：在空白与句读标点
+        （，。！？；：、…）处终止，长度限 1~32；首尾及内侧的中英文引号/括号
+        与尾部 ASCII 标点会被去掉（如「提取码："abcd"」「提取码：abcd（备注）」
+        → abcd），绝不把标点或下一句吞进提取码。ASCII 提取码（Zdjn / 4a9u）
+        与中文/全角提取码（中文密码 / ＡＢＣ１２３）都支持。"""
         if not text:
             return None
-        m = re.search(
-            r"(?:提取码|访问码|密\s*码|pwd|passcode|password|pass)"
-            r"\s*[:：=]?\s*([A-Za-z0-9]{2,16})",
-            text, re.I)
-        return m.group(1) if m else None
+        m = _PWD_CODE_RE.search(text)
+        if not m:
+            return None
+        code = m.group(1).strip(_PWD_CODE_WRAP)
+        code = _PWD_CODE_WRAP_SPLIT_RE.split(code, maxsplit=1)[0]
+        code = code.rstrip(".,;:!?").rstrip(_PWD_CODE_WRAP)
+        return code or None
 
     def _queue_trust_ask(self, url, host, category, purpose):
         """把待用户确认的网址投递给主窗口（可见则弹窗，隐藏则挂起）。"""

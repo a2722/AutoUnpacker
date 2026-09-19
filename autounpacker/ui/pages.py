@@ -295,12 +295,13 @@ class TaskPage(QWidget):
     """任务页：队列/历史表 + 失败过滤 + 「该任务日志」（当前任务 / 全部）。
 
     只持有状态与控件；任务/日志数据的装载由宿主 MainWindow 完成（便于打桩测试）。
-    信号：taskActivated(task_id) / taskDeselected() / actionTriggered(task_id, kind) /
-          copyRequested() / scopeChanged(scope) / resultFilterChanged(failed) /
-          logScopeChanged(scope) / refreshRequested()
+    信号：taskActivated(task_id) / taskDoubleClicked(task_id) / taskDeselected() /
+          actionTriggered(task_id, kind) / copyRequested() / scopeChanged(scope) /
+          resultFilterChanged(failed) / logScopeChanged(scope) / refreshRequested()
     """
 
     taskActivated = pyqtSignal(int)
+    taskDoubleClicked = pyqtSignal(int)
     taskDeselected = pyqtSignal()
     actionTriggered = pyqtSignal(int, str)
     copyRequested = pyqtSignal()
@@ -358,6 +359,7 @@ class TaskPage(QWidget):
         # 任务表
         self.table = TaskTable(self)
         self.table.taskActivated.connect(self.taskActivated)
+        self.table.taskDoubleClicked.connect(self.taskDoubleClicked)
         self.table.actionTriggered.connect(self.actionTriggered)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_TASKS)
 

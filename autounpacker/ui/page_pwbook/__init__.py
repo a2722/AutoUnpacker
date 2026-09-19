@@ -26,7 +26,10 @@
   本模块绝不直接读写 SQLite 文件（测试可对这些入口打桩）。
 关键入口：PasswordBookPage / EMPTY_BOOK / EMPTY_PWFILTER / EMPTY_SHARE
 依赖：PyQt5、db、password_book（行级 helper / 行格式解析器）、style（PALETTE）、widgets（Glyph / SegControl / show_toast）
-注意：口令与固定提取码属隐私数据——本模块不把明文写进任何日志、提示或 tooltip；
+注意：口令与固定提取码属隐私数据——明文绝不写进任何日志、notice 回执 / toast 提示；
+      刻意例外（用户已显式放宽旧约束）：口令列 hover tooltip 明文展示该行口令
+      （「口令：<明文> · 双击可复制」，仅超长时中间省略，见 models._PWD_TOOLTIP_MAX）；
+      提取码列 tooltip 仍是说明性文案（不展示提取码明文）；
       复制是用户显式动作（只写系统剪贴板）；删除只动密码本 / 提取码条目，绝不触碰任何文件。
 注意：备注列来自 passwords.note（行级 API），为空显示「—」；编辑对话框同时改口令与备注，
       备注可只改不改口令；重名口令按 id 定向删除，不再整体重写。

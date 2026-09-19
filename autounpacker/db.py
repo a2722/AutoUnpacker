@@ -871,6 +871,32 @@ def prune_logs(before_ts):
         return 0
 
 
+def delete_task(task_id):
+    """彻底删除一个任务：tasks 行 + 该任务的日志索引行（同一事务）。
+
+    这是「删除记录」的硬删除路径（与「从队列移除」的软取消不同）：删除后该任务
+    连同它的日志永久消失，绝不会再回到队列。返回是否命中 tasks 行；任何异常都不抛。
+    """
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        return False
+    if tid <= 0:
+        return False
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                conn.execute("DELETE FROM log_index WHERE task_id = ?", (tid,))
+                cur = conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
 def prune_tasks(limit=500):
     """只保留最新 limit 条终态任务，返回删除行数；非终态行永不删除。
 

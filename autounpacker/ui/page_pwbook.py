@@ -53,12 +53,12 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog
                              QWidget)
 
 from .. import db
-from ..password_book import (add_password_row, add_share_code_row,
-                             delete_password_row, delete_share_code_row,
-                             format_share_code_text, list_password_rows,
-                             list_share_code_rows, parse_share_code_text,
-                             set_share_code_rows, update_password_row,
-                             update_share_code_row)
+from ..passwords.book import (add_password_row, add_share_code_row,
+                              delete_password_row, delete_share_code_row,
+                              format_share_code_text, list_password_rows,
+                              list_share_code_rows, parse_share_code_text,
+                              set_share_code_rows, update_password_row,
+                              update_share_code_row)
 from .style import PALETTE, tokens
 from .widgets import Glyph, SegControl, show_toast
 

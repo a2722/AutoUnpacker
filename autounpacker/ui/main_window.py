@@ -29,7 +29,7 @@ from .. import hub
 from ..config import (parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE,
                       HOTKEY_ID_SHARE_CODE, MOD_NOREPEAT)
 from ..trust import add_trust_entry
-from ..password_book import PasswordBookDialog
+from .password_book import PasswordBookDialog
 from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,
                      watch_path_conflict)
 from .widgets import (WatchCard,  # noqa: F401  （M3 起主界面不再创建，保留给目录弹窗/后续里程碑）

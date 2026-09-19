@@ -120,7 +120,7 @@ def main():
     # 所以本调用必须排在它前面。）
     _setup_high_dpi()
 
-    # Qt 平台插件路径必须在任何 PyQt5 导入（含 password_book/main_window
+    # Qt 平台插件路径必须在任何 PyQt5 导入（含 ui.password_book/main_window
     # 等 UI 模块）之前注入，否则 venv 下窗口直接闪退。
     _ensure_qt_platform_plugins()
 

@@ -27,7 +27,7 @@
                               归档内部穿透（--max-depth）；含 CLI 自测入口
   sevenzip.py                 7-Zip 可执行文件检测/下载/调用封装
   trail.py                    删除回溯（回收站操作 + 记录）
-  password_book.py            密码本数据源（落 toolbox.db）
+  passwords/book.py           密码本数据源（行级 helper + 行文本解析；落 toolbox.db）
 
 二维码 / 链接
   qr_decode.py                二维码解码（图片 → 文本）

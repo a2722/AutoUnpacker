@@ -27,6 +27,7 @@ from collections import deque
 from pathlib import Path
 
 from .config import delete_policy_permanent_fallback
+from .deletion import engine as deletion_engine
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -2361,36 +2362,9 @@ def _recycle_paths(paths, permanent_fallback=True, quarantine_root=None, quarant
 
     返回 (recycled, failed)：recycled=已移入回收站的路径；failed=回收站不可用时
     已永久删除的路径（True）或未能回收、保留在原地的路径（False）。不存在的忽略。"""
-    targets = [str(p) for p in paths if Path(p).exists()]
-    if not targets:
-        return [], []
-    recycled, failed = [], []
-    try:
-        from . import trail as deletion_trail
-        ok, failed = deletion_trail.send_to_recycle_bin(targets)
-        recycled = [t for t in targets if t not in failed]
-        if not ok:
-            failed = [t for t in targets if t not in recycled]
-    except Exception:
-        recycled, failed = [], list(targets)
-    if failed and quarantine_root is not None:
-        # 隔离模式：能移则移，移不动的原样留在原位；无论成败都不永久删除。
-        try:
-            from . import trail as deletion_trail
-            moved, still = deletion_trail.move_to_quarantine(failed, quarantine_root)
-            if quarantine_out is not None:
-                quarantine_out.extend(moved)
-            failed = list(still)
-        except Exception:
-            pass
-        return recycled, failed
-    if permanent_fallback:
-        for p in failed:
-            try:
-                Path(p).unlink(missing_ok=True)
-            except OSError:
-                pass
-    return recycled, failed
+    return deletion_engine._recycle_paths(
+        paths, permanent_fallback=permanent_fallback,
+        quarantine_root=quarantine_root, quarantine_out=quarantine_out)
 
 
 def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=None):

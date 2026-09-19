@@ -24,6 +24,7 @@ from pathlib import Path
 from . import paths
 from . import extract as smart_extract   # noqa: F401  保留原名引用
 from . import trail as deletion_trail     # noqa: F401
+from .deletion import quarantine as deletion_quarantine
 from . import db                          # noqa: F401
 from . import volume_pair
 from . import baidu_manifest             # 实验性开关判定（子目录监听/分卷递归的唯一闸门）
@@ -41,10 +42,7 @@ def _in_quarantine(path):
     隔离区里的文件是「已删除源文件的可还原副本」，绝不能再被当成新压缩包扫描/重解，
     否则会被反复处理甚至再次删除。所有枚举监听/输出根的地方都必须先过这一关。
     """
-    try:
-        return deletion_trail.QUARANTINE_DIRNAME in Path(path).parts
-    except Exception:
-        return False
+    return deletion_quarantine.in_quarantine(path)
 
 
 def _tasks_changed(hub):

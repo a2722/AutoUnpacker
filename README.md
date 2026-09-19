@@ -2,7 +2,7 @@
 
 监听下载目录，自动智能解压。把压缩包丢进监听文件夹，剩下的交给它：自动识别格式、试密码、穿透多层嵌套、处理分卷、移入回收站，全程无需人工干预。
 
-> **v1.1.2** · [更新日志](CHANGELOG.md) · MIT License
+> **v2.0.0** · [更新日志](CHANGELOG.md) · GPL-3.0-only License
 
 ## 它能做什么
 
@@ -125,7 +125,7 @@ AutoUnpacker/
 
 ## 第三方依赖与致谢
 
-本项目代码为原创（MIT 许可）。运行时依赖以下开源项目，各自版权归其作者所有，
+本项目代码为原创。运行时依赖以下开源项目，各自版权归其作者所有，
 使用方式均为通过 pip / 独立安装获取，未修改、未捆绑其代码：
 
 | 依赖 | 用途 | 许可 |
@@ -138,11 +138,32 @@ AutoUnpacker/
 | [opencv-python](https://github.com/opencv/opencv-python) | 图像增强 | Apache 2.0（部分组件 LGPL） |
 | [7-Zip](https://www.7-zip.org/) | 压缩/解压引擎 | LGPL（外部调用，隔离安装到 `%APPDATA%\AutoUnpacker\7z`，不链接不修改） |
 
-> 关于 PyQt5 许可：本项目通过 `requirements.txt` 声明依赖、由用户自行安装
-> （不捆绑分发 PyQt5 二进制），按 Riverbank 官方说明属于与 GPL 代码分开分发，
-> 项目本身可保持 MIT 许可。若未来改为打包分发（PyInstaller 等），需按 GPL v3
-> 要求重新评估（开源你的应用或购买商业许可）。
+> **关于 PyQt5 与 GPL**：本项目以 PyQt5 作为唯一的 GUI 工具包，而 PyQt5 的免费
+> 版本是 **GPL v3**（注意：传染的是 PyQt **绑定层**本身；其底层 Qt 库为 LGPL v3）。
+> 因此自 v2.0.0 之后的新版本起，本项目**同样以 GPL-3.0-only 发布**——两者许可
+> 一致，不再存在冲突，**将来即使改为打包分发二进制（PyInstaller 等）也无需额外
+> 授权或购买商业许可**。
+>
+> 历史说明：v2.0.0 及更早版本曾以 MIT 发布，与上述依赖存在许可冲突。该等版本对
+> **已经获得它们的人仍按 MIT 授权，且不可撤销**——许可变更只作用于其后的新版本。
 
 ## License
 
-MIT
+Copyright (c) 2026 Diana777
+
+本项目以 **GNU 通用公共许可证第 3 版（GPL-3.0-only）** 发布，完整条款见
+[LICENSE](LICENSE)。许可变更的来龙去脉见 [CHANGELOG](CHANGELOG.md)。
+
+> v2.0.0 及更早版本曾以 MIT 许可发布，该授权对已获得这些版本的人**持续有效、
+> 不可撤销**；自 v2.0.0 之后的新版本起改为 GPL-3.0-only。
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.

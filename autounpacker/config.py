@@ -2,10 +2,12 @@
 """配置中心：默认值、净化、读取、原子保存、全局快捷键解析。
 
 职责：- 维护 DEFAULT_CONFIG 全部配置项（通知/二维码/信任/实验性等开关）
+- get_int()/get_bool()/get_str() 读配置的唯一强制转换口径（与 _sanitize_cfg 容错一致）
 - _sanitize_cfg() 净化与迁移旧版配置（旧路径密码并入全局密码本、补默认值）
 - load_config() 读取合并、损坏时备份回退默认；save_config() 原子写入
 - parse_hotkey() 把 'Ctrl+Alt+W' 解析为 (mods, vk)，供全局快捷键注册
-关键入口：load_config() / save_config() / parse_hotkey() / _sanitize_cfg()
+关键入口：get_int() / get_bool() / get_str() / load_config() / save_config() /
+          parse_hotkey() / _sanitize_cfg()
 依赖：paths（配置文件路径）、utils._norm_path_for_cfg
 注意：保存必须走 save_config()（先写 .tmp 再 os.replace），半截 JSON 会导致下次启动整个配置被静默重置
 """
@@ -115,6 +117,41 @@ DEFAULT_CONFIG = {
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
+
+
+# ---------- 配置取值访问器（全包唯一强制转换口径，与 _sanitize_cfg 容错一致） ----------
+def get_int(cfg, key, default, lo=None, hi=None):
+    """读整数配置：坏值（int() 抛异常，含 None / 坏字符串 / 列表）回退 default，
+    再钳到 [lo, hi]（给定时；default 同样参与钳位）。
+
+    容错与 _sanitize_cfg 的 poll_interval / temp_password_max /
+    task_history_limit / share_gesture_wait_sec 分支完全一致：bool 是 int 的
+    子类（True→1 / False→0），钳位用 min(hi)/max(lo) 两步，等价于
+    max(lo, min(hi, v))。绝不抛异常。
+    """
+    try:
+        v = int(cfg.get(key, default))
+    except Exception:
+        v = default
+    if hi is not None:
+        v = min(hi, v)
+    if lo is not None:
+        v = max(lo, v)
+    return v
+
+
+def get_bool(cfg, key, default):
+    """读布尔配置：与 _sanitize_cfg 的 bool(cfg.get(key, default)) 口径完全
+    一致——键缺失取 default；键存在时按 bool() 判定（None→False、非空字符串
+    →True）。不额外加容错/回退策略（加 try 会改变异常行为）。"""
+    return bool(cfg.get(key, default))
+
+
+def get_str(cfg, key, default):
+    """读字符串配置：与 _sanitize_cfg 的 str(cfg.get(key, default)) 口径完全
+    一致——键缺失取 default；键存在时一律 str()（None→"None"）。不含 strip /
+    合法性校验，那些属于各键的额外策略，由调用方按需自行处理。"""
+    return str(cfg.get(key, default))
 
 
 def _sanitize_cfg(cfg):

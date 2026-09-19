@@ -6,7 +6,7 @@
 - 特殊用户固定提取码代理到 toolbox.db（share_code_map/set_share_code_map/add_share_code/find_share_entry）
 - 临时密码的捕获、过期裁剪、条数上限、开机内持久化（temp_passwords.json）
 关键入口：AppState
-依赖：db、config.save_config、utils（_boot_time/_boot_tick）
+依赖：db、config（save_config/get_int/get_bool）、utils（_boot_time/_boot_tick）
 注意：临时密码生命周期 = 本次系统启动（程序重启不丢，系统重启自动失效）
 """
 import json
@@ -15,7 +15,7 @@ import threading
 import time
 
 from . import db, paths
-from .config import save_config
+from .config import get_bool, get_int, save_config
 from .utils import _boot_time, _boot_tick
 
 class AppState:
@@ -34,11 +34,8 @@ class AppState:
         self._load_temp_passwords()
 
     def _temp_cfg_int(self, key, default, lo, hi):
-        try:
-            v = int(self.cfg.get(key, default))
-        except Exception:
-            v = default
-        return max(lo, min(hi, v))
+        """（薄委托）整数配置读取：容错/钳位口径统一见 config.get_int。"""
+        return get_int(self.cfg, key, default, lo, hi)
 
     def _temp_max(self):
         """临时密码最多保留条数（默认 200，可在设置里改）。"""
@@ -234,7 +231,7 @@ class AppState:
 
     def auto_add(self):
         with self.lock:
-            return bool(self.cfg.get("auto_add_clipboard_password", False))
+            return get_bool(self.cfg, "auto_add_clipboard_password", False)
 
     def set_auto_add(self, flag):
         self.set("auto_add_clipboard_password", bool(flag))

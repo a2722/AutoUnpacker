@@ -20,6 +20,7 @@ from ctypes import wintypes
 import ctypes
 
 from .paths import DATA_DIR as APP_DIR
+from .utils import same_volume
 TRAIL_FILE = APP_DIR / "deletion_trail.json"
 _lock = threading.Lock()
 
@@ -465,17 +466,13 @@ def _unique_quarantine_dest(dest):
 
 
 def _same_volume(src, dest_root):
-    """src 与 dest_root 是否同一卷：优先 st_dev，取不到退回盘符比较。"""
-    try:
-        return os.stat(str(src)).st_dev == os.stat(str(dest_root)).st_dev
-    except OSError:
-        pass
-    try:
-        a = os.path.splitdrive(os.path.abspath(str(src)))[0].lower()
-        b = os.path.splitdrive(os.path.abspath(str(dest_root)))[0].lower()
-        return bool(a) and a == b
-    except Exception:
-        return False
+    """src 与 dest_root 是否同一卷：优先 st_dev，取不到退回盘符比较。
+
+    薄委托：同卷判定口径统一由 utils.same_volume 提供（保持既有名字，内部
+    调用点不改）。注意 volume_pair._same_volume 是另一套「仅盘符」语义，
+    为硬链接安全刻意保留，两者不可合并。
+    """
+    return same_volume(src, dest_root)
 
 
 def _quarantine_note_dir(qmap):

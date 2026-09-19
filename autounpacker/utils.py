@@ -3,6 +3,7 @@
 
 职责：- _boot_tick()/_boot_time() 识别「同一次系统启动」（GetTickCount64）
 - _norm_path_for_cfg() 配置路径去重规范化
+- same_volume()/drive_key() 同卷判断（st_dev 优先，取不到退回盘符比较）
 - _can_open_append() 检测文件是否被其他进程独占（下载器写入中）
 - _install_crash_log() 把未捕获异常追加进 crash.log（不吞掉原有 excepthook）
 - split_urls()/trim_url()/is_url_like()/is_baidu_pan_url() 全局唯一的网址边界
@@ -63,6 +64,32 @@ def _norm_path_for_cfg(path):
         return p
     except Exception:
         return str(path)
+
+
+def drive_key(path):
+    """路径所在卷的盘符标识（小写，如 'c:'）；取不到 / 无盘符时返回空字符串。"""
+    try:
+        return os.path.splitdrive(os.path.abspath(path))[0].lower()
+    except Exception:
+        return ""
+
+
+def same_volume(a, b):
+    """a 与 b 是否位于同一卷：优先 st_dev 比较，取不到退回盘符比较。
+
+    st_dev 是最可靠的判据（同一盘符的不同挂载点/目录联接也能识别），但要求
+    两侧路径都能 stat（已存在且可访问）；取不到时退回盘符比较（要求两侧盘符
+    都非空且相同）。任何异常一律返回 False，调用方按跨卷的保守路径处理。
+    """
+    try:
+        return os.stat(str(a)).st_dev == os.stat(str(b)).st_dev
+    except OSError:
+        pass
+    except Exception:
+        return False
+    ka = drive_key(str(a))
+    kb = drive_key(str(b))
+    return bool(ka) and ka == kb
 
 
 def watch_path_conflict(entries, new_path):

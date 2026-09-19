@@ -30,8 +30,9 @@ from . import baidu_manifest             # 实验性开关判定（子目录监�
 from .trust import (_host_of, decide_host, remember_auto_domain)
 # 网址边界识别统一走 utils（正向字符集 + 尾部标点规则只有一份）：剪贴板文本
 # 「网址 + 中文说明/提取码」的截断见 utils.split_urls 的文档。
-from .utils import (_can_open_append, split_urls, is_url_like,
-                    is_baidu_pan_url)
+from .utils import (_norm_path_for_cfg, _can_open_append, split_urls,
+                    is_url_like, is_baidu_pan_url)
+from .config import get_bool
 
 
 def _in_quarantine(path):
@@ -306,14 +307,12 @@ class FolderWatcher(threading.Thread):
 
     @staticmethod
     def _norm_path(path):
-        """规范化路径，用于去重（忽略大小写与尾部分隔符）"""
-        try:
-            p = os.path.normcase(os.path.abspath(path))
-            while p.endswith(("\\", "/")) and len(p) > 3:
-                p = p[:-1]
-            return p
-        except Exception:
-            return str(path)
+        """规范化路径，用于去重（忽略大小写与尾部分隔符）
+
+        薄委托：规范化口径统一由 utils._norm_path_for_cfg 提供，保持既有名字
+        （内部大量 self._norm_path(...) 调用点不改）。
+        """
+        return _norm_path_for_cfg(path)
 
     def _set_dir_state(self, path, state, progress=None, name=None):
         """发布一条目录状态消息（dir_state，供新版 GUI 胶囊 / 状态灯消费）。
@@ -1547,7 +1546,7 @@ class FolderWatcher(threading.Thread):
                                  else None),
                 run_script=None, script_args=[],
                 promote_to=promote_to,
-                promote_merge=bool(self.state.snapshot().get("promote_merge", True)),
+                promote_merge=get_bool(self.state.snapshot(), "promote_merge", True),
             )
             if record is not None:
                 args.delete_hook = (
@@ -2006,11 +2005,11 @@ def _should_capture_temp_password(text, cfg):
     """
     try:
         t = "" if text is None else str(text)
-        if not bool(cfg.get("url_exclude_temp_password", True)):
+        if not get_bool(cfg, "url_exclude_temp_password", True):
             return True                                   # 父关 → 照单全收
         if "://" in t.strip():
             return False                                  # 父级：网址不记
-        if bool(cfg.get("temp_password_filter", True)):
+        if get_bool(cfg, "temp_password_filter", True):
             return len(t) < 60 and not _looks_like_non_password(t)
         return True
     except Exception:

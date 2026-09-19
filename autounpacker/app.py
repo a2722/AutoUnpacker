@@ -17,7 +17,7 @@ from . import paths
 from . import extract as smart_extract
 from . import trail as deletion_trail
 from . import db
-from .config import load_config, save_config
+from .config import get_int, load_config, save_config
 from .utils import _install_crash_log
 from .state import AppState
 from .hub import Hub, install_stdout_capture
@@ -193,9 +193,11 @@ def main():
     except Exception:
         pass
 
-    # 任务历史按配置收敛（只删终态、保留最新 N 条；失败绝不影响启动）
+    # 任务历史按配置收敛（只删终态、保留最新 N 条；失败绝不影响启动）。
+    # cfg 为 load_config() 产物：task_history_limit 已被 _sanitize_cfg 钳为
+    # [1, 100000] 的 int，这里用同一口径读取（等价于旧 int(... or 500)）。
     try:
-        db.prune_tasks(int(cfg.get("task_history_limit", 500) or 500))
+        db.prune_tasks(get_int(cfg, "task_history_limit", 500, 1, 100000))
     except Exception:
         pass
 

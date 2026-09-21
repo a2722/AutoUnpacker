@@ -81,7 +81,8 @@ from .window.share_flow import (  # noqa: F401
     _clipboard_share_target, _share_input_inflight, _share_gesture_wait_sec,
     _share_uk_for_surl, _mark_gesture_launch, _gesture_launched_recently,
     _share_invoke_busy_stale, _call_start_share_pick,
-    _prefill_share_code_window, _share_parent_usable, _share_notify_via,
+    _manual_reinvoke_guard, _prefill_share_code_window, _share_parent_usable,
+    _share_notify_via,
     _take_share_ask_notified, _announce_ask_code_hidden,
     _share_pan_open_blocked, _show_share_code_window)
 
@@ -724,8 +725,10 @@ class MainWindow(QMainWindow):
     def _add_path(self):
         """「添加目录」：新建空条目并直接打开目录设置弹窗；取消/关闭则回收空条目。"""
         cfg = self.state.snapshot()
+        # 新目录默认 quarantine：与监听目录弹窗的推荐一致，避免无回收站卷上被永久删除
         entry = {"path": "", "enabled": True, "output_dir": "",
-                 "delete_source": False, "delete_policy": "auto", "mode": "surface"}
+                 "delete_source": False, "delete_policy": "quarantine",
+                 "mode": "surface"}
         cfg["watch_paths"].append(entry)
         self.state.set("watch_paths", cfg["watch_paths"])
         idx = len(cfg["watch_paths"]) - 1
@@ -772,9 +775,10 @@ class MainWindow(QMainWindow):
                     "该目录与已有监听路径重叠，可能重复处理同一批文件：\n"
                     f"{root}\n↔ {conflict.get('path')}")
                 return
+            # 新目录默认 quarantine：与监听目录弹窗的推荐一致，避免无回收站卷上被永久删除
             entries.append({"path": str(root), "enabled": True,
                             "output_dir": "", "delete_source": False,
-                            "delete_policy": "auto",
+                            "delete_policy": "quarantine",
                             "mode": "baidu"})
             self.state.set("watch_paths", entries)
             self.rebuild_cards()
@@ -2115,6 +2119,21 @@ class MainWindow(QMainWindow):
                 # 缺码小窗——它只为填写提取码而生，绝不让它赖到 120s 超时。
                 _close_share_ask_dlg(self, item.get("surl"), item.get("uk"),
                                      item.get("url"))
+            elif item["type"] == "share_dead":
+                # 抓页即判定的「链接已失效」（最早的判定点，monitor 线程投递）：
+                # 1) 当场弹一条托盘通知——不盯着日志的人也能立刻知道链接死了；
+                # 2) 核销相关待办：作废等待中的手势预定任务（否则会空等到超时，
+                #    只报一句「手势超时」），并关闭/作废同分享的填写提取码小窗
+                #    （它注定填了也没用）。
+                if getattr(self, "_pending_share_gesture", None):
+                    self._pending_share_gesture = None
+                    self._append_log(
+                        "[分享] 链接已失效，等待中的手势预定任务已作废（不再事后补拉）")
+                _close_share_ask_dlg(
+                    self, item.get("surl"), None, item.get("url"),
+                    note="[分享] 链接已失效，提取码小窗已关闭并作废")
+                _share_notify_via(self, "分享链接已失效",
+                                  f"{item.get('url')}\n{item.get('reason')}")
 
     def _refresh_share_menu(self):
         """按「实验性功能」总开关刷新分享菜单项可见性（整条 2.F 属实验性）。"""
@@ -2236,6 +2255,9 @@ class MainWindow(QMainWindow):
                     f"[分享] 剪贴板链接缺提取码：已按最近复制的提取码补上 -> {code}")
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起。
             self._pending_share_gesture = None
+            # 重复拉起拦截（Alt+2）：本次运行已拉起过 → 第一次只提醒，需再按一次
+            if _manual_reinvoke_guard(self, surl, url):
+                return
             _mark_gesture_launch(self, surl)
             self._bump_share_launch(surl)
             self._start_share_invoke(url, code, manual=True)
@@ -2390,6 +2412,10 @@ class MainWindow(QMainWindow):
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起。
             self._pending_share_gesture = None
             _surl = rec.get("surl") or rec.get("url")
+            # 重复拉起拦截（Alt+2）：本次运行已拉起过 → 第一次只提醒，需再按一次
+            # 同一手势才真正再下载（旧行为「手动即明确同意、直接再下载」正是误触重下的根因）。
+            if _manual_reinvoke_guard(self, _surl, rec.get("url")):
+                return
             # 手势时间戳：管线随后再报到同一链接时静默去重（见 _drain 自动分支）。
             _mark_gesture_launch(self, _surl)
             # 手动路径即用户明确同意：直接拉起，同时计数（与自动路径共用 d7 计数）
@@ -2576,8 +2602,7 @@ class MainWindow(QMainWindow):
                 fired["done"] = True
                 try:
                     self.hub.log(f"[分享] 已请求客户端下载（{detail}）")
-                    self.hub.q.put({"type": "notify", "title": "用客户端下载分享",
-                                    "msg": str(url)})
+                    _share_notify_via(self, "用客户端下载分享", str(url))
                 except Exception:
                     pass
 
@@ -2688,10 +2713,9 @@ class MainWindow(QMainWindow):
             self.hub.log(
                 "[分享] 实验性自动拉起不携带登录态：若客户端未运行可能需重新登录")
             try:
-                self.hub.q.put({
-                    "type": "notify",
-                    "title": "实验性自动拉起",
-                    "msg": "实验性自动拉起不携带登录态：若客户端未运行可能需重新登录"})
+                _share_notify_via(
+                    self, "实验性自动拉起",
+                    "实验性自动拉起不携带登录态：若客户端未运行可能需重新登录")
             except Exception:
                 pass
         self._share_invoke_busy = True
@@ -2727,8 +2751,7 @@ class MainWindow(QMainWindow):
                 fired["done"] = True
                 try:
                     self.hub.log(f"[分享] 提交成功: 已请求客户端下载（{detail}）")
-                    self.hub.q.put({"type": "notify", "title": "分享下载",
-                                    "msg": str(url)})
+                    _share_notify_via(self, "分享下载", str(url))
                     # 提交成功（已请求客户端下载）：该分享的小窗任务完成。
                     _notify_share_used(self, surl=surl, uk=bind_code_uk, url=url)
                 except Exception:
@@ -2875,7 +2898,13 @@ class MainWindow(QMainWindow):
         return bool(self._share_pick_flag(share_uk))
 
     def _share_notify(self, title, msg):
-        """托盘气泡（线程安全）：只向 hub 队列投递，由 `_drain()` 在 Qt 线程消费。"""
+        """托盘气泡（线程安全）：走 `hub.notify`（受通知总开关/分组开关过滤），
+        由 `_drain()` 在 Qt 线程消费；轻量宿主无 notify 时回退直接投队列。"""
+        try:
+            self.hub.notify(title, msg)
+            return
+        except Exception:
+            pass
         try:
             self.hub.q.put({"type": "notify", "title": title, "msg": msg})
         except Exception:
@@ -3157,9 +3186,9 @@ class MainWindow(QMainWindow):
             return
         self._append_log(f"[分享] 该分享本次运行已拉起过，需确认后才会再次拉起: {surl}")
         try:
-            self.hub.q.put({"type": "notify", "title": "重复的分享链接",
-                            "msg": f"本次运行已拉起过该分享（{surl}），"
-                                   f"如需再次下载请打开主界面确认。"})
+            _share_notify_via(self, "重复的分享链接",
+                              f"本次运行已拉起过该分享（{surl}），"
+                              f"如需再次下载请打开主界面确认。")
         except Exception:
             pass
 

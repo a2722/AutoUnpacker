@@ -177,8 +177,14 @@ def default_output_dir(archive):
         out = archive.with_suffix("")
     except ValueError:
         out = archive
-    if not out.name:
-        out = archive.parent / f"{archive.name}_extracted"
+    # Windows 会静默裁掉每个路径分量**结尾**的空格与点。若源文件名在扩展名前带
+    # 空格（如「标题 .txt」），去扩展名后就得到「标题 」（结尾空格）——派生名与
+    # 磁盘真实名字于是对不上：产出计数为 0、目录访问失败、删除回溯里记的是错名，
+    # 甚至把空壳目录留在原地。这里按 Windows 同一规则预先裁掉，保证派生名 == 磁盘名。
+    name = out.name.rstrip(" .")
+    if not name:
+        name = f"{archive.name}_extracted"
+    out = out.parent / name
     if out == archive or (out.exists() and not out.is_dir()):
         out = archive.parent / f"{archive.name}_extracted"
     return out

@@ -2,12 +2,13 @@
 """版本检查与自动更新：查询 GitHub Releases、下载新版并生成 update.bat 自更新。
 
 职责：- check_latest_version() 查询最新 tag；compare_versions() 语义化版本比较
-- download_release_zip()/verify_release_zip() 下载并校验更新包（防 zip slip）
+- download_release_zip()/verify_release_zip() 下载并校验更新包（SHA256 校验和 + 防 zip slip）
 - apply_update() 生成 update.bat：结束进程 → 备份旧代码 → 覆盖新代码 → 重启程序
 关键入口：check_latest_version() / apply_update() / compare_versions()
 依赖：urllib.request、zipfile、GitHub API（a2722/AutoUnpacker，无认证 60 次/小时）
 注意：绝不主动拉取（仅用户点击按钮触发）；config.json/toolbox.db/logs/backup 等数据文件绝不覆盖
 """
+import hashlib
 import json
 import os
 import shutil
@@ -117,6 +118,89 @@ def _archive_url(tag):
     return f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{tag}.zip"
 
 
+# 发布方在 Release 里附带的校验和资产名（大小写不敏感，任选其一）。
+# 发布流程约定：把 sha256sum 输出保存为 SHA256SUMS 文本并作为 Release 资产上传。
+SHA256_ASSET_NAMES = ("sha256sums", "sha256sums.txt", "sha256.txt")
+
+
+def sha256_file(path):
+    """流式计算文件的 SHA256（小写十六进制）。任何异常返回 ""。"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _parse_sha256sums(text, tag):
+    """从 SHA256SUMS 文本里取与 tag 对应的哈希。
+
+    行格式：`<64位hex>␠␠<文件名>`（可带 `*` 二进制标记；`#` 开头为注释）。
+    文件名匹配用「去掉前导 v 的 tag」（GitHub 源码包名为 `Repo-2.1.0.zip`，
+    而 tag 是 `v2.1.0`）；匹配不到时，若全文只有一条也采用。都取不到返回 ""。
+    """
+    try:
+        cands = []
+        for raw in str(text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            h, name = parts[0].strip().lower(), parts[1].strip().lstrip("*")
+            if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+                continue
+            cands.append((h, name))
+        if not cands:
+            return ""
+        bare = str(tag or "").lstrip("vV")
+        for h, name in cands:
+            if bare and bare in name:
+                return h
+        return cands[0][0] if len(cands) == 1 else ""
+    except Exception:
+        return ""
+
+
+def fetch_expected_sha256(tag, timeout=None):
+    """取发布方在该 tag 的 Release 里公布的 SHA256（无则返回 ""）。
+
+    缺资产 / 网络失败 / 解析不出都返回 ""——调用方据此按「无法校验」处理，
+    **绝不因此中断更新**（否则从「尚未附带校验和的旧版本」就再也升不上来了）。
+    """
+    try:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}"
+        req = urllib.request.Request(api, headers={
+            "User-Agent": "AutoUnpacker/" + _local_version(),
+            "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout or CHECK_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        asset = None
+        for a in (data.get("assets") or []):
+            if str(a.get("name") or "").strip().lower() in SHA256_ASSET_NAMES:
+                asset = a
+                break
+        if not asset:
+            return ""
+        url = str(asset.get("browser_download_url") or "")
+        if not url:
+            return ""
+        req2 = urllib.request.Request(url, headers={
+            "User-Agent": "AutoUnpacker/" + _local_version()})
+        with urllib.request.urlopen(req2, timeout=timeout or CHECK_TIMEOUT) as resp:
+            text = resp.read().decode("utf-8", "replace")
+        return _parse_sha256sums(text, tag)
+    except Exception:
+        return ""
+
+
 def download_release_zip(tag, dest_dir=None, progress_cb=None):
     """下载指定 tag 的源码 zip。
 
@@ -182,13 +266,20 @@ def _extract_zip(zip_path, dest_dir):
         return None
 
 
-def verify_release_zip(zip_path):
-    """校验下载的 zip：可解压且包含 autounpacker 包。
+def verify_release_zip(zip_path, expected_sha256=""):
+    """校验下载的 zip：SHA256（若发布方提供了）→ 可解压 → 包含 autounpacker 包。
 
+    `expected_sha256` 非空时**先校验哈希**，不匹配直接判失败（挡下载损坏/被替换）。
     返回 (ok: bool, 解压出的顶层目录 或 None, 错误信息)。
     解压到系统临时目录；成功时调用方负责清理（更新 bat 会删），
     失败时这里清理。
     """
+    if expected_sha256:
+        got = sha256_file(zip_path)
+        if got != str(expected_sha256).strip().lower():
+            return False, None, (
+                "更新包 SHA256 校验失败（下载可能被篡改或损坏）："
+                f"期望 {str(expected_sha256)[:12]}…，实际 {got[:12] or '(读取失败)'}…")
     tmp = Path(tempfile.gettempdir()) / f"autounpacker_stage_{uuid.uuid4().hex[:8]}"
     tmp.mkdir(parents=True, exist_ok=True)
     ok = False
@@ -215,7 +306,7 @@ def _project_root():
 
 
 def _backup_dir():
-    """更新前备份目录：backup\\update_before_<tag>_<时间戳>。"""
+    """更新前备份目录：backup\\update_before_<时间戳>（仅时间戳，不含 tag）。"""
     from . import paths
     bk = Path(paths.PROJECT_ROOT) / "backup" / \
         f"update_before_{time_str()}"
@@ -257,7 +348,11 @@ def _overwrite_tree(src_dir, dst_dir, progress_cb=None):
 def write_update_bat(stage_dir, tag):
     """生成 update.bat（更新执行脚本）。
 
-    流程：结束当前进程 → 备份旧代码 → 覆盖新代码 → 清理临时目录 → 重启程序。
+    流程：结束当前进程 → 备份旧代码到 backup 快照 → 用新版覆盖（跳过用户
+    数据；检查 robocopy 返回值，>= 8 视为失败）→ 成功则清理临时目录并重启；
+    失败则用备份快照自动回滚（同样跳过用户数据），回滚成功也重启（恢复到
+    更新前的可用状态），回滚本身失败则保留备份与更新包并提示手动恢复。
+    覆盖/回滚过程与错误写入 <备份目录>\\update.log，便于排查。
     返回 bat 文件路径。
     """
     root = _project_root()
@@ -273,7 +368,7 @@ echo [AutoUnpacker] 正在更新到 {tag} ...
 rem 1. 结束当前程序进程（通过 update.bat 独立运行，程序已自行退出）
 taskkill /IM pythonw.exe /F >nul 2>&1
 timeout /t 2 /nobreak >nul
-rem 2. 备份旧代码到 backup 目录
+rem 2. 备份旧代码到 backup 目录（布局与安装目录一致，失败时据此回滚）
 if not exist "{bk}" mkdir "{bk}"
 if exist "{root}\\autounpacker" robocopy "{root}\\autounpacker" "{bk}\\autounpacker" /E /NFL /NDL /NJH /NJS >nul 2>&1
 if exist "{root}\\main.py" copy /Y "{root}\\main.py" "{bk}\\main.py" >nul 2>&1
@@ -284,19 +379,55 @@ if exist "{root}\\LICENSE" copy /Y "{root}\\LICENSE" "{bk}\\LICENSE" >nul 2>&1
 if exist "{root}\\.gitignore" copy /Y "{root}\\.gitignore" "{bk}\\.gitignore" >nul 2>&1
 if exist "{root}\\config.example.json" copy /Y "{root}\\config.example.json" "{bk}\\config.example.json" >nul 2>&1
 rem 3. 用新版覆盖（跳过数据文件：config/toolbox.db/temp_passwords/deletion_trail/logs/backup）
-robocopy "{stage}" "{root}" /E /NFL /NDL /NJH /NJS /XD logs backup /XF config.json toolbox.db temp_passwords.json deletion_trail.json crash.log >nul 2>&1
-rem 4. 清理临时目录
+rem    robocopy 返回值 >= 8 即失败；输出写入日志便于排查（不回显到控制台）
+echo [%date% %time%] overwrite start: {stage} root={root} > "{bk}\\update.log"
+robocopy "{stage}" "{root}" /E /NFL /NDL /NJH /NJS /XD logs backup /XF config.json toolbox.db temp_passwords.json deletion_trail.json crash.log >>"{bk}\\update.log" 2>&1
+if %ERRORLEVEL% GEQ 8 goto :rollback
+rem 4. 覆盖成功：清理临时目录
 if exist "{root}\\.update_stage" rmdir /S /Q "{root}\\.update_stage" >nul 2>&1
 rem 5. 重启程序
 start "" "{pythonw}" "{root}\\main.py" --autostart
 echo [AutoUnpacker] 更新完成，程序已重启。
+goto :end
+
+:rollback
+echo.
+echo [AutoUnpacker] 更新失败！正在用备份回滚到更新前的版本 ...
+echo [AutoUnpacker] 失败详情见日志: "{bk}\\update.log"
+echo [%date% %time%] rollback start: {bk} root={root} >> "{bk}\\update.log"
+if not exist "{bk}\\autounpacker" goto :rollback_failed
+robocopy "{bk}\\autounpacker" "{root}\\autounpacker" /E /NFL /NDL /NJH /NJS /XD logs backup /XF config.json toolbox.db temp_passwords.json deletion_trail.json crash.log >>"{bk}\\update.log" 2>&1
+if %ERRORLEVEL% GEQ 8 goto :rollback_failed
+if exist "{bk}\\main.py" copy /Y "{bk}\\main.py" "{root}\\main.py" >nul 2>&1
+if exist "{bk}\\requirements.txt" copy /Y "{bk}\\requirements.txt" "{root}\\requirements.txt" >nul 2>&1
+if exist "{bk}\\README.md" copy /Y "{bk}\\README.md" "{root}\\README.md" >nul 2>&1
+if exist "{bk}\\CHANGELOG.md" copy /Y "{bk}\\CHANGELOG.md" "{root}\\CHANGELOG.md" >nul 2>&1
+if exist "{bk}\\LICENSE" copy /Y "{bk}\\LICENSE" "{root}\\LICENSE" >nul 2>&1
+if exist "{bk}\\.gitignore" copy /Y "{bk}\\.gitignore" "{root}\\.gitignore" >nul 2>&1
+if exist "{bk}\\config.example.json" copy /Y "{bk}\\config.example.json" "{root}\\config.example.json" >nul 2>&1
+echo [%date% %time%] rollback ok >> "{bk}\\update.log"
+echo [AutoUnpacker] 已回滚到更新前的版本，程序将重启。
+rem 失败时保留更新包：{stage}（便于排查，不删除）
+start "" "{pythonw}" "{root}\\main.py" --autostart
+goto :end
+
+:rollback_failed
+echo.
+echo [AutoUnpacker] 警告：回滚失败！程序可能无法正常启动。
+echo [AutoUnpacker] 更新前的备份完好保存在: "{bk}"
+echo [AutoUnpacker] 更新包保留在: {stage}
+echo [AutoUnpacker] 程序未重启（代码状态未知），请用备份手动恢复。
+echo [%date% %time%] rollback FAILED >> "{bk}\\update.log"
+goto :end
+
+:end
 """
     bat.write_text(script, encoding="utf-8")
     return str(bat)
 
 
 def apply_update(tag, progress_cb=None):
-    """执行自动更新：下载 → 校验 → 解压 → 生成 bat → 启动 bat。
+    """执行自动更新：下载 → SHA256 校验 → 解压 → 生成 bat → 启动 bat。
 
     返回 (status, message)：
       (STATUS_OK, "更新已完成，程序即将重启") —— 成功
@@ -311,8 +442,13 @@ def apply_update(tag, progress_cb=None):
     st, zip_path, err = download_release_zip(tag, progress_cb=_progress)
     if st != STATUS_OK:
         return STATUS_FAILED, err or "下载更新包失败"
-    # 2. 校验 + 解压
-    ok, stage, err = verify_release_zip(zip_path)
+    # 1.5 取发布方公布的 SHA256（有就强制校验；没有则明确告知「跳过」，不阻断更新）
+    want = fetch_expected_sha256(tag)
+    if progress_cb:
+        progress_cb("已取得发布方校验和，正在校验更新包…" if want
+                    else "该版本未提供 SHA256SUMS，跳过完整性校验…")
+    # 2. 校验（SHA256 若有）+ 解压 + 关键文件
+    ok, stage, err = verify_release_zip(zip_path, expected_sha256=want)
     if not ok:
         return STATUS_FAILED, err or "更新包校验失败"
     # 3. 生成 update.bat

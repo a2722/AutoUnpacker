@@ -104,6 +104,24 @@ class Hub:
         "网盘下载完成": "notify_baidu_done",
         "网盘任务未完成": "notify_baidu_leftover",
         "网盘重复下载": "notify_baidu_dup",
+        # 分享 / 网盘分享家族：14 种标题统一由 notify_share 一个分组开关控制
+        "分享手势超时": "notify_share",
+        "分享链接正在解析": "notify_share",
+        "二维码正在解析": "notify_share",
+        "分享缺少提取码": "notify_share",
+        # 「链接已失效」在分组开关之外再挂一个**专用**开关：想留失效提醒、只关
+        # 分享类噪音的人关 notify_share；想彻底静音的人关 notify_share_dead。
+        # 元组 = 两个开关必须同时为真才显示。
+        "分享链接已失效": ("notify_share", "notify_share_dead"),
+        "分享下载已中断": "notify_share",
+        "拉起后校验失败": "notify_share",
+        "分享拉起失败": "notify_share",
+        "分享下载失败": "notify_share",
+        "分享需要选择文件": "notify_share",
+        "用客户端下载分享": "notify_share",
+        "实验性自动拉起": "notify_share",
+        "分享下载": "notify_share",
+        "重复的分享链接": "notify_share",
     }
 
     def __init__(self, state=None):
@@ -283,8 +301,13 @@ class Hub:
             if not cfg.get("notify_enabled", True):
                 return
             key = self.NOTIFY_KEYS.get(title)
-            if key and not cfg.get(key, True):
-                return
+            # 值可以是单个键名，也可以是键名元组：全部为真才显示（分组开关 +
+            # 专用开关叠加）。元组形式用于「分享链接已失效」这类既要受分组管、
+            # 又想单独关掉的标题。
+            keys = key if isinstance(key, (tuple, list)) else (key,)
+            for k in keys:
+                if k and not cfg.get(k, True):
+                    return
         try:
             self.q.put({"type": "notify", "title": title, "msg": msg})
         except Exception:

@@ -100,11 +100,14 @@ def _share_code_in_window(win, surl, share_uk):
     return code, dlg
 
 
-def _close_share_ask_dlg(win, surl=None, uk=None, url=None):
+def _close_share_ask_dlg(win, surl=None, uk=None, url=None, note=None):
     """成功提取后关闭「属于同一分享」的缺提取码小窗（只关闭、绝不回调）。
 
     小窗的唯一职责是收集提取码；一旦该分享被成功拉起（客户端已确认）或挑选提交
     成功，它的任务即告完成，必须立刻消失，绝不赖到 120s 超时。
+
+    `note` 可覆盖收尾日志：链接失效等「非成功」场景关闭小窗时，不能用「已成功
+    提取」这句会误导人的文案（见 main_window `_drain` 的 share_dead 分支）。
 
     归属判定（复用 `_share_dlg_target`）：小窗 target_surl 等于 surl、或 target_uk
     等于 uk、或小窗记录的原链接等于 url——三者任一命中才算「同一分享」，绝不动别
@@ -147,7 +150,7 @@ def _close_share_ask_dlg(win, surl=None, uk=None, url=None):
         win._share_ask_dlg = None
     except Exception:
         pass
-    _share_log(win, "[分享] 已成功提取，提取码小窗已关闭（填写任务完成）")
+    _share_log(win, note or "[分享] 已成功提取，提取码小窗已关闭（填写任务完成）")
     return True
 
 
@@ -414,7 +417,14 @@ def _share_parent_usable(win):
 
 
 def _share_notify_via(win, title, msg):
-    """托盘气泡（module 级）：优先宿主既有 `_share_notify`，否则退回 `hub.notify`。"""
+    """托盘气泡（module 级）：三级收口。
+
+    1) 宿主既有 `_share_notify`（真实实现内部走 `hub.notify`，受通知总开关 +
+       分组开关过滤）；
+    2) `hub.notify`；
+    3) 直接投 `hub.q`——给轻量宿主（测试桩只有 `hub.q`、既无 `_share_notify`
+       也无 `hub.notify`）兜底，否则通知会被静默丢掉，用户看不到任何提示。
+    """
     fn = getattr(win, "_share_notify", None)
     if callable(fn):
         try:
@@ -424,8 +434,71 @@ def _share_notify_via(win, title, msg):
             pass
     try:
         win.hub.notify(title, msg)
+        return
     except Exception:
         pass
+    try:
+        win.hub.q.put({"type": "notify", "title": title, "msg": msg})
+    except Exception:
+        pass
+
+
+# 手动手势（Alt+2）重复拉起的「再按一次确认」窗口（秒）：第一次只提醒不拉起，
+# 窗口内再按一次同一手势才真正强制拉起。
+MANUAL_REARM_SEC = 30
+
+
+def _share_already_launched(win, key):
+    """该分享本次运行是否已拉起过。
+
+    优先宿主方法 `_share_needs_consent`（老测试桩可能没绑定它），取不到回退
+    baidu_manifest 的进程内计数器，再回退本对象的集合。任何异常都按「未拉起过」
+    处理（保持旧桩可用、绝不因这条增强分支打断手动手势）。
+    """
+    fn = getattr(win, "_share_needs_consent", None)
+    if callable(fn):
+        try:
+            return bool(fn(key))
+        except Exception:
+            pass
+    try:
+        if int(bm.share_launch_count(key)) > 0:
+            return True
+    except Exception:
+        pass
+    return key in (getattr(win, "_share_launched_surls", None) or ())
+
+
+def _manual_reinvoke_guard(win, surl, url):
+    """手动手势（Alt+2）重复拉起拦截：需「再按一次」才强制拉起。
+
+    同一分享本次运行已拉起过时：第一次按压只记一行 + 弹「重复」托盘提醒并进入
+    「待确认」，**绝不拉起**；在再确认窗口内再按一次同一手势才强制拉起一次。
+    这样误触（手滑再按一次 Alt+2）不会真的再下载一遍——旧行为「手动即明确同意、
+    直接再下载」正是误触重复下载的根因；确需重下的人只需再按一次，比弹模态框更轻，
+    也不打断连续操作。**未拉起过则一律放行**（首次拉起行为完全不变）。
+
+    返回 True = 已拦截（调用方必须立即 return，不拉起）；False = 放行。
+    """
+    key = str(surl or "").strip()
+    if not key or not _share_already_launched(win, key):
+        return False
+    now = time.time()
+    armed = getattr(win, "_manual_reinvoke_armed", None)
+    if (isinstance(armed, dict) and armed.get("surl") == key
+            and (now - float(armed.get("at") or 0)) <= MANUAL_REARM_SEC):
+        win._manual_reinvoke_armed = None
+        _share_log(win, f"[分享] 已确认（第二次 Alt+2），强制再次拉起: {key}")
+        return False
+    win._manual_reinvoke_armed = {"surl": key, "at": now}
+    _share_log(win,
+               f"[分享] 该分享本次运行已拉起过，已拦下（不重复下载）；"
+               f"如确需再拉一次，请在 {MANUAL_REARM_SEC} 秒内再按一次 Alt+2: {key}")
+    _share_notify_via(
+        win, "重复的分享链接",
+        f"{url}\n本次运行已拉起过该分享，已拦下避免重复下载。"
+        f"如确需强制再拉一次，请再按一次 Alt+2 确认。")
+    return True
 
 
 def _take_share_ask_notified(win):

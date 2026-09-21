@@ -22,6 +22,8 @@ from .utils import _install_crash_log
 from .state import AppState
 from .hub import Hub, install_stdout_capture
 from .monitors import FolderWatcher, QRMonitor, QR_AVAILABLE
+# 解码引擎（cv2 / pyzbar）惰性探测的公共入口（只 find_spec，不 import 原生库）
+from .monitor.clipboard import ensure_qr_deps
 
 # 把项目根目录加入 DLL 搜索路径（pyzbar 依赖 libzbar-64.dll / libiconv.dll，
 # DLL 位于项目根目录）
@@ -167,13 +169,17 @@ def main():
         except Exception:
             show_event = None
     else:
-        # --force 模式：清除可能残留的旧事件，避免新实例也被旧事件拦截
+        # --force 模式：清除可能残留的旧事件，避免新实例也被旧事件拦截。
+        # 同时把该事件交给本实例（show_event）：否则本实例拿不到事件句柄，
+        # 后续正常启动的 SetEvent 无人接收 —— 这个 --force 实例从此无法被唤醒，
+        # 而后续正常启动又会因 ERROR_ALREADY_EXISTS 直接静默退出（双击没反应）。
         try:
             import win32event
             import win32api
             import winerror
             ev = win32event.CreateEvent(None, True, False, paths.SINGLE_INSTANCE_EVENT)
             win32event.ResetEvent(ev)
+            show_event = ev
         except Exception:
             pass
 
@@ -279,6 +285,12 @@ def main():
     if not cfg.get("sevenzip_check_done", False):
         state.set("sevenzip_check_done", True)
         QTimer.singleShot(1200, lambda: _first_run_7z_check(state, hub, win))
+
+    # 二维码解码引擎（cv2 / pyzbar）是惰性探测的：这里显式探测一次，让下面这条
+    # 启动提示反映真实状态（探测只做 find_spec，不 import 原生库，不拖慢启动）。
+    # QR_AVAILABLE 是可刷新的 _LiveFlag，缺依赖时监控线程的闸门读到的与这里一致。
+    if cfg.get("qr_enabled"):
+        ensure_qr_deps(hub)
 
     if not QR_AVAILABLE:
         win.log_box.appendPlainText(

@@ -13,6 +13,10 @@
 """
 from .. import db
 
+# 字典密码读取失败只提示一次：让用户能区分「密码本没读到」与「密码真的不对」，
+# 同时避免每次解压尝试都刷一行。
+_DICT_READ_WARNED = False
+
 
 def get_password_for_layer(layer, user_passwords, extracted=None, default=None, dict_passwords=(), prev_used=None):
     """生成某层的候选密码列表（按尝试顺序）。
@@ -66,9 +70,13 @@ def save_password_dict(data):
 
 
 def get_dict_passwords():
+    global _DICT_READ_WARNED
     try:
         return db.get_dict_passwords()
-    except Exception:
+    except Exception as e:
+        if not _DICT_READ_WARNED:
+            _DICT_READ_WARNED = True
+            print(f"[密码本] 读取字典密码失败，本次运行不再重复提示：{e}")
         return []
 
 

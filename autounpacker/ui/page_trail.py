@@ -216,6 +216,15 @@ def record_reason(rec):
         text += " · " + note
     if rec.get("failed_paths") and "无法还原" not in text:
         text += " · 含无法还原的文件"
+    kept_paths = rec.get("kept_paths")
+    if kept_paths:
+        # 混合场景（部分回收 + 部分按「保留源文件」策略留在原位）：保留项也要有痕
+        try:
+            n_kept = len(kept_paths)
+        except TypeError:
+            n_kept = 0
+        if n_kept:
+            text += " · 另有 %d 个文件已保留在原位" % n_kept
     return text
 
 

@@ -2,9 +2,10 @@
 """删除回溯记录存储（deletion 包最底层）：记录持久化与「本次开机」回溯窗口。
 
 职责：- TRAIL_FILE / _lock：记录文件路径与包内唯一的记录互斥锁
-- load_records()/save_records()：容错读 + 原子写（绝不截断原文件）
+- load_records()/save_records()：容错读 + 原子写（绝不截断原文件；失败返回 False）
 - new_record()/add_record()/already_handled()：建档、落盘、去重判定
 - update_record()/get_record()/mark_kept()/mark_failed()/mark_deleted()：状态推进
+- mark_deleting()：删除动作前预写「正在删除…」意图（崩溃窗口不丢还原明细）
 - prune_records()：启动时丢弃上次开机前的旧记录，防累积
 - QUARANTINE_DIRNAME / _quarantine_note_dir()：隔离区目录名与回溯备注（纯函数）
 依赖：标准库（os/time/json/uuid/threading/ctypes）+ paths（DATA_DIR/deletion_trail.json）
@@ -22,6 +23,18 @@ import ctypes
 from ..paths import DATA_DIR as APP_DIR
 TRAIL_FILE = APP_DIR / "deletion_trail.json"
 _lock = threading.Lock()
+
+# 保存失败提示只打一次（进程级）：stdout 会被 GUI 捕获进日志，重复刷屏无意义。
+_save_failed_warned = False
+
+
+def _warn_save_failed():
+    """写盘失败提示：每进程只打印一次（供 GUI 日志可见，绝不静默丢明细）。"""
+    global _save_failed_warned
+    if _save_failed_warned:
+        return
+    _save_failed_warned = True
+    print("[回溯] 写入 deletion_trail.json 失败，本次删除明细可能未保存")
 
 # 隔离区目录名（回收站不可用时源文件的可还原落点）：<root>/_已删除/<YYYY-MM-DD>。
 # 监听扫描必须跳过该目录（见 monitors._in_quarantine），否则隔离文件会被当成新压缩包重解。
@@ -56,14 +69,20 @@ def save_records(records):
     处理、已删除的文件也失去可还原记录）。改为与 state._save_temp_passwords /
     config.save_config 相同的模式：先把完整 JSON 写进同目录 .tmp，再原子替换；
     序列化或写入任一步失败都会保留原文件原样。
+
+    返回 True=已原子落盘；False=写失败（原文件保持原样）。绝不抛出：调用方
+    （删除主流程）不能因为记录写入失败而中断；失败时打一条进程级一次性提示，
+    让 GUI 日志如实可见「明细可能未保存」。
     """
     try:
         data = json.dumps(records, ensure_ascii=False, indent=2)
         tmp = TRAIL_FILE.with_name(TRAIL_FILE.name + ".tmp")
         tmp.write_text(data, encoding="utf-8")
         os.replace(tmp, TRAIL_FILE)
+        return True
     except Exception:
-        pass
+        _warn_save_failed()
+        return False
 
 
 def new_record(original_path, watch_dir):
@@ -80,13 +99,15 @@ def new_record(original_path, watch_dir):
         "original_path": str(Path(original_path).resolve()),
         "name": Path(original_path).name,
         "watch_dir": str(watch_dir or Path(original_path).parent),
-        "status": "recorded",      # recorded/kept/deleted/restored/failed
+        "status": "recorded",      # recorded/deleting/kept/deleted/restored/failed
         "file_size": fsize,        # 处理时的文件身份，用于识别同名新文件
         "file_mtime": fmtime,
         "deleted_paths": [],       # 已移入回收站、可还原的路径
         "failed_paths": [],        # 永久删除、无法还原的路径
+        "kept_paths": [],          # 回收站不可用且策略保留时留在原位、未删除的路径
         "quarantine_map": [],      # 回收站不可用时移入隔离区、可还原的文件地图
                                    # [{"from": 原路径, "to": 隔离区路径}, ...]
+        "delete_targets": [],      # 删除前预写的本次删除目标（mark_deleting 写入）
         "deleted_at": "",
         "note": "",
     }
@@ -116,22 +137,25 @@ def prune_records():
 
     程序启动时调用：丢弃本次开机之前产生的记录，
     避免 deletion_trail.json 无限累积变大。
+    返回 True=无失败（含无可清理项）；False=清理结果写盘失败。绝不抛出。
     """
     boot = _boot_time()
     if boot <= 0:
-        return
+        return True
     with _lock:
         recs = load_records()
         kept = [r for r in recs if _record_ts(r) >= boot - 1]
         if len(kept) != len(recs):
-            save_records(kept)
+            return save_records(kept)
+    return True
 
 
 def add_record(rec):
+    """落盘一条新记录；返回保存结果（True/False），不改变原有语义。"""
     with _lock:
         recs = load_records()
         recs.insert(0, rec)
-        save_records(recs)
+        return save_records(recs)
 
 
 def already_handled(original_path):
@@ -169,14 +193,102 @@ def already_handled(original_path):
     return False
 
 
+def mark_restored_exempt(original_path):
+    """登记「从删除回溯还原回来的源文件 ⇒ 豁免再次解压」（路径 + 身份）。
+
+    用户从回溯页还原某个源文件，意图就是**完整保留这份源文件**；所以它再次出现在
+    监听目录里时应当跳过解压——否则解压成功后又会被 delete_policy 删掉（这正是
+    「还原后立刻又被解压、再被删」的根因）。身份 = (size, mtime)：文件被重新下载 /
+    替换（身份变化）后豁免立即失效，绝不误挡真正的新文件。
+
+    只对「已经回到原位」的 original_path 生效（不在则自动 no-op）。绝不抛异常。
+    """
+    try:
+        target = str(Path(original_path).resolve())
+        st = Path(target).stat()
+        ident = [int(st.st_size), float(st.st_mtime)]
+    except Exception:
+        return False
+    try:
+        with _lock:
+            recs = load_records()
+            for r in recs:
+                if r.get("original_path") != target:
+                    continue
+                entries = r.get("restored_exempt")
+                entries = list(entries) if isinstance(entries, list) else []
+                entries = [e for e in entries
+                           if not (isinstance(e, dict) and e.get("path") == target)]
+                entries.append({"path": target, "ident": ident})
+                r["restored_exempt"] = entries
+                return save_records(recs)
+    except Exception:
+        return False
+    return False
+
+
+def is_restored_exempt(original_path):
+    """该源文件是否处于「已还原 ⇒ 豁免」状态**且身份未变**。
+
+    身份（size, mtime）对不上 → 说明已被重新下载/替换，豁免立即失效并顺手清掉那条
+    登记（绝不让豁免黏在别的文件上）。任何异常一律按「不豁免」处理。
+    """
+    try:
+        target = str(Path(original_path).resolve())
+        st = Path(target).stat()
+        ident = [int(st.st_size), float(st.st_mtime)]
+    except Exception:
+        return False
+    hit = False
+    dirty = False
+    try:
+        with _lock:
+            recs = load_records()
+            for r in recs:
+                entries = r.get("restored_exempt")
+                if not isinstance(entries, list):
+                    continue
+                keep = []
+                for e in entries:
+                    if not (isinstance(e, dict) and e.get("path") == target):
+                        keep.append(e)
+                        continue
+                    if list(e.get("ident") or []) == ident:
+                        hit = True
+                        keep.append(e)
+                    else:
+                        dirty = True        # 身份变了 → 豁免失效
+                if len(keep) != len(entries):
+                    r["restored_exempt"] = keep
+                    dirty = True
+            if dirty:
+                save_records(recs)
+    except Exception:
+        return False
+    return hit
+
+
 def update_record(rec_id, **fields):
+    """按 id 更新记录字段并落盘；返回保存结果（True/False）。绝不抛出。"""
     with _lock:
         recs = load_records()
         for r in recs:
             if r.get("id") == rec_id:
                 r.update(fields)
                 break
-        save_records(recs)
+        return save_records(recs)
+
+
+def mark_deleting(rec_id, targets):
+    """删除动作开始前预写「正在删除…」意图记录。
+
+    删除先于结果落盘的崩溃窗口里，记录若停在「已记录（处理中）」就永远看不到
+    删除去向；先把本次将删除的路径写入 delete_targets 并置 status=deleting，
+    崩溃后至少能知道当时正在删什么。targets=本次将回收/删除的路径（可空）。
+    返回保存结果（True/False）。
+    """
+    return update_record(rec_id, status="deleting",
+                         delete_targets=[str(p) for p in (targets or [])])
 
 
 def get_record(rec_id):
@@ -222,6 +334,7 @@ def mark_deleted(rec_id, recycled, failed, quarantine_map=None):
             "deleted_paths": recycled,
             "quarantine_map": qmap,
             "failed_paths": [],     # 隔离区无永久删除
+            "kept_paths": [],       # 隔离模式不存在「保留在原位」
             "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "note": "回收站不可用，已移入隔离区（可还原）：" + _quarantine_note_dir(qmap),
         }
@@ -238,6 +351,7 @@ def mark_deleted(rec_id, recycled, failed, quarantine_map=None):
         "deleted_paths": recycled,
         "quarantine_map": [],
         "failed_paths": gone,       # 仅真正永久删除、不可还原的路径
+        "kept_paths": still_here,   # 仍留在原位、未被删除的路径（混合场景也有据可查）
         "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if gone:

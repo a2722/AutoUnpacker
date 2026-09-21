@@ -17,11 +17,38 @@ from pathlib import Path
 from .. import extract as smart_extract   # noqa: F401  保留原名引用
 from .. import trail as deletion_trail     # noqa: F401
 from ..deletion import quarantine as deletion_quarantine
+from ..deletion import records as deletion_records
 from .. import db                          # noqa: F401
 from .. import volume_pair
 from .. import baidu_manifest             # 实验性开关判定（子目录监听/分卷递归的唯一闸门）
 from ..config import get_bool
 from ..utils import (_norm_path_for_cfg, _can_open_append)
+
+# 删除前意图记录（records.mark_deleting）属本任务新增函数：trail 兼容 shim 的显式
+# 再导出清单早于它，这里把新函数绑定到 shim（shim 的 __setattr__ 会同步写 records
+# 归属模块，读写同一份状态），保证 `deletion_trail.mark_deleting` 在旧路径下可用。
+if not hasattr(deletion_trail, "mark_deleting"):
+    try:
+        deletion_trail.mark_deleting = deletion_records.mark_deleting
+    except Exception:
+        pass
+
+
+def _mark_deleting(rid, targets):
+    """删除动作前预写「正在删除…」意图记录（尽力而为，绝不打断删除主流程）。
+
+    优先走 deletion_trail.mark_deleting；调用方的 trail 被替换成不含该函数的
+    测试桩时直接退回 records 归属模块（同一 _lock/TRAIL_FILE）。任何异常都吞掉：
+    意图记录只是崩溃兜底，绝不能反过来阻断真正的删除/解压流程。
+    """
+    try:
+        fn = getattr(deletion_trail, "mark_deleting", None)
+        if not callable(fn):
+            fn = getattr(deletion_records, "mark_deleting", None)
+        if callable(fn):
+            fn(rid, targets)
+    except Exception:
+        pass
 
 
 def _in_quarantine(path):
@@ -60,6 +87,21 @@ SPLIT_INCOMPLETE_MAX = 3
 SPLIT_INCOMPLETE_DELAYS = (300, 900, 1800)
 
 
+def _restored_exempt(fp):
+    """该源文件是否处于「已还原 ⇒ 豁免」状态（防御性：取不到方法/异常一律按不豁免）。
+
+    部分离线测试把 `deletion_trail` 换成只带少量方法的替身，取不到
+    `is_restored_exempt` 时必须退回旧行为，绝不让监听线程因这条增强分支崩溃。
+    """
+    fn = getattr(deletion_trail, "is_restored_exempt", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(fp))
+    except Exception:
+        return False
+
+
 class FolderWatcher(threading.Thread):
     """多路径监听线程（只监听目录表面，不递归子孙文件夹）"""
 
@@ -85,6 +127,7 @@ class FolderWatcher(threading.Thread):
     SPLIT_INCOMPLETE_DELAYS = SPLIT_INCOMPLETE_DELAYS  # 截断分卷链退避序列（秒）
     SPLIT_MAX_WAIT = 1800        # 跨目录分卷等待兄弟卷的最长时间(秒)：超时放弃（仅保留不删）
     SPLIT_RECHECK_INTERVAL = 10  # 跨目录分卷复查间隔(秒)：节流「全监听根 rglob」
+    OFFLINE_NOTIFY_SEC = 300     # 监听目录连续离线超过 5 分钟告警一次（每段离线只发一次）
     BT_STABLE_SEC = 6    # 百度清单模式：文件大小需稳定这么久才处理（秒）
     BT_PROGRAM_EXT = {".exe", ".dll", ".bat", ".cmd", ".lnk", ".msi", ".sys",
                       ".scr", ".com", ".ocx"}
@@ -134,6 +177,10 @@ class FolderWatcher(threading.Thread):
         self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
         # 跨目录分卷等待期 {norm_source_path: {anchor, ident, since, last_check, last_sig}}
         self._split_pending = {}
+        # 当前离线的监听路径 {norm_path: 进入离线时刻}：目录不存在或无法枚举时进入，
+        # 枚举成功才由 _mark_online 清除（每段离线只记一次日志、超 5 分钟通知一次）。
+        self._offline = {}
+        self._offline_notified = set()  # 已发过「离线超 5 分钟」通知的 norm_path
         # 每目录最近一次发布的 (state, progress, name)：新版 GUI 胶囊 / 状态灯用；
         # 只在值变化时投递，避免 2s 轮询把队列刷爆（见 _set_dir_state）。
         self._dir_state = {}
@@ -272,6 +319,42 @@ class FolderWatcher(threading.Thread):
         except Exception:
             pass
 
+    # ---------- 监听目录离线检测（不可达时不假装「监听中」） ----------
+    def _mark_offline(self, watch):
+        """目录不可用（不存在 / 枚举失败）：发布 waiting，每段离线只记一次日志。
+
+        连续离线超过 OFFLINE_NOTIFY_SEC 后补发唯一一条通知；恢复由 _mark_online
+        （枚举成功时）负责复位。任何异常都吞掉：状态上报绝不打断监听主流程。
+        """
+        try:
+            key = self._norm_path(watch)
+            now = time.time()
+            since = self._offline.get(key)
+            if since is None:
+                since = now
+                self._offline[key] = since
+                self.hub.log(f"监听目录不可用（等待恢复）: {watch}")
+            self._set_dir_state(watch, "waiting")
+            if (key not in self._offline_notified
+                    and now - since > self.OFFLINE_NOTIFY_SEC):
+                self._offline_notified.add(key)
+                self.hub.notify("监听目录不可用",
+                                f"{watch} 已离线超过 5 分钟，请检查磁盘或网络")
+        except Exception:
+            pass
+
+    def _mark_online(self, watch):
+        """目录恢复可用（枚举成功）：清离线记忆与告警标记，并把离线 waiting 复位
+        为 listening（忙碌 waiting 由 _handle 自己维护，不在这里清除）。"""
+        try:
+            key = self._norm_path(watch)
+            if key in self._offline:
+                self._offline.pop(key, None)
+                self._offline_notified.discard(key)
+                self._set_dir_state(watch, "listening")
+        except Exception:
+            pass
+
     def run(self):
         # stdout 捕获由进程入口（app.main）统一幂等安装，这里不再改进程级全局。
         while True:
@@ -298,11 +381,28 @@ class FolderWatcher(threading.Thread):
                     for rk in [k for k in self._rewalk if k[0] == key]:
                         self._rewalk.pop(rk, None)   # churn 计数随监听路径移除清理
                     self._purge_traced_under(key)    # 该路径不再监听：去重记忆一并清理
+            for key in list(self._offline):
+                if key not in enabled:               # 不再监听的路径：离线记忆一并清理
+                    self._offline.pop(key, None)
+                    self._offline_notified.discard(key)
             for path, wc in enabled.items():
+                key = self._norm_path(path)
+                # 离线目录恢复：允许把离线期间发布的 waiting 复位回 listening
+                # （离线 waiting = 目录不可用，不是 _handle 的忙碌等待；extracting
+                # 永远不在此复位）。离线记忆/告警标记不在 run 里清——只有 _poll
+                # 真正枚举成功（_mark_online）才算恢复，否则「目录存在但枚举失败」
+                # 会在每轮重复刷离线日志。
+                recovered = False
+                if key in self._offline:
+                    try:
+                        recovered = Path(path).is_dir()
+                    except OSError:
+                        recovered = False
+                cur = self._dir_state.get(key, (None, None, None))[0]
                 # 空闲目录回到 listening（extracting/waiting 视为忙碌，交给 _handle
                 # 自己收敛；error 会在本轮或下一轮被这里复位为 listening）。
-                cur = self._dir_state.get(self._norm_path(path), (None, None, None))[0]
-                if cur not in ("extracting", "waiting"):
+                if (cur not in ("extracting", "waiting")
+                        or (recovered and cur == "waiting")):
                     self._set_dir_state(path, "listening")
                 try:
                     self._poll(Path(path), wc)
@@ -313,6 +413,9 @@ class FolderWatcher(threading.Thread):
     def _poll(self, watch, wc):
         # 只监听文件夹表面的一层文件，不递归子孙文件夹
         if not watch.is_dir():
+            # 目录不存在/不可达：如实上报 waiting（此前直接 return，状态永远停在
+            # 蓝色「监听中」且无日志，离线盘看起来像在正常工作）。
+            self._mark_offline(watch)
             return
         # 输出目录与监听根重叠（等于 / 在其内部）→ 可能「自己吃自己」，提示一次
         try:
@@ -345,7 +448,10 @@ class FolderWatcher(threading.Thread):
             try:
                 current = set(n for n in os.listdir(watch) if (watch / n).is_file())
             except OSError:
+                # 目录存在但枚举失败（权限/网络盘断开）同样视为离线：不得假装监听中
+                self._mark_offline(watch)
                 return
+            self._mark_online(watch)
             self.hub.log(f"开始监听: {watch}")
             # 初次扫描也处理已存在的压缩包：程序重启/监听路径重初始化时，
             # 已存在文件不能永远跳过（否则一直躺在目录里不处理）。
@@ -367,7 +473,10 @@ class FolderWatcher(threading.Thread):
         try:
             current = set(n for n in os.listdir(watch) if (watch / n).is_file())
         except OSError:
+            # 同上：枚举失败即离线（waiting + 单次日志），恢复后 run()/_mark_online 复位
+            self._mark_offline(watch)
             return
+        self._mark_online(watch)
         new = current - self.seen[key]
         deferred = set()
         probe = self.probing.setdefault(key, {})
@@ -1407,6 +1516,14 @@ class FolderWatcher(threading.Thread):
         elif smart_extract.is_non_first_volume(name):
             self.hub.log(f"非首卷分卷，等待首卷处理整个分卷: {name}")
             return "done"
+        # 还原豁免：该源文件是用户从删除回溯里**还原**回来的（登记了 路径+身份）。
+        # 用户还原的意图就是完整保留这份源文件，所以即使它又出现在监听目录里也跳过
+        # 解压——否则解压成功后又会被 delete_policy 删掉（「还原后立刻又被解压、再被
+        # 删」的根因）。身份变化（重新下载/替换）后自动失效；**与 initial_scan 无关**：
+        # 运行中还原走的是常规轮询，也必须生效。
+        elif _restored_exempt(fp):
+            self.hub.log(f"该源文件是从删除回溯还原的，豁免再次解压，跳过: {name}")
+            return "done"
         # 监听（重）初始化扫描时，跳过已成功处理过的文件（避免重复解压）
         elif initial_scan and deletion_trail.already_handled(fp):
             self.hub.log(f"已处理过的文件，跳过: {name}")
@@ -1492,6 +1609,11 @@ class FolderWatcher(threading.Thread):
                 args.delete_hook = (
                     lambda recycled, failed, quarantine_map, rid=record["id"]:
                     deletion_trail.mark_deleted(rid, recycled, failed, quarantine_map))
+                # 删除前预写「正在删除…」意图记录：删除动作先于结果落盘的崩溃窗口里，
+                # 回溯记录不再是永远停在「已记录（处理中）」。
+                args.pre_hook = (
+                    lambda targets, rid=record["id"]:
+                    _mark_deleting(rid, targets))
             self.hub.q.put({"type": "progress_start"})
             self._set_dir_state(wc.get("path"), "extracting", 0, name)
             # 任务行只在「所有 defer 闸门都过、真正要解压」时创建；重试路径先复用同目录
@@ -1794,6 +1916,8 @@ class FolderWatcher(threading.Thread):
                      if delete_policy.strip().lower() == "quarantine" else None)
             rec = deletion_trail.new_record(fp, wc.get("path"))
             deletion_trail.add_record(rec)
+            # 删除前预写「正在删除…」意图记录（与 _handle 的 pre_hook 同一语义）。
+            _mark_deleting(rec["id"], [str(fp)])
             qmap = []
             recycled, failed = smart_extract._recycle_paths(
                 [str(fp)],

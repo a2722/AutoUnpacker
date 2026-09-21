@@ -177,15 +177,24 @@ def unique_dest_path(dest):
 
 
 def is_clean_success(result):
-    """结果是否为「干净的整体成功」：success 且无失败层/不完整/分卷缺卷标记。
+    """结果是否为「干净的整体成功」：success 且无失败层/不完整/分卷缺卷标记，
+    且（仅当结果显式携带产出清单时）产出非空。
 
     后处理（提升内容、删除源文件）与「完成」报告的唯一闸门：任何一层失败
-    （引擎失败、打不开、错误跳过、CRC/大小不符）或分卷未到齐都不算成功。"""
+    （引擎失败、打不开、错误跳过、CRC/大小不符）或分卷未到齐都不算成功。
+    另加零产出防线：结果显式带 `extracted_files` 键且为空 = 本次什么都没产出，
+    同样不算成功——否则共享输出目录里预存的旧文件会掩盖零产出，让「成功」
+    闸门放行并误删源文件。无 `extracted_files` 键的裸结果（如手写
+    {"success": True}）不据此判定，仍按原语义返回 True。"""
     if not result or not result.get("success"):
         return False
-    return not (result.get("incomplete")
-                or result.get("failed_layers")
-                or result.get("split_incomplete"))
+    if (result.get("incomplete")
+            or result.get("failed_layers")
+            or result.get("split_incomplete")):
+        return False
+    if "extracted_files" in result and not result.get("extracted_files"):
+        return False
+    return True
 
 
 def build_post_actions(args):
@@ -193,6 +202,9 @@ def build_post_actions(args):
     if args.move_to:
         actions.append({"action_type": "move_to_dir", "target_dir": args.move_to})
     promote_to = getattr(args, "promote_to", None)
+    # 删除前意图钩子（pre_hook(targets)，在真正回收/删除之前回调）：随动作下传，
+    # 用于先落盘「正在删除…」，避免删除与结果记录之间的崩溃窗口丢失还原明细。
+    pre_hook = getattr(args, "pre_hook", None)
     # 源文件删除策略：随动作下传，最终驱动回收站不可用时的回退（keep=保留源文件）。
     delete_policy = getattr(args, "delete_policy", None)
     # quarantine 策略的隔离区根（空串=按源文件所在目录补 _已删除）；其它策略为 None。
@@ -204,12 +216,14 @@ def build_post_actions(args):
                         "delete_source": bool(getattr(args, "delete_source", False)),
                         "delete_policy": delete_policy,
                         "quarantine_root": quarantine_root,
-                        "delete_hook": getattr(args, "delete_hook", None)})
+                        "delete_hook": getattr(args, "delete_hook", None),
+                        "pre_hook": pre_hook})
     elif args.delete_source:
         actions.append({"action_type": "delete_source",
                         "delete_policy": delete_policy,
                         "quarantine_root": quarantine_root,
-                        "delete_hook": getattr(args, "delete_hook", None)})
+                        "delete_hook": getattr(args, "delete_hook", None),
+                        "pre_hook": pre_hook})
     if args.run_script:
         actions.append({"action_type": "run_script",
                         "script_path": args.run_script,
@@ -230,7 +244,8 @@ def apply_post_actions(result, source, output_dir, actions):
                 delete_source(source, action.get("delete_hook"),
                               permanent_fallback=delete_policy_permanent_fallback(
                                   action.get("delete_policy")),
-                              quarantine_root=action.get("quarantine_root"))
+                              quarantine_root=action.get("quarantine_root"),
+                              pre_hook=action.get("pre_hook"))
             elif action["action_type"] == "promote_content":
                 res = promote_extracted_content(
                     output_dir, action["promote_to"], source,
@@ -238,7 +253,8 @@ def apply_post_actions(result, source, output_dir, actions):
                     delete_src=action.get("delete_source", False),
                     permanent_fallback=delete_policy_permanent_fallback(
                         action.get("delete_policy")),
-                    quarantine_root=action.get("quarantine_root"))
+                    quarantine_root=action.get("quarantine_root"),
+                    pre_hook=action.get("pre_hook"))
                 result["logs"].append(f"[后处理] {res['note']}")
                 if res["promoted"]:
                     result["promoted_dir"] = res["promoted"]
@@ -424,13 +440,16 @@ def _recycle_paths(paths, permanent_fallback=True, quarantine_root=None, quarant
         quarantine_root=quarantine_root, quarantine_out=quarantine_out)
 
 
-def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=None):
+def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=None,
+                  pre_hook=None):
     """删除源文件（含分卷）。
 
     优先移入回收站（可撤销）；回收站不可用时按 permanent_fallback 决策：
     True（默认，auto / permanent 策略）退化为永久删除；False（keep 策略）**保留
     原文件**，绝不永久删除；quarantine_root 非 None（quarantine 策略）时移入隔离区，
     同样绝不永久删除。
+    pre_hook(targets) 在真正删除前回调（targets=本次将处理的路径）：删除动作先于
+    结果记录落盘，崩溃窗口里「还原明细」会丢；先落盘「正在删除…」意图记录可兜底。
     hook(recycled, failed, quarantine_map) 在删除后回调：recycled=已移入回收站，
     failed=回收站不可用时的残留（是否已永久删除取决于 permanent_fallback），
     quarantine_map=已移入隔离区、可还原的文件地图（无则 None）。
@@ -451,12 +470,34 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
         return
 
     qmap = []
+    if pre_hook:
+        pre_hook(targets)
     recycled, failed = _recycle_paths(
         targets, permanent_fallback=permanent_fallback,
         quarantine_root=quarantine_root, quarantine_out=qmap)
     if hook:
         hook(recycled, failed, qmap or None)
-    print(f"已删除源文件及分卷，共 {len(recycled) + len(failed)} 个（移入回收站）")
+    # 按真实去向分句打印，避免在「永久删除 / 保留 / 隔离区」场景下误报「移入回收站」。
+    # 隔离区条目已从 failed 中移除（见 engine._recycle_paths），故 total 不重复计数。
+    parts = []
+    if recycled:
+        parts.append(f"移入回收站 {len(recycled)} 个")
+    if qmap:
+        parts.append(f"移入隔离区 {len(qmap)} 个")
+    if failed:
+        still = 0
+        for p in failed:
+            try:
+                if Path(p).exists():
+                    still += 1
+            except OSError:
+                pass
+        if len(failed) - still:
+            parts.append(f"永久删除 {len(failed) - still} 个")
+        if still:
+            parts.append(f"保留 {still} 个")
+    total = len(recycled) + len(failed) + len(qmap)
+    print(f"已处理源文件及分卷，共 {total} 个（{'、'.join(parts)}）")
 
 
 def _dirs_conflict(src_dir, dest):
@@ -489,7 +530,7 @@ def _merge_dir(src, dst):
 
 def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=False,
                               delete_src=False, permanent_fallback=True,
-                              quarantine_root=None):
+                              quarantine_root=None, pre_hook=None):
     """解压后处理：输出目录顶层只有 1 个文件夹时，把该文件夹提升到指定地区。
 
     delete_src=True 时，随后把源文件（含分卷）与输出目录移入回收站并回调 hook 标记
@@ -497,6 +538,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     False=保留源文件，见 delete_source）；quarantine_root 非 None（quarantine 策略）
     时移入隔离区，绝不永久删除。delete_src=False（默认，数据安全优先）时
     只做提升，绝不回收源文件/分卷，仅原地清理提升后空掉的输出目录。
+    pre_hook(targets) 与 delete_source 同义：真正删除前回调，先落盘删除意图。
     条件不满足（0 个或多于 1 个顶层文件夹）时：delete_src=True 退化为仅删除源文件，
     delete_src=False 则原样保留源文件。
     merge=True 且目标同名文件夹无文件冲突时，直接并入（不建 (N) 文件夹）；
@@ -520,7 +562,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
             return {"promoted": None, "recycled": [], "hook_called": False,
                     "note": "顶层文件夹数≠1 或存在顶层文件，未提升，保留源文件"}
         delete_source(source, hook, permanent_fallback=permanent_fallback,
-                      quarantine_root=quarantine_root)
+                      quarantine_root=quarantine_root, pre_hook=pre_hook)
         return {"promoted": None, "recycled": [], "hook_called": True,
                 "note": "顶层文件夹数≠1 或存在顶层文件，未提升，仅删除源文件"}
 
@@ -614,6 +656,8 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     elif output_dir.exists():
         targets.append(str(output_dir))
 
+    if pre_hook:
+        pre_hook(targets)
     recycled2, failed2 = _recycle_paths(
         targets, permanent_fallback=permanent_fallback,
         quarantine_root=quarantine_root, quarantine_out=qmap)

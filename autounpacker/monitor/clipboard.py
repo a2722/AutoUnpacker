@@ -27,33 +27,124 @@ from ..utils import (split_urls, is_url_like, is_baidu_pan_url)
 # 剪贴板/二维码可用性：改为惰性探测（首次用到时才 import 并缓存结果）。
 # 目的：win32clipboard/PIL 在启动路径上不再加载，缩短冷启动时间；
 # 依赖缺失时首轮轮询探测一次即记入标志，后续不再重复尝试。
-QR_AVAILABLE = True
-CLIPBOARD_AVAILABLE = True
+#
+# 为什么是对象不是 bool：monitors.py 的闸门（if cfg.get("qr_enabled") and
+# QR_AVAILABLE and CLIPBOARD_AVAILABLE:）与 app.py 都是**按值导入**——模块里再
+# `global QR_AVAILABLE = False` 传不到它们手里，快照永远是 True。用 _LiveFlag +
+# __bool__ 让所有已导入的引用共享同一个对象：set() 即刻生效，而标识符名字与
+# 「and QR_AVAILABLE and ...」的用法保持完全不变（源码扫描测试依赖原文）。
+class _LiveFlag:
+    """可刷新的可用性标记：bool(QR_AVAILABLE) 始终反映最新探测结果。
+
+    之所以用对象而不是 bool：monitors.py 里那行闸门（if cfg.get("qr_enabled")
+    and QR_AVAILABLE and CLIPBOARD_AVAILABLE:）是按源码文本被测试断言的，
+    名字与用法必须保持不变；而 app.py / monitors.py 都是按值导入，直接把
+    模块级名字重新赋值（global X = False）传不到它们手里。用对象 + __bool__
+    即可让所有已导入的引用看到最新值。
+    """
+    __slots__ = ("_ok",)
+
+    def __init__(self, ok=True):
+        self._ok = bool(ok)
+
+    def set(self, ok):
+        self._ok = bool(ok)
+
+    def __bool__(self):
+        return self._ok
+
+    def __repr__(self):
+        return f"<LiveFlag {self._ok}>"
+
+
+QR_AVAILABLE = _LiveFlag(True)
+CLIPBOARD_AVAILABLE = _LiveFlag(True)
+# 真正的解码引擎（cv2 / pyzbar）：惰性探测结果缓存在这个标记里（见 ensure_qr_deps）。
+QR_DEPS_AVAILABLE = _LiveFlag(True)
 _QR_PROBED = False
 _CLIP_PROBED = False
+_QR_DEPS_PROBED = False
+# 「每进程只记一条」日志节流的共享锁：轮询线程（引擎探测）与工作线程
+# （解码失败 / 未识别到内容）都可能走到 _mark_once。
+_ONCE_LOCK = threading.Lock()
+_QR_DEPS_LOGGED = False       # 「未安装 cv2 / pyzbar」提示只记一次
+_DECODE_ERROR_LOGGED = False  # __DECODE_ERROR__ 逐图刷屏节流
+_NO_QR_LOGGED = False         # 「解码成功但未识别到二维码内容」提示只记一次
 _clipboard_mod = None   # 探测成功后缓存的 win32clipboard 模块
 _imagegrab_mod = None   # 探测成功后缓存的 PIL.ImageGrab 模块
 
 
 def _ensure_clipboard():
-    """首次调用时探测剪贴板依赖；结果缓存到模块级标志。返回 (win32clipboard, ImageGrab)。"""
-    global CLIPBOARD_AVAILABLE, QR_AVAILABLE, _QR_PROBED, _CLIP_PROBED, _clipboard_mod, _imagegrab_mod
+    """首次调用时探测剪贴板依赖；结果缓存到模块级标志。返回 (win32clipboard, ImageGrab)。
+
+    可用性标记是 _LiveFlag 对象：这里 set() 置否，可被 monitors.py / app.py 那些
+    按值导入的引用实时看到（它们在导入时拿到的是同一个对象）。"""
+    global _QR_PROBED, _CLIP_PROBED, _clipboard_mod, _imagegrab_mod
     if not _CLIP_PROBED:
         _CLIP_PROBED = True
         try:
             import win32clipboard
             _clipboard_mod = win32clipboard
         except ImportError:
-            CLIPBOARD_AVAILABLE = False
-            QR_AVAILABLE = False
+            CLIPBOARD_AVAILABLE.set(False)
+            QR_AVAILABLE.set(False)
     if not _QR_PROBED:
         _QR_PROBED = True
         try:
             from PIL import ImageGrab
             _imagegrab_mod = ImageGrab
         except ImportError:
-            QR_AVAILABLE = False
+            QR_AVAILABLE.set(False)
     return _clipboard_mod, _imagegrab_mod
+
+
+def _mark_once(flag_name):
+    """把模块级「每进程只记一条」布尔标志置位；返回 True 表示本次是第一条。
+
+    读改写用 _ONCE_LOCK 保护：轮询线程与工作线程都可能并发走到这里。
+    flag_name 是模块级名字（如 "_QR_DEPS_LOGGED"），调用方按字面量传。"""
+    with _ONCE_LOCK:
+        if globals().get(flag_name):
+            return False
+        globals()[flag_name] = True
+        return True
+
+
+def ensure_qr_deps(hub=None):
+    """惰性探测真正的解码引擎依赖（cv2 / pyzbar）；返回是否可用。
+
+    与 _ensure_clipboard 同款惰性：首次调用才探测，结果缓存在 QR_DEPS_AVAILABLE
+    （_LiveFlag）里，后续调用直接读缓存。
+
+    只做 importlib.util.find_spec 查找，**绝不 import**：cv2/pyzbar 的原生库在
+    极端输入下可能段错误/写坏堆（见 qr_decode 模块文档），只能在解码子进程里加载；
+    主进程 import 它们等于把崩溃面带回常驻进程，也违背启动路径零加载的约定。
+
+    缺依赖时把 QR_AVAILABLE 一并置否（monitors 的闸门随即停掉整条二维码链路），
+    并在给了 hub 时记**一条**「未安装 …」日志（每进程至多一条），绝不逐图刷屏。
+    传入 hub（或传 self.hub）由调用方决定；探测本身不依赖 hub。"""
+    global _QR_DEPS_PROBED
+    if not _QR_DEPS_PROBED:
+        _QR_DEPS_PROBED = True
+        from importlib.util import find_spec
+        missing = []
+        for name in ("cv2", "pyzbar"):
+            try:
+                if find_spec(name) is None:
+                    missing.append(name)
+            except Exception:
+                missing.append(name)
+        if missing:
+            QR_DEPS_AVAILABLE.set(False)
+            QR_AVAILABLE.set(False)
+    if (not QR_DEPS_AVAILABLE and hub is not None
+            and _mark_once("_QR_DEPS_LOGGED")):
+        try:
+            hub.log("未安装 cv2 / pyzbar，二维码识别已关闭"
+                    "（pip install opencv-python pyzbar）")
+        except Exception:
+            pass
+    return bool(QR_DEPS_AVAILABLE)
 
 
 def _clipboard():
@@ -269,7 +360,11 @@ class QRMonitor(threading.Thread):
                     self._enqueue(("text", new_text))
                 if cfg.get("qr_enabled") and QR_AVAILABLE and CLIPBOARD_AVAILABLE:
                     wc, ig = _ensure_clipboard()
-                    if wc is not None and ig is not None:
+                    # 引擎依赖（cv2/pyzbar）缺失时不再检测剪贴板图片：
+                    # ensure_qr_deps 已把 QR_AVAILABLE 置否，下一轮闸门直接短路；
+                    # 「未安装 …」日志由探测处每进程只记一条。
+                    if (wc is not None and ig is not None
+                            and self._qr_deps_ready()):
                         if wc.IsClipboardFormatAvailable(wc.CF_DIB):
                             image = ig.grabclipboard()
                             if image is not None:
@@ -602,6 +697,16 @@ class QRMonitor(threading.Thread):
             redirect = cfg.get("qr_url_redirect", True)
             rules = cfg.get("url_redirect_rules") or []
             action = cfg.get("qr_clipboard_action", "none")
+            if not texts:
+                # 「解码成功但没识别到二维码内容」过去完全静默（空列表进不了 for
+                # 循环、也不记任何日志）。这里每进程只记一条，避免逐图刷屏。
+                # 用默认级别（hub.log 的 level=None → guess_level → "info"）：
+                # hub.LogRecord 只认 error/success/wait/info/link，UI 的级别分段
+                # （ui/pages.LOG_LEVEL_BUCKETS）也没有 debug，传 "debug" 会被
+                # 「信息」过滤排除、反而不显眼。
+                if _mark_once("_NO_QR_LOGGED"):
+                    self.hub.log("二维码图片未识别到内容")
+                return
             for text in texts:
                 # d1/d2：二维码内容若解析为百度分享链接，只走「分享」链路
                 # （记录 + 投递 share_link，由主窗口按 experimental_enabled 与
@@ -782,8 +887,19 @@ class QRMonitor(threading.Thread):
                 except OSError:
                     pass
 
+    def _qr_deps_ready(self):
+        """解码引擎（cv2 / pyzbar）依赖是否可用；缺失时关闸并「只记一条」日志。
+
+        惰性探测只做 find_spec（不 import 原生库，见 ensure_qr_deps）；缺依赖时
+        ensure_qr_deps 会把 QR_AVAILABLE 置否，闸门随后停掉整条二维码链路。"""
+        return ensure_qr_deps(self.hub)
+
     def _decode_qr_file(self, path):
         """把解码工作放到独立子进程执行：cv2/pyzbar/PIL 原生崩溃只杀子进程。"""
+        # 引擎依赖缺失时绝不拉起子进程、也绝不逐图记日志：探测缺失本身已在
+        # ensure_qr_deps 里记过唯一一条「未安装 cv2 / pyzbar」。
+        if not self._qr_deps_ready():
+            return []
         import subprocess
         # 解码期计数只覆盖「子进程运行期」：这里是「图片/路径 → 文本」唯一的公共
         # 瓶颈，剪贴板图片链接与二维码分享两条路径都经此。放这一层而非调用方，是因为
@@ -823,6 +939,11 @@ class QRMonitor(threading.Thread):
                     kind, marker = "解码进程异常退出（已隔离）", ""
                 if marker:
                     detail = detail.replace(marker, "", 1).strip() or detail
+                if kind == "解码失败" and not _mark_once("_DECODE_ERROR_LOGGED"):
+                    # 「解码失败」逐图刷屏的节流：同一原因每进程只记一条。真缺
+                    # 依赖已由 ensure_qr_deps 记过唯一一条；这里兜住「包装了但
+                    # 环境损坏」等其它原因（如 libzbar DLL 缺失）。
+                    return []
                 self.hub.log(f"二维码{kind}: {detail[:80]}")
                 return []
             try:
@@ -933,11 +1054,28 @@ class QRMonitor(threading.Thread):
             except Exception:
                 dead = None
             if dead:
+                _dead_key = rec.get("surl") or url
+                _was_dead = ""
                 try:
-                    _bt.mark_share_dead(rec.get("surl") or url, dead)
+                    _was_dead = _bt.share_dead(_dead_key)
+                except Exception:
+                    _was_dead = ""
+                try:
+                    _bt.mark_share_dead(_dead_key, dead)
                 except Exception:
                     pass      # 标记失败只丢失缓存，绝不打断主流程
                 self.hub.log(f"{dead}，已跳过：{url}")
+                if not _was_dead:
+                    # 首次判定失效：让用户**当场**看得见。原来这里只记日志，通知
+                    # 只在用户手势路径上发，静默抓页时界面一片安静（用户只能靠翻
+                    # 日志才知道链接死了）。同时核销相关待办（等待中的 Alt+2/Alt+3
+                    # 预定任务、填写提取码小窗），避免事后空等到超时、或弹出一个
+                    # 注定失败的填码窗。统一交给 Qt 线程的 `_drain` 处理。
+                    try:
+                        self.hub.q.put({"type": "share_dead", "surl": _dead_key,
+                                        "url": url, "reason": dead})
+                    except Exception:
+                        pass
                 return True
             # d3（收紧）：URL 未带 ?pwd= 时按顺序自动回退解析提取码，命中即原地写
             # 回 rec["pwd"]（remember_share_link 存的正是同一个 dict，其它消费者立即

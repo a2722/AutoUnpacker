@@ -15,6 +15,10 @@
 """
 from .. import db
 
+# 密码本读取失败只提示一次，避免单纯翻页/刷新就刷屏；用户据此能区分
+# 「密码本没读到」与「密码本真的是空的」。
+_ROWS_READ_WARNED = False
+
 
 # ---------- 长期密码本行级 helper（薄封装 db 行级 API，供密码本页使用） ----------
 def list_password_rows():
@@ -22,9 +26,13 @@ def list_password_rows():
 
     与 db.list_passwords() 同源同序（id 升序 = 解压尝试顺序）；任何异常返回 []。
     """
+    global _ROWS_READ_WARNED
     try:
         return db.list_passwords()
-    except Exception:
+    except Exception as e:
+        if not _ROWS_READ_WARNED:
+            _ROWS_READ_WARNED = True
+            print(f"[密码本] 读取长期密码失败，本次运行不再重复提示：{e}")
         return []
 
 

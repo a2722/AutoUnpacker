@@ -50,6 +50,8 @@ def delete_policy_permanent_fallback(policy):
 DEFAULT_CONFIG = {
     "qr_enabled": True,
     "notify_enabled": True,
+    "notify_share": True,              # 分享 / 网盘分享类通知（手势/解析/拉起/下载结果统一开关）
+    "notify_share_dead": True,         # 「分享链接已失效」专用开关（叠加在 notify_share 之上）
     "notify_archive": True,
     "notify_success": True,
     "notify_failure": True,
@@ -199,6 +201,8 @@ def _sanitize_cfg(cfg):
             cfg["poll_interval"] = 2
         cfg["qr_enabled"] = bool(cfg.get("qr_enabled", True))
         cfg["notify_enabled"] = bool(cfg.get("notify_enabled", True))
+        cfg["notify_share"] = bool(cfg.get("notify_share", True))
+        cfg["notify_share_dead"] = bool(cfg.get("notify_share_dead", True))
         cfg["notify_archive"] = bool(cfg.get("notify_archive", True))
         cfg["notify_success"] = bool(cfg.get("notify_success", True))
         cfg["notify_failure"] = bool(cfg.get("notify_failure", True))

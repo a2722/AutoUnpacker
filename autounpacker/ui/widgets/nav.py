@@ -11,6 +11,7 @@ from .common import dir_state_key, repolish_tree, _clear_layout, _StatusLamp
 from .inputs import (LayoutButton, RainbowLayoutButton, Glyph, _ElideLabel)
 TRAIL_STATUS_TEXT = {
     "recorded": "已记录（处理中）",
+    "deleting": "正在删除…",
     "kept": "未删除",
     "deleted": "已删除（回收站）",
     "restored": "已还原",

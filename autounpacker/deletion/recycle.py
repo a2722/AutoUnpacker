@@ -13,7 +13,7 @@ from pathlib import Path
 from ctypes import wintypes
 import ctypes
 
-from .records import get_record, update_record
+from .records import get_record, mark_restored_exempt, update_record
 
 # ---- 删除到回收站（SHFileOperation, FOF_ALLOWUNDO） ----
 FO_DELETE = 0x0003
@@ -201,6 +201,13 @@ def restore_record(rec_id):
         if failed:
             note += "；失败: " + ", ".join(os.path.basename(f) for f in failed)
         update_record(rec_id, status=status, note=note)
+        # 还原成功 ⇒ 给「源文件」登记豁免（路径+身份）：用户还原的意图就是完整保留
+        # 这份源文件，不该在监听目录里被再次解压、再按 delete_policy 删掉。
+        # 只对真的回到原位的 original_path 生效（不在则内部自动 no-op）。
+        try:
+            mark_restored_exempt(rec.get("original_path"))
+        except Exception:
+            pass
         if not failed:
             return True, f"已还原 {len(restored)} 个文件"
         return True, f"还原 {len(restored)}/{len(targets)}，部分失败：{os.path.basename(failed[0])}"

@@ -501,7 +501,17 @@ class ExtractService:
                 "layer_records": self.layer_records,
                 "logs": self.logs, "error": err,
             }
-        final_files = [p for p in output_dir.rglob("*") if p.is_file()] if output_dir.exists() else []
+        # 产出清单 = 解压后输出目录里的全部文件（整目录口径，与原行为一致）。
+        # 为什么不用「本次新增」增量：重复解压同一个包到同一输出目录时路径集合
+        # 不变、增量为空，会把正常的重复解压误判成零产出（实测踩到，见
+        # test_hit_count_gate C1）。零产出防线改由 is_clean_success 的
+        # 「显式空清单即不算成功」承担（见 post.py）。
+        final_files = []
+        if output_dir.exists():
+            try:
+                final_files = [p for p in output_dir.rglob("*") if p.is_file()]
+            except Exception:
+                final_files = []
         _first = self.layer_records[0] if self.layer_records else {}
         return {
             "task_id": task_id, "success": True,

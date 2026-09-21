@@ -687,6 +687,13 @@ class SettingsPage(QWidget):
             "再次启动程序时，提示已在运行并打开主界面。")
         self.notify_trust_cb = self._check_row(
             box, "notify_trust_pending", "有新的网址等待确认")
+        self.notify_share_cb = self._check_row(
+            box, "notify_share", "分享 / 网盘分享类通知",
+            "分享手势、链接解析、拉起客户端与分享下载结果等提示的统一开关。")
+        self.notify_share_dead_cb = self._check_row(
+            box, "notify_share_dead", "分享链接已失效",
+            "链接被取消/过期/违规、抓页即判定失效时当场提醒（叠加在"
+            "「分享 / 网盘分享类通知」之上：两个开关都开才会弹）。")
         self._sub_label(box, "网盘任务（实验性）")
         self.notify_baidu_done_cb = self._check_row(
             box, "notify_baidu_done", "网盘下载批次完成",
@@ -736,7 +743,9 @@ class SettingsPage(QWidget):
         self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
                              self.notify_failure_cb, self.notify_error_cb,
                              self.notify_trayed_cb, self.notify_running_cb,
-                             self.notify_trust_cb, self.notify_baidu_done_cb,
+                             self.notify_trust_cb, self.notify_share_cb,
+                             self.notify_share_dead_cb,
+                             self.notify_baidu_done_cb,
                              self.notify_baidu_leftover_cb, self.notify_baidu_dup_cb)
         self._exp_subs = (self.baidu_auto_invoke_cb, self.baidu_pick_cb,
                           self.baidu_db_edit, self.baidu_db_browse_btn,
@@ -985,6 +994,8 @@ class SettingsPage(QWidget):
             self.notify_trayed_cb.setChecked(b("notify_trayed", True))
             self.notify_running_cb.setChecked(b("notify_already_running", True))
             self.notify_trust_cb.setChecked(b("notify_trust_pending", True))
+            self.notify_share_cb.setChecked(b("notify_share", True))
+            self.notify_share_dead_cb.setChecked(b("notify_share_dead", True))
             self.notify_baidu_done_cb.setChecked(b("notify_baidu_done", True))
             self.notify_baidu_leftover_cb.setChecked(b("notify_baidu_leftover", True))
             self.notify_baidu_dup_cb.setChecked(b("notify_baidu_dup", False))

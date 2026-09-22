@@ -14,6 +14,7 @@ PROJECT_ROOT = PACKAGE_DIR.parent
 DATA_DIR = PROJECT_ROOT
 CONFIG_FILE = DATA_DIR / "config.json"
 TEMP_PW_FILE = DATA_DIR / "temp_passwords.json"
+PENDING_TRUST_FILE = DATA_DIR / "pending_trust.json"   # 挂起的网址信任询问（重启恢复）
 CRASH_LOG = DATA_DIR / "crash.log"
 LOGS_DIR = DATA_DIR / "logs"
 CACHE_DIR = DATA_DIR / "cache"        # 运行时生成的缓存（如主题图标），可随时重建

@@ -18,6 +18,7 @@ from . import extract as smart_extract
 from . import trail as deletion_trail
 from . import db
 from .config import get_int, load_config, save_config
+from .extraction.formats import set_incomplete_suffixes
 from .utils import _install_crash_log
 from .state import AppState
 from .hub import Hub, install_stdout_capture
@@ -183,13 +184,20 @@ def main():
         except Exception:
             pass
 
-    # 删除回溯窗口期 = 本次开机内：启动时清掉开机前产生的记录，防止累积
+    # 回溯记录按 deleted_at TTL 清理：启动时清掉过期记录，防止累积
     try:
         deletion_trail.prune_records()
     except Exception:
         pass
 
     cfg = load_config()
+
+    # 未完成下载后缀：把配置表应用到 extraction.formats（启动即生效；CLI 不读
+    # 配置，仍用内置默认）。设置页改该键时会再同步一次。
+    try:
+        set_incomplete_suffixes(cfg.get("incomplete_download_suffixes"))
+    except Exception:
+        pass
 
     # 初始化 sqlite，并把旧 config 密码列表 / 旧字典 json 迁移进 toolbox.db
     try:

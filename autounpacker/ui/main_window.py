@@ -10,6 +10,8 @@
 注意：stdout 捕获与 Qt 插件路径由 app.main 统一处理，本模块不重复安装
 """
 import html  # noqa: F401  （已随日志助手移入 .window.logview，保留旧模块名可用）
+import json
+import os
 import queue
 import re  # noqa: F401  （已随常量移入 .window.consts，保留旧模块名可用）
 import threading
@@ -23,6 +25,7 @@ from PyQt5.QtGui import QKeySequence, QTextCursor, QTextCharFormat, QColor, QCur
 from .. import extract as smart_extract    # noqa: F401
 from .. import trail as deletion_trail     # noqa: F401
 from .. import sevenzip as sevenzip_manager  # noqa: F401
+from .. import paths
 from .. import baidu_manifest as bm
 from .. import db
 from .. import hub
@@ -95,6 +98,65 @@ except ImportError:
     win32api = win32con = win32gui = winerror = None
 
 
+# ---------- 网址信任：挂起队列的持久化（重启不丢；上限 50 条，超出丢最旧） ----------
+PENDING_TRUST_MAX = 50
+
+
+def _pending_trust_record(req):
+    """把一条待确认请求压成可 JSON 持久化的最小记录（只留弹窗需要的字段）。"""
+    req = req if isinstance(req, dict) else {}
+    return {
+        "url": str(req.get("url") or ""),
+        "host": str(req.get("host") or ""),
+        "category": req.get("category"),
+        "purpose": str(req.get("purpose") or "open"),
+    }
+
+
+def load_pending_trust():
+    """读取挂起的信任询问请求（启动恢复用）：缺失/损坏一律返回空列表。
+
+    只保留 URL 非空的记录，并防御性裁到上限（写盘时已裁，此处兜底旧文件）。"""
+    try:
+        if not paths.PENDING_TRUST_FILE.exists():
+            return []
+        data = json.loads(paths.PENDING_TRUST_FILE.read_text(encoding="utf-8"))
+        records = data.get("requests") if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            return []
+        out = [_pending_trust_record(r) for r in records
+               if isinstance(r, dict) and str(r.get("url") or "").strip()]
+        return out[-PENDING_TRUST_MAX:]
+    except Exception:
+        return []
+
+
+def save_pending_trust(requests):
+    """原子写挂起请求（先写 .tmp 再 os.replace，与 save_records/_save_temp_passwords 同口径）。"""
+    try:
+        records = [_pending_trust_record(r) for r in (requests or [])]
+        payload = json.dumps({"requests": records[-PENDING_TRUST_MAX:]},
+                             ensure_ascii=False)
+        tmp = paths.PENDING_TRUST_FILE.with_name(
+            paths.PENDING_TRUST_FILE.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, paths.PENDING_TRUST_FILE)
+    except Exception:
+        pass
+
+
+def push_pending_trust(requests, req):
+    """追加一条待确认请求并裁到上限（超出丢最旧）；返回 (新列表, 丢弃条数)。
+
+    纯函数（不碰磁盘/日志），便于离线验证上限行为；落盘与日志由调用方负责。"""
+    out = list(requests or [])
+    out.append(_pending_trust_record(req))
+    dropped = max(0, len(out) - PENDING_TRUST_MAX)
+    if dropped:
+        out = out[dropped:]
+    return out, dropped
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state, hub, show_event=None, pauser=None):
         super().__init__()
@@ -160,8 +222,9 @@ class MainWindow(QMainWindow):
         self._next_tab_sc.activated.connect(lambda: self._cycle_page(1))
         self._prev_tab_sc = QShortcut(QKeySequence("Ctrl+PgUp"), self)
         self._prev_tab_sc.activated.connect(lambda: self._cycle_page(-1))
-        # 网址信任：挂起的询问请求 + 当前打开的确认弹窗（防叠加）
-        self._pending_trust = []
+        # 网址信任：挂起的询问请求（数据目录持久化，重启不丢）+ 当前打开的
+        # 确认弹窗（防叠加）；恢复的请求在窗口显示后经 _process_pending_trust 弹出。
+        self._pending_trust = load_pending_trust()
         self._trust_dlg = None
         # 分享「拉起」：同一时刻只允许一个后台拉起任务（防重复），
         # 自动/手动两条路径共用该忙标志
@@ -1956,6 +2019,9 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_screen_watch_done", False):
             self._screen_watch_done = True
             QTimer.singleShot(0, self._install_screen_watch)
+        # 重启恢复的挂起信任请求：窗口可见后按既有队列路径弹出（隐藏到托盘时不弹）。
+        if self._pending_trust:
+            QTimer.singleShot(0, self._process_pending_trust)
 
     def _drain(self):
         # 二维码「预定任务」过期清理：每轮 tick（200ms）一次；无任务时 O(1) 早退。
@@ -3197,9 +3263,9 @@ class MainWindow(QMainWindow):
         """主窗口收到待确认网址：可见则弹非置顶询问窗，隐藏则挂起+托盘提示。"""
         if self.isVisible():
             if not self._show_trust_dialog(req):
-                self._pending_trust.append(req)   # 已有弹窗打开，排队等下一个
+                self._queue_pending_trust(req)   # 已有弹窗打开，排队等下一个
         else:
-            self._pending_trust.append(req)
+            self._queue_pending_trust(req)
             snap = self.state.snapshot()
             if (snap.get("notify_enabled", True) and hasattr(self, "tray")
                     and snap.get("notify_trust_pending", True)):
@@ -3222,13 +3288,26 @@ class MainWindow(QMainWindow):
         dlg.show()
         return True
 
+    def _queue_pending_trust(self, req):
+        """把待确认请求加入挂起队列：超上限丢最旧并如实记一行，随后立即落盘。"""
+        self._pending_trust, dropped = push_pending_trust(self._pending_trust, req)
+        if dropped:
+            try:
+                self.hub.log(
+                    f"待确认网址队列已满（上限 {PENDING_TRUST_MAX} 条），"
+                    f"已丢弃最早的 {dropped} 条请求")
+            except Exception:
+                pass
+        save_pending_trust(self._pending_trust)
+
     def _process_pending_trust(self):
-        """主界面变为可见时处理挂起的信任询问（无限挂起，不丢请求）。"""
+        """主界面变为可见时处理挂起的信任询问（超出上限时只丢最旧，其余不丢）。"""
         while self._pending_trust and getattr(self, "_trust_dlg", None) is None:
             req = self._pending_trust.pop(0)
             if not self._show_trust_dialog(req):
                 self._pending_trust.insert(0, req)
                 break
+        save_pending_trust(self._pending_trust)
 
     def _on_trust_decision(self, req, decision):
         """用户对信任询问做出选择：持久化黑白名单 + 放行或跳过。"""

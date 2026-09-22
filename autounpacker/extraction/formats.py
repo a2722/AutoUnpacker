@@ -301,8 +301,46 @@ def detect_volumes_quick(path):
 
 INCOMPLETE_DOWNLOAD_SUFFIXES = (
     ".downloading", ".crdownload", ".download", ".part", ".tmp",
-    ".td", ".opdownload", ".uc!",
+    ".td", ".opdownload", ".uc!", ".aria2", ".!ut", ".partial",
 )
+
+# 运行期覆盖表：None = 用内置默认（由 set_incomplete_suffixes 写入）。
+# 本模块被 CLI 直接使用（没有 config 对象），因此覆盖走模块级 setter，
+# 绝不导入 config；未设置覆盖时行为与过去完全一致。
+_incomplete_suffix_override = None
+
+
+def set_incomplete_suffixes(suffixes):
+    """覆盖未完成下载后缀表（None = 恢复内置默认）。
+
+    带配置的运行实例在启动 / 设置变更时调用；CLI 不调用则始终用内置默认。
+    逐项规整为「小写 + 前导点」并去重（保留顺序）；非可迭代输入（含字符串）
+    一律视为无效，回退内置默认。"""
+    global _incomplete_suffix_override
+    if suffixes is None or isinstance(suffixes, (str, bytes)):
+        _incomplete_suffix_override = None
+        return
+    try:
+        cleaned = []
+        for item in suffixes:
+            s = str(item or "").strip().lower()
+            if not s:
+                continue
+            if not s.startswith("."):
+                s = "." + s
+            if s not in cleaned:
+                cleaned.append(s)
+    except TypeError:
+        _incomplete_suffix_override = None
+        return
+    _incomplete_suffix_override = tuple(cleaned)
+
+
+def _incomplete_suffixes():
+    """当前生效的未完成下载后缀表（默认 = 内置 INCOMPLETE_DOWNLOAD_SUFFIXES）。"""
+    if _incomplete_suffix_override is not None:
+        return _incomplete_suffix_override
+    return INCOMPLETE_DOWNLOAD_SUFFIXES
 
 
 def is_incomplete_download(path):
@@ -314,14 +352,14 @@ def is_incomplete_download(path):
     name = path.name.lower()
     if name.endswith(".baiduyun.p.downloading"):
         return True
-    return any(name.endswith(s) for s in INCOMPLETE_DOWNLOAD_SUFFIXES)
+    return any(name.endswith(s) for s in _incomplete_suffixes())
 
 
 def _strip_download_suffix(name):
     """去掉下载中后缀，得到下载完成后的目标文件名（如
     xxx.7z.002.baiduyun.p.downloading -> xxx.7z.002）。"""
     low = name.lower()
-    suffixes = [".baiduyun.p.downloading"] + list(INCOMPLETE_DOWNLOAD_SUFFIXES)
+    suffixes = [".baiduyun.p.downloading"] + list(_incomplete_suffixes())
     suffixes.sort(key=len, reverse=True)
     for s in suffixes:
         if low.endswith(s):

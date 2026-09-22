@@ -8,7 +8,9 @@
 - parse_hotkey() 把 'Ctrl+Alt+W' 解析为 (mods, vk)，供全局快捷键注册
 关键入口：get_int() / get_bool() / get_str() / load_config() / save_config() /
           parse_hotkey() / _sanitize_cfg()
-依赖：paths（配置文件路径）、utils._norm_path_for_cfg
+依赖：paths（配置文件路径）、utils._norm_path_for_cfg、
+      extraction.formats.INCOMPLETE_DOWNLOAD_SUFFIXES（未完成下载后缀内置默认值，
+      单一真源；formats 本身不反向依赖 config）
 注意：保存必须走 save_config()（先写 .tmp 再 os.replace），半截 JSON 会导致下次启动整个配置被静默重置
 """
 import json
@@ -16,6 +18,7 @@ import os
 import time
 
 from . import paths
+from .extraction.formats import INCOMPLETE_DOWNLOAD_SUFFIXES
 from .utils import _norm_path_for_cfg
 
 # 源文件删除策略（每监听目录一项）。取值只在此处定义一处，新增取值（如未来的
@@ -83,6 +86,9 @@ DEFAULT_CONFIG = {
     "sevenzip_check_done": False,   # 首次启动的 7-Zip 检测已完成（避免每次启动都检查/弹窗）
     "poll_interval": 2,
     "task_history_limit": 500,     # 任务历史保留条数（只清理终态任务，非终态永不删）
+    # 未完成下载后缀（小写 + 前导点）：命中则暂不解压，等下载器改名后再处理。
+    # 默认取 formats 内置表（.aria2/.!ut/.partial 等已含）；用户可在设置页增删。
+    "incomplete_download_suffixes": list(INCOMPLETE_DOWNLOAD_SUFFIXES),
     "passwords": [],
     "auto_add_clipboard_password": False,
     "watch_paths": [
@@ -97,12 +103,12 @@ DEFAULT_CONFIG = {
     "url_trust": {
         "builtin_blacklist": True,    # 内置类别黑名单（私网/回环/链路本地/元数据/保留地址）
         "open": {
-            "new_domain_action": "none",  # none=无操作 / ask=弹窗询问 / auto_whitelist=自动信任 / auto_blacklist=自动拒绝
+            "new_domain_action": "ask",  # none=无操作 / ask=弹窗询问 / auto_whitelist=自动信任 / auto_blacklist=自动拒绝
             "whitelist": [],              # 信任域名（含全部子域），可覆盖内置黑名单类别
             "blacklist": [],              # 拒绝域名（含全部子域），最高优先级
         },
         "fetch": {
-            "new_domain_action": "none",  # 同上；两用途互不影响
+            "new_domain_action": "ask",  # 同上；两用途互不影响
             "whitelist": [],
             "blacklist": [],
         },
@@ -116,6 +122,16 @@ DEFAULT_CONFIG = {
     # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
     # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
     "pair_split_enabled": True,     # 跨名分卷链配对唯一总闸（验证通过即改名为首卷系列；无 auto 开关）
+    # ---------- 解压前安全检查（防 zip bomb）+ 磁盘空间守护（P1-14） ----------
+    # 软告警只提示、不拦；硬拒绝则拒绝解压并提示。比例类规则的单位是
+    # 「解压后体积 / 归档体积」的膨胀倍数；判定语义由解压链路解释，本处只存阈值。
+    "bomb_guard_enabled": True,     # 解压前安全检查（防 zip bomb）总开关
+    "bomb_soft_ratio": 100,         # 软告警：解压后体积膨胀倍数上限（只提示，不拦）
+    "bomb_soft_entries": 50000,     # 软告警：归档条目数上限（只提示，不拦）
+    "bomb_hard_ratio": 200,         # 硬拒绝：膨胀倍数上限（需同时达到 bomb_hard_min_gb）
+    "bomb_hard_min_gb": 1.0,        # 硬拒绝：比例规则适用的最小解压后体积（GB）
+    "bomb_hard_size_gb": 50.0,      # 硬拒绝：解压后声明总体积的绝对上限（GB）
+    "min_free_space_gb": 5.0,       # 目标盘剩余空间低于此值(GB)时暂停一切自动解压；0=关闭
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
 }
@@ -195,6 +211,23 @@ def _sanitize_cfg(cfg):
             })
         cfg["watch_paths"] = clean
         cfg["passwords"] = global_passwords
+        # 未完成下载后缀（列表值，与 whitelist/blacklist 同口径）：缺失/非列表
+        # 回退内置默认；列表逐项规整为「小写 + 前导点」、去空去重（保留顺序）。
+        _suffixes = cfg.get("incomplete_download_suffixes")
+        if not isinstance(_suffixes, list):
+            _suffixes = list(INCOMPLETE_DOWNLOAD_SUFFIXES)
+        else:
+            _clean_suffixes = []
+            for _item in _suffixes:
+                _s = str(_item or "").strip().lower()
+                if not _s:
+                    continue
+                if not _s.startswith("."):
+                    _s = "." + _s
+                if _s not in _clean_suffixes:
+                    _clean_suffixes.append(_s)
+            _suffixes = _clean_suffixes
+        cfg["incomplete_download_suffixes"] = _suffixes
         try:
             cfg["poll_interval"] = max(1, int(cfg.get("poll_interval", 2)))
         except Exception:
@@ -262,9 +295,10 @@ def _sanitize_cfg(cfg):
         def _norm_trust_sub(sub, fallback):
             d = dict(sub) if isinstance(sub, dict) else {}
             fb = fallback if isinstance(fallback, dict) else {}
-            na = str(d.get("new_domain_action", fb.get("new_domain_action", "none")))
+            # 安全默认 = ask（弹窗询问一次），绝不静默拒绝新公网域名
+            na = str(d.get("new_domain_action", fb.get("new_domain_action", "ask")))
             d["new_domain_action"] = (
-                na if na in ("none", "ask", "auto_whitelist", "auto_blacklist") else "none")
+                na if na in ("none", "ask", "auto_whitelist", "auto_blacklist") else "ask")
             for k in ("whitelist", "blacklist"):
                 v = d.get(k, fb.get(k))
                 if not isinstance(v, list):
@@ -292,6 +326,37 @@ def _sanitize_cfg(cfg):
                 5, min(600, int(cfg.get("share_gesture_wait_sec", 60))))
         except Exception:
             cfg["share_gesture_wait_sec"] = 60
+        # 解压前安全检查（防 zip bomb）/ 磁盘空间守护（P1-14）：缺失或畸形一律回退
+        # 默认（绝不抛）；比例与条目数钳到 >= 0，GB 阈值钳到 >= 0.0（0 = 关闭对应规则）。
+        cfg["bomb_guard_enabled"] = bool(cfg.get("bomb_guard_enabled", True))
+        try:
+            cfg["bomb_soft_ratio"] = max(0, int(cfg.get("bomb_soft_ratio", 100)))
+        except Exception:
+            cfg["bomb_soft_ratio"] = 100
+        try:
+            cfg["bomb_soft_entries"] = max(
+                0, int(cfg.get("bomb_soft_entries", 50000)))
+        except Exception:
+            cfg["bomb_soft_entries"] = 50000
+        try:
+            cfg["bomb_hard_ratio"] = max(0, int(cfg.get("bomb_hard_ratio", 200)))
+        except Exception:
+            cfg["bomb_hard_ratio"] = 200
+        try:
+            cfg["bomb_hard_min_gb"] = max(
+                0.0, float(cfg.get("bomb_hard_min_gb", 1.0)))
+        except Exception:
+            cfg["bomb_hard_min_gb"] = 1.0
+        try:
+            cfg["bomb_hard_size_gb"] = max(
+                0.0, float(cfg.get("bomb_hard_size_gb", 50.0)))
+        except Exception:
+            cfg["bomb_hard_size_gb"] = 50.0
+        try:
+            cfg["min_free_space_gb"] = max(
+                0.0, float(cfg.get("min_free_space_gb", 5.0)))
+        except Exception:
+            cfg["min_free_space_gb"] = 5.0
         _ut = str(cfg.get("ui_theme", "auto") or "auto").strip().lower()
         cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
         _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()

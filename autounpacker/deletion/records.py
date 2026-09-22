@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""删除回溯记录存储（deletion 包最底层）：记录持久化与「本次开机」回溯窗口。
+"""删除回溯记录存储（deletion 包最底层）：记录持久化与 TTL 回溯清理。
 
 职责：- TRAIL_FILE / _lock：记录文件路径与包内唯一的记录互斥锁
 - load_records()/save_records()：容错读 + 原子写（绝不截断原文件；失败返回 False）
 - new_record()/add_record()/already_handled()：建档、落盘、去重判定
 - update_record()/get_record()/mark_kept()/mark_failed()/mark_deleted()：状态推进
 - mark_deleting()：删除动作前预写「正在删除…」意图（崩溃窗口不丢还原明细）
-- prune_records()：启动时丢弃上次开机前的旧记录，防累积
+- prune_records()：启动时按 deleted_at TTL（默认 30 天）清理旧记录，防累积
 - QUARANTINE_DIRNAME / _quarantine_note_dir()：隔离区目录名与回溯备注（纯函数）
 依赖：标准库（os/time/json/uuid/threading/ctypes）+ paths（DATA_DIR/deletion_trail.json）
 注意：本模块是 deletion 包最底层，绝不导入 deletion.* 任何其它模块；
@@ -23,6 +23,11 @@ import ctypes
 from ..paths import DATA_DIR as APP_DIR
 TRAIL_FILE = APP_DIR / "deletion_trail.json"
 _lock = threading.Lock()
+
+# 回溯记录 TTL（天）：prune_records 按 deleted_at 老化清理的默认期限（本任务不加配置键）。
+# kept 记录不受此期限限制：只要源文件仍在原位就无条件保留（already_handled 靠它跳过
+# 已处理文件），详见 prune_records。
+TRAIL_TTL_DAYS = 30
 
 # 保存失败提示只打一次（进程级）：stdout 会被 GUI 捕获进日志，重复刷屏无意义。
 _save_failed_warned = False
@@ -114,7 +119,12 @@ def new_record(original_path, watch_dir):
 
 
 def _boot_time():
-    """系统本次开机时间（Unix 秒）。取不到时返回 0（不清旧记录）"""
+    """系统本次开机时间（Unix 秒）。取不到时返回 0。
+
+    注意：prune_records 已改为按 deleted_at TTL 清理，不再使用本函数；函数本身
+    保留是因为 trail 兼容 shim 仍从本模块再导出 _boot_time（旧名面仍需存在），
+    直接删除会破坏该再导出。
+    """
     try:
         ticks = ctypes.windll.kernel32.GetTickCount64()
         return time.time() - ticks / 1000.0
@@ -132,20 +142,61 @@ def _record_ts(rec):
         return 0.0
 
 
-def prune_records():
-    """删除回溯窗口期 = 本次开机内。
+def _record_age_ts(rec):
+    """记录的老化基准时间：优先 deleted_at（删除/还原完成的时刻），缺失或解析失败
+    时回退 created_ts/created_at；都取不到返回 0（调用方按「不过期」保守处理）。"""
+    raw = rec.get("deleted_at")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return time.mktime(time.strptime(raw, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+    return _record_ts(rec)
 
-    程序启动时调用：丢弃本次开机之前产生的记录，
-    避免 deletion_trail.json 无限累积变大。
+
+def _should_keep_record(rec, cutoff):
+    """TTL 清理判定：True=保留，False=可清理。任何异常一律按保留处理（绝不误删）。"""
+    try:
+        status = rec.get("status")
+        if status in ("recorded", "deleting"):
+            return True     # 崩溃窗口中间态：无论多旧都保留，删除去向/还原明细不能丢
+        if status == "kept":
+            # kept：源文件仍在原位就必须保留——already_handled 靠它跳过已处理文件，
+            # 清掉会导致同一文件被重新解压；仅当源文件已不存在才允许按 TTL 老化。
+            p = str(rec.get("original_path") or "")
+            if not p or Path(p).exists():
+                return True
+        ts = _record_age_ts(rec)
+        if ts <= 0:
+            return True     # 无法判龄（字段缺失/损坏）：保守保留
+        return ts >= cutoff
+    except Exception:
+        return True
+
+
+def prune_records():
+    """启动时按 TTL 清理回溯记录（不再依赖开机时间窗），防记录无限累积。
+
+    清理规则：
+    - 老化基准 = deleted_at（缺失/解析失败回退 created_ts）：仅已完成且超过
+      TRAIL_TTL_DAYS 天的记录才会被清理；
+    - status=recorded/deleting：崩溃窗口中间态，无论多旧一律保留；
+    - status=kept：源文件仍在原位时一律保留（见 _should_keep_record），
+      源文件已不存在时才按 TTL 清理；
+    - failed/restored/deleted：按 TTL 正常老化。
     返回 True=无失败（含无可清理项）；False=清理结果写盘失败。绝不抛出。
     """
-    boot = _boot_time()
-    if boot <= 0:
-        return True
+    cutoff = time.time() - TRAIL_TTL_DAYS * 86400.0
     with _lock:
         recs = load_records()
-        kept = [r for r in recs if _record_ts(r) >= boot - 1]
-        if len(kept) != len(recs):
+        kept = []
+        pruned = False
+        for r in recs:
+            if _should_keep_record(r, cutoff):
+                kept.append(r)
+            else:
+                pruned = True
+        if pruned:
             return save_records(kept)
     return True
 

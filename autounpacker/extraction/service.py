@@ -15,11 +15,11 @@ from pathlib import Path
 
 from ..passwords.resolution import get_dict_passwords, get_password_for_layer
 from .engines import (PythonZipEngine, SevenZipEngine, is_archive_open_error,
-                      is_zip_open_error, result_raw_error)
+                      is_zip_open_error, result_raw_error, run_silent)
 from .formats import (_volume_number, analyze_file, detect_format_by_magic,
-                      is_archive_file, is_do_not_extract, is_fake_volume_name,
-                      is_first_volume, is_split_gap_error, is_volume_file,
-                      is_volume_name, should_skip_volume)
+                      find_sevenzip_path, is_archive_file, is_do_not_extract,
+                      is_fake_volume_name, is_first_volume, is_split_gap_error,
+                      is_volume_file, is_volume_name, should_skip_volume)
 from .post import (_recycle_paths, _stage_rar_volumes, is_clean_success,
                    remove_empty_dirs, strip_embedded_zip, unique_dest_path)
 
@@ -146,6 +146,8 @@ class ExtractService:
                                 and is_first_volume(source_name))
         failed_layers = []        # 任何失败层都让整体结果不再是成功
         split_incomplete = False  # 分卷链不完整（缺兄弟分卷）
+        depth_exceeded = False    # 达到最大深度限制：仍有归档未处理，整体不算成功
+        depth_left = 0            # 触顶时仍未处理的排队归档数（含当前项）
 
         queue = deque([{"archive": Path(task["source_path"]),
                         "depth": 1}])
@@ -154,7 +156,13 @@ class ExtractService:
             item = queue.popleft()
             depth = item["depth"]
             if depth > max_depth:
-                self.emit(f"[第{depth}层] 超过最大深度限制 {max_depth}")
+                # 触顶：剩余排队归档（含当前项）一律不再处理。必须留痕，否则整体
+                # 结果仍会被判「干净成功」→ 源文件被删除策略回收，未处理的深层
+                # 归档随临时目录被永久删除（_cleanup 成功路径走 rmtree）。
+                depth_exceeded = True
+                depth_left = len(queue) + 1   # 当前项本身也是未处理的排队归档
+                self.emit(f"[第{depth}层] 超过最大深度限制 {max_depth}，"
+                          f"仍有 {depth_left} 个归档未处理，将保留源文件")
                 break
 
             if self.options["mode"] == "direct" and depth == 1:
@@ -202,6 +210,23 @@ class ExtractService:
                 "progress_cb": task.get("progress_cb"),
                 "pauser": task.get("pauser"),
             }
+
+            # 解压前安全检查（P1-14 选项 B+C）：先只读 7z 清单判断声明大小/
+            # 膨胀比/条目数，命中硬阈值就按失败层留痕并停止，绝不把炸弹先落盘
+            # 再事后报警（旧的 _check_size 是解压后才提醒，拦不住任何东西）。
+            bomb_reason = self._bomb_precheck(extract_src, depth)
+            if bomb_reason:
+                self.emit(f"[第{depth}层] [安全拦截] {bomb_reason}")
+                failed_record = {
+                    "layer": depth,
+                    "archive_name": item["archive"].name,
+                    "used_password": None,
+                    "success": False,
+                    "error": bomb_reason,
+                }
+                self.layer_records.append(failed_record)
+                failed_layers.append(failed_record)
+                break
 
             result = self.engine.extract(layer_task, self.options, depth)
             if (not result["success"]
@@ -475,7 +500,7 @@ class ExtractService:
                     self.move_to_output(extract_dir, output_dir)
                 self.emit(f"[第{depth}层] 完成")
 
-        if failed_layers:
+        if failed_layers or depth_exceeded:
             self.recycle_cleanup = True   # 失败：中间文件走回收站
         self._cleanup()
         # 正常解压路径也会清理空目录（如内层压缩包所在文件夹在内容被
@@ -496,6 +521,22 @@ class ExtractService:
                 "incomplete": True,
                 "failed_layers": failed_layers,
                 "split_incomplete": bool(split_incomplete),
+                "depth_reached": len(self.layer_records),
+                "extracted_files": [], "used_password": None,
+                "layer_records": self.layer_records,
+                "logs": self.logs, "error": err,
+            }
+        if depth_exceeded:
+            # 达到最大深度限制：仍有归档未处理，绝不能报「干净成功」——否则源文件
+            # 会被删除策略回收，未处理的深层归档也会随临时目录被永久删除。
+            # 与失败层同一口径：不提升、不回收源文件、不报「完成」。
+            err = f"超过最大深度限制 {max_depth}，仍有 {depth_left} 个归档未处理"
+            self.emit(f"[结果] 解压未完成（{err}），已保留源文件")
+            return {
+                "task_id": task_id, "success": False,
+                "incomplete": True,
+                "depth_exceeded": True,
+                "failed_layers": failed_layers,
                 "depth_reached": len(self.layer_records),
                 "extracted_files": [], "used_password": None,
                 "layer_records": self.layer_records,
@@ -545,6 +586,97 @@ class ExtractService:
             ratio = total / original_size
             if ratio > self.options["max_size_ratio"]:
                 self.emit(f"[安全警告] 解压后大小膨胀 {ratio:.1f} 倍，可能存在 zip bomb")
+
+    def _opt_number(self, key, default):
+        """读数值型安全选项：缺失/None/非法值一律回退默认值，绝不抛异常。"""
+        try:
+            value = self.options.get(key, default)
+            return default if value is None else float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _parse_declared_listing(output):
+        """解析 `7z l -slt` 输出：返回 (声明未压缩总字节, 文件条目数)。
+
+        与 engines._listing_info 同一口径：Path = 重置目录标记，Folder = +
+        的目录条目不计入；一条 Size 都解析不出（空归档/输出异常）时返回
+        (None, None) = 未知，由调用方按未知放行。"""
+        total = 0
+        entries = 0
+        is_dir = False
+        has_size = False
+        for line in (output or "").splitlines():
+            s = line.strip()
+            if s.startswith("Path = "):
+                is_dir = False
+            elif s.startswith("Folder = "):
+                is_dir = (s[9:].strip() == "+")
+            elif s.startswith("Size = ") and not is_dir:
+                try:
+                    size = int(s[7:].strip())
+                except ValueError:
+                    continue
+                total += size
+                entries += 1
+                has_size = True
+        if not has_size:
+            return None, None
+        return total, entries
+
+    def _list_declared_size(self, archive):
+        """解压前只读 7z 清单（不传密码、不解压）：(声明总字节, 条目数)。
+
+        7-Zip 缺失、命令失败、清单里没有 Size（密码/头部加密归档的常态）
+        一律返回 (None, None)：视作未知，绝不据此拦截正常解压。"""
+        sevenzip = find_sevenzip_path()
+        if sevenzip is None:
+            return None, None
+        try:
+            r = run_silent([str(sevenzip), "l", "-slt", str(archive)])
+        except Exception:
+            return None, None
+        if r is None or r.returncode != 0:
+            return None, None
+        return self._parse_declared_listing(r.stdout)
+
+    def _bomb_precheck(self, archive, depth):
+        """解压前 zip bomb 安全检查（选项 B 硬拦截 + 选项 C 软提示）。
+
+        只读清单、不解压；返回硬拦截的中文原因，None = 放行。任何「未知」
+        （7z 缺失/列不出/解析不出）都放行——密码或头部加密的归档本来就
+        列不出清单，绝不能因为探测不到就拦住正常解压。"""
+        if not self.options.get("bomb_guard_enabled", True):
+            return None
+        declared, entries = self._list_declared_size(archive)
+        if declared is None:
+            return None
+        try:
+            archive_size = Path(archive).stat().st_size
+        except OSError:
+            return None
+        hard_size_gb = self._opt_number("bomb_hard_size_gb", 50.0)
+        hard_ratio = self._opt_number("bomb_hard_ratio", 200.0)
+        hard_min_gb = self._opt_number("bomb_hard_min_gb", 1.0)
+        soft_ratio = self._opt_number("bomb_soft_ratio", 100.0)
+        soft_entries = self._opt_number("bomb_soft_entries", 50000.0)
+        gib = 1024 ** 3
+        declared_gb = declared / gib
+        if declared > hard_size_gb * gib:
+            return (f"声明解压后大小 {declared_gb:.1f} GB 超过硬上限 "
+                    f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压")
+        ratio = declared / archive_size if archive_size > 0 else 0.0
+        if ratio >= hard_ratio and declared_gb >= hard_min_gb:
+            return (f"声明膨胀比 {ratio:.0f}:1（解压后 {declared_gb:.2f} GB / "
+                    f"压缩包 {archive_size / 1048576:.1f} MB）达到硬阈值 "
+                    f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压")
+        if ratio > soft_ratio:
+            self.emit(f"[第{depth}层] [安全提示] 声明膨胀比 {ratio:.0f}:1 超过提示阈值 "
+                      f"{soft_ratio:g}:1，继续解压，请留意磁盘空间")
+        if entries > soft_entries:
+            self.emit(f"[第{depth}层] [安全提示] 归档条目数 {entries} 超过提示阈值 "
+                      f"{soft_entries:g}，继续解压，请留意耗时与磁盘空间")
+        return None
 
     def _all_entries_extracted(self, extract_dir, archive):
         """7-Zip 返回非零退出码后，用 Python 核对输出目录是否已包含归档的全部文件。

@@ -175,6 +175,10 @@ class FolderWatcher(threading.Thread):
         self._bt_sticky = None  # set(norm_abs_path)，来自 toolbox.db 的粘性记忆
         self._bt_consolidated = set()  # 已归拢（或已放弃）的跨目录分卷首卷：不再重复归拢
         self._out_warned = set()  # 已提示过「输出目录与监听根重叠」的路径
+        # P1-14（选项 D）磁盘空间闸门：已发过「空间不足」提醒的监听目录 norm_path。
+        # 低空间期间同一目录只记一次日志 / 发一次通知；空间恢复后清除并记一次
+        # 「恢复」，重新武装下一次提醒（见 _disk_space_ok）。
+        self._disk_warned = set()
         # 跨目录分卷等待期 {norm_source_path: {anchor, ident, since, last_check, last_sig}}
         self._split_pending = {}
         # 当前离线的监听路径 {norm_path: 进入离线时刻}：目录不存在或无法枚举时进入，
@@ -184,6 +188,13 @@ class FolderWatcher(threading.Thread):
         # 每目录最近一次发布的 (state, progress, name)：新版 GUI 胶囊 / 状态灯用；
         # 只在值变化时投递，避免 2s 轮询把队列刷爆（见 _set_dir_state）。
         self._dir_state = {}
+        # P1-9（选项 D）未完成下载可见性：{watch_key: set(name)} 各监听目录当前
+        # 「下载中后缀」文件名单（只按文件名判断，无额外 stat）；总数与
+        # _inc_total 不同才记一行日志；_inc_notified 按 norm_path 记已通知的
+        # 文件（每文件只通知一次）。只做展示，不参与重走/复查。
+        self._inc_dirs = {}
+        self._inc_total = 0
+        self._inc_notified = set()
 
     @staticmethod
     def _file_identity(path):
@@ -355,6 +366,55 @@ class FolderWatcher(threading.Thread):
         except Exception:
             pass
 
+    # ---------- 未完成下载可见性（P1-9 选项 D：只可见，不重扫/不重走） ----------
+
+    def _inc_recount(self):
+        """未完成下载总数与上次记录不同时记一行日志（绝不逐轮重复）。"""
+        try:
+            total = sum(len(s) for s in self._inc_dirs.values())
+            if total == self._inc_total:
+                return
+            self._inc_total = total
+            sample = sorted(n for s in self._inc_dirs.values() for n in s)[:3]
+            more = " 等" if total > len(sample) else ""
+            detail = ("：" + "、".join(sample) + more) if sample else ""
+            self.hub.log(f"当前有 {total} 个未完成下载（下载完成后才会自动解压）"
+                         f"{detail}")
+        except Exception:
+            pass
+
+    def _note_incomplete_downloads(self, watch, key, names):
+        """统计本目录的未完成下载文件：数量变化时记一行日志；新文件通知一次。
+
+        P1-9 选项 D 的刻意取舍：只让「同名且大小不变 → 永不再查」的盲区可见，
+        绝不重扫目录、绝不重走 seen、绝不改变 _handle 的返回值语义。只按文件名
+        判断（is_incomplete_download 仅读 path.name，无额外 stat），异常一律吞掉。
+        """
+        try:
+            inc = set()
+            for name in names:
+                try:
+                    if smart_extract.is_incomplete_download(watch / name):
+                        inc.add(name)
+                except Exception:
+                    continue
+            self._inc_dirs[key] = inc
+            # 每个文件首次出现时通知一次（按 norm_path 去重，绝不重复）
+            for name in sorted(inc):
+                np = self._norm_path(watch / name)
+                if np in self._inc_notified:
+                    continue
+                self._inc_notified.add(np)
+                try:
+                    self.hub.notify(
+                        "发现未完成下载",
+                        f"{name}\n下载完成后（后缀消失）才会自动解压")
+                except Exception:
+                    pass
+            self._inc_recount()
+        except Exception:
+            pass
+
     def run(self):
         # stdout 捕获由进程入口（app.main）统一幂等安装，这里不再改进程级全局。
         while True:
@@ -385,6 +445,13 @@ class FolderWatcher(threading.Thread):
                 if key not in enabled:               # 不再监听的路径：离线记忆一并清理
                     self._offline.pop(key, None)
                     self._offline_notified.discard(key)
+            dropped_inc = False
+            for key in list(self._inc_dirs):
+                if key not in enabled:               # 不再监听的路径：未完成下载统计一并清理
+                    self._inc_dirs.pop(key, None)
+                    dropped_inc = True
+            if dropped_inc:
+                self._inc_recount()                  # 计数变化（含归零）时如实记一行
             for path, wc in enabled.items():
                 key = self._norm_path(path)
                 # 离线目录恢复：允许把离线期间发布的 waiting 复位回 listening
@@ -453,6 +520,9 @@ class FolderWatcher(threading.Thread):
                 return
             self._mark_online(watch)
             self.hub.log(f"开始监听: {watch}")
+            # P1-9 选项 D：只统计未完成下载（数量变化记一行、新文件通知一次），
+            # 不重扫、不重走 seen，_handle 的返回值语义完全不变。
+            self._note_incomplete_downloads(watch, key, current)
             # 初次扫描也处理已存在的压缩包：程序重启/监听路径重初始化时，
             # 已存在文件不能永远跳过（否则一直躺在目录里不处理）。
             # 已成功处理过的文件由 _handle 的 already_handled 跳过；
@@ -477,6 +547,8 @@ class FolderWatcher(threading.Thread):
             self._mark_offline(watch)
             return
         self._mark_online(watch)
+        # P1-9 选项 D：同上，仅按文件名统计可见性，不改变任何处理语义。
+        self._note_incomplete_downloads(watch, key, current)
         new = current - self.seen[key]
         deferred = set()
         probe = self.probing.setdefault(key, {})
@@ -1483,12 +1555,76 @@ class FolderWatcher(threading.Thread):
         except Exception:
             pass
 
+    @staticmethod
+    def _free_space_gb(path):
+        """目标路径所在卷的剩余空间（GB）；取不到（路径无效/卷不可读）返回 None。
+
+        只读探测，绝不创建/改动任何文件；任何异常都返回 None，由调用方按
+        「放行」处理——读不到空间绝不反过来卡住解压。
+        """
+        try:
+            return shutil.disk_usage(str(path)).free / (1024 ** 3)
+        except Exception:
+            return None
+
+    def _disk_space_ok(self, fp, wc):
+        """P1-14（选项 D）磁盘空间闸门：目标卷剩余空间足够 → True（放行）。
+
+        目标卷 = 监听配置的 output_dir（非空时）所在盘；未配置 output_dir 时，
+        解压结果会抬升到**源文件所在目录**旁（见 _handle 的 promote_to），故用
+        源文件所在盘。阈值 min_free_space_gb 每轮从实时配置读取（缺省 5.0，
+        0 = 关闭闸门），改配置无需重启。空间不足时按监听目录只记一次日志 /
+        发一次通知，目录状态置为既有的 waiting；空间恢复后记一次「恢复」并
+        重新武装下一次提醒。任何异常一律放行：绝不因读不到空间而卡住解压。
+        """
+        try:
+            cfg = self.state.snapshot() or {}
+            try:
+                limit_gb = float(cfg.get("min_free_space_gb", 5.0))
+            except (TypeError, ValueError):
+                limit_gb = 5.0
+            if limit_gb <= 0:
+                return True                     # 0（或负数）= 关闭闸门
+            key = self._norm_path(wc.get("path"))
+            target = str(wc.get("output_dir") or "").strip()
+            if not target:
+                target = str(Path(fp).parent)   # 无 output_dir：结果在源文件旁
+            free_gb = self._free_space_gb(target)
+            if free_gb is None:
+                return True                     # 读不到空间：放行（fail open）
+            if free_gb >= limit_gb:
+                if key in self._disk_warned:
+                    # 空间恢复：只记一次「恢复」，并重新武装下一次「空间不足」
+                    self._disk_warned.discard(key)
+                    self.hub.log(
+                        f"磁盘空间已恢复（剩余 {free_gb:.1f}GB），恢复自动解压")
+                    self._set_dir_state(wc.get("path"), "listening")
+                return True
+            if key not in self._disk_warned:
+                self._disk_warned.add(key)
+                self.hub.log(
+                    f"磁盘空间不足（剩余 {free_gb:.1f}GB < 阈值 {limit_gb:.1f}GB），"
+                    f"已暂停自动解压，等待空间释放: {wc.get('path')}")
+                self.hub.notify(
+                    "磁盘空间不足",
+                    f"{wc.get('path')} 所在卷剩余空间 {free_gb:.1f}GB，低于阈值 "
+                    f"{limit_gb:.1f}GB，已暂停自动解压；空间恢复后自动继续")
+            self._set_dir_state(wc.get("path"), "waiting")
+            return False
+        except Exception:
+            return True
+
     def _handle(self, fp, wc, traced=False, initial_scan=False, out=None):
         """返回: "done"=已处理/已定型, "skip"=当前不是压缩包(可复查), "defer"=稍后重试"""
         name = fp.name
         # 用户暂停：延后所有解压（静默 defer，不刷日志），恢复后下轮自然继续。
         # 放在最前面，暂停期间连"下载未完成"等提示也不发。
         if self.pauser is not None and self.pauser.is_paused():
+            return "defer"
+        # P1-14（选项 D）磁盘空间闸门：目标卷剩余空间低于配置阈值时暂停所有自动
+        # 解压。与暂停同一 defer 语义（文件不进 seen，下一轮重试）；空间恢复后
+        # 自动继续，不打断下方任何既有闸门。
+        if not self._disk_space_ok(fp, wc):
             return "defer"
         if smart_extract.is_incomplete_download(fp):
             self.hub.log(f"下载未完成，暂不解压（等待后缀消失）: {name}")

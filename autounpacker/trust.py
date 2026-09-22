@@ -157,8 +157,8 @@ def decide_host(cfg, host, purpose="open"):
     cat = classify_host(host)
     if ut.get("builtin_blacklist", True) and cat and cat != "public":
         return "deny", cat
-    # 4) 公网新域名：按该用途的默认策略处理
-    mode = sub.get("new_domain_action", "none")
+    # 4) 公网新域名：按该用途的默认策略处理（缺省/坏值一律 ask，安全默认不静默拒绝）
+    mode = sub.get("new_domain_action", "ask")
     if mode == "auto_whitelist":
         return "allow", cat
     if mode == "auto_blacklist":
@@ -180,7 +180,7 @@ def remember_auto_domain(cfg, host, purpose="open"):
     if not isinstance(ut, dict):
         return None
     sub = _purpose_cfg(ut, purpose)
-    mode = str(sub.get("new_domain_action", "none"))
+    mode = str(sub.get("new_domain_action", "ask"))
     if mode not in ("auto_whitelist", "auto_blacklist"):
         return None
     if not host:

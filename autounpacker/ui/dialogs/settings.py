@@ -261,11 +261,11 @@ class SettingsDialog(QDialog):
         grp = QButtonGroup(box)
         grp.setExclusive(True)
         self._na_buttons[purpose] = {}
-        current = str((sub or {}).get("new_domain_action", "none"))
+        current = str((sub or {}).get("new_domain_action", "ask"))
         for val, label, t in (
-                ("none", "无操作（默认）",
+                ("none", "无操作",
                  "不打开、不询问、也不记录，静默跳过。"),
-                ("ask", "弹窗询问",
+                ("ask", "弹窗询问（默认）",
                  "每次遇到本用途下未信任的新域名都弹窗询问。"),
                 ("auto_whitelist", "自动信任",
                  "公网新域名自动放行并加入本用途白名单。"),

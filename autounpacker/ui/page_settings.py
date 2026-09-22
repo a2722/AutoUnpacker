@@ -83,6 +83,25 @@ def _parse_domain_lines(text):
     return out
 
 
+def _parse_suffix_lines(text):
+    """未完成下载后缀编辑框文本 -> 去重小写列表（自动补前导点；与 config 净化同口径）。"""
+    out = []
+    for line in str(text or "").splitlines():
+        line = line.strip().lower()
+        if not line:
+            continue
+        if not line.startswith("."):
+            line = "." + line
+        if line not in out:
+            out.append(line)
+    return out
+
+
+def _format_suffix_lines(suffixes):
+    """未完成后缀列表 -> 编辑框文本（每行一个，落盘与回填的互逆表示）。"""
+    return "\n".join(str(s) for s in (suffixes or []))
+
+
 def _parse_redirect_rules(text):
     """重定向编辑框文本 -> [{'from','to'}]：每行一条「源域名 -> 目标域名」。"""
     rules = []
@@ -494,6 +513,50 @@ class SettingsPage(QWidget):
             "小于 10MB 的单 json 文件夹，若文件名命中某大文件夹名则移入该文件夹；"
             "小文件夹先出现时监控 5 分钟等待目标。")
 
+        self.dl_suffix_edit = QPlainTextEdit(self)
+        self.dl_suffix_edit.setMaximumHeight(64)
+        self.dl_suffix_edit.setPlaceholderText("每行一个后缀，如 .part")
+        self.dl_suffix_edit.setToolTip(
+            "命中这些后缀的文件视为「未完成下载」，暂不解压，等下载器改名后再处理。\n"
+            "每行一个；不写前导点会自动补上。默认含 .aria2 / .!ut / .partial 等。")
+        self._sub_label(box, "未完成下载后缀（每行一个）")
+        box.addWidget(self.dl_suffix_edit)
+        self._reg("incomplete_download_suffixes", self.dl_suffix_edit)
+        self._bind_text(self.dl_suffix_edit, "incomplete_download_suffixes",
+                        lambda: _parse_suffix_lines(self.dl_suffix_edit.toPlainText()))
+        box.addWidget(self._hint(
+            "命中后缀的文件暂不解压（下载器临时文件）；清空后不再按后缀拦截，"
+            "但百度网盘 .baiduyun.p.downloading 始终拦截。"))
+
+        # ---- P1-14 解压前安全检查（防 zip bomb）+ 磁盘空间守护 ----
+        # 本页只放三个最常用的控件（总开关 / 条目数软告警 / 剩余空间下限）；
+        # bomb_soft_ratio、bomb_hard_ratio、bomb_hard_min_gb、bomb_hard_size_gb
+        # 四个高级阈值保持「仅配置文件」可调（避免设置页膨胀），因此只在下面的
+        # 只读说明行上登记归属、不给可编辑控件（与 passwords / ui_theme_cached
+        # 的只读登记同例）。
+        self.bomb_guard_cb = self._check_row(
+            box, "bomb_guard_enabled", "解压前安全检查（防 zip bomb）",
+            "解压前预检归档：膨胀倍数或解压后声明体积命中硬限时拒绝解压并提示。\n"
+            "硬拒绝比例默认 200 倍（解压后体积需同时达到 1 GB 才生效）；"
+            "解压后总体积绝对上限默认 50 GB；软告警比例默认 100 倍。\n"
+            "硬限与软告警比例均在配置文件里调整。")
+        self.bomb_entries_spin = self._spin_row(
+            box, ["bomb_soft_entries"], "条目数告警", self._spin(0, 1000000),
+            tip="归档条目数超过此值时只提示、不拦截（软告警）；0 = 关闭条目数告警。"
+                "范围 0~1000000。")
+        self.free_space_spin = self._spin_row(
+            box, ["min_free_space_gb"], "剩余空间下限", self._spin(0, 1000),
+            unit="GB",
+            tip="目标盘剩余空间低于此值（GB）时暂停一切自动解压，空间恢复后继续；"
+                "0 = 关闭该守护。范围 0~1000 GB。")
+        self.bomb_limits_hint = self._hint(
+            "高级阈值仅在配置文件里调整：软告警比例、硬拒绝比例 / 最小体积、"
+            "解压后绝对上限。", self)
+        for _limits_key in ("bomb_soft_ratio", "bomb_hard_ratio",
+                            "bomb_hard_min_gb", "bomb_hard_size_gb"):
+            self._reg(_limits_key, self.bomb_limits_hint)
+        box.addWidget(self.bomb_limits_hint)
+
     def _on_delete_master(self, checked):
         """删源总控：点击即把 delete_source 统一写入全部监听目录。
 
@@ -891,8 +954,8 @@ class SettingsPage(QWidget):
         self._sub_label(lay, title)
         radios, _grp = self._radio_col(
             lay, ["url_trust.%s.new_domain_action" % purpose],
-            (("none", "无操作（默认）", "不打开、不询问、也不记录，静默跳过。"),
-             ("ask", "弹窗询问", "每次遇到本用途下未信任的新域名都弹窗询问。"),
+            (("none", "无操作", "不打开、不询问、也不记录，静默跳过。"),
+             ("ask", "弹窗询问（默认）", "每次遇到本用途下未信任的新域名都弹窗询问。"),
              ("auto_whitelist", "自动信任", "公网新域名自动放行并加入本用途白名单。"),
              ("auto_blacklist", "自动拒绝", "公网新域名自动拒绝并加入本用途黑名单。")),
             on_change=self._commit_trust)
@@ -1035,6 +1098,16 @@ class SettingsPage(QWidget):
             self.pair_split_cb.setChecked(b("pair_split_enabled", True))
             self.promote_merge_cb.setChecked(b("promote_merge", True))
             self.translate_cb.setChecked(b("translation_move_enabled", True))
+            # 解压前安全检查（防 zip bomb）+ 磁盘空间守护（P1-14）
+            self.bomb_guard_cb.setChecked(b("bomb_guard_enabled", True))
+            self.bomb_entries_spin.setValue(
+                max(0, min(1000000, i("bomb_soft_entries", 50000))))
+            self.free_space_spin.setValue(
+                max(0, min(1000, i("min_free_space_gb", 5))))
+            suffixes = cfg.get("incomplete_download_suffixes")
+            if not isinstance(suffixes, list):
+                suffixes = DEFAULT_CONFIG.get("incomplete_download_suffixes")
+            self.dl_suffix_edit.setPlainText(_format_suffix_lines(suffixes))
 
             # 分享与手势
             self.share_wait_spin.setValue(
@@ -1098,10 +1171,10 @@ class SettingsPage(QWidget):
         self.trust_builtin_cb.setChecked(bool(ut.get("builtin_blacklist", True)))
         for purpose in ("open", "fetch"):
             sub = ut.get(purpose) if isinstance(ut.get(purpose), dict) else {}
-            action = str((sub or {}).get("new_domain_action", "none"))
+            action = str((sub or {}).get("new_domain_action", "ask"))
             radios = self._trust_radios.get(purpose) or {}
             if action not in radios:
-                action = "none"
+                action = "ask"
             radios[action].setChecked(True)
             for key in ("whitelist", "blacklist"):
                 edit = (self.trust_editors.get(purpose) or {}).get(key)
@@ -1172,6 +1245,8 @@ class SettingsPage(QWidget):
         hotkey_error = ""
         if key in ("hotkey", "hotkey_share", "hotkey_share_code", "hotkey_enabled"):
             hotkey_error = self._apply_hotkey_change()
+        if key == "incomplete_download_suffixes":
+            self._apply_incomplete_suffixes()
         if key in ("hotkey", "hotkey_share", "hotkey_share_code"):
             self._refresh_hotkey_display()
         if not self._verify_saved({key: value}):
@@ -1185,6 +1260,17 @@ class SettingsPage(QWidget):
             self._notice("已保存", announce=False)
         self.settingsSaved.emit()
         return True
+
+    def _apply_incomplete_suffixes(self):
+        """把未完成下载后缀表同步到 extraction.formats（监听/解压线程即时生效）。
+
+        与主题/热键一样属于「改即存」的既有副作用；异常只吞掉，绝不打断保存。"""
+        try:
+            from ..extraction.formats import set_incomplete_suffixes
+            set_incomplete_suffixes(
+                self._snapshot().get("incomplete_download_suffixes"))
+        except Exception:
+            pass
 
     def _apply_hotkey_change(self):
         """快捷键相关键变更后：与载入基线比对，变了才重新注册并通知宿主。
@@ -1271,7 +1357,7 @@ class SettingsPage(QWidget):
     def _collect_trust(self):
         ut = {"builtin_blacklist": bool(self.trust_builtin_cb.isChecked())}
         for purpose in ("open", "fetch"):
-            action = "none"
+            action = "ask"
             for value, rb in (self._trust_radios.get(purpose) or {}).items():
                 if rb.isChecked():
                     action = value
@@ -1353,6 +1439,7 @@ class SettingsPage(QWidget):
             self._notice("恢复默认失败：%s" % e, ok=False)
             return
         self._load_from_cfg()
+        self._apply_incomplete_suffixes()
         if self._theme_pref != old_pref:
             self._apply_theme_path(self._theme_pref)
         if old_hotkeys != self._hotkeys_at_load:

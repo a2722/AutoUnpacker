@@ -12,6 +12,8 @@ toolbox.db-*
 *.db-journal
 # 删除回溯记录（含真实文件路径）
 deletion_trail.json
+# 挂起的网址信任询问（含用户访问过的网址/域名）
+pending_trust.json
 # 运行日志（含明文密码和文件路径）
 logs/
 # 崩溃日志（含用户路径，含轮转出来的 crash.log.1 等）

@@ -162,6 +162,34 @@ class _PwHeader(QHeaderView):
             painter.end()
 
 
+# 动作列宽 = 行内控件 sizeHint + 本余量。14px = 单元格左右内缩 12px（网格线 + 项边距）
+# + 2px 安全余量；实测（离屏、真实样式表）4 字按钮「设为永久」在列宽 186px 时完整显示、
+# 182px 时仍被中间截断成「为永」，故用 sizeHint + 14 作下限。
+_ACTION_COL_INSET = 14
+
+
+def _fit_action_column(table, col):
+    """把动作列宽调到「最宽那一行」的实际需求（只增不减）。
+
+    临时行的「设为永久」比两字按钮宽：固定 158px 时该按钮会被挤到只露出中段字
+    （显示成「为永」）。这里按各行行内控件的 sizeHint 取最大值再留出单元格内缩
+    ——sizeHint 已包含 QSS padding 与当前字体，所以换主题 / 换字号会自动跟随；
+    异常一律保留原宽度。
+    """
+    try:
+        cur = int(table.columnWidth(int(col)))
+        need = cur
+        for w in table._action_widgets:
+            try:
+                need = max(need, int(w.sizeHint().width()) + _ACTION_COL_INSET)
+            except Exception:
+                continue
+        if need > cur:
+            table.setColumnWidth(int(col), need)
+    except Exception:
+        pass
+
+
 class _PwTable(QTableView):
     """口令表：掩码列 + 行内 复制 / 编辑 / 删除；Delete 键发 deleteKeyPressed。
 
@@ -326,18 +354,19 @@ class _PwTable(QTableView):
             widget = self._make_actions(row, data)
             self.setIndexWidget(self._model.index(row, _PwModel.COL_ACT), widget)
             self._action_widgets.append(widget)
+        _fit_action_column(self, _PwModel.COL_ACT)
 
     def _make_actions(self, row_index, data):
         kind = str(data.get("kind"))
         is_temp = kind == "temp"
         can_edit = kind == "book"
-        can_delete = kind in ("book", "temp")
+        can_delete = kind in ("book", "temp", "dict")
         if can_edit:
             del_tip = "从密码本删除这条口令"
         elif is_temp:
             del_tip = "移除这条临时口令（剪贴板捕获）"
         else:
-            del_tip = "字典口令来自解压命中记录，不支持删除"
+            del_tip = "从密码字典删除这条记录（不影响密码本）"
         w = QWidget(self)
         lay = QHBoxLayout(w)
         lay.setContentsMargins(0, 0, 6, 0)
@@ -493,6 +522,7 @@ class _ShareTable(QTableView):
             widget = self._make_actions(row, data)
             self.setIndexWidget(self._model.index(row, _ShareModel.COL_ACT), widget)
             self._action_widgets.append(widget)
+        _fit_action_column(self, _ShareModel.COL_ACT)
 
     def _make_actions(self, row_index, data):
         w = QWidget(self)

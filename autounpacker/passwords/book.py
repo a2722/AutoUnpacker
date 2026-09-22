@@ -60,6 +60,23 @@ def delete_password_row(pid):
         return False
 
 
+# ---------- 密码字典 helper（薄封装 db，供密码本页删除 / 清空字典条目） ----------
+def delete_dict_password(password):
+    """从密码字典按口令精确删除一条记录（不影响密码本），返回是否命中；失败返回 False。"""
+    try:
+        return db.delete_dict_password(password)
+    except Exception:
+        return False
+
+
+def clear_password_dict():
+    """清空密码字典（命中统计随之归零），返回删除条数；失败返回 -1。"""
+    try:
+        return db.clear_password_dict()
+    except Exception:
+        return -1
+
+
 # ---------- 固定提取码行级 helper（薄封装 db 行级 API，供密码本页使用） ----------
 def list_share_code_rows():
     """行级读取固定提取码：[{"share_uk","code","note","pick","updated_at"}, ...]；异常返回 []。"""

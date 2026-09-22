@@ -9,6 +9,7 @@ import time
 
 from ... import db
 from ...passwords.book import (add_password_row, add_share_code_row,
+                               clear_password_dict, delete_dict_password,
                                delete_password_row, delete_share_code_row,
                                list_password_rows, list_share_code_rows,
                                set_share_code_rows, update_password_row,
@@ -190,6 +191,27 @@ class _PwData:
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def dict_count(self):
+        """密码字典当前收录条数（「清空密码字典」的条数口径）。"""
+        return len(self.hits())
+
+    def remove_dict(self, row):
+        """从密码字典按口令删除一行（只影响命中统计，不影响密码本），返回是否成功。"""
+        try:
+            p = str((row or {}).get("password") or "")
+            if not p:
+                return False
+            return bool(delete_dict_password(p))
+        except Exception:
+            return False
+
+    def clear_dict(self):
+        """清空密码字典（命中统计随之归零），返回删除条数；失败返回 -1。"""
+        try:
+            return int(clear_password_dict())
+        except Exception:
+            return -1
 
     def rows(self):
         """合并成页面行：长期 -> 临时 -> 字典补缺（同口令只留最靠前的一条）。"""

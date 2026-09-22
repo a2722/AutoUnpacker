@@ -348,6 +348,40 @@ def add_dict_password(password):
             conn.close()
 
 
+def delete_dict_password(password):
+    """从密码字典按口令精确删除一条记录（不影响密码本），返回是否命中；任何异常都不抛。"""
+    pw = str(password or "")
+    if not pw:
+        return False
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "DELETE FROM password_dict WHERE password = ?", (pw,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
+def clear_password_dict():
+    """清空密码字典（命中次数 / 最近命中统计随之归零），返回删除条数；失败返回 -1，任何异常都不抛。"""
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute("DELETE FROM password_dict")
+                conn.commit()
+                return max(0, int(cur.rowcount or 0))
+            finally:
+                conn.close()
+    except Exception:
+        return -1
+
+
 # ---------- 百度清单模式：粘性记忆 ----------
 def sticky_remember(path, kind="file", note=""):
     """记住一个「属于本次网盘下载」的路径（跨重启 / 客户端清历史后仍认得）。"""

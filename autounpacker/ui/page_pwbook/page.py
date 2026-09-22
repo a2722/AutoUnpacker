@@ -213,10 +213,17 @@ class PasswordBookPage(QWidget):
         self.sel_del_btn = QPushButton("删除选中", self)
         self.sel_del_btn.setObjectName("ghostSm")
         self.sel_del_btn.setCursor(Qt.PointingHandCursor)
-        self.sel_del_btn.setToolTip("删除选中的口令（先确认；仅字典收录的行会跳过）")
+        self.sel_del_btn.setToolTip("删除选中的口令（先确认；字典收录行只从密码字典移除）")
         self.sel_del_btn.clicked.connect(self._delete_selected)
         self.sel_del_btn.setVisible(False)
         row.addWidget(self.sel_del_btn)
+        self.dict_clear_btn = QPushButton("清空密码字典", self)
+        self.dict_clear_btn.setObjectName("ghostSm")
+        self.dict_clear_btn.setCursor(Qt.PointingHandCursor)
+        self.dict_clear_btn.setToolTip(
+            "清空密码字典（「命中次数 / 最近命中」统计随之归零；不影响密码本与临时口令）")
+        self.dict_clear_btn.clicked.connect(self._on_clear_dict)
+        row.addWidget(self.dict_clear_btn)
         self.dedup_btn = QPushButton("查重", self)
         self.dedup_btn.setObjectName("ghostSm")
         self.dedup_btn.setCursor(Qt.PointingHandCursor)
@@ -416,6 +423,7 @@ class PasswordBookPage(QWidget):
         self.table.set_rows(picked, keep_scroll=keep_scroll)
         if keep:
             self.table.select_passwords(keep)
+        self._on_selection_changed()   # 模型重置不发信号：重建后同步「复制/删除选中」显隐
         self.table_empty.set_empty(
             not picked, EMPTY_PWFILTER if self._rows else EMPTY_BOOK)
 
@@ -695,7 +703,7 @@ class PasswordBookPage(QWidget):
         """按行 kind 逐行删除，返回 (deleted, skipped)。
 
         book -> 数据库按 id 精确删除；temp -> state.remove_temp_password（同步落盘
-        剪贴板清单）；仅字典收录（dict）的行是派生数据，一律跳过。"""
+        剪贴板清单）；dict -> 从密码字典按口令删除（只影响命中统计，不影响密码本）。"""
         deleted = 0
         skipped = 0
         for row in rows or []:
@@ -710,6 +718,11 @@ class PasswordBookPage(QWidget):
                     deleted += 1
                 else:
                     skipped += 1
+            elif kind == "dict":
+                if self._data.remove_dict(row):
+                    deleted += 1
+                else:
+                    skipped += 1
             else:
                 skipped += 1
         return deleted, skipped
@@ -718,13 +731,16 @@ class PasswordBookPage(QWidget):
         """批量删除确认（只说条数与后果，绝不携带明文口令）；确认返回 True。"""
         n_book = sum(1 for r in rows if str(r.get("kind")) == "book")
         n_temp = sum(1 for r in rows if str(r.get("kind")) == "temp")
+        n_dict = sum(1 for r in rows if str(r.get("kind")) == "dict")
         detail = []
         if n_book:
             detail.append("长期口令 %d 条（解压将不再尝试）" % n_book)
         if n_temp:
             detail.append("临时口令 %d 条（剪贴板捕获记录）" % n_temp)
+        if n_dict:
+            detail.append("字典收录 %d 条（仅影响「命中次数 / 最近命中」统计）" % n_dict)
         text = ("确定删除选中的 %d 条口令吗？\n%s\n"
-                "删除只影响密码本 / 剪贴板记录，不会删除任何已解压的文件。"
+                "删除只影响密码本 / 剪贴板记录 / 命中统计，不会删除任何已解压的文件。"
                 % (len(rows), " · ".join(detail)))
         answer = QMessageBox.question(
             self, "删除口令", text,
@@ -733,7 +749,7 @@ class PasswordBookPage(QWidget):
 
     def _delete_row(self, row_index):
         """行内「删除」按钮：book 先二次确认；temp 是剪贴板临时记录，直接移除；
-        dict 行（仅解压命中收录）拒绝删除。"""
+        dict 从密码字典移除（只影响命中统计，不影响密码本）。"""
         row = self.table.row_at(row_index) or {}
         kind = str(row.get("kind") or "")
         if kind == "book":
@@ -761,36 +777,75 @@ class PasswordBookPage(QWidget):
             else:
                 self.notice.emit("删除失败：无法移除临时口令")
             return
-        self.notice.emit("字典口令来自解压命中记录，不支持删除")
+        if kind == "dict":
+            deleted, _skipped = self._delete_rows([row])
+            if deleted:
+                self.reload()
+                self.changed.emit()
+                self.notice.emit("已从密码字典删除（命中统计已同步）")
+            else:
+                self.notice.emit("删除失败：无法写入密码字典")
+            return
+        self.notice.emit("选中的行不支持删除")
 
     def _delete_selected(self):
         """删除全部选中行（Delete 键与「删除选中」共用）：先确认，再逐行删除。
 
-        长期行按 id 删、临时行从剪贴板记录移除；仅字典收录的行跳过并如实回执。"""
+        长期行按 id 删、临时行从剪贴板记录移除、字典收录行从密码字典移除（只影响
+        命中统计）；无法写入的行跳过并如实回执。"""
         rows = self.table.selected_rows_data()
         if not rows:
             self.notice.emit("请先选择要删除的口令")
             return
         deletable = [r for r in rows
-                     if str(r.get("kind") or "") in ("book", "temp")]
+                     if str(r.get("kind") or "") in ("book", "temp", "dict")]
         if not deletable:
-            self.notice.emit("字典口令来自解压命中记录，不支持删除")
+            self.notice.emit("选中的行不支持删除")
             return
         if not self._confirm_delete(deletable):
             return
-        dict_skipped = len(rows) - len(deletable)
+        unknown_skipped = len(rows) - len(deletable)
         deleted, skipped = self._delete_rows(deletable)
-        skipped += dict_skipped
+        skipped += unknown_skipped
         if deleted:
             self.reload()
             self.changed.emit()
         if deleted and skipped:
-            self.notice.emit("已删除 %d 条口令，跳过 %d 条（字典 / 无法写入）"
+            self.notice.emit("已删除 %d 条，跳过 %d 条（无法写入）"
                              % (deleted, skipped))
         elif deleted:
             self.notice.emit("已删除 %d 条口令" % deleted)
         else:
             self.notice.emit("删除失败：无法写入密码本")
+
+    # ---- 密码字典：整表清空（强二次确认，镜像回溯页「清空记录」的两段确认） ----
+    def _on_clear_dict(self):
+        """清空密码字典：连续两次确认（强二次确认）后整表清空；命中统计随之归零。
+
+        字典只用于「命中次数 / 最近命中」统计，清空不影响密码本与临时口令；
+        回执只说条数，绝不携带明文口令。"""
+        n = self._data.dict_count()
+        if n <= 0:
+            self.notice.emit("密码字典为空，无需清空")
+            return
+        if QMessageBox.question(
+                self, "清空密码字典",
+                "确定清空密码字典吗？\n将删除全部 %d 条字典收录记录。" % n,
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        if QMessageBox.warning(
+                self, "再次确认",
+                "清空后所有口令的「命中次数 / 最近命中」统计将全部归零且无法恢复"
+                "（密码本与临时口令本身不受影响），确定继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        removed = self._data.clear_dict()
+        if removed < 0:
+            self.notice.emit("清空密码字典失败：无法写入")
+            return
+        self.reload()
+        self.changed.emit()
+        self.notice.emit("已清空密码字典（命中统计已归零，删除 %d 条）" % removed)
 
     # ---- 口令整理：查重（排序已改为点列头的纯视图重排，见 _on_header_clicked） ----
     def _on_dedup(self):

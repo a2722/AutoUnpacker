@@ -203,7 +203,7 @@ def _lamp_color(state):
     key = dir_state_key(state)
     if key == "extracting":
         return PALETTE["success"]
-    if key == "waiting":
+    if key in ("waiting", "missing"):
         return _tk("nbar_warn", PALETTE["muted"])
     if key == "error":
         return PALETTE["danger"]

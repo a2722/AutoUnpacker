@@ -62,7 +62,7 @@ from .hub import Hub, StdoutCapture
 from .utils import (_boot_tick, _boot_time, _norm_path_for_cfg,
                     _can_open_append, _install_crash_log)
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __all__ = [
     "PROJECT_ROOT", "DATA_DIR", "CONFIG_FILE", "TEMP_PW_FILE", "CRASH_LOG",
     "LOGS_DIR", "WORKERS_DIR", "SINGLE_INSTANCE_EVENT",

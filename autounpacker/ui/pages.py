@@ -292,7 +292,7 @@ class _QueueLogSplitter(QSplitter):
 
 
 class TaskPage(QWidget):
-    """任务页：队列/历史表 + 失败过滤 + 「该任务日志」（当前任务 / 全部）。
+    """任务页：队列/历史表 + 失败过滤 + 「该任务日志」（全部 / 当前任务，默认全部）。
 
     只持有状态与控件；任务/日志数据的装载由宿主 MainWindow 完成（便于打桩测试）。
     信号：taskActivated(task_id) / taskDoubleClicked(task_id) / taskDeselected() /
@@ -314,7 +314,8 @@ class TaskPage(QWidget):
         super().__init__(parent)
         self._scope = "queue"
         self._result_failed = False
-        self._log_scope = "task"
+        # 日志范围默认「全部」：未选中任务时视图不空（选中/清空再随选中联动）
+        self._log_scope = "all"
         self._current_task = None
         self._counts = {}
         self.log_view = log_view
@@ -377,7 +378,7 @@ class TaskPage(QWidget):
         head.addWidget(self.badge)
         head.addStretch(1)
         self.seg_logscope = SegControl(self)
-        self.seg_logscope.set_items([("当前任务", "task"), ("全部", "all")])
+        self.seg_logscope.set_items([("全部", "all"), ("当前任务", "task")])
         self.seg_logscope.currentChanged.connect(self._on_log_scope)
         head.addWidget(self.seg_logscope)
         self.retry_btn = _ghost_button("重试", self)
@@ -526,13 +527,18 @@ class TaskPage(QWidget):
         self.seg_logscope.set_current(self._log_scope)
 
     def set_current_task(self, task, name=None):
-        """设置当前任务（dict 或 None）：更新徽标与三个操作按钮的可用性。"""
+        """设置当前任务（dict 或 None）：更新徽标与三个操作按钮的可用性。
+
+        日志范围随选中联动：清空选中回「全部」（视图不空）；换选任务切「当前任务」。
+        """
         if not isinstance(task, dict):
             self._current_task = None
             self.badge.clear()
             self.badge.hide()
             self._set_task_buttons(False)
+            self.set_log_scope("all")
             return
+        prev_id = self.current_task_id()
         self._current_task = dict(task)
         full = str(name or task.get("file_name") or "")
         self.badge.setToolTip(full)
@@ -543,6 +549,8 @@ class TaskPage(QWidget):
             self.badge.setText(full)
         self.badge.setVisible(bool(full))
         self._set_task_buttons(self.current_task_id() is not None)
+        if self.current_task_id() != prev_id:
+            self.set_log_scope("task")
 
     def _set_task_buttons(self, enabled):
         for btn in (self.retry_btn, self.open_btn, self.copy_btn):

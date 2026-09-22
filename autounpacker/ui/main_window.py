@@ -1412,8 +1412,16 @@ class MainWindow(QMainWindow):
         self._open_watchdir_dialog(int(idx))
 
     def _open_watchdir_dialog(self, idx):
-        """打开 WatchDirDialog 并接线保存/移除；返回 exec_ 的返回码。"""
-        dlg = WatchDirDialog(self.state, int(idx), self)
+        """打开 WatchDirDialog 并接线保存/移除；返回 exec_ 的返回码。
+
+        传入 _dir_entries() 解析后的条目（含 _dir_states 运行时缓存的真实状态），
+        弹窗状态徽标与目录胶囊同一口径；配置条目本身没有 state 键，不能再拿它
+        冒充「监听中」。"""
+        try:
+            entry = self._dir_entries()[int(idx)]
+        except Exception:
+            entry = None
+        dlg = WatchDirDialog(self.state, int(idx), self, entry=entry)
         self._watchdir_dlg = dlg
         dlg.saved.connect(self._on_watchdir_saved)
         dlg.removeRequested.connect(self._on_watchdir_remove_requested)

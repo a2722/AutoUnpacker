@@ -124,7 +124,8 @@ class PasswordBookPage(QWidget):
         self.stats_label.setObjectName("stripHint")
         strip.addWidget(self.stats_label)
         strip.addStretch(1)
-        self.hint_label = QLabel("命中次数来自解压使用记录 · 双击行可复制口令", self)
+        self.hint_label = QLabel(
+            "命中次数来自解压使用记录 · 双击行可复制口令 · 双击备注列可编辑备注", self)
         self.hint_label.setObjectName("stripHint")
         strip.addWidget(self.hint_label)
         lay.addLayout(strip)
@@ -134,6 +135,8 @@ class PasswordBookPage(QWidget):
         self.table = _PwTable(self)
         self.table.copyRequested.connect(self._copy_row)
         self.table.editRequested.connect(self._edit_row)
+        self.table.editNoteRequested.connect(self._edit_note_row)
+        self.table.promoteRequested.connect(self._promote_row)
         self.table.deleteRowRequested.connect(self._delete_row)
         self.table.deleteKeyPressed.connect(self._delete_selected)
         self.table.headerClicked.connect(self._on_header_clicked)
@@ -537,20 +540,26 @@ class PasswordBookPage(QWidget):
         except Exception:
             pass
 
-    def _ask_edit(self, title, current, note):
+    def _ask_edit(self, title, current, note, focus_note=False):
         """弹新增 / 编辑对话框（口令 + 备注）；取消返回 None（口令绝不进日志）。
 
+        focus_note=True 时对话框把键盘焦点锁进备注栏（双击备注列进入编辑用）。
         真实对话框接受备注；旧测试桩只接受 (parent, title, password) 三参，构造
         失败时退回三参并令 note=None（表示该数据源 / 对话框不支持备注）。
         批量导入（仅新增对话框提供）经返回值的 batch 字段传递，页面统一走
         与单条新增相同的 _PwData.add 入口写入。
         """
         try:
-            dlg = _PasswordEditDialog(self, title, current, note)
+            dlg = _PasswordEditDialog(self, title, current, note,
+                                      focus_note=focus_note)
             has_note = True
         except TypeError:
-            dlg = _PasswordEditDialog(self, title, current)
-            has_note = False
+            try:
+                dlg = _PasswordEditDialog(self, title, current, note)
+                has_note = True
+            except TypeError:
+                dlg = _PasswordEditDialog(self, title, current)
+                has_note = False
         if dlg.exec_() != QDialog.Accepted:
             return None
         out = {"password": str(dlg.password() or "").strip()}
@@ -616,14 +625,15 @@ class PasswordBookPage(QWidget):
             "批量导入完成：新增 %d 条，跳过 %d 条（重复 %d / 空行 %d / 失败 %d）"
             % (imported, skipped, dup, empty, failed))
 
-    def _edit_row(self, row_index):
+    def _edit_row(self, row_index, focus_note=False):
+        """行内「编辑」/ 双击备注列：打开编辑对话框（focus_note=True 时焦点锁进备注栏）。"""
         row = self.table.row_at(row_index) or {}
         if str(row.get("kind")) != "book":
             self.notice.emit("临时 / 字典口令不支持编辑")
             return
         old = str(row.get("password") or "")
         old_note = str(row.get("note") or "")
-        result = self._ask_edit("编辑口令", old, old_note)
+        result = self._ask_edit("编辑口令", old, old_note, focus_note=focus_note)
         if result is None:
             return
         new = result["password"]
@@ -641,6 +651,35 @@ class PasswordBookPage(QWidget):
         self.reload()
         self.changed.emit()
         self.notice.emit("口令已更新" if new != old else "备注已更新")
+
+    def _edit_note_row(self, row_index):
+        """双击备注列：打开编辑对话框并把键盘焦点锁进备注栏（其余列双击仍是复制）。"""
+        self._edit_row(row_index, focus_note=True)
+
+    def _promote_row(self, row_index):
+        """行内「设为永久」：把临时（剪贴板）口令加入长期密码本并移出临时记录。
+
+        与剪贴板自动收录走同一条后端入口（_PwData.add -> state.add_password_row /
+        db.add_password，source=manual）：先落库成功再移除临时记录，写库失败时
+        绝不误删临时记录；两步结果都如实回执（绝不静默），口令明文不进回执。
+        """
+        row = self.table.row_at(row_index) or {}
+        if str(row.get("kind")) != "temp":
+            self.notice.emit("只有临时口令可以设为永久")
+            return
+        password = str(row.get("password") or "")
+        if not password:
+            return
+        if not self._data.add(password, str(row.get("note") or "")):
+            self.notice.emit("设为永久失败：无法写入密码本")
+            return
+        removed = self._remove_temp(password)
+        self.reload()
+        self.changed.emit()
+        if removed:
+            self.notice.emit("已设为永久口令（已移出临时记录）")
+        else:
+            self.notice.emit("已加入密码本，但临时记录未能移除")
 
     def _remove_temp(self, password):
         """移除一条临时（剪贴板）口令；state 不支持该接口（旧整表桩）时返回 False。"""

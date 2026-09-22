@@ -2,7 +2,7 @@
 """设置页（正式页面）：把全部配置项做成页内分区表单，替代过渡占位页。
 
 职责：
-- SettingsPage：9 个分区覆盖 config.DEFAULT_CONFIG 的全部键；
+- SettingsPage：10 个分区覆盖 config.DEFAULT_CONFIG 的全部键；
 - 「改即存」：每个控件变更即走 AppState.set()（config.save_config 原子写），
   文本 / 多行编辑 400ms 防抖、失焦立即落盘；写后回读磁盘校验，失败如实回报；
 - 「恢复默认」：二次确认后写回 config._sanitize_cfg(DEFAULT_CONFIG)（与
@@ -27,7 +27,7 @@
       themeChanged(str) / notice(str)。
 注意：本模块不联网、不起线程、不重启应用；所有异常都转成页内 notice 提示。
 注意（allow: SIZE_OK）：按任务要求「单文件承载全部设置表单、不得新建兄弟模块」，
-      9 个分区 + 全部顶层键覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
+      10 个分区 + 全部顶层键覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
       「键 -> 控件 -> 即时保存」的覆盖契约在一个文件里可直接审计。
 """
 import json
@@ -232,7 +232,8 @@ class SettingsPage(QWidget):
         self._build_hotkey_section()       # 全局快捷键
         self._build_share_section()        # 分享与手势
         self._build_qr_section()           # 二维码与剪贴板
-        self._build_notify_section()       # 通知与实验性
+        self._build_notify_section()       # 通知
+        self._build_experimental_section() # 实验性
         self._build_trust_section()        # 网址信任
         self._build_close_section()        # 托盘与关闭
         self._lay.addStretch(1)
@@ -729,21 +730,22 @@ class SettingsPage(QWidget):
         box.addWidget(self._hint("长期密码本在「密码本」页管理；此处只读显示条目数。"))
 
     # ------------------------------------------------------------------
-    # 分区：通知与实验性
+    # 分区：通知
     # ------------------------------------------------------------------
     def _build_notify_section(self):
         box = self._section(
-            "alert", "通知与实验性",
-            "通知总开关关闭后不弹任何提示（运行日志仍记录）；实验性功能默认关闭。")
+            "alert", "通知",
+            "通知总开关关闭后不弹任何提示（运行日志仍记录），下方通知项一并禁用。")
         self.notify_cb = self._check_row(
             box, "notify_enabled", "通知总开关",
-            "关闭后不弹出任何通知（运行日志仍会记录）。")
-        self._sub_label(box, "解压事件")
+            "关闭后不弹出任何通知（运行日志仍会记录），下方通知项全部禁用；"
+            "重新打开总开关即可恢复。")
+        self.notify_event_label = self._sub_label(box, "解压事件")
         self.notify_archive_cb = self._check_row(box, "notify_archive", "发现压缩包")
         self.notify_success_cb = self._check_row(box, "notify_success", "解压完成")
         self.notify_failure_cb = self._check_row(box, "notify_failure", "解压失败")
         self.notify_error_cb = self._check_row(box, "notify_error", "解压出错")
-        self._sub_label(box, "托盘提示")
+        self.notify_tray_label = self._sub_label(box, "托盘提示")
         self.notify_trayed_cb = self._check_row(box, "notify_trayed", "已最小化到托盘")
         self.notify_running_cb = self._check_row(
             box, "notify_already_running", "程序已在运行时提示",
@@ -757,7 +759,7 @@ class SettingsPage(QWidget):
             box, "notify_share_dead", "分享链接已失效",
             "链接被取消/过期/违规、抓页即判定失效时当场提醒（叠加在"
             "「分享 / 网盘分享类通知」之上：两个开关都开才会弹）。")
-        self._sub_label(box, "网盘任务（实验性）")
+        self.notify_baidu_label = self._sub_label(box, "网盘任务（实验性）")
         self.notify_baidu_done_cb = self._check_row(
             box, "notify_baidu_done", "网盘下载批次完成",
             "实验性功能开启时：一个下载批次全部任务完成时通知。")
@@ -768,6 +770,23 @@ class SettingsPage(QWidget):
             box, "notify_baidu_dup", "新任务与历史下载重复",
             "实验性功能开启时：新任务在下载历史里已存在（同名同大小）时通知。")
 
+        self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
+                             self.notify_failure_cb, self.notify_error_cb,
+                             self.notify_trayed_cb, self.notify_running_cb,
+                             self.notify_trust_cb, self.notify_share_cb,
+                             self.notify_share_dead_cb,
+                             self.notify_baidu_done_cb,
+                             self.notify_baidu_leftover_cb, self.notify_baidu_dup_cb)
+        # 子分组标题也随总开关一起变灰（与 _exp_subs 里的 share_nologin_hint 同例）
+        self._notify_labels = (self.notify_event_label, self.notify_tray_label,
+                               self.notify_baidu_label)
+        self.notify_cb.toggled.connect(lambda _s: self._sync_notify_enabled())
+
+    # ------------------------------------------------------------------
+    # 分区：实验性
+    # ------------------------------------------------------------------
+    def _build_experimental_section(self):
+        box = self._section("queue", "实验性", "实验性功能默认关闭。")
         self.experimental_cb = self._check_row(
             box, "experimental_enabled", "开启实验性功能（默认关）",
             "实验性、默认关闭。当前用途：只读探测百度网盘客户端的本地任务库，"
@@ -803,17 +822,9 @@ class SettingsPage(QWidget):
             "因此自动拉起前会先检查客户端进程，未运行时跳过并提示。", self, warn=True)
         box.addWidget(self.share_nologin_hint)
 
-        self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
-                             self.notify_failure_cb, self.notify_error_cb,
-                             self.notify_trayed_cb, self.notify_running_cb,
-                             self.notify_trust_cb, self.notify_share_cb,
-                             self.notify_share_dead_cb,
-                             self.notify_baidu_done_cb,
-                             self.notify_baidu_leftover_cb, self.notify_baidu_dup_cb)
         self._exp_subs = (self.baidu_auto_invoke_cb, self.baidu_pick_cb,
                           self.baidu_db_edit, self.baidu_db_browse_btn,
                           self.share_nologin_hint)
-        self.notify_cb.toggled.connect(lambda _s: self._sync_notify_enabled())
         self.experimental_cb.toggled.connect(lambda _s: self._sync_experimental())
 
     def _browse_baidu_db(self):
@@ -826,9 +837,10 @@ class SettingsPage(QWidget):
             self.baidu_db_edit.setText(path)
 
     def _sync_notify_enabled(self):
+        """通知总开关联动：关闭时通知子控件（选框 + 子分组标题）全部禁用，打开即恢复。"""
         on = bool(self.notify_cb.isChecked())
-        for cb in self._notify_subs:
-            cb.setEnabled(on)
+        for w in self._notify_subs + self._notify_labels:
+            w.setEnabled(on)
 
     def _sync_experimental(self):
         on = bool(self.experimental_cb.isChecked())

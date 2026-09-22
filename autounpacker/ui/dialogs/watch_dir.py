@@ -20,7 +20,9 @@ from .delete_policy import DeletePolicyAskDialog
 class WatchDirDialog(QDialog):
     """目录设置弹窗（对应原型 12）：宽 600、模态、居中于父窗口。
 
-    由目录胶囊点击后打开：`WatchDirDialog(state, idx, parent)`。结构：
+    由目录胶囊点击后打开：`WatchDirDialog(state, idx, parent, entry=None)`；entry 为
+    宿主（MainWindow._dir_entries）解析后的条目（含运行时 state/progress/name），
+    状态徽标据此显示真实状态，不再拿配置里不存在的 state 冒充「监听中」。结构：
     - 头部：目录图标 + 标题 + 等宽路径 + 实时状态徽标 + 关闭；
     - 表单：监听路径 / 解压到 / 监听模式（**两张平铺卡，严禁 QComboBox**）/
       启用监听 + 解压成功后删除源文件 / 回收站说明 /「当前正在处理」卡片；
@@ -38,12 +40,14 @@ class WatchDirDialog(QDialog):
     saved = pyqtSignal(int)
     removeRequested = pyqtSignal(int)
 
-    def __init__(self, state, idx, parent=None):
+    def __init__(self, state, idx, parent=None, entry=None):
         super().__init__(parent)
         self.state = state
         self.idx = int(idx)
         self._scrim = None
-        self._orig = self._load_entry()
+        # entry：宿主解析后的条目（与目录胶囊同一口径，含运行时 state）；为 None
+        # 时退回按 idx 读配置快照（兼容直接构造/离线测试）。
+        self._orig = dict(entry) if isinstance(entry, dict) and entry else self._load_entry()
         self._state_key = dir_state_key(self._orig.get("state") or "listening")
         self._progress = None
         try:
@@ -312,7 +316,7 @@ class WatchDirDialog(QDialog):
             color = PALETTE["success"]
             if self._state_key == "error":
                 color = PALETTE["danger"]
-            elif self._state_key in ("paused", "waiting"):
+            elif self._state_key in ("paused", "waiting", "missing"):
                 color = PALETTE["muted"]
             elif self._state_key == "listening":
                 color = PALETTE["accent_text"]

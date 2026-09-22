@@ -21,9 +21,13 @@ class _PasswordEditDialog(QDialog):
     新增（初始口令为空）时提供「批量导入」：同一对话框切换为多行输入（一行一个
     口令），备注对每个口令生效；「返回单条」切回单条表单。编辑既有口令不提供批量
     入口（避免把「改一条」误变成「加一批」）。对话框只收集输入，不写库。
+
+    focus_note=True（双击备注列进入编辑）时键盘焦点直接锁进备注栏，光标停在
+    备注文本末尾，打开即可输入；默认仍是焦点在口令栏。
     """
 
-    def __init__(self, parent=None, title="新增口令", password="", note=""):
+    def __init__(self, parent=None, title="新增口令", password="", note="",
+                 focus_note=False):
         super().__init__(parent)
         self.setWindowTitle(str(title))
         self.setMinimumWidth(380)
@@ -80,6 +84,9 @@ class _PasswordEditDialog(QDialog):
         self.batch_edit.textChanged.connect(self._sync_save)
         self.edit.returnPressed.connect(self._on_return)
         self.edit.setFocus()
+        if focus_note:
+            self.note_edit.setFocus()
+            self.note_edit.setCursorPosition(len(self.note_edit.text()))
 
     def _toggle_batch(self):
         """单条 / 批量输入切换（同一表单；备注字段两种模式共用）。"""

@@ -165,12 +165,18 @@ class _PwHeader(QHeaderView):
 class _PwTable(QTableView):
     """口令表：掩码列 + 行内 复制 / 编辑 / 删除；Delete 键发 deleteKeyPressed。
 
+    长期行行内为 复制 / 编辑 / 删除；临时（剪贴板）行编辑本就不可用，改为
+    「设为永久」（promoteRequested）——不再放出点不动的禁用按钮。
+    双击备注列发 editNoteRequested（页面打开编辑框并把焦点锁进备注栏），
+    双击其余列仍是复制（copyRequested）。
     支持 ExtendedSelection（Shift / Ctrl 多选）；点列头发 headerClicked（页面做
     仅显示层的排序，动作列除外）；列头指示器只做视觉提示，Qt 自身排序保持关闭。
     """
 
     copyRequested = pyqtSignal(int)
     editRequested = pyqtSignal(int)
+    editNoteRequested = pyqtSignal(int)
+    promoteRequested = pyqtSignal(int)
     deleteRowRequested = pyqtSignal(int)
     deleteKeyPressed = pyqtSignal()
     headerClicked = pyqtSignal(int)
@@ -323,11 +329,12 @@ class _PwTable(QTableView):
 
     def _make_actions(self, row_index, data):
         kind = str(data.get("kind"))
+        is_temp = kind == "temp"
         can_edit = kind == "book"
         can_delete = kind in ("book", "temp")
         if can_edit:
             del_tip = "从密码本删除这条口令"
-        elif kind == "temp":
+        elif is_temp:
             del_tip = "移除这条临时口令（剪贴板捕获）"
         else:
             del_tip = "字典口令来自解压命中记录，不支持删除"
@@ -339,19 +346,29 @@ class _PwTable(QTableView):
         copy_btn = self._small_button("复制", "复制口令到剪贴板")
         copy_btn.clicked.connect(
             lambda _=False, r=row_index: self.copyRequested.emit(int(r)))
-        edit_btn = self._small_button(
-            "编辑", "编辑这条口令" if can_edit else "临时 / 字典口令不支持编辑")
-        edit_btn.setEnabled(can_edit)
-        if can_edit:
-            edit_btn.clicked.connect(
-                lambda _=False, r=row_index: self.editRequested.emit(int(r)))
+        lay.addWidget(copy_btn)
+        if is_temp:
+            # 临时（剪贴板）口令不支持编辑，按钮改为「设为永久」：把该口令加入
+            # 长期密码本并移出临时记录（复用剪贴板自动收录的同一后端入口）。
+            promote_btn = self._small_button(
+                "设为永久", "把这条临时口令加入长期密码本（并移出临时记录）")
+            promote_btn.clicked.connect(
+                lambda _=False, r=row_index: self.promoteRequested.emit(int(r)))
+            lay.addWidget(promote_btn)
+        else:
+            edit_btn = self._small_button(
+                "编辑", "编辑这条口令" if can_edit else "字典口令不支持编辑")
+            edit_btn.setEnabled(can_edit)
+            if can_edit:
+                edit_btn.clicked.connect(
+                    lambda _=False, r=row_index: self.editRequested.emit(int(r)))
+            lay.addWidget(edit_btn)
         del_btn = self._small_button("删除", del_tip, danger=True)
         del_btn.setEnabled(can_delete)
         if can_delete:
             del_btn.clicked.connect(
                 lambda _=False, r=row_index: self.deleteRowRequested.emit(int(r)))
-        for btn in (copy_btn, edit_btn, del_btn):
-            lay.addWidget(btn)
+        lay.addWidget(del_btn)
         return w
 
     def _small_button(self, text, tip, danger=False):
@@ -394,8 +411,13 @@ class _PwTable(QTableView):
         self.headerClicked.emit(col)
 
     def _on_double_clicked(self, index):
-        if index.isValid():
-            self.copyRequested.emit(int(index.row()))
+        """双击备注列 -> 编辑该行（焦点锁进备注栏）；双击其余列仍是复制。"""
+        if not index.isValid():
+            return
+        if index.column() == _PwModel.COL_NOTE:
+            self.editNoteRequested.emit(int(index.row()))
+            return
+        self.copyRequested.emit(int(index.row()))
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:

@@ -332,10 +332,12 @@ class FolderWatcher(threading.Thread):
 
     # ---------- 监听目录离线检测（不可达时不假装「监听中」） ----------
     def _mark_offline(self, watch):
-        """目录不可用（不存在 / 枚举失败）：发布 waiting，每段离线只记一次日志。
+        """目录不可用（不存在 / 枚举失败）：发布 missing，每段离线只记一次日志。
 
-        连续离线超过 OFFLINE_NOTIFY_SEC 后补发唯一一条通知；恢复由 _mark_online
-        （枚举成功时）负责复位。任何异常都吞掉：状态上报绝不打断监听主流程。
+        与 _handle 的忙碌 waiting 区分：missing 专指「目录不存在/不可枚举」
+        （文案「目录不存在」），不再冒充「等待中」。连续离线超过
+        OFFLINE_NOTIFY_SEC 后补发唯一一条通知；恢复由 _mark_online（枚举成功时）
+        负责复位。任何异常都吞掉：状态上报绝不打断监听主流程。
         """
         try:
             key = self._norm_path(watch)
@@ -345,7 +347,7 @@ class FolderWatcher(threading.Thread):
                 since = now
                 self._offline[key] = since
                 self.hub.log(f"监听目录不可用（等待恢复）: {watch}")
-            self._set_dir_state(watch, "waiting")
+            self._set_dir_state(watch, "missing")
             if (key not in self._offline_notified
                     and now - since > self.OFFLINE_NOTIFY_SEC):
                 self._offline_notified.add(key)
@@ -355,7 +357,7 @@ class FolderWatcher(threading.Thread):
             pass
 
     def _mark_online(self, watch):
-        """目录恢复可用（枚举成功）：清离线记忆与告警标记，并把离线 waiting 复位
+        """目录恢复可用（枚举成功）：清离线记忆与告警标记，并把离线 missing 复位
         为 listening（忙碌 waiting 由 _handle 自己维护，不在这里清除）。"""
         try:
             key = self._norm_path(watch)
@@ -454,8 +456,8 @@ class FolderWatcher(threading.Thread):
                 self._inc_recount()                  # 计数变化（含归零）时如实记一行
             for path, wc in enabled.items():
                 key = self._norm_path(path)
-                # 离线目录恢复：允许把离线期间发布的 waiting 复位回 listening
-                # （离线 waiting = 目录不可用，不是 _handle 的忙碌等待；extracting
+                # 离线目录恢复：允许把离线期间发布的 missing 复位回 listening
+                # （离线 missing = 目录不可用，不是 _handle 的忙碌等待；extracting
                 # 永远不在此复位）。离线记忆/告警标记不在 run 里清——只有 _poll
                 # 真正枚举成功（_mark_online）才算恢复，否则「目录存在但枚举失败」
                 # 会在每轮重复刷离线日志。
@@ -466,10 +468,11 @@ class FolderWatcher(threading.Thread):
                     except OSError:
                         recovered = False
                 cur = self._dir_state.get(key, (None, None, None))[0]
-                # 空闲目录回到 listening（extracting/waiting 视为忙碌，交给 _handle
-                # 自己收敛；error 会在本轮或下一轮被这里复位为 listening）。
-                if (cur not in ("extracting", "waiting")
-                        or (recovered and cur == "waiting")):
+                # 空闲目录回到 listening（extracting/waiting/missing 视为忙碌，交给
+                # _handle / _mark_online 自己收敛；error 会在本轮或下一轮被这里复位
+                # 为 listening）。
+                if (cur not in ("extracting", "waiting", "missing")
+                        or (recovered and cur in ("waiting", "missing"))):
                     self._set_dir_state(path, "listening")
                 try:
                     self._poll(Path(path), wc)
@@ -480,7 +483,7 @@ class FolderWatcher(threading.Thread):
     def _poll(self, watch, wc):
         # 只监听文件夹表面的一层文件，不递归子孙文件夹
         if not watch.is_dir():
-            # 目录不存在/不可达：如实上报 waiting（此前直接 return，状态永远停在
+            # 目录不存在/不可达：如实上报 missing（此前直接 return，状态永远停在
             # 蓝色「监听中」且无日志，离线盘看起来像在正常工作）。
             self._mark_offline(watch)
             return
@@ -543,7 +546,7 @@ class FolderWatcher(threading.Thread):
         try:
             current = set(n for n in os.listdir(watch) if (watch / n).is_file())
         except OSError:
-            # 同上：枚举失败即离线（waiting + 单次日志），恢复后 run()/_mark_online 复位
+            # 同上：枚举失败即离线（missing + 单次日志），恢复后 run()/_mark_online 复位
             self._mark_offline(watch)
             return
         self._mark_online(watch)

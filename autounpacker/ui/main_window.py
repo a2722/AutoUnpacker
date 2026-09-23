@@ -77,7 +77,9 @@ from .window.logview import (  # noqa: F401
     _record_degraded_link, _degraded_spans_for, _pop_degraded_link,
     _restore_link_span, _restore_degraded_in_view, _rerender_log_view,
     _restore_link_in_view, _log_view_for, _accepts_in_task_view,
-    _append_log_html, _share_log, _persist_log)
+    _append_log_html, _share_log, _persist_log,
+    FoldController,
+    _fold_item_at, _toggle_log_fold, _show_fold_tip, _hide_fold_tip)
 from .window.share_flow import (  # noqa: F401
     _share_dlg_target, _share_window_alive, _share_code_in_window,
     _close_share_ask_dlg, _notify_share_used, _effective_share_code,
@@ -314,6 +316,11 @@ class MainWindow(QMainWindow):
         self.log_box.setMinimumHeight(60)
         self.log_box.viewport().installEventFilter(self)
         self.log_box.viewport().setMouseTracking(True)
+        # 该任务日志同款折叠（与运行日志页共用 FoldController 一套实现）：
+        # 块内原始行先攒着，收尾行到达折成一行、点击展开；视图外一行不动。
+        self.log_box_folds = FoldController(self.log_box,
+                                            render=self._append_log_to,
+                                            parent=self)
 
         self.task_page = TaskPage(self.log_box, self.pages)
         self.task_page.taskActivated.connect(self._on_task_activated)
@@ -1126,14 +1133,23 @@ class MainWindow(QMainWindow):
         except Exception:
             rows = []
         try:
+            self.log_box_folds.reset()      # 重装视图 = 新的一份快照：折叠重新计算
+        except Exception:
+            pass
+        try:
             box.clear()
         except Exception:
             pass
         for r in rows:
             try:
-                self._append_log_to(box, ui_pages.task_log_line(r))
+                self.log_box_folds.feed(ui_pages.task_log_line(r))
             except Exception:
                 pass
+        # 有限快照收尾：未收尾的块立即按原始行吐出（尾巴绝不藏着等 10 秒超时）。
+        try:
+            self.log_box_folds.finish()
+        except Exception:
+            pass
         try:
             tp.set_log_empty(not rows, tp.log_empty_copy())
         except Exception:
@@ -1275,11 +1291,21 @@ class MainWindow(QMainWindow):
         self._append_log("[任务] 该任务还没有可打开的目录（输出目录未生成）")
 
     def _copy_task_log(self):
-        """复制该任务日志到剪贴板；日志为空时退化为复制文件名。"""
+        """复制该任务日志到剪贴板；日志为空时退化为复制文件名。
+
+        折叠块按原始行完整展开后再复制（与日志页导出同一口径）：复制出去的内容
+        绝不因为视图里折起来了就少行。"""
         try:
-            text = self.log_box.toPlainText() if self.log_box is not None else ""
+            ctl = getattr(self, "log_box_folds", None)
+            if ctl is not None:
+                text = ctl.export_text()
+            else:
+                text = self.log_box.toPlainText() if self.log_box is not None else ""
         except Exception:
-            text = ""
+            try:
+                text = self.log_box.toPlainText()
+            except Exception:
+                text = ""
         if not text.strip():
             cur = self.task_page.current_task() or {}
             text = str(cur.get("file_name") or "")
@@ -1582,9 +1608,16 @@ class MainWindow(QMainWindow):
                 pass
         view_msg = msg if shown is None else shown
         if _accepts_in_task_view(self, record):
-            box = getattr(self, "log_box", None)
-            if box is not None:
-                _append_log_html(self, box, view_msg)
+            ctl = getattr(self, "log_box_folds", None)
+            try:
+                if ctl is not None:
+                    ctl.feed(view_msg)       # 该任务日志同样折叠（与日志页共用一套）
+                else:
+                    box = getattr(self, "log_box", None)
+                    if box is not None:
+                        _append_log_html(self, box, view_msg)
+            except Exception:
+                pass
         lp = getattr(self, "log_page", None)
         if lp is not None:
             try:
@@ -1645,7 +1678,9 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         """日志视图事件过滤器：悬停手型光标 + 单击未使用链接静默复制。
 
-        该任务日志与运行日志页共用同一套命中/降级/回滚管线（见 _hit_log_link）。"""
+        该任务日志与运行日志页共用同一套命中/降级/回滚管线（见 _hit_log_link）。
+        折叠行（整行点击展开/收起）与置顶折叠条由 FoldController 自己的事件过滤器
+        处理——它只消费折叠相关事件，其余一律放行到这里，链接行为完全不变。"""
         try:
             box = _log_view_for(self, obj)
             if box is not None:
@@ -1785,6 +1820,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.log_page.refresh_theme()
+        except Exception:
+            pass
+        try:
+            self.log_box_folds.refresh_theme()   # 该任务日志的置顶折叠条同款重贴
         except Exception:
             pass
         # M4：三个正式页的内联色也在同一条主题切换路径里重贴（不另造机制）

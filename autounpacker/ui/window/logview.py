@@ -6,12 +6,16 @@ Stage 6f 从 ui/main_window.py 原样拆出；函数体/签名/文档字符串�
       share_flow 经 `from .logview import _share_log` 共用日志落盘。
 """
 import html
+import re
 import threading
+import time
 
+from PyQt5.QtCore import QEvent, QObject, QTimer, Qt
 from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor, QCursor
+from PyQt5.QtWidgets import QLabel, QToolTip
 
 from ...utils import split_urls
-from ..style import PALETTE
+from ..style import PALETTE, tokens
 from ..widgets import show_toast
 from .consts import _HUB_LOG_PREFIX, _LOG_VALUE_LABELS
 
@@ -109,6 +113,777 @@ def _render_log_html(msg, color, degraded=None):
         return (f'<span style="color:{PALETTE["log_ts"]}">{html.escape(ts)}</span>'
                 f'<span style="color:{color}">{inner}</span>')
     return f'<span style="color:{color}">{inner}</span>'
+
+
+# ---------------------------------------------------------------------------
+# 日志视图折叠（显示层）：7-Zip 原始输出整块折成一行，点击展开 / 收起
+#
+# 只影响「视图」：日志文件与生产者一行都不动（折叠不落盘、不裁剪、不改任何数据）。
+# 块边界靠生产者契约的两行标记（中间每行都带 hub 时间戳前缀，标记是唯一边界）：
+#   起始：含 "--- 7-Zip 原始输出 ---"
+#   收尾：含 "--- 7-Zip 原始输出结束（共 N 行）---"（N = 原始行数）
+# 安全阀：未收尾的块（旧版本日志 / 写入中断）按行数上限或超时原样吐出，绝不吞行。
+# 另有两道「绝不吞行」的闸门：块内再见起始标记（把上一个块按隐式收尾折起来）、
+# 有限快照收尾（重载/重装视图结束即把仍在缓冲的块原样吐出）。
+# ---------------------------------------------------------------------------
+
+_FOLD_START_MARK = "--- 7-Zip 原始输出 ---"
+_FOLD_END_MARK = "7-Zip 原始输出结束"
+_FOLD_AFFORDANCE = "—— 点击"
+_FOLD_HREF_PREFIX = "fold://"
+# 时间戳前缀：视图行是 "[HH:MM:SS] "（Hub 队列 / task_log_line 补），日志文件是
+# "[YYYY-MM-DD HH:MM:SS] "；折叠行按原样保留拿到的那种，看起来仍像原生日志。
+_FOLD_TS_RE = re.compile(
+    r"^(?:\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]\s*)?(?:\[\d{2}:\d{2}:\d{2}\]\s*)?")
+_FOLD_LAYER_RE = re.compile(r"^(\[[^\[\]]*?层\]\s*)")
+# 安全阀上限：实测真实块就是 739 行（分卷缺卷时 7z 逐条报 Unavailable data），上限
+# 必须高于真实块——否则块还没收尾就被冲掉，折叠对真实场景失效；10 秒超时仍是主兜底。
+_FOLD_MAX_LINES = 2000
+_FOLD_TIMEOUT_SEC = 10.0
+# 视图模型（_view_items）上限：只留最近这么多项，长时间运行也绝不无界增长。
+_VIEW_ITEMS_MAX = 3000
+# 置顶折叠条（置顶 = 已展开的块滚过头后，折叠头钉在视图顶部）：
+# 复用视图的行高与调色板，尺寸/配色不另造一套。
+_FOLD_PIN_OBJECT_NAME = "logFoldPin"
+_FOLD_PIN_MAX_WALK = 3000     # 向上找折叠头 block 的最大步数（与视图行数上限同量级）
+_FOLD_PIN_PAD_X = 6
+_FOLD_PIN_PAD_Y = 2
+
+
+def _fold_line_head(line):
+    """起始行 -> (时间戳前缀, "[第N层] " 前缀)，都按原样保留（折叠行仍像原生日志）。"""
+    text = str(line or "")
+    m = _FOLD_TS_RE.match(text)
+    ts = m.group(0) if m else ""
+    rest = text[len(ts):]
+    m2 = _FOLD_LAYER_RE.match(rest)
+    return ts, (m2.group(1) if m2 else "")
+
+
+def _fold_href(fold):
+    """折叠项的锚点 href：点击侧据此精确回查折叠项，不依赖块号/绝对位置。"""
+    try:
+        return "%s%d" % (_FOLD_HREF_PREFIX, int(fold.get("id")))
+    except Exception:
+        return ""
+
+
+def _fold_href_of_block(block):
+    """block 上的 fold:// 锚点 href（无则 None）：整行可点，命中判定只看锚点。"""
+    try:
+        it = block.begin()
+        while not it.atEnd():
+            fr = it.fragment()
+            it += 1
+            if fr.isValid():
+                href = str(fr.charFormat().anchorHref() or "")
+                if href.startswith(_FOLD_HREF_PREFIX):
+                    return href
+    except Exception:
+        pass
+    return None
+
+
+def _fold_head_text(fold, expanded, affordance=True):
+    """折叠头行文本：保留原时间戳 + [第N层] 前缀，形如
+    "[21:48:43] [第3层] 7-Zip 原始输出（739 行）—— 点击展开"。
+
+    affordance=False（搜索/级别过滤中整块展开）时只留「（N 行）」摘要，不给
+    「点击收起」入口——那种状态下收起会藏住命中的行。"""
+    ts = str(fold.get("ts") or "")
+    layer = str(fold.get("layer") or "")
+    try:
+        count = max(0, int(fold.get("count") or 0))
+    except Exception:
+        count = 0
+    text = "%s%s7-Zip 原始输出（%d 行）" % (ts, layer, count)
+    if affordance:
+        text += "—— 点击收起" if expanded else "—— 点击展开"
+    return text
+
+
+def _anchor_fold_affordance(block, text, href):
+    """给折叠头行的「—— 点击展开/收起」片段套上 fold:// 锚点（整行可点，样式只改该片段）。"""
+    i = str(text).rfind(_FOLD_AFFORDANCE)
+    if i < 0 or not href:
+        return
+    _restore_link_span(block, i, len(text), href)
+
+
+def _fold_tip_text(fold):
+    """折叠行悬停提示（紧凑一行）。
+
+    隐式收尾的块（旧版本日志没有收尾标记）只在**提示**里说明一句；折叠行本身的
+    文字与正常块完全一致（不给视图文字加任何特例）。"""
+    try:
+        count = max(0, int(fold.get("count") or 0))
+    except Exception:
+        count = 0
+    if bool(fold.get("expanded")):
+        return "已展开 %d 行 7-Zip 原始输出；点击收起" % count
+    if fold.get("implicit"):
+        return "已折叠 %d 行 7-Zip 原始输出（该块无收尾标记）；点击展开" % count
+    return "已折叠 %d 行 7-Zip 原始输出；点击展开" % count
+
+
+class LogFold:
+    """「7-Zip 原始输出」块的显示层折叠缓冲（纯 Python，无 Qt 依赖，离线可测）。
+
+    feed() 逐行吃入，返回本次应渲染的显示项：("line", 原文) 或 ("fold", 折叠项)。
+    块内原始行先缓冲、收尾行到达才吐出一条折叠项；块内再见起始标记 = 上一个块结束
+    （旧版本日志没有收尾标记）→ 按「隐式收尾」折成一行，本行重新开块。实时路径的
+    两个安全阀（行数上限 / 超时）与快照收尾 finish() 一律把未收尾块原样吐出——
+    缓冲绝不吞掉任何一行，更不吞后续无关日志。折叠头显示的行数恒等于实际缓冲行数。
+    """
+
+    def __init__(self, max_lines=_FOLD_MAX_LINES, timeout=_FOLD_TIMEOUT_SEC):
+        self.max_lines = int(max_lines)
+        self.timeout = float(timeout)
+        self.pending = None      # 正在缓冲的折叠项（None = 不在块内）
+        self._seq = 0
+
+    def feed(self, line, now=None):
+        """吃进一行；返回应渲染的显示项列表（空 = 仍在缓冲，暂不显示）。"""
+        text = str(line or "")
+        now = time.time() if now is None else float(now)
+        if self.pending is not None:
+            return self._feed_in_block(text, now)
+        if _FOLD_START_MARK in text:
+            self._seq += 1
+            ts, layer = _fold_line_head(text)
+            self.pending = {"id": self._seq, "ts": ts, "layer": layer,
+                            "start": text, "lines": [], "count": 0,
+                            "expanded": False, "at": now}
+            return []
+        return [("line", text)]
+
+    def flush(self):
+        """安全阀：把缓冲原样吐出（起始行 + 已缓冲原始行），绝不吞行。"""
+        pend, self.pending = self.pending, None
+        if pend is None:
+            return []
+        out = [("line", pend.get("start") or "")]
+        out += [("line", ln) for ln in pend.get("lines") or ()]
+        return out
+
+    def finish(self):
+        """有限快照收尾：把仍在缓冲的行原样吐出（重载/重装视图等快照路径必须调用）。
+
+        与 flush() 只差语义：flush() 是实时路径的超时安全阀，finish() 是「这份日志
+        读到头了」——两条路径都绝不吞行，实现共用一份，绝不各写一套。"""
+        return self.flush()
+
+    def stale(self, now=None):
+        """缓冲是否已超时（宿主定时器据此决定要不要 flush）。"""
+        if self.pending is None:
+            return False
+        now = time.time() if now is None else float(now)
+        try:
+            return (now - float(self.pending.get("at") or now)) > self.timeout
+        except Exception:
+            return False
+
+    def _feed_in_block(self, text, now):
+        pend = self.pending
+        if _FOLD_START_MARK in text:
+            # 块内又见起始标记 = 上一个块已经结束（旧版本日志没有收尾标记 / 写入中断）：
+            # 按「隐式收尾」把它折成一行，本行重新开块。块被下一块的起始标记明确界定，
+            # 行数取实际缓冲行数（绝不谎报），点击即可展开——旧格式块不再整段铺在视图里，
+            # 也绝不吞掉后面的内容（旧实现会把后面全吞掉，上一版则整段原样吐出）。
+            pend["count"] = len(pend["lines"])
+            pend["implicit"] = True
+            pend["end"] = None
+            pend.pop("at", None)
+            self.pending = None
+            out = [("fold", pend)]
+            out.extend(self.feed(text, now))
+            return out
+        if _FOLD_END_MARK in text:
+            # FIX 3（关键）：标签必须等于「实际被藏住的行数」= 已缓冲原始行数；
+            # 收尾标记里解析出的 N 只来自生产者，可能与缓冲不一致（旧版本/截断），
+            # 一律以缓冲为准——折叠头绝不谎报行数。
+            pend["count"] = len(pend["lines"])
+            pend["end"] = text
+            pend.pop("at", None)
+            self.pending = None
+            return [("fold", pend)]
+        pend["lines"].append(text)
+        if len(pend["lines"]) > self.max_lines or self.stale(now):
+            return self.flush()
+        return []
+
+
+class FoldController(QObject):
+    """「7-Zip 原始输出」折叠控制器（一套折叠机制服务多个日志视图）。
+
+    拥有：折叠缓冲（LogFold）、视图模型（view_items）、id 映射（folds）、超时定时器、
+    展开态、命中判定（fold_at）、点击/悬停处理与置顶折叠条。渲染由宿主注入
+    render(view, msg)——着色/链接管线只有一份实现，本类绝不另造一套。
+    事件过滤器只消费「折叠相关」事件（命中折叠头的移动/点击、置顶条上的点击），
+    其余事件一律返回 False：链接悬停/点击复制/拖选行为完全不受影响。
+    """
+
+    def __init__(self, view, render=None, force_open=None, parent=None):
+        super().__init__(parent)
+        self.view = view
+        self.buffer = LogFold()
+        self.folds = {}                  # 折叠 id -> 折叠项（点击侧按锚点回查）
+        self.view_items = []             # 视图模型：("line", 原文) / ("fold", 折叠项)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(int(_FOLD_TIMEOUT_SEC * 1000))
+        self.timer.timeout.connect(self.on_timeout)
+        self._render = render            # callable(view, msg)
+        self._force_open = force_open    # callable() -> bool（搜索/过滤时整块展开）
+        self._pin = None                 # 置顶折叠条（惰性创建）
+        self._pin_fold_id = None         # 置顶条当前指向的折叠 id
+        self._pin_cache = (None, None)   # (firstVisibleBlock 号, 解析出的折叠项)
+        self._pin_count = None           # 上次解析时的块数（变小 = 发生过裁剪）
+        self._tip_key = None
+        try:
+            self.view.viewport().installEventFilter(self)
+            self.view.viewport().setMouseTracking(True)
+            self.view.installEventFilter(self)
+            self.view.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        except Exception:
+            pass
+
+    # ---- 缓冲 / 模型 ----
+    def reset(self):
+        """重载/清空：停表、重开缓冲、丢弃展开态与 id 映射（展开态不跨重载保留）。"""
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        self.buffer = LogFold()
+        self.folds = {}
+        self.view_items = []
+        self.invalidate_pin()
+        self.update_pin()
+
+    def feed(self, msg):
+        """喂一行日志：只有缓冲吐出的显示项才渲染（块内原始行先攒着）。
+
+        超时定时器在块「刚开始」时武装（不随每行重启）：块起 10 秒仍未见收尾行就
+        原样吐出——慢慢滴的旧版本块也绝不无限吞行；上一个块被新起始标记冲掉后，
+        新块重新计时（两个块各有各的兜底）。"""
+        for line in (str(msg).splitlines() or [""]):
+            before = self.buffer.pending
+            before_id = before.get("id") if isinstance(before, dict) else None
+            for item in self.buffer.feed(line):
+                self.append_item(item)
+            after = self.buffer.pending
+            after_id = after.get("id") if isinstance(after, dict) else None
+            if after_id is not None and after_id != before_id:
+                self.timer.start()
+
+    def finish(self):
+        """有限快照收尾（重载 / 重装该任务日志）：停表并把缓冲原样吐出。
+
+        FIX 2：快照的末尾绝不因为「还没等到收尾行」而藏住不显示——旧版本日志的
+        未收尾块在快照结束处立即按原始行渲染；10 秒超时兜底只服务实时（流式）路径。"""
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            items = self.buffer.finish()
+        except Exception:
+            items = []
+        for item in items:
+            self.append_item(item)
+
+    def on_timeout(self):
+        """超时安全阀：起始行起 10 秒仍未见收尾行 -> 缓冲原样吐出（绝不吞行）。"""
+        try:
+            items = self.buffer.flush()
+        except Exception:
+            items = []
+        for item in items:
+            self.append_item(item)
+
+    def force_open(self):
+        """搜索/级别过滤生效时为 True：整块展开渲染（折叠绝不藏住命中的行）。"""
+        try:
+            return bool(self._force_open()) if self._force_open is not None else False
+        except Exception:
+            return False
+
+    def is_open(self, fold):
+        """该折叠项当前是否展开（用户展开过，或搜索/级别过滤要求整块可见）。"""
+        return bool(fold.get("expanded")) or self.force_open()
+
+    def append_item(self, item):
+        """记入视图模型并渲染；模型只留最近若干项，避免长时间运行无界增长。"""
+        self.view_items.append(item)
+        if item[0] == "fold":
+            try:
+                self.folds[int(item[1].get("id"))] = item[1]
+            except Exception:
+                pass
+        if len(self.view_items) > _VIEW_ITEMS_MAX:
+            del self.view_items[:len(self.view_items) - _VIEW_ITEMS_MAX]
+            self.prune_folds()
+        self.render_item(item)
+        self.update_pin()
+
+    def prune_folds(self):
+        """丢弃已不在视图模型里的折叠项（id 映射绝不无界增长）。"""
+        live = set()
+        for kind, payload in self.view_items:
+            if kind == "fold":
+                try:
+                    live.add(int(payload.get("id")))
+                except Exception:
+                    pass
+        if len(self.folds) > len(live) + 64:
+            self.folds = {k: v for k, v in self.folds.items() if k in live}
+
+    def render_item(self, item):
+        kind, payload = item
+        if kind == "fold":
+            self.render_fold(payload)
+        else:
+            self.render_line(payload)
+
+    def render_fold(self, fold):
+        """折叠头行：折叠态 1 行；展开态 = 头行 + 全部原始行（原样、原色）。"""
+        force = self.force_open()
+        text = _fold_head_text(fold, self.is_open(fold), affordance=not force)
+        self.render_line(text)                # 走宿主既有管线（着色/纯文本都一致）
+        if not force and self.view is not None:
+            # 只给「—— 点击展开/收起」片段套锚点：整行可点，样式仍像原生日志
+            try:
+                _anchor_fold_affordance(self.view.document().lastBlock(), text,
+                                        _fold_href(fold))
+            except Exception:
+                pass
+        if self.is_open(fold):
+            for line in fold.get("lines") or ():
+                self.render_line(line)
+
+    def render_line(self, msg):
+        """渲染一行：宿主管线优先，缺失/异常时退回纯文本（与折叠无关的行也走这里）。"""
+        if self._render is not None:
+            try:
+                self._render(self.view, msg)
+                return
+            except Exception:
+                pass
+        try:
+            self.view.appendPlainText(str(msg))
+        except Exception:
+            pass
+
+    def fold_at(self, pos):
+        """pos 命中的折叠项：整行可点（行内含 fold:// 锚点即算命中）；无则 None。"""
+        if pos is None:
+            return None
+        try:
+            block = self.view.cursorForPosition(pos).block()
+            href = _fold_href_of_block(block)
+            if href:
+                try:
+                    return self.folds.get(int(href[len(_FOLD_HREF_PREFIX):]))
+                except Exception:
+                    return None
+            return self.fold_by_text(block.text())   # 纯文本模式兜底（无锚点）
+        except Exception:
+            return None
+
+    def fold_by_text(self, text):
+        """无锚点兜底：按折叠头行文本回查（只有纯文本模式会走到）。"""
+        for kind, payload in reversed(self.view_items):
+            if kind != "fold":
+                continue
+            if text in (_fold_head_text(payload, False), _fold_head_text(payload, True)):
+                return payload
+        return None
+
+    def toggle(self, fold):
+        """展开/收起一个折叠块并整页重画（视图有 3000 行上限，重画很便宜）。"""
+        if not isinstance(fold, dict):
+            return False
+        if self.force_open():
+            return False      # 搜索/级别过滤中：保持展开，绝不藏住命中行
+        fold["expanded"] = not bool(fold.get("expanded"))
+        self.rerender_view()
+        return True
+
+    def rerender_view(self):
+        """按当前展开态整页重画（视图模型不动；滚动位置尽力保留）。"""
+        sb = None
+        value = 0
+        try:
+            sb = self.view.verticalScrollBar()
+            value = sb.value()
+        except Exception:
+            sb = None
+        try:
+            self.view.clear()
+        except Exception:
+            pass
+        for item in self.view_items:
+            self.render_item(item)
+        try:
+            if sb is not None:
+                sb.setValue(min(value, sb.maximum()))
+        except Exception:
+            pass
+        self.invalidate_pin()
+        self.update_pin()
+
+    def export_text(self):
+        """导出/复制文本：折叠块按原始行完整展开（绝不因折叠少行）。
+
+        视图里折叠行只占一行，但导出/复制出去的内容必须与落盘日志同量级：按视图
+        模型重建「未折叠」文本（起始行 + 全部原始行 + 收尾行）。"""
+        out = []
+        for kind, payload in self.view_items:
+            if kind == "fold":
+                out.append(str(payload.get("start") or ""))
+                out.extend(str(ln) for ln in payload.get("lines") or ())
+                if payload.get("end"):
+                    out.append(str(payload["end"]))
+            else:
+                out.append(str(payload))
+        return "\n".join(out)
+
+    # ---- 置顶折叠条 ----
+    def invalidate_pin(self):
+        """作废「顶部折叠」解析缓存（重绘 / 重置 / 尺寸变化后必须调用）。"""
+        self._pin_cache = (None, None)
+
+    def _on_scroll(self, _value=None):
+        self.update_pin()
+
+    def pin_fold(self):
+        """viewport 顶部落在哪个「已展开」折叠块体内（没有则 None）。
+
+        定位不依赖任何块号映射：取 firstVisibleBlock，向上逐块找带 fold:// 锚点的
+        折叠头（最多 _FOLD_PIN_MAX_WALK 步）；顶部到该折叠头的距离必须落在块体内，
+        否则顶部已在块后面的普通日志上，不置顶。结果按顶部块号缓存，滚动时绝大
+        多数调用直接命中缓存（缓存只在重绘/重置/尺寸变化/裁剪时作废）。"""
+        try:
+            if not self.view.isVisible() or self.view.blockCount() <= 0:
+                return None
+            if not any(bool(f.get("expanded")) for f in self.folds.values()):
+                return None      # 没有任何展开块：置顶条不可能出现（省一次向上回溯）
+            first = self.view.firstVisibleBlock()
+            if not first.isValid():
+                return None
+            key = first.blockNumber()
+            if self._pin_cache[0] == key:
+                return self._pin_cache[1]
+            fold = self._resolve_pin_fold(first)
+            self._pin_cache = (key, fold)
+            return fold
+        except Exception:
+            return None
+
+    def _resolve_pin_fold(self, first):
+        """顶部块 -> 它所在的已展开折叠项（不在任何块体内则 None）。"""
+        head, href = self._header_above(first)
+        if head is None or not href:
+            return None
+        try:
+            fold = self.folds.get(int(href[len(_FOLD_HREF_PREFIX):]))
+        except Exception:
+            fold = None
+        if not isinstance(fold, dict) or not fold.get("expanded"):
+            return None
+        delta = first.blockNumber() - head.blockNumber()
+        if delta <= 0 or delta > len(fold.get("lines") or ()):
+            return None      # 顶部已在块体之外（块后面的普通日志 / 折叠头本身）
+        return fold
+
+    def _header_above(self, first):
+        """从 first 向上找最近的折叠头 block，返回 (block, href)（找不到 None, None）。"""
+        block = first
+        hops = 0
+        while block.isValid() and hops <= _FOLD_PIN_MAX_WALK:
+            href = _fold_href_of_block(block)
+            if href:
+                return block, href
+            block = block.previous()
+            hops += 1
+        return None, None
+
+    def update_pin(self):
+        """按当前滚动位置显示/隐藏置顶折叠条（空视图/隐藏视图绝不显示）。"""
+        try:
+            count = self.view.blockCount()
+            if self._pin_count is not None and count < self._pin_count:
+                self.invalidate_pin()   # 触发过 3000 行裁剪：块号整体位移，缓存作废
+            self._pin_count = count
+            fold = self.pin_fold()
+            if fold is None:
+                self._pin_fold_id = None
+                if self._pin is not None and self._pin.isVisible():
+                    self._pin.hide()
+                return
+            pin = self.ensure_pin()
+            if pin is None:
+                return
+            text = _fold_head_text(fold, True)
+            fm = self.view.fontMetrics()
+            height = max(1, fm.height() + 2 * _FOLD_PIN_PAD_Y)
+            width = max(1, self.view.viewport().width())
+            if (pin.isVisible() and pin.width() == width
+                    and pin.height() == height and pin.text() == text):
+                self._pin_fold_id = fold.get("id")   # 文本/几何都没变：不做无谓重绘
+                return
+            if pin.text() != text:
+                pin.setText(text)
+            pin.setGeometry(0, 0, width, height)
+            self._pin_fold_id = fold.get("id")
+            pin.show()
+            pin.raise_()
+        except Exception:
+            pass
+
+    def ensure_pin(self):
+        """惰性创建置顶折叠条（QLabel 子控件；主题切换由 refresh_theme 重贴色）。"""
+        if self._pin is not None:
+            return self._pin
+        try:
+            pin = QLabel(self.view.viewport())
+            pin.setObjectName(_FOLD_PIN_OBJECT_NAME)
+            pin.setCursor(Qt.PointingHandCursor)
+            pin.setAutoFillBackground(True)
+            pin.hide()
+            pin.installEventFilter(self)
+            self._pin = pin
+            self._style_pin()
+        except Exception:
+            self._pin = None
+        return self._pin
+
+    def _style_pin(self):
+        """置顶条配色：不透明底 + 底部分隔线，全部取自既有主题 token（日志文字不透出来）。
+
+        用 QLabel#objectName 选择器：QSS 里 QLabel 默认 background: transparent，
+        只有带上 objectName 的高优先级规则才画得出不透明底。"""
+        if self._pin is None:
+            return
+        try:
+            tk = tokens()
+            self._pin.setStyleSheet(
+                "QLabel#%s { background-color: %s; color: %s;"
+                " border-bottom: 1px solid %s; padding: 0 %dpx; }"
+                % (_FOLD_PIN_OBJECT_NAME, tk.get("log_bg"), tk.get("log_fg"),
+                   tk.get("log_border") or PALETTE["log_ts"], _FOLD_PIN_PAD_X))
+        except Exception:
+            pass
+
+    def refresh_theme(self):
+        """主题切换：置顶条按新调色板重贴并重算显隐。"""
+        self._style_pin()
+        self.invalidate_pin()
+        self.update_pin()
+
+    def collapse_pinned(self):
+        """点击置顶条：收起它指向的折叠块，并把视图滚到该折叠头（位置不迷惑）。"""
+        fold = None
+        try:
+            fold = self.folds.get(int(self._pin_fold_id))
+        except Exception:
+            fold = None
+        if not isinstance(fold, dict) or not self.toggle(fold):
+            self.update_pin()
+            return False
+        if not bool(fold.get("expanded")):
+            self._scroll_to_fold(fold)
+        self.update_pin()
+        return True
+
+    def _scroll_to_fold(self, fold):
+        """把折叠头滚到 viewport 顶部（收起后仍一眼看到自己在哪一块）。
+
+        QPlainTextEdit 的纵向滚动条单位就是块号（value == firstVisibleBlock 的
+        块号）：直接按块号设值即可精确置顶，绝不做像素/块号混算。"""
+        block = self.fold_header_block(fold)
+        if block is None:
+            return
+        try:
+            sb = self.view.verticalScrollBar()
+            sb.setValue(max(sb.minimum(), min(sb.maximum(), block.blockNumber())))
+        except Exception:
+            pass
+
+    def fold_header_block(self, fold):
+        """按 fold:// 锚点在文档里回查折叠头 block（重画后 href 仍随折叠项走）。"""
+        href = _fold_href(fold)
+        if not href:
+            return None
+        try:
+            block = self.view.document().firstBlock()
+            while block.isValid():
+                if _fold_href_of_block(block) == href:
+                    return block
+                block = block.next()
+        except Exception:
+            pass
+        return None
+
+    # ---- 事件处理（只消费折叠相关事件；其余一律放行）----
+    def eventFilter(self, obj, event):
+        try:
+            if self._pin is not None and obj is self._pin:
+                return self._pin_event(event)
+            viewport = self.view.viewport()
+            if obj is viewport:
+                et = event.type()
+                if et == QEvent.Resize:
+                    self.invalidate_pin()
+                    self.update_pin()
+                elif et == QEvent.Show:
+                    self.update_pin()
+                elif et == QEvent.Hide:
+                    if self._pin is not None:
+                        self._pin.hide()
+                elif et == QEvent.MouseMove:
+                    return self._mouse_move(event)
+                elif et == QEvent.MouseButtonRelease:
+                    return self._mouse_release(event)
+                elif et == QEvent.Leave:
+                    self._hide_tip()
+                return False
+            if obj is self.view:
+                et = event.type()
+                if et in (QEvent.Show, QEvent.Resize):
+                    self.update_pin()
+                elif et == QEvent.Hide and self._pin is not None:
+                    self._pin.hide()
+                return False
+        except Exception:
+            pass
+        return False
+
+    def _pin_event(self, event):
+        """置顶条上的鼠标：按下即消费（绝不透给视图/链接管线），松开左键即收起。"""
+        et = event.type()
+        if et == QEvent.MouseButtonPress:
+            return True
+        if et == QEvent.MouseButtonRelease:
+            if event.button() == Qt.LeftButton:
+                self.collapse_pinned()
+            return True
+        if et == QEvent.MouseMove:
+            try:
+                self._pin.setCursor(Qt.PointingHandCursor)
+            except Exception:
+                pass
+        return False
+
+    def _mouse_move(self, event):
+        """悬停折叠头：手型 + 紧凑提示；命中才消费事件（其余交给链接悬停管线）。"""
+        fold = self.fold_at(event.pos())
+        if fold is None:
+            self._hide_tip()
+            return False
+        try:
+            self.view.viewport().setCursor(Qt.PointingHandCursor)
+        except Exception:
+            pass
+        self._show_tip(fold, event)
+        return True
+
+    def _mouse_release(self, event):
+        """点击折叠头：整行展开/收起（拖选中时不干扰；未命中放行给链接点击管线）。"""
+        if event.button() != Qt.LeftButton:
+            return False
+        try:
+            if self.view.textCursor().hasSelection():
+                return False
+        except Exception:
+            pass
+        fold = self.fold_at(event.pos())
+        if fold is None:
+            return False
+        return bool(self.toggle(fold))
+
+    def _show_tip(self, fold, event):
+        """折叠行悬停提示：同一行只在首次悬停时弹一次（避免每次 MouseMove 重弹闪烁）。"""
+        key = (id(fold), bool(fold.get("expanded")))
+        if self._tip_key == key:
+            return
+        self._tip_key = key
+        try:
+            gpos = event.globalPos()
+        except Exception:
+            gpos = None
+        if gpos is None:
+            return
+        try:
+            QToolTip.showText(gpos, _fold_tip_text(fold))
+        except Exception:
+            pass
+
+    def _hide_tip(self):
+        """离开折叠行：撤下悬停提示（没弹过就什么都不做）。"""
+        if self._tip_key is None:
+            return
+        self._tip_key = None
+        try:
+            QToolTip.hideText()
+        except Exception:
+            pass
+
+
+# 以下 4 个 module 级助手是折叠机制的旧入口（宿主曾直接调用）：生产路径已由
+# FoldController 统一接管（运行日志页 / 该任务日志两个视图共用一套），这里保留
+# 原样实现供旧调用方与回归测试使用，不改变任何行为。
+def _fold_item_at(win, box, pos):
+    """pos 处命中的折叠项（仅运行日志页的视图；无则 None）。"""
+    lp = getattr(win, "log_page", None)
+    if lp is None or box is None or box is not getattr(lp, "log_view", None):
+        return None
+    try:
+        return lp.fold_at(pos)
+    except Exception:
+        return None
+
+
+def _toggle_log_fold(win, box, pos):
+    """点击折叠头行：展开/收起并整页重画。返回是否已处理（未命中返回 False）。"""
+    fold = _fold_item_at(win, box, pos)
+    if fold is None:
+        return False
+    lp = getattr(win, "log_page", None)
+    try:
+        return bool(lp.toggle_fold(fold))
+    except Exception:
+        return False
+
+
+def _show_fold_tip(win, fold, event):
+    """折叠行悬停提示：同一行只在首次悬停时弹一次（避免每次 MouseMove 重弹闪烁）。"""
+    key = (id(fold), bool(fold.get("expanded")))
+    if getattr(win, "_fold_tip_key", None) == key:
+        return
+    win._fold_tip_key = key
+    try:
+        gpos = event.globalPos()
+    except Exception:
+        gpos = None
+    if gpos is None:
+        return
+    try:
+        QToolTip.showText(gpos, _fold_tip_text(fold))
+    except Exception:
+        pass
+
+
+def _hide_fold_tip(win):
+    """离开折叠行：撤下悬停提示（没弹过就什么都不做）。"""
+    if getattr(win, "_fold_tip_key", None) is None:
+        return
+    win._fold_tip_key = None
+    try:
+        QToolTip.hideText()
+    except Exception:
+        pass
 
 
 def _copy_toast(win, text, pos=None):
@@ -268,6 +1043,7 @@ def _rerender_log_view(win, box):
             text = block.text()
             if not text:
                 continue
+            href = _fold_href_of_block(block)   # 折叠头行：重绘后锚点必须还在
             cur = QTextCursor(block)
             cur.setPosition(block.position())
             cur.setPosition(block.position() + block.length() - 1,
@@ -275,6 +1051,8 @@ def _rerender_log_view(win, box):
             cur.insertHtml(_render_log_html(
                 text, win._log_color_for(text),
                 _degraded_spans_for(win, box, text)))
+            if href:
+                _anchor_fold_affordance(doc.findBlockByNumber(i), text, href)
         cursor.endEditBlock()
     except Exception:
         pass

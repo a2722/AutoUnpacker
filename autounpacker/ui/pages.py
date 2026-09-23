@@ -28,6 +28,7 @@ from ..hub import guess_level
 from .style import PALETTE, tokens
 from .widgets import (DEFAULT_TIPS, FilterChipStrip, Glyph,
                       NeedsAttentionCard, SegControl, StatusTipTicker, TaskTable)
+from .window.logview import FoldController, _VIEW_ITEMS_MAX
 
 # 级别分段 -> log_index.level 集合（success/link 归入「信息」，与原型计数口径一致）
 LOG_LEVEL_BUCKETS = {
@@ -602,6 +603,8 @@ class LogPage(QWidget):
 
     信号：filtersChanged()（宿主据此重查 db）/ taskActivated(task_id) /
           actionTriggered(task_id, kind) / notice(text)（导出等用户可见回执）。
+    显示层折叠：7-Zip 原始输出块（起始/收尾标记之间）在视图里折成一行、点击展开；
+    日志文件与生产者不动，过滤/搜索仍作用于原始行（折叠是过滤之后的显示变换）。
     """
 
     filtersChanged = pyqtSignal()
@@ -609,12 +612,16 @@ class LogPage(QWidget):
     actionTriggered = pyqtSignal(int, str)
     notice = pyqtSignal(str)
 
+    _VIEW_ITEMS_MAX = _VIEW_ITEMS_MAX   # 兼容旧引用；折叠模型上限归 FoldController
+
     def __init__(self, render_to=None, parent=None):
         super().__init__(parent)
         self._render_to = render_to          # callable(view, msg)：复用宿主的着色/链接管线
         self._records = []
         self._value_labels = {}
         self._danger_labels = []
+        # 折叠控制器在 log_view 建好后创建（见下方「日志视图 + 右栏」之后）。
+        self.fold_ctl = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 10)
@@ -660,6 +667,11 @@ class LogPage(QWidget):
         self.log_view = QPlainTextEdit(self)
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(3000)
+        # 折叠控制器：拥有缓冲/视图模型/id 映射/定时器/置顶折叠条，并自行接管
+        # 折叠头的悬停与点击（链接悬停/点击复制仍走宿主 _append_log_to 管线）。
+        self.fold_ctl = FoldController(self.log_view, render=self._render_to,
+                                       force_open=self._fold_force_open,
+                                       parent=self)
         main.addWidget(self.log_view, 1)
         self.log_empty = _EmptyOverlay(self.log_view, EMPTY_LOG)
 
@@ -777,9 +789,13 @@ class LogPage(QWidget):
                   if log_matches(r, self.levels(), None, None)]
         picked.reverse()                      # db 返回倒序 -> 展示用正序（最新在底）
         self._records = picked
+        self._fold_reset()                    # 重载即重算折叠（展开态不跨重载保留）
         self.log_view.clear()
         for r in picked:
-            self._render_line(task_log_line(r))
+            self._feed_line(task_log_line(r))
+        # FIX 2：这是一份有限的快照——结束时把缓冲原样吐出（旧版本日志的未收尾块
+        # 立即按原始行渲染），并把实时超时兜底停掉：快照的尾巴绝不藏着不显示。
+        self._fold_finish()
         self.log_empty.set_empty(not picked)
         if picked and self.auto_scroll.isChecked():
             self.scroll_bottom()
@@ -800,7 +816,7 @@ class LogPage(QWidget):
 
     def append_line(self, msg):
         """活日志：按当前级别/路径/搜索判定后追加（宿主在 _append_log 里调用）。"""
-        self._render_line(msg)
+        self._feed_line(msg)
         if self.auto_scroll.isChecked():
             self.scroll_bottom()
 
@@ -836,19 +852,107 @@ class LogPage(QWidget):
                 label.setStyleSheet("color: %s;" % PALETTE["danger"])
             except Exception:
                 pass
+        try:
+            self.fold_ctl.refresh_theme()     # 置顶折叠条按新调色板重贴
+        except Exception:
+            pass
+
+    # ---- 7-Zip 原始输出折叠（显示层；文件与生产者一行不动）----
+    #
+    # 实现全部在 FoldController（与「该任务日志」视图共用一套），这里只留薄委托：
+    # 旧方法名/属性名（_fold/_folds/_view_items/_fold_timer 等）保持可用，行为不变。
+    @property
+    def _fold(self):
+        """兼容旧属性：折叠缓冲（真实归属 FoldController.buffer）。"""
+        return self.fold_ctl.buffer
+
+    @property
+    def _folds(self):
+        """兼容旧属性：折叠 id -> 折叠项（真实归属 FoldController.folds）。"""
+        return self.fold_ctl.folds
+
+    @property
+    def _view_items(self):
+        """兼容旧属性：视图模型（真实归属 FoldController.view_items）。"""
+        return self.fold_ctl.view_items
+
+    @property
+    def _fold_timer(self):
+        """兼容旧属性：未收尾块的超时兜底定时器（真实归属 FoldController.timer）。"""
+        return self.fold_ctl.timer
+
+    def _fold_force_open(self):
+        """搜索框有词或级别过滤生效：整块展开渲染（折叠绝不藏住命中的行）。"""
+        try:
+            if str(self.search.text()).strip():
+                return True
+            return self.levels() is not None
+        except Exception:
+            return False
+
+    def _fold_is_open(self, fold):
+        """该折叠项当前是否展开（用户展开过，或搜索/级别过滤要求整块可见）。"""
+        return self.fold_ctl.is_open(fold)
+
+    def _fold_reset(self):
+        """重载/清空时重置折叠：缓冲清空、定时器停、展开态与 id 映射丢弃。"""
+        self.fold_ctl.reset()
+
+    def _fold_finish(self):
+        """有限快照收尾（重载结束）：停表并把缓冲原样吐出，尾巴绝不藏着。"""
+        self.fold_ctl.finish()
+
+    def _feed_line(self, msg):
+        """喂一行给折叠缓冲：只有缓冲吐出的显示项才渲染（块内原始行先攒着）。"""
+        self.fold_ctl.feed(msg)
+
+    def _append_item(self, item):
+        """记入视图模型并渲染（兼容旧入口）。"""
+        self.fold_ctl.append_item(item)
+
+    def _prune_folds(self):
+        """丢弃已不在视图模型里的折叠项（兼容旧入口）。"""
+        self.fold_ctl.prune_folds()
+
+    def _render_item(self, item):
+        """渲染一个视图模型项（兼容旧入口）。"""
+        self.fold_ctl.render_item(item)
+
+    def _render_fold(self, fold):
+        """折叠头行：折叠态 1 行；展开态 = 头行 + 全部原始行（兼容旧入口）。"""
+        self.fold_ctl.render_fold(fold)
+
+    def _render_line(self, msg):
+        """渲染一行（兼容旧入口）。"""
+        self.fold_ctl.render_line(msg)
+
+    def fold_at(self, pos):
+        """pos 命中的折叠项：整行可点（行内含 fold:// 锚点即算命中）；无则 None。"""
+        return self.fold_ctl.fold_at(pos)
+
+    def toggle_fold(self, fold):
+        """展开/收起一个折叠块并整页重画（视图有 3000 行上限，重画很便宜）。"""
+        return self.fold_ctl.toggle(fold)
+
+    def _rerender_view(self):
+        """按当前展开态整页重画（视图模型不动；滚动位置尽力保留）。"""
+        self.fold_ctl.rerender_view()
+
+    def _on_fold_timeout(self):
+        """超时安全阀：起始行起 10 秒仍未见收尾行 -> 缓冲原样吐出（绝不吞行）。"""
+        self.fold_ctl.on_timeout()
+
+    def export_text(self):
+        """导出文本：折叠块按原始行完整展开（导出是诊断材料，绝不因折叠少行）。
+
+        视图里折叠行只占一行，但导出/复制出去的内容必须与落盘日志同量级：这里按
+        视图模型重建「未折叠」文本（起始行 + 全部原始行 + 收尾行）。"""
+        return self.fold_ctl.export_text()
 
     # ---- 内部 ----
-    def _render_line(self, msg):
-        if self._render_to is not None:
-            try:
-                self._render_to(self.log_view, msg)
-                return
-            except Exception:
-                pass
-        self.log_view.appendPlainText(str(msg))
-
     def _on_clear(self):
         self._records = []
+        self._fold_reset()
         self.log_view.clear()
         self.log_empty.set_empty(True)
 
@@ -860,7 +964,7 @@ class LogPage(QWidget):
             if not path:
                 return
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self.log_view.toPlainText())
+                f.write(self.export_text())     # 折叠块展开后导出：绝不因折叠少行
             self.notice.emit("运行日志已导出: %s" % path)
         except Exception as e:
             try:

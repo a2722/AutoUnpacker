@@ -584,7 +584,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
         promote_to.mkdir(parents=True, exist_ok=True)
         dest = promote_to / src_dir.name
         # 目标名被「本次即将回收的源文件/其分卷」占用：典型为无扩展名压缩包与其
-        # 内层同名文件夹撞名（源文件 E:\test\2022 与内层文件夹 2022）。此时既不能
+        # 内层同名文件夹撞名（源文件 D:\下载\2022 与内层文件夹 2022）。此时既不能
         # 合并进去、也不能直接 move 覆盖；先回收占位文件让出位置，提升后才能用回
         # 原名（否则会退化成 2022(1)）。
         if dest.is_file() and source.exists():

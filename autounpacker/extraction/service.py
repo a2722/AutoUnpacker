@@ -88,6 +88,18 @@ class ExtractService:
         else:
             shutil.rmtree(path, ignore_errors=True)
 
+    def _primary_layer_ok(self):
+        """第 1 层（最外层归档）是否成功解出：是则本次已有真实成果，失败回退时
+        不该把成果一起端走（更深的嵌套层没解开只是附赠部分没拿到）。
+
+        例外：安全拦截（zip bomb 预检等）**不算**「嵌套层没解开」——那是我们为安全
+        主动拒绝继续解压，仍按旧口径整体回退，半成品不留在输出目录里。
+        """
+        recs = self.layer_records or []
+        if any(r.get("safety_block") for r in recs):
+            return False
+        return bool(recs) and recs[0].get("layer") == 1 and bool(recs[0].get("success"))
+
     @staticmethod
     def _retry_unlink(path, max_attempts=5):
         """删除文件，短暂重试几次。刚解压出来的大文件可能被 7z 进程/
@@ -223,6 +235,8 @@ class ExtractService:
                     "used_password": None,
                     "success": False,
                     "error": bomb_reason,
+                    # 安全拦截 ≠ 「嵌套层没解开」：见 _primary_layer_ok 的例外说明
+                    "safety_block": True,
                 }
                 self.layer_records.append(failed_record)
                 failed_layers.append(failed_record)
@@ -525,6 +539,9 @@ class ExtractService:
                 "extracted_files": [], "used_password": None,
                 "layer_records": self.layer_records,
                 "logs": self.logs, "error": err,
+                # 分卷链不完整是「待重试」而非「部分完成」：主层解出的只是截断
+                # 载荷，回退语义必须保持（截断分卷整体走回收站，可恢复）。
+                "keep_output_dir": self._primary_layer_ok() and not split_incomplete,
             }
         if depth_exceeded:
             # 达到最大深度限制：仍有归档未处理，绝不能报「干净成功」——否则源文件
@@ -541,6 +558,7 @@ class ExtractService:
                 "extracted_files": [], "used_password": None,
                 "layer_records": self.layer_records,
                 "logs": self.logs, "error": err,
+                "keep_output_dir": self._primary_layer_ok(),
             }
         # 产出清单 = 解压后输出目录里的全部文件（整目录口径，与原行为一致）。
         # 为什么不用「本次新增」增量：重复解压同一个包到同一输出目录时路径集合

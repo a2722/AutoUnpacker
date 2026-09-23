@@ -261,7 +261,7 @@ def get_active_tasks(db_path=None):
 
 
 def detect_download_root(db_path=None, history_limit=300):
-    """从下载历史推断百度网盘下载根目录（如 E:\\test）。无法推断返回 None。
+    """从下载历史推断百度网盘下载根目录（如 D:\\下载）。无法推断返回 None。
 
     注意：**不做 os.path.exists / is_dir 判死**——目标盘（如移动硬盘）此刻可能
     未插入，仍应返回推断出的路径，交给调用方决定是否加为监听路径。
@@ -292,7 +292,7 @@ def detect_download_root(db_path=None, history_limit=300):
         common = Path(os.path.commonpath(dirs))
     except Exception:
         common = None
-    # 共同根若退化成盘符根（E:\），改用最高频的父目录
+    # 共同根若退化成盘符根（D:\），改用最高频的父目录
     if common is None or str(common).rstrip("\\/") == common.anchor.rstrip("\\/"):
         from collections import Counter
         top = Counter(dirs).most_common(1)

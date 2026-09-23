@@ -306,15 +306,21 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
         # 回退：解压失败时中间文件移入回收站（可恢复），绝不永久删除。
         # 源文件(含分卷)未删除，之后可重试。仅当输出目录"解压前为空"
         # (即本次新建)才整体回收，避免误删用户预先放入自定义输出目录的内容。
-        try:
-            if out_dir.exists() and was_empty and not result.get("keep_output_dir"):
-                recycled, _failed = _recycle_paths([out_dir], permanent_fallback=False)
-                if recycled:
-                    print(f"已回退，中间文件已移入回收站: {out_dir}")
-                else:
-                    print(f"已回退（中间文件移入回收站失败，保留原样）: {out_dir}")
-        except Exception:
-            pass
+        # keep_output_dir：主层已产出真实内容、只是更深的嵌套层没解开 ——
+        # 本次已有成果，不回退（失败的嵌套包本身按「已保留失败文件」留着，
+        # 用户补上密码后仍可自行打开）。
+        if result.get("keep_output_dir"):
+            print(f"已保留已解出的内容（输出目录未回退）: {out_dir}")
+        else:
+            try:
+                if out_dir.exists() and was_empty:
+                    recycled, _failed = _recycle_paths([out_dir], permanent_fallback=False)
+                    if recycled:
+                        print(f"已回退，中间文件已移入回收站: {out_dir}")
+                    else:
+                        print(f"已回退（中间文件移入回收站失败，保留原样）: {out_dir}")
+            except Exception:
+                pass
     return result
 
 

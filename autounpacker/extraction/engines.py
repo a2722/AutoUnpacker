@@ -539,8 +539,13 @@ class SevenZipEngine:
         concise = concise_error(last_raw if last_raw else last_error, last_rc)
         raw_logs = [f"使用 {self.name} 引擎解压失败"]
         if last_raw:
+            raw_lines = str(last_raw).splitlines()
+            # 原始输出**完整**保留在日志里（事后排查全靠它，绝不截断/省略）；
+            # 只在首尾各加一个显式标记，供日志界面把整块折叠成一行、点击再展开。
+            # 折叠只发生在界面显示层，日志文件内容一个字节都不少。
             raw_logs.append("--- 7-Zip 原始输出 ---")
-            raw_logs.extend(str(last_raw).splitlines())
+            raw_logs.extend(raw_lines)
+            raw_logs.append(f"--- 7-Zip 原始输出结束（共 {len(raw_lines)} 行）---")
         return {"success": False, "used_password": None, "encrypted": bool(encrypted),
                 "error": concise, "raw_error": last_raw or last_error,
                 "logs": raw_logs}

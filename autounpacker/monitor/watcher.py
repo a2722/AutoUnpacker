@@ -1875,7 +1875,7 @@ class FolderWatcher(threading.Thread):
                     _tasks_changed(self.hub)
                     self._set_dir_state(wc.get("path"), "waiting", name=name)
                     self._split_pending[abs_fp] = {
-                        "anchor": str(anchor), "ident": ident,
+                        "anchor": str(anchor), "ident": ident, "tid": tid,
                         "since": time.time(), "last_check": 0.0,
                         "last_sig": self._split_signature(anchor),
                     }
@@ -1912,8 +1912,15 @@ class FolderWatcher(threading.Thread):
                                 pass
                         return "defer"
                     self._lock_retry.pop(abs_fp, None)
-                self.hub.log(f"{name} 解压失败: {err}")
-                self.hub.notify("智能解压失败", f"{name}\n{err}")
+                if (result or {}).get("keep_output_dir"):
+                    # 主层已解出真实内容、只是更深的嵌套层失败：不回退、不报「失败」，
+                    # 如实说「部分完成」，并点明输出目录里保留着已解出的内容。
+                    self.hub.log(f"{name} 部分完成: {err}（已保留已解出的内容）")
+                    self.hub.notify("智能解压部分完成",
+                                    f"{name}\n{err}\n已解出的内容已保留在输出目录")
+                else:
+                    self.hub.log(f"{name} 解压失败: {err}")
+                    self.hub.notify("智能解压失败", f"{name}\n{err}")
                 db.update_task_state(
                     tid, ("need_password" if "密码" in err else "failed"),
                     error=err, finished_at=int(time.time()))
@@ -2013,6 +2020,16 @@ class FolderWatcher(threading.Thread):
         if not fp.exists() or not anchor.exists():
             self._split_pending.pop(abs_fp, None)
             self._set_dir_state(wc.get("path"), "listening")
+            try:
+                orig_tid = st.get("tid")
+                if orig_tid:
+                    db.update_task_state(
+                        orig_tid, "failed",
+                        error="跨目录分卷等待中源文件或分卷锚点已消失，已中止自动归拢",
+                        finished_at=int(time.time()))
+                    _tasks_changed(self.hub)
+            except Exception:
+                pass
             return "done"
         moved = self._gather_and_consolidate(anchor, wc)
         sig = self._split_signature(anchor)
@@ -2027,6 +2044,16 @@ class FolderWatcher(threading.Thread):
             result = out.get("result")
             if result is not None and result.get("success"):
                 self._split_pending.pop(abs_fp, None)
+                try:
+                    orig_tid = st.get("tid")
+                    if orig_tid:
+                        db.update_task_state(
+                            orig_tid, "done", finished_at=int(time.time()),
+                            output_dir=(result.get("promoted_dir")
+                                        or str(Path(st["anchor"]).parent)))
+                        _tasks_changed(self.hub)
+                except Exception:
+                    pass
                 self._recover_finish(fp, wc)
                 return "done"
             if result is None:
@@ -2036,6 +2063,16 @@ class FolderWatcher(threading.Thread):
             self.hub.log(f"跨目录分卷 {self.SPLIT_MAX_WAIT}s 内未到齐，放弃自动归拢"
                          f"（分卷已保留: {anchor}；源文件保留: {fp.name}）")
             self._split_pending.pop(abs_fp, None)
+            try:
+                orig_tid = st.get("tid")
+                if orig_tid:
+                    db.update_task_state(
+                        orig_tid, "failed",
+                        error="分卷兄弟卷未到齐（跨目录归拢超时）",
+                        finished_at=int(time.time()))
+                    _tasks_changed(self.hub)
+            except Exception:
+                pass
             self._set_dir_state(wc.get("path"), "error")
             try:
                 rec = deletion_trail.new_record(fp, wc.get("path"))

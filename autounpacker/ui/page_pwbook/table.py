@@ -194,7 +194,8 @@ class _PwTable(QTableView):
     """口令表：掩码列 + 行内 复制 / 编辑 / 删除；Delete 键发 deleteKeyPressed。
 
     长期行行内为 复制 / 编辑 / 删除；临时（剪贴板）行编辑本就不可用，改为
-    「设为永久」（promoteRequested）——不再放出点不动的禁用按钮。
+    「设为永久」（promoteRequested）——不再放出点不动的禁用按钮；字典（派生）
+    行只留 复制 / 删除（编辑同样不放出来）。
     双击备注列发 editNoteRequested（页面打开编辑框并把焦点锁进备注栏），
     双击其余列仍是复制（copyRequested）。
     支持 ExtendedSelection（Shift / Ctrl 多选）；点列头发 headerClicked（页面做
@@ -384,13 +385,12 @@ class _PwTable(QTableView):
             promote_btn.clicked.connect(
                 lambda _=False, r=row_index: self.promoteRequested.emit(int(r)))
             lay.addWidget(promote_btn)
-        else:
-            edit_btn = self._small_button(
-                "编辑", "编辑这条口令" if can_edit else "字典口令不支持编辑")
-            edit_btn.setEnabled(can_edit)
-            if can_edit:
-                edit_btn.clicked.connect(
-                    lambda _=False, r=row_index: self.editRequested.emit(int(r)))
+        elif can_edit:
+            # 只有长期（密码本）口令可编辑。字典行是解压命中记录派生出来的、
+            # 本就改不了，不再放一个点不动的灰「编辑」按钮（只留 复制 / 删除）。
+            edit_btn = self._small_button("编辑", "编辑这条口令")
+            edit_btn.clicked.connect(
+                lambda _=False, r=row_index: self.editRequested.emit(int(r)))
             lay.addWidget(edit_btn)
         del_btn = self._small_button("删除", del_tip, danger=True)
         del_btn.setEnabled(can_delete)

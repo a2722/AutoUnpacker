@@ -264,6 +264,28 @@ def bump_share_launch(surl):
         return 0
 
 
+def unbump_share_launch(surl):
+    """把该 surl 的拉起次数 -1 并返回新值（下限 0，减到 0 即删除该键）。
+
+    与 `bump_share_launch` 成对：调用方在起 worker **之前**同步计入，而真正的
+    客户端预检在 worker 内；预检拦下说明本次没有发出任何唤醒、不存在重复下载
+    风险，须撤回这次计数，否则会被误判「本次运行已拉起过」而逼用户二次确认。
+    空 surl 忽略（返回 0）；仅内存、不持久化；绝不抛异常。
+    """
+    try:
+        key = str(surl or "").strip()
+        if not key:
+            return 0
+        n = int(_LAUNCHES.get(key) or 0) - 1
+        if n <= 0:
+            _LAUNCHES.pop(key, None)
+            return 0
+        _LAUNCHES[key] = n
+        return n
+    except Exception:
+        return 0
+
+
 def _norm_path(p):
     return str(p or "").replace("/", "\\").rstrip("\\").lower()
 

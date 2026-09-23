@@ -2661,6 +2661,11 @@ class MainWindow(QMainWindow):
         队列（由 `_drain()` 在主线程消费）。异常一律吞掉，忙标志在 finally 复位。"""
         try:
             if self._share_gate_blocked(manual, where="拉起客户端"):
+                # 预检拦下＝本次没有发出任何唤醒：撤回调用方已同步计入的 d7 计数，
+                # 免得之后真拉起时被误判「已拉起过」而逼用户再按一次确认。
+                _revoke = getattr(self, "_revoke_share_launch", None)
+                if callable(_revoke):
+                    _revoke(url)
                 return
             self.hub.log(f"[分享] {'手动' if manual else '自动'}拉起客户端下载…: {url}")
             from .. import baidu_task as bt
@@ -2812,6 +2817,11 @@ class MainWindow(QMainWindow):
         确需提取码才把「询问」请求投回 Qt 线程。异常一律吞掉，忙标志在 finally 复位。"""
         try:
             if self._share_gate_blocked(manual, where="准备管线"):
+                # 与 _invoke_share_worker 同一口径：预检拦下＝什么都没拉起，
+                # 撤回本次计数（本入口已在起线程前同步计入）。
+                _revoke = getattr(self, "_revoke_share_launch", None)
+                if callable(_revoke):
+                    _revoke(url, surl)
                 return
             from .. import baidu_share as bs
             # 唤醒即通知：与 `_invoke_share_worker` 同一策略——链路一发出唤醒就
@@ -3238,6 +3248,39 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._share_launched_surls.add(key)
+        except Exception:
+            pass
+
+    def _revoke_share_launch(self, url, surl=None):
+        """撤回本次「已拉起」计数：客户端预检拦下＝什么都没拉起，不算「已拉起过」。
+
+        d7 计数由调用方在起 worker **之前**同步计入（保住「再按一次确认」的时序），
+        而客户端预检在 worker 内；预检拦下时本次没有发出任何唤醒、不存在重复下载
+        风险 → 撤回该计数与进程内集合兜底，用户之后重试无需再按一次 Alt+2。
+        键优先用 surl，其次从 url 解析；解析不出则静默放弃。绝不抛异常。"""
+        try:
+            key = str(surl or "").strip()
+            if not key:
+                try:
+                    _p = bm.parse_share_url(url)
+                    key = str((_p or {}).get("surl") or "").strip()
+                except Exception:
+                    key = ""
+            if not key:
+                return
+            try:
+                bm.unbump_share_launch(key)
+            except Exception:
+                pass
+            try:
+                _seen = getattr(self, "_share_launched_surls", None)
+                if _seen is not None:
+                    _seen.discard(key)
+            except Exception:
+                pass
+            self.hub.log(
+                "[分享] 本次未真正拉起（客户端未运行），已撤回「已拉起」计数："
+                "重试无需再按一次 Alt+2")
         except Exception:
             pass
 

@@ -4,27 +4,22 @@ from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QShortcut,
-                             QStackedWidget, QVBoxLayout, QWidget)
+                             QVBoxLayout, QWidget)
 
 from ..widgets import Glyph, SegControl, show_toast
 
-from .data import (_PwData, _ShareData, _hit_count, _passes_filter, _pick_on,
-                   _row_matches)
-from .dialogs import _PasswordEditDialog, _ShareEditDialog, _ShareTextDialog
+from .data import _PwData, _hit_count, _passes_filter, _row_matches
+from .dialogs import _PasswordEditDialog
 from .models import _PwModel
-from .table import _EmptyOverlay, _PwTable, _ShareTable, _icon_button
+from .table import _EmptyOverlay, _PwTable, _icon_button
 
 
 # 空态文案（与 pages.py 的空态语气一致）
 EMPTY_BOOK = "密码本还是空的 · 点「新增口令」，或让剪贴板 / 二维码自动收录提取码"
 EMPTY_PWFILTER = "没有符合当前搜索 / 筛选条件的口令"
-EMPTY_SHARE = "还没有固定提取码 · 点「新增提取码」，或「批量编辑（文本）」粘贴多行"
 
 # 筛选分段（key, 文案）——计数在运行期刷新
 _FILTERS = (("all", "全部"), ("hit", "命中过"), ("miss", "未命中"), ("src", "有来源"))
-
-# 视图模式分段（口令本 / 固定提取码）——计数在运行期刷新
-_MODES = (("pwd", "口令"), ("share", "固定提取码"))
 
 
 # ---------------------------------------------------------------------------
@@ -32,14 +27,12 @@ _MODES = (("pwd", "口令"), ("share", "固定提取码"))
 # ---------------------------------------------------------------------------
 
 class PasswordBookPage(QWidget):
-    """密码本页：口令视图（搜索 + 四筛选 + 口令表 + 行内操作，含排序 / 查重）+
-    固定提取码视图（特殊网盘作者的固定提取码：行级增删改 + 批量文本编辑）。
+    """密码本页：口令视图（搜索 + 四筛选 + 口令表 + 行内操作，含排序 / 查重）。
 
-    两个视图共用一页、用模式分段（口令 / 固定提取码）互斥切换；口令数据经 _PwData、
-    固定提取码经 _ShareData 行级读写。
-    信号：notice(text)（复制/新增/编辑/删除等用户可见回执，绝不携带明文口令或提取码）、
+    口令数据经 _PwData 行级读写。
+    信号：notice(text)（复制/新增/编辑/删除等用户可见回执，绝不携带明文口令）、
           changed()（口令本发生写操作后发出，宿主可据此刷新标签徽标）。
-    宿主接缝：reload()（切回本页时重查两个数据集）/ refresh_theme()（主题切换后重贴内联色）。
+    宿主接缝：reload()（切回本页时重查数据集）/ refresh_theme()（主题切换后重贴内联色）。
     """
 
     notice = pyqtSignal(str)
@@ -49,12 +42,9 @@ class PasswordBookPage(QWidget):
         super().__init__(parent)
         self.state = state
         self._data = _PwData(state)
-        self._share_data = _ShareData(state)
         self._rows = []
-        self._share_rows = []
         self._keyword = ""
         self._filter = "all"
-        self._mode = "pwd"
         # 视图排序状态：默认按命中次数降序（命中多的排最前）；仅重排显示，不写库
         self._sort_col = _PwModel.COL_HITS
         self._sort_order = Qt.DescendingOrder
@@ -65,12 +55,7 @@ class PasswordBookPage(QWidget):
         root.setSpacing(10)
 
         root.addLayout(self._build_header())
-
-        # 口令 / 固定提取码两个视图互斥切换（模式分段在页头）
-        self.stack = QStackedWidget(self)
-        self.stack.addWidget(self._build_pwd_view())
-        self.stack.addWidget(self._build_share_view())
-        root.addWidget(self.stack, 1)
+        root.addWidget(self._build_pwd_view(), 1)
 
         # Ctrl+F：页内任意子控件有焦点时聚焦搜索框（页不可见时不抢焦点）
         self._sc_search = QShortcut(QKeySequence("Ctrl+F"), self)
@@ -101,10 +86,6 @@ class PasswordBookPage(QWidget):
         self.hit_label.setObjectName("modeBadge")
         head.addWidget(self.hit_label)
         head.addStretch(1)
-        self.seg_mode = SegControl(self)
-        self.seg_mode.set_items([(label, key) for key, label in _MODES])
-        self.seg_mode.currentChanged.connect(self._on_mode)
-        head.addWidget(self.seg_mode)
         self.refresh_btn = _icon_button("refresh", "刷新", self)
         self.refresh_btn.clicked.connect(self._on_refresh)
         head.addWidget(self.refresh_btn)
@@ -146,47 +127,6 @@ class PasswordBookPage(QWidget):
             sm.selectionChanged.connect(self._on_selection_changed)
         lay.addWidget(self.table, 1)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_BOOK)
-        return view
-
-    def _build_share_view(self):
-        """固定提取码视图：说明 + 计数/操作行 + 提取码表 + 空态。"""
-        view = QWidget(self)
-        lay = QVBoxLayout(view)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-
-        guide = QLabel(
-            "特殊网盘作者的固定提取码：遇到这些分享者时优先填入提取码；"
-            "勾选「需挑选」表示只挑需要的文件下载。", self)
-        guide.setObjectName("stripHint")
-        guide.setWordWrap(True)
-        lay.addWidget(guide)
-
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
-        self.share_count_lbl = QLabel("", self)
-        self.share_count_lbl.setObjectName("stripHint")
-        bar.addWidget(self.share_count_lbl)
-        bar.addStretch(1)
-        self.share_batch_btn = QPushButton("批量编辑（文本）", self)
-        self.share_batch_btn.setObjectName("ghostSm")
-        self.share_batch_btn.setCursor(Qt.PointingHandCursor)
-        self.share_batch_btn.setToolTip("按「分享者UK 提取码 [pick] [#备注]」逐行批量编辑")
-        self.share_batch_btn.clicked.connect(self._batch_edit_share)
-        bar.addWidget(self.share_batch_btn)
-        self.share_add_btn = QPushButton("新增提取码", self)
-        self.share_add_btn.setObjectName("primary")
-        self.share_add_btn.setCursor(Qt.PointingHandCursor)
-        self.share_add_btn.setToolTip("登记一个特殊网盘作者的固定提取码")
-        self.share_add_btn.clicked.connect(self._add_share)
-        bar.addWidget(self.share_add_btn)
-        lay.addLayout(bar)
-
-        self.share_table = _ShareTable(self)
-        self.share_table.editRequested.connect(self._edit_share)
-        self.share_table.deleteRowRequested.connect(self._delete_share)
-        lay.addWidget(self.share_table, 1)
-        self.share_empty = _EmptyOverlay(self.share_table, EMPTY_SHARE)
         return view
 
     def _build_filters(self):
@@ -252,14 +192,6 @@ class PasswordBookPage(QWidget):
     def current_filter(self):
         return self._filter
 
-    def current_mode(self):
-        """当前视图模式：pwd（口令）| share（固定提取码）。"""
-        return self._mode
-
-    def share_rows(self):
-        """固定提取码全部行（不受口令搜索 / 筛选影响）。"""
-        return [dict(r) for r in self._share_rows]
-
     def stats(self):
         """页头口径统计：total / hit / miss / source / book / temp / dict。"""
         out = {"total": len(self._rows), "hit": 0, "miss": 0, "source": 0,
@@ -278,7 +210,7 @@ class PasswordBookPage(QWidget):
 
     # ---- 装载 ----
     def reload(self, keep_view=False):
-        """从数据层重读全部口令与固定提取码并重建行（保留仍可见的选中行）。
+        """从数据层重读全部口令并重建行（保留仍可见的选中行）。
 
         keep_view=True 时额外保持竖向滚动位置（实时刷新用，绝不跳回顶部）。"""
         try:
@@ -287,7 +219,6 @@ class PasswordBookPage(QWidget):
             rows = []
         self._rows = [dict(r) for r in rows if isinstance(r, dict)]
         self._apply_filters(keep_scroll=keep_view)
-        self._reload_share()
         self._live_signature = self._data_signature()
 
     def _data_signature(self):
@@ -361,23 +292,6 @@ class PasswordBookPage(QWidget):
         except Exception:
             pass
         super().hideEvent(event)
-
-    def _reload_share(self):
-        """重读固定提取码并重建表（保留空态与模式分段计数）。"""
-        try:
-            rows = self._share_data.rows()
-        except Exception:
-            rows = []
-        self._share_rows = [dict(r) for r in rows if isinstance(r, dict)]
-        self.share_table.set_rows(self._share_rows)
-        self.share_count_lbl.setText("共 %d 条" % len(self._share_rows))
-        self.share_empty.set_empty(not self._share_rows)
-        self._update_mode_labels()
-
-    def _update_mode_labels(self):
-        """模式分段计数：口令 N / 固定提取码 N（与列表页分段计数同语气）。"""
-        self.seg_mode.set_label("pwd", "口令 %d" % len(self._rows))
-        self.seg_mode.set_label("share", "固定提取码 %d" % len(self._share_rows))
 
     def _sorted_rows(self, rows):
         """按当前列头排序状态对可见行做「仅显示层」重排（绝不改写库内顺序）。
@@ -454,12 +368,6 @@ class PasswordBookPage(QWidget):
         return str((row or {}).get("password") or "")
 
     # ---- 交互 ----
-    def _on_mode(self, data):
-        """模式分段：切换口令 / 固定提取码视图（不重查数据，重查由 reload 负责）。"""
-        key = str(data or "pwd")
-        self._mode = key if key in dict(_MODES) else "pwd"
-        self.stack.setCurrentIndex(0 if self._mode == "pwd" else 1)
-
     def _on_search_changed(self, text):
         self._keyword = str(text).strip()
         self._apply_filters()
@@ -861,102 +769,9 @@ class PasswordBookPage(QWidget):
         self.changed.emit()
         self.notice.emit("已移除重复口令 %d 条" % removed)
 
-    # ---- 固定提取码：行级增 / 改 / 删 + 批量文本编辑 ----
-    def _ask_share_edit(self, title, share_uk, code, note, pick):
-        """弹新增 / 编辑固定提取码对话框（UK + 提取码 + 需挑选 + 备注）；取消返回 None。
-
-        提取码 / UK 绝不进入日志或回执——只在这两个对话框控件里出现。
-        """
-        try:
-            dlg = _ShareEditDialog(self, title, share_uk, code, note, pick)
-        except Exception:
-            self.notice.emit("打开编辑框失败")
-            return None
-        if dlg.exec_() != QDialog.Accepted:
-            return None
-        return dlg.values()
-
-    def _add_share(self):
-        result = self._ask_share_edit("新增提取码", "", "", "", 0)
-        if result is None:
-            return
-        uk, code, note, pick = result
-        if not uk or not code:
-            return
-        if self._share_data.find(uk) is not None:
-            QMessageBox.information(
-                self, "新增提取码", "该分享者 UK 已有固定提取码，请改用「编辑」。")
-            return
-        if not self._share_data.add(uk, code, note, pick):
-            self.notice.emit("新增失败：无法写入固定提取码")
-            return
-        self._reload_share()
-        self.notice.emit("已新增固定提取码")
-
-    def _edit_share(self, row_index):
-        row = self.share_table.row_at(row_index) or {}
-        old_uk = str(row.get("share_uk") or "")
-        old_code = str(row.get("code") or "")
-        old_note = str(row.get("note") or "")
-        old_pick = 1 if _pick_on(row.get("pick")) else 0
-        if not old_uk:
-            return
-        result = self._ask_share_edit("编辑提取码", old_uk, old_code, old_note, old_pick)
-        if result is None:
-            return
-        uk, code, note, pick = result
-        if not uk or not code:
-            return
-        if (uk == old_uk and code == old_code and note == old_note
-                and pick == old_pick):
-            return                                 # 什么都没改
-        if uk != old_uk and self._share_data.find(uk) is not None:
-            QMessageBox.information(self, "编辑提取码", "该分享者 UK 已有固定提取码。")
-            return
-        if not self._share_data.update(old_uk, new_share_uk=uk, code=code,
-                                       note=note, pick=pick):
-            self.notice.emit("保存失败：无法写入固定提取码")
-            return
-        self._reload_share()
-        self.notice.emit("固定提取码已更新")
-
-    def _delete_share(self, row_index):
-        row = self.share_table.row_at(row_index) or {}
-        uk = str(row.get("share_uk") or "")
-        if not uk:
-            return
-        answer = QMessageBox.question(
-            self, "删除固定提取码",
-            "确定删除这条固定提取码吗？\n"
-            "删除后遇到该分享者将不再自动填入提取码（不会删除任何文件）。",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
-            return
-        if self._share_data.remove(uk):
-            self._reload_share()
-            self.notice.emit("已删除固定提取码")
-        else:
-            self.notice.emit("删除失败：无法写入固定提取码")
-
-    def _batch_edit_share(self):
-        """批量编辑（文本）：复用既有行格式的解析 / 格式化，保存走整表覆盖。"""
-        try:
-            dlg = _ShareTextDialog(self, self._share_rows)
-        except Exception:
-            self.notice.emit("打开批量编辑失败")
-            return
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        if not self._share_data.replace_all(dlg.items()):
-            self.notice.emit("保存失败：无法写入固定提取码")
-            return
-        self._reload_share()
-        self.notice.emit("固定提取码已保存")
-
     def refresh_theme(self):
-        """主题切换后重贴内联色（两张表的行内删除按钮 danger 色来自 PALETTE）。"""
-        for table in (self.table, self.share_table):
-            try:
-                table.refresh_theme()
-            except Exception:
-                pass
+        """主题切换后重贴内联色（表的行内删除按钮 danger 色来自 PALETTE）。"""
+        try:
+            self.table.refresh_theme()
+        except Exception:
+            pass

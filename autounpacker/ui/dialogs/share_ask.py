@@ -27,7 +27,6 @@ class ShareCodeAskDialog(QDialog):
 
     三个按钮即回调词表（语义见下），一律经 _finish 恰好回调一次，回调不向外抛异常：
       「本次使用」   -> on_decision("once", code)
-      「绑定并下载」 -> on_decision("mapped", code)
       「忽略」/关闭  -> on_decision("ignore", "")
 
     只读访问器（供接线侧读取本窗当前状态）：
@@ -36,7 +35,7 @@ class ShareCodeAskDialog(QDialog):
     本类只发回调、绝不写库；持久化由调用方负责。
     """
 
-    def __init__(self, parent, surl, url, share_uk, mapped_code="",
+    def __init__(self, parent, surl, url, share_uk,
                  timeout_sec=SHARE_ASK_TIMEOUT_SEC, on_decision=None,
                  state=None, hub=None):
         # UX-5：挂到传进来的主窗上（子工具窗，随主窗移动/隐藏）。非 QWidget
@@ -123,9 +122,6 @@ class ShareCodeAskDialog(QDialog):
         self.code_edit.setMaxLength(4)
         self.code_edit.setValidator(QRegularExpressionValidator(
             QRegularExpression("[A-Za-z0-9]{0,4}"), self))
-        prefill = str(mapped_code or "").strip()
-        if prefill:
-            self.code_edit.setText(prefill)
         lay.addWidget(self.code_edit)
 
         self.hint_label = QLabel("请输入 4 位提取码（字母或数字）")
@@ -139,10 +135,6 @@ class ShareCodeAskDialog(QDialog):
         self.once_btn.clicked.connect(self._on_once_clicked)
         lay.addWidget(self.once_btn)
 
-        self.mapped_btn = QPushButton("绑定并下载（Alt+3）")
-        self.mapped_btn.clicked.connect(self._on_mapped_clicked)
-        lay.addWidget(self.mapped_btn)
-
         foot = QHBoxLayout()
         foot.addStretch(1)
         self.ignore_btn = QPushButton("忽略")
@@ -150,15 +142,13 @@ class ShareCodeAskDialog(QDialog):
         foot.addWidget(self.ignore_btn)
         lay.addLayout(foot)
 
-        # 码无效时两个下载按钮置灰（有效即恢复），行内提示随状态变色
+        # 码无效时下载按钮置灰（有效即恢复），行内提示随状态变色
         self.code_edit.textChanged.connect(self._refresh_state)
         self._refresh_state()
 
-        # Alt+2 / Alt+3：鼠标路径的键盘等价（仅本窗激活时生效，不注册全局热键）
+        # Alt+2：鼠标路径的键盘等价（仅本窗激活时生效，不注册全局热键）
         QShortcut(QKeySequence("Alt+2"), self).activated.connect(
             self._on_once_clicked)
-        QShortcut(QKeySequence("Alt+3"), self).activated.connect(
-            self._on_mapped_clicked)
 
         # 逐秒倒计时：单个 1s 重复 QTimer；到点走 _on_timeout（只关闭、不回调）
         self._timer = QTimer(self)
@@ -194,11 +184,10 @@ class ShareCodeAskDialog(QDialog):
 
     # ---- 状态刷新 / 按钮入口 ----
     def _refresh_state(self):
-        """按框内内容刷新两个下载按钮可用态与行内提示（码无效即置灰）。"""
+        """按框内内容刷新下载按钮可用态与行内提示（码无效即置灰）。"""
         raw = self.code_edit.text().strip()
         valid = bool(self.current_code())
         self.once_btn.setEnabled(valid)
-        self.mapped_btn.setEnabled(valid)
         if not raw:
             self.hint_label.setText("请输入 4 位提取码（字母或数字）")
             self.hint_label.setStyleSheet(
@@ -225,9 +214,6 @@ class ShareCodeAskDialog(QDialog):
 
     def _on_once_clicked(self):
         self._submit("once")
-
-    def _on_mapped_clicked(self):
-        self._submit("mapped")
 
     def _on_ignore_clicked(self):
         if self._done or self._timed_out:

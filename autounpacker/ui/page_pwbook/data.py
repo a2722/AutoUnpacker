@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""密码本页数据层（阶段6e 自 ui/page_pwbook.py 纯搬移）：口令行级门面 _PwData、
-固定提取码行级门面 _ShareData，以及两侧共用的纯函数助手与来源常量。
+"""密码本页数据层（阶段6e 自 ui/page_pwbook.py 纯搬移）：口令行级门面 _PwData
+以及纯函数助手与来源常量。
 
 无 Qt 依赖；行级读写仍只经 state 代理 / password_book 薄封装 / db，
 绝不直接读写 SQLite 文件（测试可对这些入口打桩）。
@@ -8,12 +8,9 @@
 import time
 
 from ... import db
-from ...passwords.book import (add_password_row, add_share_code_row,
-                               clear_password_dict, delete_dict_password,
-                               delete_password_row, delete_share_code_row,
-                               list_password_rows, list_share_code_rows,
-                               set_share_code_rows, update_password_row,
-                               update_share_code_row)
+from ...passwords.book import (add_password_row, clear_password_dict,
+                               delete_dict_password, delete_password_row,
+                               list_password_rows, update_password_row)
 
 
 # 来源文案：显示库中真实存储的 source（manual→手动 / clipboard→剪贴板，未知原样显示）；
@@ -99,31 +96,6 @@ def _make_row(password, source, kind, hits, pid=None, note=""):
     return {"id": pid, "password": str(password), "source": str(source or ""),
             "hit_count": count, "last_hit": last, "note": str(note or ""),
             "kind": str(kind)}
-
-
-def _pick_on(value):
-    """「需挑选」归一化为 True/False（兼容 bool / 0/1 / "pick"/"挑选" 等写法；绝不抛错）。"""
-    try:
-        if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes", "on", "pick", "挑选")
-        return int(value) != 0
-    except Exception:
-        return False
-
-
-def _valid_share_uk(text):
-    """分享者 UK 是否合法（非空纯数字）——与文本行格式「分享者UK 提取码 …」的解析口径一致。"""
-    uk = str(text or "").strip()
-    return bool(uk) and uk.isascii() and uk.isdigit()
-
-
-def _valid_share_code(text):
-    """提取码是否合法（1~16 位 ASCII 字母或数字）——与文本行格式的解析口径一致。
-
-    口径一致保证行编辑写入的数据一定能被「批量编辑（文本）」完整往返，不会静默丢行。
-    """
-    code = str(text or "").strip()
-    return 1 <= len(code) <= 16 and code.isascii() and code.isalnum()
 
 
 # ---------------------------------------------------------------------------
@@ -342,98 +314,5 @@ class _PwData:
             else:
                 db.set_passwords(list(passwords))
             return True
-        except Exception:
-            return False
-
-
-# ---------------------------------------------------------------------------
-# 固定提取码数据层（私有）：share_code_map 按 share_uk 行级读 / 增 / 改 / 删
-# ---------------------------------------------------------------------------
-
-class _ShareData:
-    """固定提取码的数据层：share_uk 为主键，行级读写（含备注 / 需挑选）。
-
-    行级优先顺序与 _PwData 一致：
-      1) state 提供对应接口（share_code_map / add_share_code / find_share_entry /
-         set_share_code_map；AppState 已提供）时经 state 代理落库；
-      2) 行级更新 / 删除没有 state 代理，一律走 password_book 的薄封装
-         （update_share_code_row / delete_share_code_row → db.update/delete_share_code）；
-      3) 无 state 时读取也直连 password_book / db 的只读入口。
-    任何异常都退化为「空 / 失败」，绝不让页面因数据层抖动而崩。
-    """
-
-    def __init__(self, state=None):
-        self._state = state
-
-    def rows(self):
-        """全部行：[{"share_uk","code","note","pick","updated_at"}, ...]（pick 为 0/1）。"""
-        try:
-            if self._state is not None and hasattr(self._state, "share_code_map"):
-                items = self._state.share_code_map()
-            else:
-                items = list_share_code_rows()
-        except Exception:
-            return []
-        out = []
-        for it in items or []:
-            if not isinstance(it, dict):
-                continue
-            uk = str(it.get("share_uk") or "").strip()
-            code = str(it.get("code") or "").strip()
-            if not uk or not code:
-                continue
-            out.append({"share_uk": uk, "code": code,
-                        "note": str(it.get("note") or ""),
-                        "pick": 1 if _pick_on(it.get("pick")) else 0,
-                        "updated_at": it.get("updated_at") or 0})
-        return out
-
-    def find(self, share_uk):
-        """按 share_uk 取单行（无记录 / 异常返回 None）。"""
-        try:
-            if self._state is not None and hasattr(self._state, "find_share_entry"):
-                return self._state.find_share_entry(share_uk)
-            return db.find_share_entry(share_uk)
-        except Exception:
-            return None
-
-    def add(self, share_uk, code, note="", pick=0):
-        """行级新增（同 UK UPSERT 覆盖），返回是否成功。"""
-        try:
-            if self._state is not None and hasattr(self._state, "add_share_code"):
-                return bool(self._state.add_share_code(share_uk, code, note, pick))
-            return bool(add_share_code_row(share_uk, code, note, pick))
-        except Exception:
-            return False
-
-    def update(self, share_uk, new_share_uk=None, code=None, note=None, pick=None):
-        """行级更新（只写显式提供的字段，可为分享者 UK 改名），返回是否命中。"""
-        try:
-            if self._state is not None and hasattr(self._state, "update_share_code"):
-                return bool(self._state.update_share_code(
-                    share_uk, new_share_uk=new_share_uk, code=code,
-                    note=note, pick=pick))
-            return bool(update_share_code_row(share_uk, new_share_uk=new_share_uk,
-                                              code=code, note=note, pick=pick))
-        except Exception:
-            return False
-
-    def remove(self, share_uk):
-        """行级按 share_uk 精确删除，返回是否命中。"""
-        try:
-            if self._state is not None and hasattr(self._state, "delete_share_code"):
-                return bool(self._state.delete_share_code(share_uk))
-            return bool(delete_share_code_row(share_uk))
-        except Exception:
-            return False
-
-    def replace_all(self, items):
-        """整表覆盖（批量文本编辑保存，沿用旧弹窗的 set_share_code_map 语义）。"""
-        try:
-            if self._state is not None and hasattr(self._state, "set_share_code_map"):
-                return bool(self._state.set_share_code_map(items))
-            if self._state is None:
-                return bool(set_share_code_rows(items))
-            return False                   # 桩既无行级也无整表接口：无法保存
         except Exception:
             return False

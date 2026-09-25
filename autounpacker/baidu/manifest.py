@@ -333,66 +333,6 @@ def looks_like_share_code(text):
         return False
 
 
-def mapped_code(share_uk):
-    """该分享者是否配置了固定提取码；返回 code 或 None（薄封装 db.find_share_code，**不做应用**）。
-
-    d3 收紧后的口径：固定映射不再自动套用——monitor 用本函数只判断「有没有」，
-    是否使用必须由用户显式手势决定。绝不抛异常。
-    """
-    try:
-        if not share_uk:
-            return None
-        from .. import db as _db
-        code = _db.find_share_code(str(share_uk))
-        if code:
-            c = str(code).strip()
-            if c:
-                return c
-    except Exception:
-        pass
-    return None
-
-
-def recent_code_from_history(history):
-    """只在「运行时剪贴板历史」里选一个候选提取码，返回 (code|None, source)。
-
-    history 元素通常是 (t, text)（t 为墙钟 float），也容忍纯字符串（时间未知）
-    与畸形条目：取 t 最大且像提取码的那条；若都没有可用时间戳但有条目像提取码，
-    回退到「最后一个」像提取码的条目。source："recent" 命中，"" 无候选。
-    绝不抛异常。
-    """
-    try:
-        best_ts = None
-        best_text = None
-        fallback_text = None
-        for ent in (history or []):
-            if isinstance(ent, str):
-                text = ent
-                ts = None
-            else:
-                try:
-                    text = ent[1]
-                except Exception:
-                    continue          # 畸形条目直接跳过
-                try:
-                    ts = float(ent[0])
-                except Exception:
-                    ts = None
-            if not looks_like_share_code(text):
-                continue
-            fallback_text = text
-            if ts is not None and (best_ts is None or ts > best_ts):
-                best_ts = ts
-                best_text = text
-        if best_text is not None:
-            return (best_text, "recent")
-        if fallback_text is not None:
-            return (fallback_text, "recent")
-    except Exception:
-        pass
-    return (None, "")
-
-
 # 手动拉起时「最近提取码」的有效期（秒），用户定的 120
 CODE_CANDIDATE_TTL = 120.0
 
@@ -400,7 +340,7 @@ CODE_CANDIDATE_TTL = 120.0
 def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None, since_ts=None):
     """只在「时间戳可解析且仍在时效内」的历史条目里选一个候选提取码。
 
-    与 recent_code_from_history 的差别：本函数**严格要求时间戳**——
+    与「无时效候选」的差别：本函数**严格要求时间戳**——
     只有满足 `0 <= now - ts <= ttl` 的条目才参与，无时间戳的条目一律忽略
     （手动拉起是事后补码，必须严格按时效，不能拿陈年旧码充数）。
 
@@ -447,47 +387,6 @@ def fresh_code_from_history(history, ttl=CODE_CANDIDATE_TTL, now=None, since_ts=
             return (best_text, "recent")
     except Exception:
         pass
-    return (None, "")
-
-
-def resolve_invoke_code(share_uk, entries, ttl=CODE_CANDIDATE_TTL):
-    """手动拉起分享、记录本身无提取码时，决定要不要补码。返回 (code|None, source)。
-
-    三态语义：
-    - ("mapped")：该分享者配有**固定提取码映射** → 返回 (None, "mapped")，
-      即**不**静默套用固定码（固定码是「固定提取码手势」/Alt+3 的显式手势，
-      这里只提示用户改用那个手势）；
-    - ("recent")：无固定映射，但在时效内找到最近捕获的提取码 → (code, "recent")；
-    - ("")：无固定映射、时效内也无候选 → (None, "")。
-
-    `entries` 形如 [(ts, text)]（见 AppState.temp_password_entries）。
-    绝不抛异常。"""
-    try:
-        if mapped_code(share_uk):
-            return (None, "mapped")
-        return fresh_code_from_history(entries, ttl)
-    except Exception:
-        return (None, "")
-
-
-def pick_share_code(share_uk, history):
-    """按 d3/d4/d5 选一个候选提取码，返回 (code, source)。
-
-    source 取值："map" = 特殊用户（share_uk）固定提取码映射命中；
-                  "recent" = 运行时剪贴板历史里「绝对最近」且像提取码的那条；
-                  "" = 没有候选。
-    优先级：特殊用户映射 > 最近复制（d5 要求映射优先）。
-    只返回一个候选（d4：默认只试最近 1 个）。绝不抛异常。
-    实现＝ mapped_code + recent_code_from_history 的组合（行为与旧版逐字一致）。
-    """
-    # d3/d5：特殊用户固定映射优先于「最近复制」。
-    code = mapped_code(share_uk)
-    if code:
-        return (code, "map")
-    # d5：否则取剪贴板历史里「绝对最近」且像提取码的那条。
-    c, src = recent_code_from_history(history)
-    if c is not None:
-        return (c, src)
     return (None, "")
 
 

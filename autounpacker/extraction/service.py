@@ -226,7 +226,9 @@ class ExtractService:
             # 解压前安全检查（P1-14 选项 B+C）：先只读 7z 清单判断声明大小/
             # 膨胀比/条目数，命中硬阈值就按失败层留痕并停止，绝不把炸弹先落盘
             # 再事后报警（旧的 _check_size 是解压后才提醒，拦不住任何东西）。
-            bomb_reason = self._bomb_precheck(extract_src, depth)
+            # 同一次清单再认「Missing volume」：分卷缺兄弟卷时提前判失败，省掉
+            # 一次注定失败的大解压与数百行 7-Zip 噪声（见 _precheck）。
+            bomb_reason, gap_reason = self._precheck(extract_src, depth)
             if bomb_reason:
                 self.emit(f"[第{depth}层] [安全拦截] {bomb_reason}")
                 failed_record = {
@@ -242,7 +244,24 @@ class ExtractService:
                 failed_layers.append(failed_record)
                 break
 
-            result = self.engine.extract(layer_task, self.options, depth)
+            if gap_reason:
+                # 预检即发现缺兄弟分卷：不跑注定失败的引擎解压（省掉一次完整解压
+                # 尝试与数百行 7-Zip 噪声），合成一个同文案的失败结果，交给下方统一
+                # 的失败处理归类——嵌套层经 is_split_gap_error 留缺卷锚点待跨目录
+                # 归拢；首层经 is_archive_open_error 判 split_incomplete 保留源文件
+                # 等分卷补齐。语义与「真跑完引擎再失败」完全一致。
+                self.emit(f"[第{depth}层] 预检发现分卷缺卷（{gap_reason[:80]}），"
+                          f"跳过注定失败的解压")
+                result = {
+                    "success": False,
+                    "used_password": None,
+                    "encrypted": False,
+                    "error": gap_reason,
+                    "logs": [f"[预检] 7-Zip 只读清单报告缺兄弟分卷，已跳过解压："
+                             f"{gap_reason}"],
+                }
+            else:
+                result = self.engine.extract(layer_task, self.options, depth)
             if (not result["success"]
                     and info["detected_format"] == "zip"
                     and isinstance(self.engine, SevenZipEngine)
@@ -642,37 +661,78 @@ class ExtractService:
             return None, None
         return total, entries
 
-    def _list_declared_size(self, archive):
-        """解压前只读 7z 清单（不传密码、不解压）：(声明总字节, 条目数)。
+    def _list_archive_raw(self, archive):
+        """单次只读 `7z l -slt` 调用（不传密码、不解压）的原始结果。
 
-        7-Zip 缺失、命令失败、清单里没有 Size（密码/头部加密归档的常态）
-        一律返回 (None, None)：视作未知，绝不据此拦截正常解压。"""
+        7-Zip 缺失或调用异常 → None。刻意保留非 0 退出码时的 stdout/stderr：
+        分卷缺兄弟卷正是以「非 0 退出 + 输出里 Missing volume」体现的，不能像
+        旧 _list_declared_size 那样在非 0 时把输出丢掉。"""
         sevenzip = find_sevenzip_path()
         if sevenzip is None:
-            return None, None
+            return None
         try:
-            r = run_silent([str(sevenzip), "l", "-slt", str(archive)])
+            return run_silent([str(sevenzip), "l", "-slt", str(archive)])
         except Exception:
-            return None, None
-        if r is None or r.returncode != 0:
-            return None, None
-        return self._parse_declared_listing(r.stdout)
+            return None
 
-    def _bomb_precheck(self, archive, depth):
-        """解压前 zip bomb 安全检查（选项 B 硬拦截 + 选项 C 软提示）。
+    @staticmethod
+    def _listing_gap_evidence(archive, result):
+        """从只读清单结果里提取「分卷缺兄弟卷」证据行（无则空串）。
 
-        只读清单、不解压；返回硬拦截的中文原因，None = 放行。任何「未知」
-        （7z 缺失/列不出/解析不出）都放行——密码或头部加密的归档本来就
-        列不出清单，绝不能因为探测不到就拦住正常解压。"""
+        只认两个「结构上确实缺卷」的硬证据（本机 7z 26.03 实测）：
+          - WinZip 跨卷（B7236.zip 缺 .z01）→ `Missing volume`；
+          - 7-Zip -v 的 zip 分卷（set.zip.001..）缺任一卷 → `Unexpected end of
+            archive`（缺首/中/末卷都报它、退出码 2）。
+        末卷 base.zip 不带编号也照样命中（Missing volume 不看文件名）。
+
+        刻意**不含**泛化的 "Cannot open the file as"：它对单个损坏/非归档文件、
+        以及截断的 7z 分卷清单（.7z.001 报 `Cannot open the file as [7z] archive`）
+        也会出现——那类情况恰恰要留给引擎真跑一次的既有兜底与原始输出留痕，提前
+        短接会架空前者的日志与文案。正常归档（含不传口令时的加密分卷，实测清单
+        rc=0）不含这些错误文本 → 不触发，绝不误伤需要口令的正常分卷。"""
+        if result is None:
+            return ""
+        text = (str(getattr(result, "stdout", "") or "")
+                + "\n" + str(getattr(result, "stderr", "") or ""))
+        if not any(tok in text
+                   for tok in ("Missing volume", "Unexpected end of archive")):
+            return ""
+        if not (is_volume_name(Path(archive).name) or "Missing volume" in text):
+            return ""
+        for line in text.splitlines():
+            s = line.strip()
+            if "Missing volume" in s or "Unexpected end of archive" in s:
+                return s
+        return "分卷缺卷"
+
+    def _precheck(self, archive, depth):
+        """解压前的单次只读清单预检（`7z l -slt`，不解压、不传密码）。
+
+        返回 (bomb_reason, gap_reason)：
+          - bomb_reason：命中 zip bomb 硬阈值的中文原因，None = 放行；
+          - gap_reason：清单报 Missing volume（缺兄弟分卷）时的证据行，
+            None = 未发现缺卷。
+
+        两条铁律：
+          1. bomb_guard_enabled=False → 一律 (None, None)：连 7z 路径都不查、
+             清单都不列（沿用既有开关语义，见 test_p14 E）。
+          2. 任何「未知」（7z 缺失 / 列不出 / 解析不出）都放行——密码或头部
+             加密的归档本来就列不出清单，绝不能因为探测不到就拦住正常解压。"""
         if not self.options.get("bomb_guard_enabled", True):
-            return None
-        declared, entries = self._list_declared_size(archive)
+            return None, None
+        r = self._list_archive_raw(archive)
+        if r is None:
+            return None, None
+        gap_reason = self._listing_gap_evidence(archive, r)
+        if r.returncode != 0:
+            return None, gap_reason
+        declared, entries = self._parse_declared_listing(r.stdout)
         if declared is None:
-            return None
+            return None, gap_reason
         try:
             archive_size = Path(archive).stat().st_size
         except OSError:
-            return None
+            return None, gap_reason
         hard_size_gb = self._opt_number("bomb_hard_size_gb", 50.0)
         hard_ratio = self._opt_number("bomb_hard_ratio", 200.0)
         hard_min_gb = self._opt_number("bomb_hard_min_gb", 1.0)
@@ -682,19 +742,19 @@ class ExtractService:
         declared_gb = declared / gib
         if declared > hard_size_gb * gib:
             return (f"声明解压后大小 {declared_gb:.1f} GB 超过硬上限 "
-                    f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压")
+                    f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压"), gap_reason
         ratio = declared / archive_size if archive_size > 0 else 0.0
         if ratio >= hard_ratio and declared_gb >= hard_min_gb:
             return (f"声明膨胀比 {ratio:.0f}:1（解压后 {declared_gb:.2f} GB / "
                     f"压缩包 {archive_size / 1048576:.1f} MB）达到硬阈值 "
-                    f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压")
+                    f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压"), gap_reason
         if ratio > soft_ratio:
             self.emit(f"[第{depth}层] [安全提示] 声明膨胀比 {ratio:.0f}:1 超过提示阈值 "
                       f"{soft_ratio:g}:1，继续解压，请留意磁盘空间")
         if entries > soft_entries:
             self.emit(f"[第{depth}层] [安全提示] 归档条目数 {entries} 超过提示阈值 "
                       f"{soft_entries:g}，继续解压，请留意耗时与磁盘空间")
-        return None
+        return None, gap_reason
 
     def _all_entries_extracted(self, extract_dir, archive):
         """7-Zip 返回非零退出码后，用 Python 核对输出目录是否已包含归档的全部文件。

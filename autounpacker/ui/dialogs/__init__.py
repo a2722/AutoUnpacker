@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
-"""各类对话框：删除回溯、7-Zip 管理、设置、关闭行为确认、网址信任确认、目录设置。
+"""各类对话框：删除回溯、7-Zip 管理、关闭行为确认、网址信任确认、目录设置。
 
 职责：- DeleteTrailDialog 展示删除回溯记录并一键还原
 - SevenZipSetupDialog 检测/安装/卸载 7-Zip（隔离版与全局版）
-- SettingsDialog 全部配置项编辑（监听路径、通知、信任名单、快捷键等）
 - CloseActionDialog 关闭行为询问；TrustAskDialog 新网址信任确认
 - ShareCodeAskDialog 分享缺提取码时贴主窗右缘的非阻塞取码小窗（120s 到点关闭作废）
 - WatchDirDialog 目录设置弹窗（对应原型 12；监听模式为两张平铺卡，严禁下拉框）
 - TaskDetailsDialog 任务详情弹窗（队列行「详细信息」/ 双击行；按状态给出出路动作）
-关键入口：SettingsDialog / SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog /
+关键入口：SevenZipSetupDialog / DeleteTrailDialog / TrustAskDialog /
           ShareCodeAskDialog / WatchDirDialog / TaskDetailsDialog
 依赖：PyQt5、trail、sevenzip、trust、widgets
 注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
@@ -19,7 +18,6 @@
 # `autounpacker.ui.dialogs.X` 与旧模块完全一致，含以 `_` 开头的内部名）：
 #   common.py        共享模块级名字（状态词表/回收站文案/取码小窗常量、
 #                    _call_decision、_CodeLineEdit）
-#   settings.py      SettingsDialog
 #   trail.py         DeleteTrailDialog
 #   sevenzip.py      SevenZipSetupDialog / _SevenZipOp
 #   trust.py         TrustAskDialog / CloseActionDialog
@@ -39,7 +37,6 @@ from .common import (  # noqa: F401
     SHARE_ASK_WINDOW_WIDTH, _call_decision, _CodeLineEdit)
 from .trail import DeleteTrailDialog  # noqa: F401
 from .sevenzip import SevenZipSetupDialog, _SevenZipOp  # noqa: F401
-from .settings import SettingsDialog  # noqa: F401
 from .trust import TrustAskDialog, CloseActionDialog  # noqa: F401
 from .share_ask import ShareCodeAskDialog  # noqa: F401
 from .delete_policy import DeletePolicyAskDialog  # noqa: F401
@@ -51,7 +48,7 @@ __all__ = [
     "TRASH_HINT_NO_BIN", "SHARE_ASK_TIMEOUT_SEC", "SHARE_ASK_EDGE_MARGIN",
     "SHARE_ASK_WINDOW_WIDTH", "_call_decision", "_CodeLineEdit",
     "DeleteTrailDialog", "_SevenZipOp", "SevenZipSetupDialog",
-    "SettingsDialog", "CloseActionDialog", "TrustAskDialog",
+    "CloseActionDialog", "TrustAskDialog",
     "ShareCodeAskDialog", "DeletePolicyAskDialog", "WatchDirDialog",
     "TaskDetailsDialog",
 ]

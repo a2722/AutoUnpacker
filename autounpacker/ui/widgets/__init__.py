@@ -46,7 +46,7 @@ from PyQt5.QtGui import (  # noqa: F401
     QPainterPath, QPalette, QFont)
 
 from ...config import (  # noqa: F401
-    _HK_NAME_BY_VK, HOTKEY_ID, HOTKEY_ID_SHARE, HOTKEY_ID_SHARE_CODE,
+    _HK_NAME_BY_VK, HOTKEY_ID, HOTKEY_ID_SHARE, HOTKEY_ID_SHARE_PICK,
     WM_HOTKEY)
 from ..style import PALETTE  # noqa: F401
 from .. import style as ui_style  # noqa: F401

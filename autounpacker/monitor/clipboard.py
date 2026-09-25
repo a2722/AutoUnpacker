@@ -1081,9 +1081,7 @@ class QRMonitor(threading.Thread):
             # 回 rec["pwd"]（remember_share_link 存的正是同一个 dict，其它消费者立即
             # 可见）：1) 文本内嵌（如「…链接 提取码：Zdjn」）→ 2) 仅采用**最近 120 秒内**
             # 复制过的文本（严格时效；拿旧码去 verify 只会白烧唯一一次配额）。
-            # **绝不**在此自动套用分享者的固定映射：使用固定码必须由用户显式手势
-            # 触发（面板/托盘/热键）。本处只通过 has_map 告知 UI「该分享者配有固定
-            # 码」，由 UI 去征询；fresh_code_from_history 缺失或异常时按无码处理。
+            # fresh_code_from_history 缺失或异常时按无码处理。
             # 此处只做快速只读查询，绝不发起网络请求。
             code_source = "url" if rec.get("pwd") else ""
             if not rec.get("pwd"):
@@ -1119,14 +1117,9 @@ class QRMonitor(threading.Thread):
             self.hub.log(f"已记录分享链接: surl={rec.get('surl')} "
                          f"shareid={rec.get('shareid')} pwd={rec.get('pwd')}")
             try:
-                has_map = bool(_bt.mapped_code(rec.get("share_uk")))
-            except Exception:
-                has_map = False
-            try:
                 self.hub.q.put({"type": "share_link", "url": rec.get("url"),
                                 "surl": rec.get("surl"), "pwd": rec.get("pwd"),
                                 "share_uk": rec.get("share_uk"),
-                                "has_map": has_map,
                                 "code_source": code_source})
             except Exception:
                 pass

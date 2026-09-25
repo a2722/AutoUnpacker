@@ -344,58 +344,25 @@ def _share_invoke_busy_stale(win):
 
 
 def _call_start_share_pick(win, url, surl, pwd, manual=False, item=None,
-                           bind_code_uk=None):
-    """调用 `win._start_share_pick` 并转发 `bind_code_uk`；兼容不接受该参数的旧桩。
+                           force_pick=False):
+    """调用 `win._start_share_pick` 并转发 `force_pick`；兼容不接受该参数的旧桩。
 
-    真实实现接受 `bind_code_uk`；既有大量测试把 `_start_share_pick` 换成不含该形参
-    的桩。这里按签名判断：不接受时退回位置调用（绑定语义对桩不可观测，本就不会执行
+    真实实现接受 `force_pick`；既有大量测试把 `_start_share_pick` 换成不含该形参
+    的桩。这里按签名判断：不接受时退回位置调用（挑选手势对桩不可观测，本就不会执行
     worker），绝不因签名差异让调用抛错。module 级定义使旧桩（未绑定本方法）可用。"""
     fn = win._start_share_pick
     accepts = True
     try:
         import inspect
         params = inspect.signature(fn).parameters
-        accepts = ("bind_code_uk" in params) or any(
+        accepts = ("force_pick" in params) or any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     except Exception:
         accepts = True
     if accepts:
         return fn(url, surl, pwd, manual=manual, item=item,
-                  bind_code_uk=bind_code_uk)
+                  force_pick=force_pick)
     return fn(url, surl, pwd, manual=manual, item=item)
-
-
-def _prefill_share_code_window(dlg, code):
-    """复用小窗时预填「最新已知码」：只在框内当前码为空时填入，绝不覆盖用户输入。
-
-    优先冻结的可写方法（set_code / prefill_code / prefill，若将来落地）；
-    否则回退已知输入框属性（once_edit / code_edit / mapped_edit）。"""
-    code = str(code or "").strip()
-    if not code or dlg is None:
-        return
-    try:
-        fn = getattr(dlg, "current_code", None)
-        if callable(fn) and str(fn() or "").strip():
-            return                      # 用户已填：不覆盖
-    except Exception:
-        pass
-    for name in ("set_code", "prefill_code", "prefill"):
-        fn = getattr(dlg, name, None)
-        if callable(fn):
-            try:
-                fn(code)
-                return
-            except Exception:
-                pass
-    for attr in ("once_edit", "code_edit", "mapped_edit"):
-        ed = getattr(dlg, attr, None)
-        if ed is not None and hasattr(ed, "setText"):
-            try:
-                if not str(ed.text() or "").strip():
-                    ed.setText(code)
-                    return
-            except Exception:
-                pass
 
 
 def _share_parent_usable(win):
@@ -547,11 +514,10 @@ def _share_pan_open_blocked(win, url):
     return True
 
 
-def _show_share_code_window(win, surl, url, share_uk, mapped_code="",
-                            open_browser=False):
+def _show_share_code_window(win, surl, url, share_uk, open_browser=False):
     """把「缺提取码小窗」收敛到唯一入口（Qt 主线程调用）。
 
-    - 已有小窗且属于同一分享 → 复用并预填最新已知码（不覆盖用户已填内容）；
+    - 已有小窗且属于同一分享 → 复用（不覆盖用户已填内容）；
     - 已有小窗属于别的分享 → 关掉旧的换新的（同一时刻只允许一个小窗）；
     - 主窗缺失/隐藏（托盘）/最小化时**不再悬浮独立小窗**：只记一行日志 +
       一条托盘气泡（hub.notify 路径），返回 None，由调用方既有「无码回退」继续；
@@ -594,7 +560,6 @@ def _show_share_code_window(win, surl, url, share_uk, mapped_code="",
         (t_surl and surl_s and t_surl == surl_s)
         or (uk_s and t_uk and uk_s == t_uk)))
     if same:
-        _prefill_share_code_window(dlg, mapped_code)
         try:
             dlg.show()
         except Exception:
@@ -623,7 +588,7 @@ def _show_share_code_window(win, surl, url, share_uk, mapped_code="",
     try:
         # 传 hub= 让 120s 超时日志（「分享询问超时(120s)，已关闭丢弃」）真正出现。
         new_dlg = ShareCodeAskDialog(parent=win, surl=surl, url=url,
-                                     share_uk=share_uk, mapped_code=mapped_code,
+                                     share_uk=share_uk,
                                      hub=getattr(win, "hub", None))
     except Exception as e:
         _share_log(win, f"[分享] 打开提取码询问失败: {e}")

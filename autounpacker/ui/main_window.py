@@ -30,9 +30,8 @@ from .. import baidu_manifest as bm
 from .. import db
 from .. import hub
 from ..config import (parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE,
-                      HOTKEY_ID_SHARE_CODE, MOD_NOREPEAT)
+                      HOTKEY_ID_SHARE_PICK, MOD_NOREPEAT)
 from ..trust import add_trust_entry
-from .password_book import PasswordBookDialog
 from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,  # noqa: F401
                      watch_path_conflict)
 from .widgets import (WatchCard,  # noqa: F401  （M3 起主界面不再创建，保留给目录弹窗/后续里程碑）
@@ -46,7 +45,7 @@ from .pages import TaskPage, LogPage, StatusBar
 from .page_pwbook import PasswordBookPage
 from .page_trail import TrailPage
 from .page_settings import SettingsPage
-from .dialogs import (SettingsDialog, DeleteTrailDialog, SevenZipSetupDialog,
+from .dialogs import (DeleteTrailDialog, SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
                       TaskDetailsDialog)
 
@@ -77,7 +76,7 @@ from .window.logview import (  # noqa: F401
     _record_degraded_link, _degraded_spans_for, _pop_degraded_link,
     _restore_link_span, _restore_degraded_in_view, _rerender_log_view,
     _restore_link_in_view, _log_view_for, _accepts_in_task_view,
-    _append_log_html, _share_log, _persist_log,
+    _append_log_html, _share_log,
     FoldController,
     _fold_item_at, _toggle_log_fold, _show_fold_tip, _hide_fold_tip)
 from .window.share_flow import (  # noqa: F401
@@ -86,7 +85,7 @@ from .window.share_flow import (  # noqa: F401
     _clipboard_share_target, _share_input_inflight, _share_gesture_wait_sec,
     _share_uk_for_surl, _mark_gesture_launch, _gesture_launched_recently,
     _share_invoke_busy_stale, _call_start_share_pick,
-    _manual_reinvoke_guard, _prefill_share_code_window, _share_parent_usable,
+    _manual_reinvoke_guard, _share_parent_usable,
     _share_notify_via,
     _take_share_ask_notified, _announce_ask_code_hidden,
     _share_pan_open_blocked, _show_share_code_window)
@@ -202,14 +201,14 @@ class MainWindow(QMainWindow):
             self._hotkey_filter = _HotkeyFilter(
                 self._show_window, self._on_system_theme_changed,
                 self._on_share_hotkey,
-                on_hotkey_share_code=self._on_share_code_hotkey)
+                on_hotkey_share_pick=self._on_share_code_hotkey)
             app.installNativeEventFilter(self._hotkey_filter)
         # 全局快捷键：**等窗口显示后再注册**。在 __init__ 里立刻注册时，winId()
         # 拿到的原生窗口句柄可能尚未“坐实”，偶发 RegisterHotKey 失败(1400 无效句柄)；
         # 延后注册 + 失败重试可彻底消除这个启动偶发。
         # 全局热键的**真实注册结果**（None=未尝试/不适用，True=已注册，False=失败）。
         # 底栏据此诚实标注「（未生效）」，不再拿配置值冒充已生效（见 _sync_hotkey_display）。
-        self._hotkey_ok = {"main": None, "share": None, "share_code": None}
+        self._hotkey_ok = {"main": None, "share": None, "share_pick": None}
         QTimer.singleShot(600, self._register_hotkey)
         # 主界面快捷键：Esc / Ctrl+W 触发关闭（走 close_action 逻辑：
         # 询问弹窗 / 隐藏到托盘 / 关闭程序）。仅主界面激活时生效，
@@ -678,9 +677,9 @@ class MainWindow(QMainWindow):
         # 2.F「用客户端下载最近分享」：整条链路属实验性功能，未开启时整项隐藏。
         self._open_share_action = menu.addAction("用客户端打开最近分享")
         self._open_share_action.triggered.connect(self._open_recent_share)
-        # d3：用分享者的「固定提取码」下载最近分享（同为实验性，未开启时整项隐藏）。
-        self._open_share_code_action = menu.addAction("用固定提取码下载最近分享")
-        self._open_share_code_action.triggered.connect(self._open_recent_share_with_code)
+        # Alt+3：下载最近分享前先打开文件挑选窗（同为实验性，未开启时整项隐藏）。
+        self._open_share_pick_action = menu.addAction("挑选文件下载最近分享")
+        self._open_share_pick_action.triggered.connect(self._open_recent_share_with_code)
         # 菜单每次展开前刷新一次可见性（配置可能刚被改过，无需额外的变更通知）
         menu.aboutToShow.connect(self._refresh_share_menu)
         menu.addSeparator()
@@ -775,13 +774,6 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.Information, 2500)
 
     # ---------- 控制 ----------
-    def _open_settings(self):
-        dlg = SettingsDialog(self.state, self.hub, self,
-                             on_hotkey_change=self._register_hotkey,
-                             on_theme_change=self.on_theme_changed)
-        dlg.exec_()
-        self._on_settings_saved()
-
     def _on_settings_saved(self):
         """设置保存后的主窗同步：轮询间隔 / 底栏热键文案（旧弹窗与设置页共用）。"""
         # 设置里可能改了轮询间隔 / 快捷键：回到主界面立刻同步到底栏显示
@@ -858,10 +850,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.hub.log(f"添加百度网盘下载目录失败: {e}")
             QMessageBox.warning(self, "百度网盘下载目录", f"添加失败：{e}")
-
-    def _open_password_book(self):
-        dlg = PasswordBookDialog(self.state, self)
-        dlg.exec_()
 
     def _open_delete_trail(self):
         dlg = DeleteTrailDialog(self)
@@ -2181,43 +2169,27 @@ class MainWindow(QMainWindow):
                         self._append_log(
                             f"[分享] 该分享刚由手势拉起，已跳过本次自动拉起: {surl}")
                     elif not pwd:
-                        # d3：空提取码绝不自动拉起。先看该分享者有无固定映射：
-                        #   有 → 直接弹「询问」（不浪费一次探针）；
-                        #   无 → 起后台线程先 prepare_share(url, "") 探测是否根本不需要
-                        #        提取码，确需提取码才把「询问」请求投回 Qt 线程。
-                        mapped = None
-                        try:
-                            mapped = bm.mapped_code(item.get("share_uk"))
-                        except Exception:
-                            mapped = None
-                        if mapped:
-                            self._share_ask_code(item, url, surl)
-                        else:
-                            self._start_share_pick(url, surl, "", manual=False,
-                                                   item=item)
+                        # d3：空提取码绝不自动拉起。起后台线程先 prepare_share(url, "")
+                        # 探测是否根本不需要提取码，确需提取码才把「询问」请求投回 Qt 线程。
+                        self._start_share_pick(url, surl, "", manual=False,
+                                               item=item)
                     elif self._share_needs_consent(surl):
                         # d7：同一分享本次运行已拉起过 → 未经用户同意不再自动拉起
                         self._confirm_share_reinvoke(surl, url, pwd)
                     else:
                         self._start_share_pick(url, surl, pwd, manual=False)
-                # 触发小窗（三触发之一）：链接本身无码、也查不到固定码 → 弹/聚焦
-                # 提取码小窗（**不管** baidu_auto_invoke 开关、不管是否手势）。有码
-                # 则不弹；未知分享者顺手开一次浏览器探针（已在弹小窗时不重复开）。
+                # 触发小窗（三触发之一）：链接本身无码 → 弹/聚焦提取码小窗（**不管**
+                # baidu_auto_invoke 开关、不管是否手势）。有码则不弹；未知分享者顺手
+                # 开一次浏览器探针（已在弹小窗时不重复开）。
                 # 刻意放在 baidu_auto_invoke 分支之后：不改变其既有顺序与语义。
                 try:
                     if self.state.snapshot().get("experimental_enabled"):
                         _pwd = str(item.get("pwd") or "").strip()
                         if not _pwd:
-                            _mapped = None
-                            try:
-                                _mapped = bm.mapped_code(item.get("share_uk"))
-                            except Exception:
-                                _mapped = None
-                            if not _mapped:
-                                _show_share_code_window(
-                                    self, item.get("surl"), item.get("url"),
-                                    item.get("share_uk"), mapped_code="",
-                                    open_browser=True)
+                            self._share_ask_force_pick = False
+                            _show_share_code_window(
+                                self, item.get("surl"), item.get("url"),
+                                item.get("share_uk"), open_browser=True)
                 except Exception:
                     pass
             elif item["type"] == "share_pick":
@@ -2254,8 +2226,8 @@ class MainWindow(QMainWindow):
             visible = bool(self.state.snapshot().get("experimental_enabled"))
             if hasattr(self, "_open_share_action"):
                 self._open_share_action.setVisible(visible)
-            if hasattr(self, "_open_share_code_action"):
-                self._open_share_code_action.setVisible(visible)
+            if hasattr(self, "_open_share_pick_action"):
+                self._open_share_pick_action.setVisible(visible)
         except Exception:
             pass
 
@@ -2328,7 +2300,7 @@ class MainWindow(QMainWindow):
         try:
             if kind == "share_code":
                 self._append_log(
-                    "[分享] 二维码解析完成，按预定任务（固定提取码）自动拉起…（Alt+3）")
+                    "[分享] 二维码解析完成，按预定任务（打开文件挑选窗）自动拉起…（Alt+3）")
                 self._open_recent_share_with_code()
             else:
                 self._append_log("[分享] 二维码解析完成，按预定任务自动拉起…（Alt+2）")
@@ -2361,7 +2333,8 @@ class MainWindow(QMainWindow):
                     # 文案（三种方式）并置去重标记，随后 _show_share_code_window
                     # 的兜底提示静默，一次用户动作只有一条气泡。
                     _announce_ask_code_hidden(self, url)
-                _show_share_code_window(self, surl, url, None, mapped_code="")
+                self._share_ask_force_pick = False
+                _show_share_code_window(self, surl, url, None)
                 return
             if _src == "recent":
                 self._append_log(
@@ -2380,20 +2353,14 @@ class MainWindow(QMainWindow):
     def _launch_clipboard_share_code(self, url, surl, pwd):
         """A 快路径（Alt+3）：剪贴板同一段文本的链接，取值后走「准备→挑选→提交」。
 
-        取值顺序与 Alt+3 冻结口径一致：小窗码 > 文本自带码 > 收紧历史 >
-        该分享者固定映射（仅当该链接已被记录、能拿到 share_uk 时）。仍无码 →
-        诚实放弃并摆出提取码小窗。"""
+        取值顺序：小窗码 > 文本自带码 > 收紧历史。仍无码 → 诚实放弃并摆出提取码
+        小窗。取到码后**强制打开文件挑选窗**（force_pick=True）。"""
         try:
             self._append_log(
-                f"[分享] 剪贴板内已有分享链接，按固定提取码手势处理: {url}")
+                f"[分享] 剪贴板内已有分享链接，按挑选手势处理: {url}")
             _uk = _share_uk_for_surl(surl)
             code, _src = _effective_share_code(
                 self, surl, _uk, pwd, "text" if pwd else "")
-            if not code:
-                try:
-                    code = bm.mapped_code(_uk) or ""
-                except Exception:
-                    code = ""
             if not code:
                 self._append_log(
                     "[分享] 缺少可确认的提取码，已放弃拉起（避免拉错链接）")
@@ -2405,15 +2372,16 @@ class MainWindow(QMainWindow):
                     # 主窗不可用：与 Alt+2 快路径同一口径——诚实三方式文案 + 去重，
                     # 绝不先发一条承诺「右侧小窗」的气泡。
                     _announce_ask_code_hidden(self, url)
-                _show_share_code_window(self, surl, url, _uk or None, mapped_code="")
+                self._share_ask_force_pick = True
+                _show_share_code_window(self, surl, url, _uk or None)
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
             self._pending_share_gesture = None
             _mark_gesture_launch(self, surl)
             _call_start_share_pick(self, url, surl, code, manual=True,
-                                   bind_code_uk=_uk or None)
+                                   force_pick=True)
         except Exception as e:
-            self._append_log(f"按固定提取码下载出错: {e}")
+            self._append_log(f"按挑选手势下载出错: {e}")
 
     def _open_recent_share(self):
         """托盘动作：把最近捕获的分享链接交给网盘客户端下载（2.F『拉起』全链路）。
@@ -2495,18 +2463,6 @@ class MainWindow(QMainWindow):
                 # 把来源不明的猜测码发给 /share/verify（errno=-9 的根因）。
                 self._append_log(
                     "[分享] 缺少可确认的提取码，已放弃拉起（避免拉错链接）")
-                _mapped = ""
-                try:
-                    _mapped = bm.mapped_code(rec.get("share_uk")) or ""
-                except Exception:
-                    _mapped = ""
-                if _mapped:
-                    self._append_log("[分享] 该分享者配有固定提取码，需用「固定提取码」手势")
-                    self._share_notify(
-                        "分享缺少提取码",
-                        f"{rec.get('url')}\n该分享者配有固定提取码：请用「固定提取码」"
-                        f"手势（托盘菜单 / Alt+3）下载。")
-                    return
                 if _share_parent_usable(self):
                     self._append_log(
                         "[分享] 该分享缺少提取码，已跳过拉起（请在右侧小窗填写提取码，"
@@ -2518,9 +2474,10 @@ class MainWindow(QMainWindow):
                 else:
                     # 主窗不可用：小窗弹不出来 —— 提示改为诚实文案（唯一发声点）
                     _announce_ask_code_hidden(self, rec.get("url"))
+                self._share_ask_force_pick = False
                 _show_share_code_window(
                     self, rec.get("surl") or rec.get("url"), rec.get("url"),
-                    rec.get("share_uk"), mapped_code=_mapped)
+                    rec.get("share_uk"))
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起。
             self._pending_share_gesture = None
@@ -2542,18 +2499,18 @@ class MainWindow(QMainWindow):
         self._open_recent_share()
 
     def _open_recent_share_with_code(self):
-        """托盘动作/热键：用固定/小窗提取码下载最近分享（d3 显式手势，成功才绑定）。
+        """托盘动作/热键（Alt+3）：下载最近分享前**始终打开文件挑选窗**。
 
-        与「用客户端打开最近分享」并列，但走新的「准备 →（可选）挑选 → 提交」管线；
+        与「用客户端打开最近分享」并列，走「准备 → 挑选 → 提交」管线；
         按压时同样先就地读剪贴板（A 快路径）：命中分享链接即按该链接取值，否则在
         有输入解析在途时登记意图等解析完成，最后才回退最近记录。
-        取值顺序：小窗码 > 文本自带码/权威记录码（收紧历史）> 分享者固定映射。
-        仍无码时**不再死胡同**：弹/聚焦提取码小窗，等用户填完走「本次使用」或直接下载。
-        本次携带 `bind_code_uk`，由 worker 在**提交成功后**才把码写入固定映射。"""
+        取值顺序：小窗码 > 文本自带码/权威记录码（收紧历史）。
+        仍无码时**不再死胡同**：弹/聚焦提取码小窗，等用户填完走「本次使用」。
+        取到码后一律以 `force_pick=True` 进管线，worker 无条件打开挑选窗。"""
         try:
             # 整条 2.F 属实验性功能：全局热键也可能被按下，这里必须再校验一次。
             if not self.state.snapshot().get("experimental_enabled"):
-                self._append_log("实验性功能未开启，「用固定提取码下载分享」不可用")
+                self._append_log("实验性功能未开启，「挑选文件下载分享」不可用")
                 return
             # A. 按压时刻的剪贴板：命中分享链接就从该文本就地解析（零等待）。
             _fresh = _clipboard_share_target(self)
@@ -2576,42 +2533,31 @@ class MainWindow(QMainWindow):
                 return
             self._append_log(
                 f"[分享] 剪贴板无分享链接，沿用最近记录: {rec.get('url')}")
-            # 失效短路：固定提取码也救不活失效链接 → 零网络请求、绝不唤起客户端，
-            # 日志 + 托盘通知并说明固定提取码也无效。
+            # 失效短路：失效链接救不活 → 零网络请求、绝不唤起客户端，日志 + 托盘通知。
             try:
                 dead = bm.share_dead(rec.get("surl") or rec.get("url"))
             except Exception:
                 dead = ""
             if dead:
                 self._append_log(
-                    f"[分享] 该分享链接已失效，固定提取码也无法下载，已跳过：{dead}")
+                    f"[分享] 该分享链接已失效，已跳过：{dead}")
                 self._share_notify(
                     "分享链接已失效",
-                    f"{rec.get('url')}\n{dead}（固定提取码也无法下载）")
+                    f"{rec.get('url')}\n{dead}")
                 return
-            # 取值顺序（冻结）：小窗码 > 取值助手 > 该分享者固定映射码。
+            # 取值顺序（冻结）：小窗码 > 取值助手。
             code, _src = _effective_share_code(
                 self, rec.get("surl") or rec.get("url"),
                 rec.get("share_uk"), rec.get("pwd"), rec.get("code_source"))
             if not code:
-                try:
-                    code = bm.mapped_code(rec.get("share_uk")) or ""
-                except Exception:
-                    code = ""
-            if not code:
-                # 无固定码也不再死胡同：弹/聚焦提取码小窗，给出可操作提示。
+                # 不再死胡同：弹/聚焦提取码小窗，给出可操作提示。
                 # D：先诚实标注「没有可确认与当前链接同源的码」。
                 self._append_log(
                     "[分享] 缺少可确认的提取码，已放弃拉起（避免拉错链接）")
-                _mapped = ""
-                try:
-                    _mapped = bm.mapped_code(rec.get("share_uk")) or ""
-                except Exception:
-                    _mapped = ""
                 if _share_parent_usable(self):
                     self._append_log(
-                        "[分享] 该分享者未配置固定提取码，该分享需要提取码："
-                        "请在右侧小窗填写（或按 Alt+2 用临时码）")
+                        "[分享] 该分享需要提取码：请在右侧小窗填写"
+                        "（或按 Alt+2 用临时码）")
                     self._share_notify(
                         "分享缺少提取码",
                         f"{rec.get('url')}\n该分享需要提取码：请在右侧小窗填写提取码"
@@ -2619,23 +2565,23 @@ class MainWindow(QMainWindow):
                 else:
                     # 主窗不可用：小窗弹不出来 —— 提示改为诚实文案（唯一发声点）
                     _announce_ask_code_hidden(self, rec.get("url"))
+                self._share_ask_force_pick = True
                 _show_share_code_window(
                     self, rec.get("surl") or rec.get("url"), rec.get("url"),
-                    rec.get("share_uk"), mapped_code=_mapped)
+                    rec.get("share_uk"))
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
             self._pending_share_gesture = None
             _mark_gesture_launch(self, rec.get("surl") or rec.get("url"))
             # 计数已移入 _start_share_pick：手动路径同样计入（明确同意）。
-            # Alt+3 = 绑定并下载：携带 bind_code_uk，worker 提交成功后才写库。
+            # Alt+3 = 挑选手势：强制进管线打开文件挑选窗（force_pick=True）。
             _call_start_share_pick(self, rec.get("url"), rec.get("surl"), code,
-                                   manual=True,
-                                   bind_code_uk=rec.get("share_uk"))
+                                   manual=True, force_pick=True)
         except Exception as e:
-            self._append_log(f"按固定提取码下载出错: {e}")
+            self._append_log(f"按挑选手势下载出错: {e}")
 
     def _on_share_code_hotkey(self):
-        """全局热键：用固定提取码下载最近分享（等价托盘菜单那项）。"""
+        """全局热键：下载最近分享前始终打开文件挑选窗（等价托盘菜单那项）。"""
         self._open_recent_share_with_code()
 
     def _share_gate_blocked(self, manual, where=""):
@@ -2766,7 +2712,7 @@ class MainWindow(QMainWindow):
                         self._share_notify(
                             "分享缺少提取码",
                             f"{url}\n该分享需要提取码：把「链接 + 提取码」整段复制到剪贴板后"
-                            f"再试，或用「固定提取码」手势（托盘菜单 / Alt+3）。")
+                            f"再试。")
                     elif manual:
                         # 用户明确按了手势却毫无反馈是最糟的体验：手动失败必须通知。
                         # 自动路径（manual=False）保持只有日志，避免噪音。
@@ -2778,7 +2724,7 @@ class MainWindow(QMainWindow):
 
     # ---------- d3：分享「准备 →（可选）挑选 → 提交」管线 ----------
     def _start_share_pick(self, url, surl, pwd, manual=False, item=None,
-                          bind_code_uk=None):
+                          force_pick=False):
         """统一的分享管线入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
 
         `prepare_share` / `commit_download` / `list_share_dir` 均含网络 IO，**绝不能**
@@ -2786,8 +2732,8 @@ class MainWindow(QMainWindow):
         一个分享管线。`item` 仅用于空提取码探测：确认需要提取码时把它回传给 Qt 线程弹
         询问面板（不传则询问面板按未知分享者处理）。
 
-        `bind_code_uk` 非空表示本次是「绑定并下载」（Alt+3 / 小窗 mapped 按钮）：
-        由 worker 在**提交成功后**把 `(share_uk, pwd)` 写入固定提取码映射。
+        `force_pick=True`（Alt+3 挑选手势）：worker 无条件打开文件挑选窗（旧版的
+        按分享者「需挑选」标记与全局挑选开关已随该功能一并退场，无需再判断）。
 
         d7 计数在**忙检查通过之后**才计入（被忙标志跳过的启动不计），询问路径最终也
         汇入本入口，故同样计入一次。
@@ -2843,17 +2789,19 @@ class MainWindow(QMainWindow):
             pass
         self._bump_share_launch(surl)
         threading.Thread(target=self._pick_share_worker,
-                         args=(url, surl, pwd, manual, item, bind_code_uk),
+                         args=(url, surl, pwd, manual, item, force_pick),
                          daemon=True).start()
 
     def _pick_share_worker(self, url, surl, pwd, manual, item=None,
-                           bind_code_uk=None):
+                           force_pick=False):
         """后台线程：跑「准备 →（可选）挑选 → 提交」管线（网络 IO，绝不阻塞界面）。
 
         线程内**不碰 UI**：日志走线程安全的 `self.hub.log`，托盘提示与挑选窗/询问窗
         请求都走 `hub.q`（由 `_drain()` 在 Qt 线程消费/构造）。需要挑选时本线程阻塞
         等待用户在 Qt 线程做出的选择。空提取码时先探测该分享是否根本不需要提取码，
-        确需提取码才把「询问」请求投回 Qt 线程。异常一律吞掉，忙标志在 finally 复位。"""
+        确需提取码才把「询问」请求投回 Qt 线程。异常一律吞掉，忙标志在 finally 复位。
+
+        `force_pick=True`：无条件打开挑选窗（Alt+3 挑选手势）。"""
         try:
             if self._share_gate_blocked(manual, where="准备管线"):
                 # 与 _invoke_share_worker 同一口径：预检拦下＝什么都没拉起，
@@ -2876,7 +2824,7 @@ class MainWindow(QMainWindow):
                     self.hub.log(f"[分享] 提交成功: 已请求客户端下载（{detail}）")
                     _share_notify_via(self, "分享下载", str(url))
                     # 提交成功（已请求客户端下载）：该分享的小窗任务完成。
-                    _notify_share_used(self, surl=surl, uk=bind_code_uk, url=url)
+                    _notify_share_used(self, surl=surl, url=url)
                 except Exception:
                     pass
 
@@ -2929,13 +2877,13 @@ class MainWindow(QMainWindow):
                     self._share_notify("分享下载失败", f"{url}\n{prep}")
                     return
             prep_ts = time.time()
-            if self._share_pick_wanted(prep.get("share_uk")):
-                # 需要挑选：把 prep 交给 Qt 线程弹挑选窗，阻塞等待用户选择。
+            if force_pick:
+                # 挑选手势（Alt+3）：把 prep 交给 Qt 线程弹挑选窗，阻塞等待用户选择。
                 req = {"type": "share_pick", "prep": prep, "url": url,
                        "pwd": pwd, "surl": surl, "ts": prep_ts,
                        "event": threading.Event(), "pairs": None,
                        "cancelled": True, "answered": False}
-                self.hub.log("[分享] 该分享者需要挑选文件，等待用户选择…")
+                self.hub.log("[分享] 打开文件挑选窗，等待用户选择…")
                 try:
                     self.hub.q.put(req)
                 except Exception as e:
@@ -2975,12 +2923,7 @@ class MainWindow(QMainWindow):
                 # 子集选择相关的既有日志信息一律保留。
                 self.hub.log(f"[分享] 链路完成: {detail}")
                 # 确认完成：关闭同分享小窗（on_wake 已投过一次，重复投递为幂等空操作）。
-                _notify_share_used(self, surl=surl, uk=bind_code_uk, url=url)
-                # 绑定只在**提交成功后**落库：失败（ok3 假）只本次生效，绝不写库。
-                # `_persist_share_code` 内的诊断日志已做线程安全分流（worker 线程走
-                # hub 队列，见 `_persist_log`），故可安全在 worker 中调用。
-                if bind_code_uk:
-                    self._persist_share_code(bind_code_uk, pwd)
+                _notify_share_used(self, surl=surl, url=url)
             else:
                 self.hub.log(f"[分享] 提交失败: {detail}")
                 self._share_notify("分享下载失败", f"{url}\n{detail}")
@@ -2988,37 +2931,6 @@ class MainWindow(QMainWindow):
             self.hub.log(f"[分享] 准备出错: {e}")
         finally:
             self._share_invoke_busy = False
-
-    def _share_pick_flag(self, share_uk):
-        """读该分享者的「需要挑选」标记：AppState 优先，其次 db；不可用按 0（整包）。
-
-        `find_share_entry` 是并行新增接口，缺失（未落地 / 旧实现 / 查询失败）时一律
-        按「不需要挑选」处理，绝不因此中断下载。"""
-        try:
-            ent = None
-            state = getattr(self, "state", None)
-            if state is not None and hasattr(state, "find_share_entry"):
-                ent = state.find_share_entry(share_uk)
-            if ent is None:
-                from .. import db as _db
-                ent = _db.find_share_entry(share_uk)
-            if isinstance(ent, dict):
-                return ent.get("pick")
-        except Exception:
-            pass
-        return 0
-
-    def _share_pick_wanted(self, share_uk):
-        """是否需要弹文件挑选窗：分享者标记 pick，或全局「分享前总是挑选」开关。
-
-        全局开关 `baidu_pick_before_download`（默认关，实验性）读取失败/缺失一律按
-        关闭处理，绝不因此中断下载。返回布尔值。"""
-        try:
-            if self.state.snapshot().get("baidu_pick_before_download", False):
-                return True
-        except Exception:
-            pass
-        return bool(self._share_pick_flag(share_uk))
 
     def _share_notify(self, title, msg):
         """托盘气泡（线程安全）：走 `hub.notify`（受通知总开关/分组开关过滤），
@@ -3175,22 +3087,15 @@ class MainWindow(QMainWindow):
         except Exception:
             return pairs
 
-    # ---------- d3：空提取码处理（弹/聚焦提取码小窗，绝不自动套用固定码） ----------
+    # ---------- d3：空提取码处理（弹/聚焦提取码小窗） ----------
     def _share_ask_code(self, item, url, surl):
         """空提取码处理（Qt 线程）：弹/聚焦顶层提取码小窗（主窗隐藏时同样弹）。
 
-        未知分享者（has_map=False）额外用浏览器打开分享页做「探针」，方便用户查看；
-        有固定映射（has_map=True）只弹窗、不开浏览器。已在弹小窗（或复用）时不再
+        额外用浏览器打开分享页做「探针」，方便用户查看；已在弹小窗（或复用）时不再
         重复开浏览器。主窗隐藏在托盘时额外补一条托盘气泡：新小窗会弹出来，气泡仅
         作补充提醒。任何异常都不向外抛。"""
         try:
             share_uk = item.get("share_uk")
-            has_map = bool(item.get("has_map"))
-            mapped = None
-            try:
-                mapped = bm.mapped_code(share_uk)
-            except Exception:
-                mapped = None
             visible = True
             try:
                 visible = bool(self.isVisible())
@@ -3200,29 +3105,26 @@ class MainWindow(QMainWindow):
                 # 小窗弹不出来：以本处为唯一发声点（诚实文案：打开主界面后才能弹，
                 # 不再谎称「已在提取码小窗等待填写」）；兜底提示看到标记会静默。
                 _announce_ask_code_hidden(self, url)
+            self._share_ask_force_pick = False
             _show_share_code_window(self, surl, url, share_uk,
-                                    mapped_code=mapped, open_browser=not has_map)
+                                    open_browser=True)
         except Exception as e:
             self._append_log(f"[分享] 处理缺少提取码的分享出错: {e}")
 
     def _on_share_code_decision(self, kind, code, url, surl, share_uk):
-        """提取码询问回调（Qt 线程）：mapped=成功后才绑定；once=只本次；ignore=忽略。"""
+        """提取码询问回调（Qt 线程）：once=只本次使用；ignore=忽略。"""
         try:
             self._share_ask_dlg = None
             if kind == "ignore" or not code:
                 self._append_log(f"[分享] 已忽略缺少提取码的分享: {surl}")
                 return
-            if kind == "mapped" and not str(share_uk or "").strip():
-                # 无法绑定到具体分享者：立即如实说明「仅本次生效」，不再假装成功。
-                self._append_log(
-                    "[分享] 未识别到分享者，固定提取码未能保存，仅本次生效")
-            # mapped：绑定交给 worker，**提交成功后**才写库（与 Alt+3 同源）；
-            # once：绝不写库。
-            # manual=True：本回调只由小窗/询问面板按钮触发，用户明确点击 = 手动，
+            # manual=True：本回调只由小窗按钮触发，用户明确点击 = 手动，
             # 绝不吃「实验性自动拉起不携带登录态」托盘提示（与 Alt+2/Alt+3 一致）。
-            bind_uk = share_uk if kind == "mapped" else None
+            # 手势归属：Alt+3 挑选手势即便先经缺码小窗，敲定提取码后仍强制挑文件。
+            _fp = bool(getattr(self, "_share_ask_force_pick", False))
+            self._share_ask_force_pick = False
             _call_start_share_pick(self, url, surl, code, manual=True,
-                                   bind_code_uk=bind_uk)
+                                   force_pick=_fp)
         except Exception as e:
             self._append_log(f"[分享] 处理提取码选择出错: {e}")
 
@@ -3232,36 +3134,11 @@ class MainWindow(QMainWindow):
         优先级冻结：小窗码 > 权威记录码 > 重新取 120s 内最近码 > 空。"""
         return _effective_share_code(self, surl, share_uk, rec_pwd, code_source)
 
-    def _show_share_code_window(self, surl, url, share_uk, mapped_code=""):
+    def _show_share_code_window(self, surl, url, share_uk):
         """正式缺码小窗入口（module 级 `_show_share_code_window` 的薄包装）。
 
-        同一时刻只允许一个小窗：同分享复用并预填、异分享关旧换新；主窗隐藏也弹。"""
-        return _show_share_code_window(self, surl, url, share_uk,
-                                       mapped_code=mapped_code)
-
-    def _persist_share_code(self, share_uk, code):
-        """把用户选择的固定提取码写入映射（pick=0）；旧签名不支持 pick 时退回 3 参。
-
-        由 `state.add_share_code`（内部走 db，带锁，线程安全）落库；诊断日志经
-        `_persist_log` 分流，故本方法在 worker 线程调用也安全。持久化可能因未识别
-        到分享者（share_uk 为空）等原因返回假值；此时明确告知用户未能保存，绝不
-        谎报「已保存」。"""
-        note = "自动加入(d3面板)"
-        try:
-            saved = self.state.add_share_code(share_uk, code, note, 0)
-        except TypeError:
-            try:
-                saved = self.state.add_share_code(share_uk, code, note)
-            except Exception as e:
-                _persist_log(self, f"[分享] 保存固定提取码失败: {e}")
-                return
-        except Exception as e:
-            _persist_log(self, f"[分享] 保存固定提取码失败: {e}")
-            return
-        if not saved:
-            _persist_log(self, "[分享] 未识别到分享者，固定提取码未能保存，仅本次生效")
-        else:
-            _persist_log(self, "[分享] 已把提取码绑定到该分享者")
+        同一时刻只允许一个小窗：同分享复用、异分享关旧换新；主窗隐藏也弹。"""
+        return _show_share_code_window(self, surl, url, share_uk)
 
     # ---------- 分享重复拉起（d7）：同一 surl 本次运行再次拉起需用户同意 ----------
     def _share_needs_consent(self, surl):
@@ -3485,7 +3362,7 @@ class MainWindow(QMainWindow):
         finally:
             # 主热键无论走哪条分支（含上面的提前 return），都顺带注册两个分享热键
             self._register_share_hotkey()
-            self._register_share_code_hotkey()
+            self._register_share_pick_hotkey()
             # 底栏「快捷键 <config>」与播报末句按**真实注册结果**显示：
             # 注册失败追加「（未生效）」，成功/未尝试保持原配置值文案。
             self._sync_hotkey_display()
@@ -3521,36 +3398,36 @@ class MainWindow(QMainWindow):
             self._hotkey_ok["share"] = False
             self.hub.log(f"分享快捷键注册失败: {e}")
 
-    def _register_share_code_hotkey(self):
-        """注册「用固定提取码下载最近分享」的全局热键（可选，默认不设置）。
+    def _register_share_pick_hotkey(self):
+        """注册「挑选文件下载最近分享」的全局热键（可选，默认不设置）。
 
         与分享热键同口径：可选功能，注册失败不重试、不打扰；未启用全局热键、
         未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
         if win32gui is None:
             return
-        self._hotkey_ok["share_code"] = None
+        self._hotkey_ok["share_pick"] = None
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
                 return
-            combo = str(self.state.snapshot().get("hotkey_share_code", "")).strip()
+            combo = str(self.state.snapshot().get("hotkey_share_pick", "")).strip()
             if not combo or combo.lower() in ("无", "none", "null"):
                 return
             parsed = parse_hotkey(combo)
             if parsed is None:
-                self.hub.log(f"固定提取码快捷键配置无效，未注册: {combo}")
-                self._hotkey_ok["share_code"] = False
+                self.hub.log(f"挑选手势快捷键配置无效，未注册: {combo}")
+                self._hotkey_ok["share_pick"] = False
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
-                self._hotkey_ok["share_code"] = False
+                self._hotkey_ok["share_pick"] = False
                 return
-            win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE_CODE, mods | MOD_NOREPEAT, vk)
-            self._hotkey_ok["share_code"] = True
-            self.hub.log(f"固定提取码快捷键已注册: {combo}")
+            win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE_PICK, mods | MOD_NOREPEAT, vk)
+            self._hotkey_ok["share_pick"] = True
+            self.hub.log(f"挑选手势快捷键已注册: {combo}")
         except Exception as e:
-            self._hotkey_ok["share_code"] = False
-            self.hub.log(f"固定提取码快捷键注册失败: {e}")
+            self._hotkey_ok["share_pick"] = False
+            self.hub.log(f"挑选手势快捷键注册失败: {e}")
 
     def _unregister_hotkey(self):
         if win32gui is None:
@@ -3567,7 +3444,7 @@ class MainWindow(QMainWindow):
             pass
         try:
             hwnd = int(self.winId())
-            win32gui.UnregisterHotKey(hwnd, HOTKEY_ID_SHARE_CODE)
+            win32gui.UnregisterHotKey(hwnd, HOTKEY_ID_SHARE_PICK)
         except Exception:
             pass
 

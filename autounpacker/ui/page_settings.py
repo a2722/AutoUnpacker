@@ -46,7 +46,7 @@ from . import style as ui_style
 from .style import PALETTE
 from .widgets import Glyph, HotkeyEdit
 
-# 主题偏好与显示名（与 dialogs.SettingsDialog 的选项一一对应）
+# 主题偏好与显示名（设置页主题下拉的唯一真源）
 _THEME_ITEMS = (("跟随系统", "auto"), ("浅色", "fluent"), ("深色", "devtool"))
 _THEME_NAMES = {"auto": "跟随系统", "fluent": "浅色（Fluent）",
                 "devtool": "深色（DevTool）"}
@@ -137,8 +137,8 @@ class SettingsPage(QWidget):
     """设置页：分区表单 + 改即存 / 恢复默认；覆盖 DEFAULT_CONFIG 全部键。
 
     宿主接入（集成步骤）：`SettingsPage(state, hub, parent,
-    on_hotkey_change=..., on_theme_change=...)`——两个回调与旧 SettingsDialog
-    同名同义（分别是「重新注册全局快捷键」「主题已切换」），可原样传入
+    on_hotkey_change=..., on_theme_change=...)`——两个回调分别是「重新注册全局
+    快捷键」「主题已切换」，可原样传入
     MainWindow._register_hotkey / MainWindow.on_theme_changed。
 
     信号：settingsSaved() / settingsReset() / watchPathsChanged() /
@@ -635,23 +635,23 @@ class SettingsPage(QWidget):
             lambda combo: self._commit("hotkey_share", str(combo).strip()))
         box.addLayout(row)
 
-        self.hotkey_share_code_edit = HotkeyEdit(self)
-        self.hotkey_share_code_clear = QPushButton("清除", self)
-        self.hotkey_share_code_clear.setObjectName("ghostSm")
-        self.hotkey_share_code_clear.setCursor(Qt.PointingHandCursor)
-        self.hotkey_share_code_clear.clicked.connect(
-            lambda: self._clear_hotkey(self.hotkey_share_code_edit, "hotkey_share_code"))
+        self.hotkey_share_pick_edit = HotkeyEdit(self)
+        self.hotkey_share_pick_clear = QPushButton("清除", self)
+        self.hotkey_share_pick_clear.setObjectName("ghostSm")
+        self.hotkey_share_pick_clear.setCursor(Qt.PointingHandCursor)
+        self.hotkey_share_pick_clear.clicked.connect(
+            lambda: self._clear_hotkey(self.hotkey_share_pick_edit, "hotkey_share_pick"))
         row2 = QHBoxLayout()
         row2.setSpacing(8)
-        lbl2 = QLabel("固定提取码", self)
+        lbl2 = QLabel("挑选文件", self)
         lbl2.setObjectName("fLabel")
         lbl2.setFixedWidth(96)
         row2.addWidget(lbl2)
-        row2.addWidget(self.hotkey_share_code_edit, 1)
-        row2.addWidget(self.hotkey_share_code_clear)
-        self._reg("hotkey_share_code", self.hotkey_share_code_edit)
-        self.hotkey_share_code_edit.comboChanged.connect(
-            lambda combo: self._commit("hotkey_share_code", str(combo).strip()))
+        row2.addWidget(self.hotkey_share_pick_edit, 1)
+        row2.addWidget(self.hotkey_share_pick_clear)
+        self._reg("hotkey_share_pick", self.hotkey_share_pick_edit)
+        self.hotkey_share_pick_edit.comboChanged.connect(
+            lambda combo: self._commit("hotkey_share_pick", str(combo).strip()))
         box.addLayout(row2)
 
         self.hotkey_display_label = self._hint("", self)
@@ -795,9 +795,6 @@ class SettingsPage(QWidget):
             box, "baidu_auto_invoke", "检测到分享链接时自动拉起客户端下载",
             "开启后：复制到百度网盘分享链接时，程序自动把它交给网盘客户端下载（整包）。"
             "会自动触发下载，请确认来源可信；也可随时用托盘菜单手动触发。")
-        self.baidu_pick_cb = self._check_row(
-            box, "baidu_pick_before_download", "分享下载前先让我挑选文件",
-            "分享里文件很多、只想下载其中一部分时使用。")
         brow = QHBoxLayout()
         brow.setSpacing(8)
         blbl = QLabel("任务库路径", self)
@@ -822,7 +819,7 @@ class SettingsPage(QWidget):
             "因此自动拉起前会先检查客户端进程，未运行时跳过并提示。", self, warn=True)
         box.addWidget(self.share_nologin_hint)
 
-        self._exp_subs = (self.baidu_auto_invoke_cb, self.baidu_pick_cb,
+        self._exp_subs = (self.baidu_auto_invoke_cb,
                           self.baidu_db_edit, self.baidu_db_browse_btn,
                           self.share_nologin_hint)
         self.experimental_cb.toggled.connect(lambda _s: self._sync_experimental())
@@ -1079,7 +1076,6 @@ class SettingsPage(QWidget):
             # 实验性
             self.experimental_cb.setChecked(b("experimental_enabled", False))
             self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
-            self.baidu_pick_cb.setChecked(b("baidu_pick_before_download", False))
             self.baidu_db_edit.setText(s("baidu_task_db"))
             self._sync_experimental()
 
@@ -1125,7 +1121,7 @@ class SettingsPage(QWidget):
             self.share_wait_spin.setValue(
                 max(5, min(600, i("share_gesture_wait_sec", 60))))
             self.hotkey_share_edit.setText(s("hotkey_share"))
-            self.hotkey_share_code_edit.setText(s("hotkey_share_code"))
+            self.hotkey_share_pick_edit.setText(s("hotkey_share_pick"))
             self._refresh_hotkey_display(cfg)
 
             # 界面
@@ -1155,7 +1151,7 @@ class SettingsPage(QWidget):
             self.hotkey_edit.setText(s("hotkey"))
             self._hotkeys_at_load = (s("hotkey").strip(),
                                      s("hotkey_share").strip(),
-                                     s("hotkey_share_code").strip(),
+                                     s("hotkey_share_pick").strip(),
                                      b("hotkey_enabled", True))
 
             # 托盘与关闭
@@ -1217,8 +1213,8 @@ class SettingsPage(QWidget):
             return str(cfg.get(key) or "").strip() or "（未设置）"
 
         self.hotkey_display_label.setText(
-            "当前快捷键：唤起 %s · 分享下载 %s · 固定提取码 %s"
-            % (show("hotkey"), show("hotkey_share"), show("hotkey_share_code")))
+            "当前快捷键：唤起 %s · 分享下载 %s · 挑选文件 %s"
+            % (show("hotkey"), show("hotkey_share"), show("hotkey_share_pick")))
 
     def _refresh_passwords_label(self):
         try:
@@ -1255,11 +1251,11 @@ class SettingsPage(QWidget):
     def _after_commit(self, key, value):
         """写入后的既有副作用：热键变更检测 → 回读校验 → 提示 / 信号。"""
         hotkey_error = ""
-        if key in ("hotkey", "hotkey_share", "hotkey_share_code", "hotkey_enabled"):
+        if key in ("hotkey", "hotkey_share", "hotkey_share_pick", "hotkey_enabled"):
             hotkey_error = self._apply_hotkey_change()
         if key == "incomplete_download_suffixes":
             self._apply_incomplete_suffixes()
-        if key in ("hotkey", "hotkey_share", "hotkey_share_code"):
+        if key in ("hotkey", "hotkey_share", "hotkey_share_pick"):
             self._refresh_hotkey_display()
         if not self._verify_saved({key: value}):
             self._notice("保存失败：配置写入未生效（config.json 是否可写？）", ok=False)
@@ -1291,7 +1287,7 @@ class SettingsPage(QWidget):
         cfg = self._snapshot()
         now = (str(cfg.get("hotkey") or "").strip(),
                str(cfg.get("hotkey_share") or "").strip(),
-               str(cfg.get("hotkey_share_code") or "").strip(),
+               str(cfg.get("hotkey_share_pick") or "").strip(),
                bool(cfg.get("hotkey_enabled", True)))
         if now == self._hotkeys_at_load:
             return ""

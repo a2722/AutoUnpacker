@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""口令表 / 固定提取码表的私有视图组件：空态覆盖层、图标按钮、等宽委托、
-自绘排序指示器列头与两张表本体（阶段6e 自 ui/page_pwbook.py 纯搬移）。"""
+"""口令表的私有视图组件：空态覆盖层、图标按钮、等宽委托、
+自绘排序指示器列头与表本体（阶段6e 自 ui/page_pwbook.py 纯搬移）。"""
 from PyQt5.QtCore import QEvent, QItemSelectionModel, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath
 from PyQt5.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView,
@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView,
 from ..style import PALETTE, tokens
 from ..widgets import Glyph
 
-from .models import _PwModel, _ShareModel
+from .models import _PwModel
 
 
 # ---------------------------------------------------------------------------
@@ -454,116 +454,3 @@ class _PwTable(QTableView):
             event.accept()
             return
         super().keyPressEvent(event)
-
-
-# ---------------------------------------------------------------------------
-# 固定提取码表：模型 / 视图
-# ---------------------------------------------------------------------------
-
-class _ShareTable(QTableView):
-    """固定提取码表：行内 编辑 / 删除（表格 QSS 复用 #taskTable）。"""
-
-    editRequested = pyqtSignal(int)
-    deleteRowRequested = pyqtSignal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("taskTable")    # 复用既有表格 QSS（style.py 禁改）
-        self._model = _ShareModel(self)
-        self.setModel(self._model)
-        self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.setAlternatingRowColors(True)
-        self.setShowGrid(False)
-        self.setWordWrap(False)
-        self.setTextElideMode(Qt.ElideMiddle)
-        self.setMinimumHeight(150)
-        self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(40)
-        hh = self.horizontalHeader()
-        hh.setHighlightSections(False)
-        hh.setStretchLastSection(False)
-        hh.setSectionResizeMode(_ShareModel.COL_UK, QHeaderView.Fixed)
-        self.setColumnWidth(_ShareModel.COL_UK, 150)
-        hh.setSectionResizeMode(_ShareModel.COL_CODE, QHeaderView.Fixed)
-        self.setColumnWidth(_ShareModel.COL_CODE, 110)
-        hh.setSectionResizeMode(_ShareModel.COL_PICK, QHeaderView.Fixed)
-        self.setColumnWidth(_ShareModel.COL_PICK, 72)
-        hh.setSectionResizeMode(_ShareModel.COL_NOTE, QHeaderView.Stretch)
-        hh.setSectionResizeMode(_ShareModel.COL_ACT, QHeaderView.Fixed)
-        self.setColumnWidth(_ShareModel.COL_ACT, 128)
-        self._action_widgets = []
-        self._danger_buttons = []
-
-    # ---- 装载 ----
-    def set_rows(self, rows):
-        self._clear_actions()
-        self._model.set_rows(rows)
-        self._build_actions()
-        self.scroll_to_top()
-
-    def share_model(self):
-        return self._model
-
-    def row_at(self, row):
-        return self._model.row_at(row)
-
-    def scroll_to_top(self):
-        try:
-            self.verticalScrollBar().setValue(0)
-        except Exception:
-            pass
-
-    # ---- 行内操作 ----
-    def _build_actions(self):
-        for row in range(self._model.rowCount()):
-            data = self._model.row_at(row) or {}
-            widget = self._make_actions(row, data)
-            self.setIndexWidget(self._model.index(row, _ShareModel.COL_ACT), widget)
-            self._action_widgets.append(widget)
-        _fit_action_column(self, _ShareModel.COL_ACT)
-
-    def _make_actions(self, row_index, data):
-        w = QWidget(self)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(0, 0, 6, 0)
-        lay.setSpacing(4)
-        lay.addStretch(1)
-        edit_btn = self._small_button("编辑", "编辑这条固定提取码")
-        edit_btn.clicked.connect(
-            lambda _=False, r=row_index: self.editRequested.emit(int(r)))
-        del_btn = self._small_button("删除", "删除这条固定提取码", danger=True)
-        del_btn.clicked.connect(
-            lambda _=False, r=row_index: self.deleteRowRequested.emit(int(r)))
-        for btn in (edit_btn, del_btn):
-            lay.addWidget(btn)
-        return w
-
-    def _small_button(self, text, tip, danger=False):
-        btn = QPushButton(str(text), self)
-        btn.setObjectName("ghostSm")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setToolTip(str(tip))
-        if danger:
-            btn.setStyleSheet("color: %s;" % PALETTE["danger"])
-            self._danger_buttons.append(btn)
-        return btn
-
-    def _clear_actions(self):
-        for w in self._action_widgets:
-            try:
-                w.setParent(None)
-                w.deleteLater()
-            except Exception:
-                pass
-        self._action_widgets = []
-        self._danger_buttons = []
-
-    def refresh_theme(self):
-        """主题切换后重贴删除按钮的 danger 色（内联样式不随 QSS 自动变）。"""
-        for btn in self._danger_buttons:
-            try:
-                btn.setStyleSheet("color: %s;" % PALETTE["danger"])
-            except Exception:
-                pass

@@ -3,7 +3,6 @@
 
 职责：- 线程安全的配置读写（snapshot/set/update_path/set_path）
 - 长期密码本代理到 toolbox.db（passwords/set_passwords/all_passwords + 行级 password_rows/add_password_row/update_password_row/delete_password_row）
-- 特殊用户固定提取码代理到 toolbox.db（share_code_map/set_share_code_map/add_share_code/find_share_entry）
 - 临时密码的捕获、过期裁剪、条数上限、开机内持久化（temp_passwords.json）
 关键入口：AppState
 依赖：db、config（save_config/get_int/get_bool）、utils（_boot_time/_boot_tick）
@@ -211,23 +210,6 @@ class AppState:
     def delete_password_row(self, pid):
         """行级按 id 精确删除一条长期口令，返回是否命中。"""
         return db.delete_password(pid)
-
-    # ---------- 特殊用户固定提取码（存于 toolbox.db） ----------
-    def share_code_map(self):
-        """全部固定提取码列表"""
-        return db.get_share_code_map()
-
-    def set_share_code_map(self, items):
-        """覆盖固定提取码表"""
-        return db.set_share_code_map(items)
-
-    def add_share_code(self, share_uk, code, note="", pick=0):
-        """新增/更新单个分享者的固定提取码（pick=1 表示需要挑选文件）"""
-        return db.add_share_code(share_uk, code, note, pick)
-
-    def find_share_entry(self, share_uk):
-        """单个分享者的固定提取码完整记录（含 pick），无记录返回 None"""
-        return db.find_share_entry(share_uk)
 
     def auto_add(self):
         with self.lock:

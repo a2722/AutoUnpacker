@@ -67,9 +67,8 @@ from .manifest import (  # noqa: F401
     mark_share_dead,
     share_dead,
     # 2.F：提取码候选（**时效版**）——monitors 捕获路径回捞用。
-    # 刻意**不**转发无时效的 recent_code_from_history：捕获路径必须严格按时效，
+    # 刻意**不**转发无时效的候选历史接口：捕获路径必须严格按时效，
     # 拿陈年旧码去 verify 只会白烧唯一一次、且间隔受限的配额。
-    mapped_code,
     fresh_code_from_history,
     CODE_CANDIDATE_TTL,
 )

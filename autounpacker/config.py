@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
     "hotkey_enabled": True,             # 全局快捷键唤起主界面
     "hotkey": "Ctrl+Alt+W",             # 快捷键组合（空/无 表示禁用）
     "hotkey_share": "",                 # 「用客户端下载最近分享」全局快捷键（空=不设置）
-    "hotkey_share_code": "",            # 「用固定提取码下载最近分享」全局快捷键（空=不设置）
+    "hotkey_share_pick": "",            # 「挑选文件下载最近分享」全局快捷键（空=不设置）
     "url_redirect_rules": [
         {"from": "drive.uc.cn", "to": "fast.uc.cn"},
     ],
@@ -117,7 +117,6 @@ DEFAULT_CONFIG = {
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
-    "baidu_pick_before_download": False,  # 实验性：分享下载前总是先让我挑选文件（默认关）
     "share_gesture_wait_sec": 60,   # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
     # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
     # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
@@ -273,7 +272,11 @@ def _sanitize_cfg(cfg):
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))
         cfg["hotkey"] = str(cfg.get("hotkey", "Ctrl+Alt+W")).strip()
         cfg["hotkey_share"] = str(cfg.get("hotkey_share", "")).strip()
-        cfg["hotkey_share_code"] = str(cfg.get("hotkey_share_code", "")).strip()
+        # 旧键 hotkey_share_code（已退场的手势）已废弃：丢弃旧键，避免残留。
+        # 值的迁移在 load_config() 合并默认值**之前**完成（此处 cfg 已含默认的
+        # hotkey_share_pick，无法再区分用户是否显式设置过新键）。
+        cfg.pop("hotkey_share_code", None)
+        cfg["hotkey_share_pick"] = str(cfg.get("hotkey_share_pick", "")).strip()
         rules = []
         for r in cfg.get("url_redirect_rules") or []:
             if isinstance(r, dict) and r.get("from") and r.get("to"):
@@ -317,7 +320,8 @@ def _sanitize_cfg(cfg):
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
-        cfg["baidu_pick_before_download"] = bool(cfg.get("baidu_pick_before_download", False))
+        # baidu_pick_before_download 已退场：丢弃陈旧键（与 pair_split_auto 同口径）。
+        cfg.pop("baidu_pick_before_download", None)
         cfg["pair_split_enabled"] = bool(cfg.get("pair_split_enabled", True))
         # pair_split_auto 已退场：丢弃陈旧键，老配置里残留也不影响行为（无害）
         cfg.pop("pair_split_auto", None)
@@ -371,6 +375,12 @@ def load_config():
         if paths.CONFIG_FILE.exists():
             data = json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                # 一次性迁移：旧手势键 hotkey_share_code → 新挑选手势键。
+                # 必须在合并默认值之前判断，否则默认值会让新键恒存在、
+                # 无法区分用户是否显式设置过（见 _sanitize_cfg 对应注释）。
+                if ("hotkey_share_code" in data
+                        and "hotkey_share_pick" not in data):
+                    data["hotkey_share_pick"] = data["hotkey_share_code"]
                 merged = json.loads(json.dumps(DEFAULT_CONFIG))
                 merged.update(data)
                 return _sanitize_cfg(merged)
@@ -391,7 +401,7 @@ def load_config():
 # ---------- 全局快捷键（Win32 RegisterHotKey + WM_HOTKEY） ----------
 HOTKEY_ID = 0x5354          # 自定义 id（WM_HOTKEY 的 wParam）
 HOTKEY_ID_SHARE = 0x5355   # 「用客户端下载最近分享」的全局热键 id（第二个）
-HOTKEY_ID_SHARE_CODE = 0x5356  # 「用固定提取码下载最近分享」的全局热键 id（第三个）
+HOTKEY_ID_SHARE_PICK = 0x5356  # 「挑选文件下载最近分享」的全局热键 id（第三个）
 WM_HOTKEY = 0x0312
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
 MOD_NOREPEAT = 0x4000

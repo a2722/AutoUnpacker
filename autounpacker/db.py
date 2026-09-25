@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """统一 SQLite 小数据库（toolbox.db）：共享密码本、密码字典、百度粘性记忆、任务/日志索引、旧数据迁移。
 
-职责：- 维护 passwords / password_dict / baidu_sticky / share_code_map / tasks / log_index 六张表（连接时自动建表，WAL 模式）
+职责：- 维护 passwords / password_dict / baidu_sticky / tasks / log_index 五张表（连接时自动建表，WAL 模式）
 - 共享密码本与密码字典的增删查（原存 config.json 与 ~/.smart_extract_password_dict.json）
 - 百度清单模式的粘性记忆（sticky_remember/sticky_known/sticky_list/sticky_prune）
-- 特殊用户固定提取码（find_share_code/find_share_entry/get_share_code_map/set_share_code_map/add_share_code/
-  update_share_code/delete_share_code）
 - 任务表与日志索引（add_task/find_open_task/update_task_state/get_task/list_tasks/count_tasks/task_logs；add_log_index/query_logs/prune_logs/prune_tasks）
 - migrate_legacy() 把旧 config 密码列表 / 旧字典 json 一次性迁入数据库
 关键入口：init_db() / get_passwords() / set_passwords() / list_passwords() / add_password() /
@@ -47,13 +45,6 @@ CREATE TABLE IF NOT EXISTS baidu_sticky (
     last_seen INTEGER NOT NULL,
     kind TEXT NOT NULL DEFAULT 'file',
     note TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS share_code_map (
-    share_uk TEXT PRIMARY KEY,
-    code TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL DEFAULT 0,
-    pick INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,13 +97,12 @@ def _connect():
     # 连接级、不随库持久化），故保留在 gated 块之外，语义不变。
     if str(DB_FILE) not in _migrated:
         conn.executescript(_SCHEMA)
-        # 老库的 share_code_map 可能已存在但缺 pick 列（CREATE TABLE IF NOT EXISTS 不会补列），
-        # 而「需要挑选」标记是后加的，所以这里显式补一列：列已存在时 SQLite 报
-        # duplicate column name，直接忽略即可——迁移幂等、只增列、不改动任何旧数据、绝不抛错。
-        # 老库的 passwords 同理可能已存在但缺 note 列（行级 API 的备注是后加的），
-        # 同样显式补一列且忽略「列已存在」：迁移幂等、只增列、不动旧行、绝不抛错。
+        # 旧的分享者提取码映射功能已整条退场：老库里可能还留着 share_code_map
+        # 表，这里幂等删除（DROP TABLE IF EXISTS），新库本就没有该表、执行即空操作。
+        # 老库的 passwords 可能已存在但缺 note 列（行级 API 的备注是后加的），
+        # 显式补一列且忽略「列已存在」：迁移幂等、只增列、不动旧行、绝不抛错。
         for stmt in (
-            "ALTER TABLE share_code_map ADD COLUMN pick INTEGER NOT NULL DEFAULT 0",
+            "DROP TABLE IF EXISTS share_code_map",
             "ALTER TABLE passwords ADD COLUMN note TEXT NOT NULL DEFAULT ''",
         ):
             try:
@@ -418,202 +408,6 @@ def sticky_prune(keep_days=7):
     """清理长期未再出现的记录（默认保留 7 天）。"""
     cutoff = int(time.time()) - int(keep_days) * 86400
     _execute("DELETE FROM baidu_sticky WHERE last_seen < ?", (cutoff,))
-
-
-# ---------- 特殊用户固定提取码 ----------
-def _pick_flag(value):
-    """把「需要挑选」标记归一化为 0/1：兼容 bool、整数、"1"/"0" 及 int-ish 写法，绝不抛错。"""
-    try:
-        if isinstance(value, str):
-            t = value.strip().lower()
-            if t in ("1", "true", "yes", "on", "pick", "挑选"):
-                return 1
-            if t in ("", "0", "false", "no", "off", "none"):
-                return 0
-            return 1 if float(t) else 0
-        return 1 if int(value) else 0
-    except Exception:
-        return 0
-
-
-def find_share_entry(share_uk):
-    """查某个分享者 uk 的完整映射：share_uk/code/note/pick/updated_at；没有记录或 uk 为空返回 None。
-
-    pick 为 0/1（0=整包下载，1=需要挑选文件）；任何异常都不抛，按「无记录」处理。
-    """
-    uk = str(share_uk or "").strip()
-    if not uk:
-        return None
-    try:
-        rows = _execute(
-            "SELECT share_uk, code, note, pick, updated_at FROM share_code_map "
-            "WHERE share_uk = ? LIMIT 1",
-            (uk,), fetch=True)
-        if rows:
-            r = rows[0]
-            return {"share_uk": r[0], "code": r[1], "note": r[2],
-                    "pick": _pick_flag(r[3]), "updated_at": r[4]}
-    except Exception:
-        pass
-    return None
-
-
-def find_share_code(share_uk):
-    """查某个分享者 uk 的固定提取码（没有记录或 uk 为空时返回 None）。"""
-    uk = str(share_uk or "").strip()
-    if not uk:
-        return None
-    try:
-        rows = _execute(
-            "SELECT code FROM share_code_map WHERE share_uk = ? LIMIT 1",
-            (uk,), fetch=True)
-        if rows:
-            return rows[0][0]
-    except Exception:
-        pass
-    return None
-
-
-def get_share_code_map():
-    """返回全部固定提取码：share_uk/code/note/pick/updated_at 五字段列表（pick 为 0/1）。"""
-    try:
-        rows = _execute(
-            "SELECT share_uk, code, note, pick, updated_at FROM share_code_map",
-            fetch=True)
-        return [{"share_uk": r[0], "code": r[1], "note": r[2],
-                 "pick": _pick_flag(r[3]), "updated_at": r[4]}
-                for r in (rows or [])]
-    except Exception:
-        return []
-
-
-def set_share_code_map(items):
-    """整体覆盖固定提取码表：先清空再写入；非法条目跳过，同 uk 后者覆盖前者。
-
-    每个条目可带可选的 "pick"（缺省 0），值兼容 True/False、"1"/"0" 等 int-ish 写法。
-    """
-    try:
-        clean = {}
-        for it in items or []:
-            if not isinstance(it, dict):
-                continue
-            uk = str(it.get("share_uk") or "").strip()
-            code = str(it.get("code") or "").strip()
-            if not uk or not code:
-                continue
-            clean[uk] = (code, str(it.get("note") or ""), _pick_flag(it.get("pick", 0)))
-        with _lock:
-            conn = _connect()
-            try:
-                conn.execute("DELETE FROM share_code_map")
-                now = int(time.time())
-                for uk, (code, note, pick) in clean.items():
-                    conn.execute(
-                        "INSERT INTO share_code_map (share_uk, code, note, pick, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (uk, code, note, pick, now))
-                conn.commit()
-            finally:
-                conn.close()
-        return True
-    except Exception:
-        return False
-
-
-def add_share_code(share_uk, code, note="", pick=0):
-    """新增/更新单个分享者的固定提取码（同 uk UPSERT，后者覆盖前者；pick=1 表示需要挑选）。"""
-    uk = str(share_uk or "").strip()
-    cd = str(code or "").strip()
-    if not uk or not cd:
-        return False
-    try:
-        now = int(time.time())
-        pv = _pick_flag(pick)
-        with _lock:
-            conn = _connect()
-            try:
-                conn.execute(
-                    "INSERT INTO share_code_map (share_uk, code, note, pick, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(share_uk) DO UPDATE SET "
-                    "code = ?, note = ?, pick = ?, updated_at = ?",
-                    (uk, cd, str(note or ""), pv, now, cd, str(note or ""), pv, now))
-                conn.commit()
-            finally:
-                conn.close()
-        return True
-    except Exception:
-        return False
-
-
-def update_share_code(share_uk, new_share_uk=None, code=None, note=None, pick=None):
-    """按原 share_uk 更新一条固定提取码，只写显式提供（非 None）的字段，返回是否命中该行。
-
-    - new_share_uk 去空白后为空视为非法，整次放弃（返回 False，不改任何列）；
-    - code 去空白后为空视为非法，同样整次放弃；
-    - 新 share_uk 与别的行重复会触发主键约束，返回 False 且不写任何行；
-    - note / pick 为 None 表示不改（pick 兼容 True/"1"/"pick" 等 int-ish 写法）；
-    - 命中则顺带刷新 updated_at；任何异常都不抛。
-    """
-    uk = str(share_uk or "").strip()
-    if not uk:
-        return False
-    sets = []
-    params = []
-    if new_share_uk is not None:
-        nuk = str(new_share_uk or "").strip()
-        if not nuk:
-            return False
-        sets.append("share_uk = ?")
-        params.append(nuk)
-    if code is not None:
-        cd = str(code or "").strip()
-        if not cd:
-            return False
-        sets.append("code = ?")
-        params.append(cd)
-    if note is not None:
-        sets.append("note = ?")
-        params.append(str(note))
-    if pick is not None:
-        sets.append("pick = ?")
-        params.append(_pick_flag(pick))
-    if not sets:
-        return False
-    sets.append("updated_at = ?")
-    params.append(int(time.time()))
-    params.append(uk)
-    try:
-        with _lock:
-            conn = _connect()
-            try:
-                cur = conn.execute(
-                    "UPDATE share_code_map SET " + ", ".join(sets) + " WHERE share_uk = ?",
-                    params)
-                conn.commit()
-                return cur.rowcount > 0
-            finally:
-                conn.close()
-    except Exception:
-        return False
-
-
-def delete_share_code(share_uk):
-    """按 share_uk 精确删除一行固定提取码，返回是否命中；任何异常都不抛。"""
-    uk = str(share_uk or "").strip()
-    if not uk:
-        return False
-    try:
-        with _lock:
-            conn = _connect()
-            try:
-                cur = conn.execute("DELETE FROM share_code_map WHERE share_uk = ?", (uk,))
-                conn.commit()
-                return cur.rowcount > 0
-            finally:
-                conn.close()
-    except Exception:
-        return False
 
 
 # ---------- 旧数据迁移 ----------

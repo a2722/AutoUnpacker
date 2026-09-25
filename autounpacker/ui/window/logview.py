@@ -7,7 +7,6 @@ Stage 6f 从 ui/main_window.py 原样拆出；函数体/签名/文档字符串�
 """
 import html
 import re
-import threading
 import time
 
 from PyQt5.QtCore import QEvent, QObject, QTimer, Qt
@@ -1139,23 +1138,6 @@ def _share_log(win, msg):
             return
         except Exception:
             pass
-    try:
-        win.hub.log(msg)
-    except Exception:
-        pass
-
-
-def _persist_log(win, msg):
-    """固定提取码绑定的诊断日志（线程安全分流，module 级以免依赖实例绑定）。
-
-    Qt 主线程（面板/热键路径）直接 `_append_log` 落日志；后台 worker 线程
-    （Alt+3 提交成功后绑定）绝不能碰控件，改走 `hub.log` 由 `_drain` 消费。"""
-    try:
-        if threading.current_thread() is threading.main_thread():
-            _share_log(win, msg)
-            return
-    except Exception:
-        pass
     try:
         win.hub.log(msg)
     except Exception:

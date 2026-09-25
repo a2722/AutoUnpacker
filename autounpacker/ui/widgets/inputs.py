@@ -12,7 +12,7 @@ from PyQt5.QtCore import (Qt, QTimer, QRectF, QEvent, QSize, pyqtSignal,
 from PyQt5.QtGui import (QIcon, QPixmap, QPainter, QColor, QBrush, QPen,
                          QConicalGradient, QPainterPath, QPalette)
 
-from ...config import (HOTKEY_ID, HOTKEY_ID_SHARE, HOTKEY_ID_SHARE_CODE,
+from ...config import (HOTKEY_ID, HOTKEY_ID_SHARE, HOTKEY_ID_SHARE_PICK,
                        WM_HOTKEY)
 from ..style import PALETTE
 from .common import (_key_display_name, WM_SETTINGCHANGE, _tk, _draw_glyph,
@@ -191,12 +191,12 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
     """Win32 消息过滤器：捕获 WM_HOTKEY（全局快捷键）与 WM_SETTINGCHANGE（主题变化）。"""
 
     def __init__(self, on_hotkey, on_settings_change=None, on_hotkey_share=None,
-                 on_hotkey_share_code=None):
+                 on_hotkey_share_pick=None):
         super().__init__()
         self._on_hotkey = on_hotkey
         self._on_settings_change = on_settings_change
         self._on_hotkey_share = on_hotkey_share
-        self._on_hotkey_share_code = on_hotkey_share_code
+        self._on_hotkey_share_pick = on_hotkey_share_pick
 
     def nativeEventFilter(self, eventType, message):
         if eventType == b"windows_generic_MSG":
@@ -217,10 +217,10 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
                 except Exception:
                     pass
                 return True, 0
-            if (msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID_SHARE_CODE
-                    and self._on_hotkey_share_code is not None):
+            if (msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID_SHARE_PICK
+                    and self._on_hotkey_share_pick is not None):
                 try:
-                    self._on_hotkey_share_code()
+                    self._on_hotkey_share_pick()
                 except Exception:
                     pass
                 return True, 0

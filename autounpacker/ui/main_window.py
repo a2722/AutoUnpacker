@@ -47,7 +47,7 @@ from .page_trail import TrailPage
 from .page_settings import SettingsPage
 from .dialogs import (DeleteTrailDialog, SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
-                      TaskDetailsDialog)
+                      DragBehaviorDialog, TaskDetailsDialog)
 
 # ---------------------------------------------------------------------------
 # Stage 6f：模块级常量与助手已拆分到 .window 包（consts/logview/share_flow/chrome）。
@@ -302,6 +302,9 @@ class MainWindow(QMainWindow):
         self.chip_strip.dirActivated.connect(self._on_chip_dir_activated)
         self.chip_strip.addRequested.connect(self._add_path)
         self.chip_strip.netdiskRequested.connect(self._add_baidu_download_dir)
+        self.chip_strip.orderChanged.connect(self._on_chip_order_changed)
+        self.chip_strip.dragBehaviorRequested.connect(
+            self._open_drag_behavior_dialog)
         self.add_btn = self.chip_strip.add_btn     # 兼容旧属性（见 _update_rainbow）
         root.addWidget(self.chip_strip)
 
@@ -427,10 +430,28 @@ class MainWindow(QMainWindow):
             self._handle_drop_file(p)
 
     def _handle_drop_file(self, path):
-        """后台线程处理单个拖入文件（不阻塞界面）。"""
+        """后台线程处理单个拖入文件（不阻塞界面）。
+
+        队列「重试」也复用本入口（见 _retry_task）：重试是用户显式动作，不受
+        「拖拽行为」总开关约束（`_drop_from_retry` 为真时跳过总开关判定，其余
+        行为设置照常生效）。
+        """
         import os as _os
         from pathlib import Path
         path = Path(path)
+
+        # 「拖拽行为」设置（缺键一律按默认 True/True/True/False，与旧版逐字一致）
+        try:
+            drop_cfg = self.state.snapshot() or {}
+        except Exception:
+            drop_cfg = {}
+        if (not getattr(self, "_drop_from_retry", False)
+                and not bool(drop_cfg.get("drop_enabled", True))):
+            self.hub.log(f"拖放: 已在「拖拽行为」中关闭，不处理: {path.name}")
+            return
+        drop_qr = bool(drop_cfg.get("drop_qr_recognize", True))
+        drop_nested = bool(drop_cfg.get("drop_nested", True))
+        drop_delete_source = bool(drop_cfg.get("drop_delete_source", False))
 
         # 目录：不支持，跳过
         if path.is_dir():
@@ -454,7 +475,8 @@ class MainWindow(QMainWindow):
 
         # 二维码图片：拖入即识别。廉价前置过滤——先只认图片扩展名，再读前 32 字节
         # 魔数；这样「一眼就是图片」的文件绝不进入昂贵的多格式归档扫描。
-        if path.suffix.lower().lstrip(".") in IMAGE_EXTS:
+        # 「拖拽行为」关闭二维码识别时整段跳过，图片按普通文件回落（非压缩包即跳过）。
+        if drop_qr and path.suffix.lower().lstrip(".") in IMAGE_EXTS:
             header = b""
             try:
                 with open(path, "rb") as _fh:
@@ -576,8 +598,9 @@ class MainWindow(QMainWindow):
                         return
                 passwords = self.state.all_passwords()
                 options = {
-                    "enable_nested": True,
-                    "max_depth": 10,
+                    # 「拖拽行为」：智能穿透关 = 只解第一层（最深 1 层）
+                    "enable_nested": bool(drop_nested),
+                    "max_depth": (10 if drop_nested else 1),
                     "max_size_ratio": 100.0,
                     "use_dict": False,
                     "default_password": None,
@@ -585,7 +608,8 @@ class MainWindow(QMainWindow):
                 }
                 args = types.SimpleNamespace(
                     move_to=None,
-                    delete_source=False,   # 拖放不删除源文件
+                    # 删除源文件由「拖拽行为」决定（默认关：拖放不删除源文件）
+                    delete_source=bool(drop_delete_source),
                     run_script=None, script_args=[],
                     promote_to=None,
                     promote_merge=bool(self.state.snapshot().get("promote_merge", True)),
@@ -914,6 +938,11 @@ class MainWindow(QMainWindow):
         sig = tuple(str(e.get("path") or "") for e in entries)
         try:
             self.chip_strip.set_dirs(entries)
+        except Exception:
+            pass
+        try:
+            self.chip_strip.set_drag_state(
+                self.state.snapshot().get("drop_enabled", True))
         except Exception:
             pass
         if sig != self._strip_sig:
@@ -1253,10 +1282,15 @@ class MainWindow(QMainWindow):
                 f"请重新下载或把文件拖进窗口")
             return
         self._append_log(f"[任务] 重试：已把 {name} 重新交给解压引擎（拖放入口）")
+        # 重试是用户显式动作：不受「拖拽行为」总开关约束（用一次性标记跳过该
+        # 判定，其余行为设置仍照常生效）；异常路径也必定清标记，绝不残留。
+        self._drop_from_retry = True
         try:
             self._handle_drop_file(path)
         except Exception as e:
             self._append_log(f"[任务] 重试出错: {e}")
+        finally:
+            self._drop_from_retry = False
 
     def _open_task_dir(self, task_id):
         """打开该任务的输出目录；不可用时退化到源目录，再退化为一行日志提示。"""
@@ -1424,6 +1458,67 @@ class MainWindow(QMainWindow):
         if not (0 <= int(idx) < len(self._watch_paths())):
             return
         self._open_watchdir_dialog(int(idx))
+
+    def _on_chip_order_changed(self, order):
+        """目录胶囊拖拽重排：order = 新槽位 -> 原条目索引（胶囊条保证是排列）。
+
+        校验失败一律静默忽略（一次异常拖拽绝不动配置）；顺序没变则不写盘、
+        不重建。成功后 watch_paths 的列表顺序即新显示顺序（_sanitize_cfg 保序），
+        重建让每个胶囊的 idx 重新对齐槽位。"""
+        try:
+            paths = self._watch_paths()
+            n = len(paths)
+            seq = [int(i) for i in (order or [])]
+        except Exception:
+            return
+        if n < 2 or len(seq) != n or sorted(seq) != list(range(n)):
+            return
+        if seq == list(range(n)):
+            return
+        try:
+            self.state.set("watch_paths", [dict(paths[i]) for i in seq])
+        except Exception:
+            return
+        self.rebuild_cards()
+        try:
+            self.hub.log("监听目录顺序已按拖拽更新")
+        except Exception:
+            pass
+
+    def _open_drag_behavior_dialog(self):
+        """「拖拽行为」固定胶囊：打开设置弹窗，保存后写回 4 个 drop_* 键。
+
+        配置缺失/异常一律按默认（开 / 识别二维码 / 智能穿透 / 不删源），
+        保证默认拖放行为与旧版完全一致。"""
+        try:
+            snap = self.state.snapshot() or {}
+        except Exception:
+            snap = {}
+        current = {
+            "drop_enabled": bool(snap.get("drop_enabled", True)),
+            "drop_qr_recognize": bool(snap.get("drop_qr_recognize", True)),
+            "drop_nested": bool(snap.get("drop_nested", True)),
+            "drop_delete_source": bool(snap.get("drop_delete_source", False)),
+        }
+        dlg = DragBehaviorDialog(current, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        values = dlg.values()
+        for key in ("drop_enabled", "drop_qr_recognize", "drop_nested",
+                    "drop_delete_source"):
+            try:
+                self.state.set(key, bool(values.get(key)))
+            except Exception:
+                pass
+        try:
+            self.chip_strip.set_drag_state(values.get("drop_enabled", True))
+        except Exception:
+            pass
+        try:
+            self.hub.log("拖拽行为设置已更新：%s" % (
+                "已开启" if values.get("drop_enabled", True) else "已关闭"))
+        except Exception:
+            pass
 
     def _open_watchdir_dialog(self, idx):
         """打开 WatchDirDialog 并接线保存/移除；返回 exec_ 的返回码。

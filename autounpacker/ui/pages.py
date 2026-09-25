@@ -16,7 +16,6 @@
 import time
 
 from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QPainter, QPalette
 from PyQt5.QtWidgets import (QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QSizePolicy, QSplitter,
@@ -257,32 +256,19 @@ def _ghost_button(text, parent=None):
 # ---------------------------------------------------------------------------
 
 class _QueueLogSplitHandle(QSplitterHandle):
-    """队列/日志分隔条手柄：居中一条 1px 细线（卡片描边色，悬停转主题强调色）。
+    """队列 ⇄ 该任务日志分隔条手柄：整条手柄即「该任务日志」头部行。
 
-    分隔条没有 QSS 规则（style.py 不含 QSplitter 段），默认绘制在深/浅两套
-    主题下都接近「空白间隙」；这里按当前主题 token 自绘，切主题自动跟随。
+    头部控件（分段 / 重试 / 打开输出目录 / 复制）自行消费鼠标事件；图标、
+    标题、badge 与拉伸区等空白落到手柄本体，沿用 QSplitterHandle 默认的
+    垂直分屏光标与拖动逻辑。旧的居中 1px 细线已移除（不再有突兀的独立分隔线）。
     """
 
-    def paintEvent(self, event):
-        key = "ctl_focus" if self.underMouse() else "card_border"
-        try:
-            color = QColor(tokens().get(key))
-        except Exception:
-            color = self.palette().color(QPalette.Mid)
-        painter = QPainter(self)
-        try:
-            painter.fillRect(0, max(0, (self.height() - 1) // 2),
-                             self.width(), 1, color)
-        finally:
-            painter.end()
-
-    def enterEvent(self, event):
-        super().enterEvent(event)
-        self.update()
-
-    def leaveEvent(self, event):
-        super().leaveEvent(event)
-        self.update()
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        # 头部行容器：与旧 head 完全同间距（8px）/ 同零外边距（子布局默认即 0）
+        self.head = QHBoxLayout(self)
+        self.head.setContentsMargins(0, 0, 0, 0)
+        self.head.setSpacing(8)
 
 
 class _QueueLogSplitter(QSplitter):
@@ -365,58 +351,63 @@ class TaskPage(QWidget):
         self.table.actionTriggered.connect(self.actionTriggered)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_TASKS)
 
-        # 该任务日志头部
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        head.addWidget(Glyph("layers", self, 14, role="muted"))
-        title = QLabel("该任务日志", self)
-        title.setObjectName("sectionTitle")
-        head.addWidget(title)
-        self.badge = QLabel("", self)
-        self.badge.setObjectName("modeBadge")       # QSS 的 token 药丸样式（随主题）
-        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.badge.hide()
-        head.addWidget(self.badge)
-        head.addStretch(1)
-        self.seg_logscope = SegControl(self)
-        self.seg_logscope.set_items([("全部", "all"), ("当前任务", "task")])
-        self.seg_logscope.currentChanged.connect(self._on_log_scope)
-        head.addWidget(self.seg_logscope)
-        self.retry_btn = _ghost_button("重试", self)
-        self.retry_btn.clicked.connect(lambda: self._emit_action("retry"))
-        head.addWidget(self.retry_btn)
-        self.open_btn = _ghost_button("打开输出目录", self)
-        self.open_btn.clicked.connect(lambda: self._emit_action("open_dir"))
-        head.addWidget(self.open_btn)
-        self.copy_btn = _ghost_button("复制", self)
-        self.copy_btn.clicked.connect(self.copyRequested.emit)
-        head.addWidget(self.copy_btn)
-
-        # 日志区 = 头部行 + 日志视图，整体作为分隔条下半区
+        # 日志区 = 日志视图（「该任务日志」头部行已移入分隔条手柄，见下方）
         self.log_pane = QWidget(self)
         log_lay = QVBoxLayout(self.log_pane)
         log_lay.setContentsMargins(0, 0, 0, 0)
-        log_lay.setSpacing(10)              # 与原 root 间距一致（头部 → 日志）
-        log_lay.addLayout(head)
+        log_lay.setSpacing(0)
 
         if self.log_view is None:
             self.log_view = QPlainTextEdit(self)
             self.log_view.setReadOnly(True)
         log_lay.addWidget(self.log_view, 1)
         self.log_empty = _EmptyOverlay(self.log_view, EMPTY_TASK_LOG)
-        self.log_pane.setMinimumHeight(130)  # 头部 + 最小可读日志高度
+        self.log_pane.setMinimumHeight(96)   # 日志视图最小可读高度（不再含头部行）
 
-        # 队列 ⇄ 日志：垂直分隔条，拖动改变两区高度（初始 1:2，同原布局）
+        # 队列 ⇄ 日志：垂直分隔条；手柄本体即「该任务日志」头部行（整行除控件
+        # 外都是拖动带），拖动改变两区高度（初始 1:2，同原布局）
         self.splitter = _QueueLogSplitter(Qt.Vertical, self)
         self.splitter.setObjectName("queueSplit")
         self.splitter.setChildrenCollapsible(False)
-        self.splitter.setHandleWidth(10)     # 与原布局 10px 行距同宽，细线居中
+        self.splitter.setHandleWidth(34)     # 手柄厚度 = 头部行自然高度（拖动带）
         self.table.setMinimumHeight(120)
         self.splitter.addWidget(self.table)
         self.splitter.addWidget(self.log_pane)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setSizes([1, 2])
+
+        # addWidget 之后 QSplitter 已建好 handle(1)：头部控件全部挂到手柄上，
+        # 空白处（图标 / 标题 / badge / 拉伸区）落到手柄本体 -> 整行可拖动。
+        # 一律 AlignVCenter：手柄比头部自然行高厚，不给对齐会被拉满 34px
+        # （badge 药丸 / 分段框会变成大高块）；旧 head 行内本就是自然高度。
+        self.split_handle = self.splitter.handle(1)
+        head = self.split_handle.head
+        head.addWidget(Glyph("layers", self.split_handle, 14, role="muted"),
+                       0, Qt.AlignVCenter)
+        self.log_title = QLabel("该任务日志", self.split_handle)
+        self.log_title.setObjectName("sectionTitle")
+        head.addWidget(self.log_title, 0, Qt.AlignVCenter)
+        self.badge = QLabel("", self.split_handle)
+        self.badge.setObjectName("modeBadge")       # QSS 的 token 药丸样式（随主题）
+        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.badge.hide()
+        head.addWidget(self.badge, 0, Qt.AlignVCenter)
+        head.addStretch(1)
+        self.seg_logscope = SegControl(self.split_handle)
+        self.seg_logscope.set_items([("全部", "all"), ("当前任务", "task")])
+        self.seg_logscope.currentChanged.connect(self._on_log_scope)
+        head.addWidget(self.seg_logscope, 0, Qt.AlignVCenter)
+        self.retry_btn = _ghost_button("重试", self.split_handle)
+        self.retry_btn.clicked.connect(lambda: self._emit_action("retry"))
+        head.addWidget(self.retry_btn, 0, Qt.AlignVCenter)
+        self.open_btn = _ghost_button("打开输出目录", self.split_handle)
+        self.open_btn.clicked.connect(lambda: self._emit_action("open_dir"))
+        head.addWidget(self.open_btn, 0, Qt.AlignVCenter)
+        self.copy_btn = _ghost_button("复制", self.split_handle)
+        self.copy_btn.clicked.connect(self.copyRequested.emit)
+        head.addWidget(self.copy_btn, 0, Qt.AlignVCenter)
+
         root.addWidget(self.splitter, 1)
         self._split_sized = False
 
@@ -431,8 +422,9 @@ class TaskPage(QWidget):
     def _apply_initial_split(self):
         """QSplitter.setSizes 只认像素：显示后按实际高度换算一次。
 
-        日志头部行 + 其间距是固定开销，不参与 1:2 分配（与原 QVBoxLayout 的
-        stretch 1/2 算法一致）；之后高度一律由用户拖动决定，不再自动改写。
+        头部行现已驻留分隔条手柄（手柄厚度固定，本就落在手柄项里），log_pane
+        只剩日志视图，chrome（固定开销）≈ 0——保留该差值项以防日志区日后
+        再加固定头；之后高度一律由用户拖动决定，不再自动改写。
         """
         if self._split_sized:
             return

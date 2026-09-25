@@ -1,5 +1,9 @@
 {
   "qr_enabled": true,
+  "drop_enabled": true,
+  "drop_qr_recognize": true,
+  "drop_nested": true,
+  "drop_delete_source": false,
   "notify_enabled": true,
   "notify_archive": false,
   "notify_success": false,

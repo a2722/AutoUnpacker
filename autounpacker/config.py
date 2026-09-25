@@ -133,6 +133,8 @@ DEFAULT_CONFIG = {
     "min_free_space_gb": 5.0,       # 目标盘剩余空间低于此值(GB)时暂停一切自动解压；0=关闭
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
+    "show_status_tips": True,       # 底栏滚动提示（使用提示条）；关掉不再轮播。原「幽灵键」转正
+    "settings_wizard_done": False,  # 设置向导已跳过/已完成；True 时设置页不再显示「设置向导」入口
 }
 
 
@@ -245,6 +247,18 @@ def _sanitize_cfg(cfg):
         cfg["notify_baidu_done"] = bool(cfg.get("notify_baidu_done", True))
         cfg["notify_baidu_leftover"] = bool(cfg.get("notify_baidu_leftover", True))
         cfg["notify_baidu_dup"] = bool(cfg.get("notify_baidu_dup", False))
+        # 拖拽行为（固定胶囊「拖拽行为」）：默认值与历史行为逐一对应——缺键时
+        # 拖入文件的行为与旧版完全一致（总开关开 / 识别二维码 / 智能穿透 / 不删源）。
+        cfg["drop_enabled"] = bool(cfg.get("drop_enabled", True))
+        cfg["drop_qr_recognize"] = bool(cfg.get("drop_qr_recognize", True))
+        cfg["drop_nested"] = bool(cfg.get("drop_nested", True))
+        cfg["drop_delete_source"] = bool(cfg.get("drop_delete_source", False))
+        # 幽灵键转正（2026-09-25 设置页 A 方案 D2-b）：main_window 一直在读
+        # show_status_tips 控制底栏滚动提示，但此前 DEFAULT_CONFIG / 界面都没有它，
+        # 实际恒为「显示」。现补默认值与真控件（「外观与快捷键 · 底栏滚动提示」）。
+        cfg["show_status_tips"] = bool(cfg.get("show_status_tips", True))
+        # 设置向导「跳过后不再显示」的持久化状态（2026-09-25 D1-a）。
+        cfg["settings_wizard_done"] = bool(cfg.get("settings_wizard_done", False))
         action = str(cfg.get("qr_clipboard_action", "none"))
         cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "none"
         cfg["qr_url_redirect"] = bool(cfg.get("qr_url_redirect", True))

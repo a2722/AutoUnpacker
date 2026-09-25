@@ -47,6 +47,57 @@ def _host_matches(entry, host):
     return host.endswith("." + entry)
 
 
+# 常见「国家/地区二级后缀」：last-2-label 在这些后缀下会退化，需多看一层。
+# 只列真正会导致同域判定错误的高频项（不引入完整公共后缀表，避免新依赖）。
+_MULTI_LABEL_SUFFIXES = frozenset((
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "co.jp", "ne.jp", "or.jp",
+    "com.hk", "com.tw", "com.sg", "com.au", "co.kr", "com.br",
+))
+
+
+def _registrable_domain(host):
+    """取 host 的可注册主域（近似 eTLD+1），用于「同主域」判断。
+
+    - 纯 IP：返回 IP 本身（同一 IP 才算同域）。
+    - 域名：默认取末两层（`a.b.example.com` -> `example.com`）；若末两层命中
+      常见国家/地区二级后缀（如 `com.cn`），则再往前取一层（`example.com.cn`）。
+    - 异常/空：返回 None（调用方按「无法判定同域」处理，走原严格路径）。
+
+    这是一个**保守收紧**的近似：宁可判为「不同域」（回退到原有信任询问），
+    也绝不把两个真正不同的站点当成同主域放行。"""
+    if not host:
+        return None
+    h = str(host).strip().lower().rstrip(".")
+    if not h:
+        return None
+    try:
+        ipaddress.ip_address(h)
+        return h                      # IP：字面相同才同域
+    except ValueError:
+        pass
+    labels = [p for p in h.split(".") if p]
+    if len(labels) < 2:
+        return h                      # 单标签主机（如 localhost）：原样
+    last2 = ".".join(labels[-2:])
+    if last2 in _MULTI_LABEL_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last2
+
+
+def same_site(host_a, host_b):
+    """两个 host 是否属于同一主域（eTLD+1 近似）。任一侧无法判定返回 False。
+
+    用途：重定向逐跳校验时，「同一主域的自身跳转」（如
+    `pan.baidu.com/s/x` -> `pan.baidu.com/share/init`）不该被当成
+    「新的第三方域名」而触发信任询问——它仍是用户已同意访问的那一个站点。"""
+    ra = _registrable_domain(host_a)
+    rb = _registrable_domain(host_b)
+    if not ra or not rb:
+        return False
+    return ra == rb
+
+
 def _classify_ip(ip):
     """对 IP 对象分类：private / loopback / link_local / reserved / public。
     注意 ipaddress 中 0.0.0.0/8 的 is_private 为 True、169.254.0.0/16 与

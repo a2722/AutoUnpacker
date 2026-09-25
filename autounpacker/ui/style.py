@@ -268,6 +268,13 @@ QPlainTextEdit {
     border-radius: $radius_card; padding: 6px;
     font-family: Consolas, monospace; font-size: 12px;
 }
+/* 设置页里的多行输入（后缀表 / 重定向规则 / 名单）：按输入框样式，不用日志控制台的黑底 */
+QPlainTextEdit#settingsTextEdit {
+    background: $ctl_bg; color: $ctl_fg; border: 1px solid $ctl_border;
+    border-radius: $radius_ctl; padding: 4px 6px;
+    font-family: inherit; font-size: 12px;
+}
+QPlainTextEdit#settingsTextEdit:focus { border: 1px solid $ctl_focus; }
 
 QScrollArea { border: none; background: transparent; }
 QListWidget#settingsCat {
@@ -281,6 +288,27 @@ QListWidget#settingsCat::item:hover { background: $cat_hover; }
 QListWidget#settingsCat::item:selected {
     background: $item_sel_bg; color: $item_sel_fg; font-weight: bold;
 }
+
+/* 设置页 A 方案：领域页 / 分组 / 极简行 / 补充信息气泡。
+   全部复用既有 token，不新增颜色。 */
+QLabel#groupTitle {
+    color: $group_title; font-size: 12px; font-weight: 600;
+    padding: 10px 0 6px 0;
+}
+QFrame#groupSep { background: $group_border; border: none; max-height: 1px; }
+QFrame#settingsTop { background: transparent; }
+QLabel#setName { font-size: 13px; font-weight: 600; color: $window_fg; }
+QLabel#devDot { color: $badge_fg; font-size: 14px; }
+QLabel#riskBadge {
+    color: $danger_fg; background: $danger_bg; border: 1px solid $danger_border;
+    border-radius: 4px; padding: 0 6px; font-size: 11px;
+}
+QFrame#settingsBubble {
+    background: $card_bg; border: 1px solid $card_border;
+    border-radius: $radius_card;
+}
+QFrame#bubbleRisk { border: 1px solid $danger_border; background: $danger_bg;
+    border-radius: 4px; }
 
 QGroupBox {
     border: 1px solid $group_border; border-radius: $radius_card;

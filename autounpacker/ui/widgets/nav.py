@@ -3,8 +3,9 @@
 以及回溯状态 / 目录状态 / 底栏播报文案表。"""
 
 from PyQt5.QtWidgets import (QLabel, QWidget, QHBoxLayout, QProgressBar,
-                             QSizePolicy)
-from PyQt5.QtCore import Qt, QSize, pyqtSignal
+                             QSizePolicy, QApplication)
+from PyQt5.QtCore import (Qt, QSize, pyqtSignal, QParallelAnimationGroup,
+                          QPropertyAnimation, QEasingCurve)
 
 from ..style import PALETTE
 from .common import dir_state_key, repolish_tree, _clear_layout, _StatusLamp
@@ -49,6 +50,8 @@ class DirChip(LayoutButton):
     """目录胶囊：状态灯 + 等宽路径 + 状态词 +（解压中）细进度条 + 齿轮。
 
     set_selected() 只翻转 selected 动态属性并 repolish，绝不改状态灯颜色。
+    拖拽：按住左键移动超过 startDragDistance 才进入重排拖拽（交给胶囊条做
+    平滑位移动画）；未越阈值的按下/抬起仍是普通点击 -> clickedDir。
     """
 
     clickedDir = pyqtSignal(int)
@@ -62,6 +65,9 @@ class DirChip(LayoutButton):
         self._state = dir_state_key(self._entry.get("state"))
         self._progress = self._entry.get("progress")
         self._name = str(self._entry.get("name") or "")
+        # 拖拽重排状态：按下点 + 是否已越过阈值（阈值内一律按普通点击放行）
+        self._press_pos = None
+        self._dragging = False
 
         self.setObjectName("dirChip")
         self.setProperty("selected", False)
@@ -100,6 +106,60 @@ class DirChip(LayoutButton):
 
     def _emit_clicked(self):
         self.clickedDir.emit(self.idx)
+
+    def _strip(self):
+        """所在的目录胶囊条（构造期可能无父级 / 不在条内时返回 None）。"""
+        parent = self.parent()
+        while parent is not None:
+            if isinstance(parent, DirChipStrip):
+                return parent
+            parent = parent.parent()
+        return None
+
+    def mousePressEvent(self, event):
+        """左键按下只记起点；其余按钮与普通点击逻辑完全不变。"""
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """按住左键越过 startDragDistance 才进入重排拖拽（光标换左右箭头）。
+
+        未越阈值的移动原样放行给 QPushButton：轻点（按下即抬起、或小幅抖动）
+        仍然走 clicked -> clickedDir，绝不被拖拽逻辑吞掉。"""
+        if self._press_pos is not None and (event.buttons() & Qt.LeftButton):
+            if not self._dragging:
+                moved = (event.pos() - self._press_pos).manhattanLength()
+                if moved >= QApplication.startDragDistance():
+                    self._dragging = True
+                    self.setCursor(Qt.SizeHorCursor)
+                    strip = self._strip()
+                    if strip is not None:
+                        strip._begin_chip_drag(self)
+            if self._dragging:
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """释放：拖拽态吞掉这次点击、请求胶囊条重排；普通释放照旧发 clickedDir。"""
+        dragging = self._dragging and event.button() == Qt.LeftButton
+        self._dragging = False
+        self._press_pos = None
+        if dragging:
+            # 越过阈值 = 重排手势：清掉按钮按下态，绝不当成点击（不打开设置弹窗）
+            try:
+                self.setDown(False)
+            except Exception:
+                pass
+            self.setCursor(Qt.PointingHandCursor)
+            strip = self._strip()
+            if strip is not None:
+                strip._drop_chip(self, event.globalPos())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def minimumSizeHint(self):
         """胶囊的真实最小尺寸：路径可继续省略，别的元素是固定的。
@@ -165,11 +225,23 @@ class DirChip(LayoutButton):
 
 
 class DirChipStrip(QWidget):
-    """目录胶囊条：常显于标签页下方；点胶囊 -> dirActivated(idx)（宿主开设置弹窗）。"""
+    """目录胶囊条：常显于标签页下方；点胶囊 -> dirActivated(idx)（宿主开设置弹窗）。
+
+    拖拽重排：胶囊越过阈值拖动后按释放点换槽，槽位变化走 QPropertyAnimation
+    平滑位移；动画结束才发 orderChanged（新槽位 → 原条目索引），由宿主落盘
+    并按新顺序重建 —— 重建发生在动画终点，视觉上绝不跳变。
+
+    「拖拽行为」是固定胶囊（drag_btn）：常显、不可删、不参与重排，点击发
+    dragBehaviorRequested（宿主开拖拽行为设置弹窗）；状态词由 set_drag_state 刷新。
+    """
 
     dirActivated = pyqtSignal(int)
     addRequested = pyqtSignal()
     netdiskRequested = pyqtSignal()
+    orderChanged = pyqtSignal(list)      # 拖拽重排：新槽位 -> 原条目索引（排列）
+    dragBehaviorRequested = pyqtSignal()  # 点「拖拽行为」固定胶囊（开设置弹窗）
+
+    CHIP_ANIM_MS = 180                   # 重排位移动画时长（毫秒）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -178,6 +250,9 @@ class DirChipStrip(QWidget):
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._chips = []
         self._highlight = -1
+        self._drag_chip = None       # 正在拖拽的胶囊（None=没有）
+        self._anim = None            # 进行中的位移动画组（持引用防被 GC）
+        self._drag_enabled = True    # 「拖拽行为」开关态（宿主 set_drag_state 同步）
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(7)
@@ -195,6 +270,28 @@ class DirChipStrip(QWidget):
         add_lay.addWidget(QLabel("添加目录", self.add_btn))
         self.add_btn.clicked.connect(self.addRequested.emit)
         lay.addWidget(self.add_btn)
+
+        # 固定胶囊「拖拽行为」：紧跟在「添加目录」之后；不是 DirChip、不进 chips()、
+        # 也绝不参与重排（重排只操作 self._chips）。状态词「开 / 已关闭」随配置刷新。
+        self.drag_btn = LayoutButton(self)
+        self.drag_btn.setObjectName("dirChip")
+        self.drag_btn.setProperty("drag", True)
+        self.drag_btn.setCursor(Qt.PointingHandCursor)
+        self.drag_btn.setFixedHeight(30)
+        self.drag_btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        drag_lay = QHBoxLayout(self.drag_btn)
+        drag_lay.setContentsMargins(10, 0, 10, 0)
+        drag_lay.setSpacing(7)
+        drag_lay.addWidget(Glyph("bolt", self.drag_btn, 13, role="muted"))
+        drag_label = QLabel("拖拽行为", self.drag_btn)
+        drag_label.setObjectName("chipState")   # 复用胶囊小字样式（跟着主题走）
+        drag_lay.addWidget(drag_label)
+        self.drag_state = QLabel("开", self.drag_btn)
+        self.drag_state.setObjectName("chipState")
+        self.drag_state.setStyleSheet("font-weight: 600;")
+        drag_lay.addWidget(self.drag_state)
+        self.drag_btn.clicked.connect(self.dragBehaviorRequested.emit)
+        lay.addWidget(self.drag_btn)
 
         self._chips_box = QWidget(self)
         self._chip_lay = QHBoxLayout(self._chips_box)
@@ -219,6 +316,8 @@ class DirChipStrip(QWidget):
 
     def set_dirs(self, entries):
         """按 entries（path/enabled/state/progress/name/…）整体重建胶囊。"""
+        self._stop_chip_anim()       # 旧胶囊即将销毁：先停掉引用它们的动画
+        self._drag_chip = None
         _clear_layout(self._chip_lay)
         self._chips = []
         self._highlight = -1
@@ -231,23 +330,171 @@ class DirChipStrip(QWidget):
             self._chips.append(chip)
 
     def update_dir_state(self, idx, state, progress=None, name=None):
+        """按条目索引更新胶囊：重排后索引 != 槽位，故按 chip.idx 找（老语义兜底）。"""
         try:
-            if 0 <= int(idx) < len(self._chips):
-                self._chips[int(idx)].set_state(state, progress, name)
+            key = int(idx)
+        except Exception:
+            return
+        try:
+            for chip in self._chips:
+                if chip.idx == key:
+                    chip.set_state(state, progress, name)
+                    return
+            if 0 <= key < len(self._chips):
+                self._chips[key].set_state(state, progress, name)
         except Exception:
             pass
 
     def set_highlight(self, idx):
-        """「在这里」高亮（正在编辑设置的那一个）；-1 清除。"""
+        """「在这里」高亮（正在编辑设置的那一个）；-1 清除。按 chip.idx 定位。"""
         self._highlight = int(idx)
-        for i, chip in enumerate(self._chips):
-            chip.set_selected(i == self._highlight)
+        for chip in self._chips:
+            chip.set_selected(chip.idx == self._highlight)
 
     def highlight(self):
         return self._highlight
 
     def chips(self):
         return list(self._chips)
+
+    def set_drag_state(self, enabled):
+        """「拖拽行为」固定胶囊的开关态：状态词 + tooltip，并 repolish 跟主题。
+
+        只在视觉上标注；真实开关值由宿主写回 config 的 drop_enabled。"""
+        self._drag_enabled = bool(enabled)
+        text = "开" if self._drag_enabled else "已关闭"
+        try:
+            self.drag_state.setText(text)
+        except Exception:
+            pass
+        try:
+            self.drag_btn.setToolTip(
+                "拖拽行为：%s（点击设置拖入文件后执行什么）" % text)
+        except Exception:
+            pass
+        repolish_tree(self.drag_btn)
+
+    # ---------- 拖拽重排：位移动画 + 顺序广播 ----------
+    def _begin_chip_drag(self, chip):
+        """越过拖拽阈值：登记被拖的胶囊并抬到最上层（不打断已在跑的旧动画）。"""
+        self._drag_chip = chip
+        try:
+            chip.raise_()
+        except Exception:
+            pass
+
+    def _drop_chip(self, chip, global_pos):
+        """拖拽释放：按释放点找目标槽；槽没变则什么都不做（旧动画照常收尾）。"""
+        dragged = self._drag_chip
+        self._drag_chip = None
+        if dragged is not None and dragged is not chip:
+            return
+        try:
+            frm = self._chips.index(chip)
+        except ValueError:
+            return
+        to = self._slot_at(global_pos)
+        if to >= 0 and to != frm:
+            self._move_chip(frm, to)
+
+    def _slot_at(self, global_pos):
+        """释放点最接近哪个槽（比较各胶囊水平中心）；-1 = 没找到。"""
+        best, best_dist = -1, None
+        try:
+            x = self._chips_box.mapFromGlobal(global_pos).x()
+        except Exception:
+            return -1
+        for i, chip in enumerate(self._chips):
+            rect = chip.geometry()
+            dist = abs(x - (rect.x() + rect.width() / 2.0))
+            if best_dist is None or dist < best_dist:
+                best, best_dist = i, dist
+        return best
+
+    def _move_chip(self, from_idx, to_idx):
+        """把 from 槽的胶囊移到 to 槽：布局重排 + 平滑位移动画。
+
+        先记录旧矩形，再让布局算好新矩形并回填旧矩形，动画从旧位置滑到新位置；
+        顺序只在动画结束后经 orderChanged 广播（宿主落盘重建时胶囊已在终点，
+        看不到跳变）。中途再重排会先停旧动画——stop() 不回卷，新动画从当前帧
+        继续，最终顺序由最后一次广播一并带出。"""
+        n = len(self._chips)
+        try:
+            frm, to = int(from_idx), int(to_idx)
+        except Exception:
+            return False
+        if n < 2 or frm == to or not (0 <= frm < n and 0 <= to < n):
+            return False
+        self._stop_chip_anim()
+        before = {chip: chip.geometry() for chip in self._chips}
+        chip = self._chips.pop(frm)
+        self._chips.insert(to, chip)
+        # QHBoxLayout 不支持直接换位：整体重插布局项，插入顺序即新槽位顺序
+        for item in self._chips:
+            self._chip_lay.removeWidget(item)
+        for i, item in enumerate(self._chips):
+            self._chip_lay.insertWidget(i, item)
+        try:
+            self._chip_lay.activate()        # 让布局先算出目标矩形（同帧回填，不闪）
+        except Exception:
+            pass
+        after = {item: item.geometry() for item in self._chips}
+        group = QParallelAnimationGroup(self)
+        for item in self._chips:
+            item.setGeometry(before.get(item, after[item]))
+            start = item.geometry()
+            end = after[item]
+            if start == end:
+                continue
+            anim = QPropertyAnimation(item, b"geometry", group)
+            anim.setDuration(self.CHIP_ANIM_MS)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.setStartValue(start)
+            anim.setEndValue(end)
+            group.addAnimation(anim)
+        try:
+            chip.raise_()                    # 被拖的那个从其它胶囊上方滑过
+        except Exception:
+            pass
+        if not group.animationCount():
+            group.deleteLater()
+            self._emit_order_changed()
+            return True
+        self._anim = group
+        group.finished.connect(self._on_chip_anim_finished)
+        group.start()
+        return True
+
+    def _stop_chip_anim(self):
+        """停住进行中的位移动画（stop 不回卷，胶囊停在当前帧）；不发任何信号。"""
+        group = self._anim
+        self._anim = None
+        if group is not None:
+            try:
+                group.stop()
+            except Exception:
+                pass
+            try:
+                group.deleteLater()
+            except Exception:
+                pass
+
+    def _on_chip_anim_finished(self):
+        """位移动画结束：清引用并把新顺序广播给宿主（落盘 + 按新序重建）。"""
+        group = self._anim
+        self._anim = None
+        self._emit_order_changed()
+        if group is not None:
+            try:
+                group.deleteLater()
+            except Exception:
+                pass
+
+    def _emit_order_changed(self):
+        """当前槽位顺序（新槽位 -> 原条目索引）必须仍是完整排列，否则不发。"""
+        order = [int(chip.idx) for chip in self._chips]
+        if len(order) >= 2 and sorted(order) == list(range(len(order))):
+            self.orderChanged.emit(order)
 
 
 # 标签键 -> 图标（键不认识时只显示文字，不影响布局）

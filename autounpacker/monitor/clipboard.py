@@ -1036,7 +1036,9 @@ class QRMonitor(threading.Thread):
                 prev_share_ts = 0.0
             html = ""
             try:
-                data = self._fetch_url(url)
+                # for_share=True：分享抓页不受网址信任名单约束（见 _fetch_url /
+                # _handle_baidu_share），自身跳转绝不弹信任询问。
+                data = self._fetch_url(url, for_share=True)
                 if data:
                     html = data.decode("utf-8", "replace")
             except Exception:
@@ -1212,24 +1214,44 @@ class QRMonitor(threading.Thread):
                 except OSError:
                     pass
 
-    def _fetch_url(self, url, timeout=8, max_bytes=16 << 20):
+    def _fetch_url(self, url, timeout=8, max_bytes=16 << 20, for_share=False):
         """拉取网址内容（限制大小，超时/超限返回 None）。
 
         安全措施：
         - HTTPS 证书默认验证（仅当设置开启 tls_skip_verify 才跳过校验）
         - 重定向逐跳校验目标 host：落入用户黑名单/内置敏感类别（内网、
-          回环、元数据等）即中止跳转，防止 302 逃逸进内网/云元数据"""
+          回环、元数据等）即中止跳转，防止 302 逃逸进内网/云元数据
+
+        for_share=True：本次抓取是「分享链路拿 shareid/share_uk」用途。分享链路
+        本就**不受网址信任名单限制**（见 _handle_baidu_share），故其跳转**绝不弹
+        信任询问**——只保留内置敏感类别（SSRF/内网）拦截。
+
+        两条放行规则（都只为消除「自身跳转被误判成新第三方域名」的假询问）：
+        1. 同一主域内的跳转（如 pan.baidu.com/s/x -> pan.baidu.com/share/init）
+           直接跟随：目标仍是用户已同意访问的那一个站点。
+        2. for_share（分享抓页）时，非内置敏感类别一律静默跟随、不弹询问。
+        用户黑名单与内置敏感类别**始终**拦截，两条规则都不会放行它们。"""
         import ssl
         from urllib.request import (Request, HTTPRedirectHandler,
                                     build_opener, HTTPSHandler)
         from urllib.error import HTTPError
+        from ..trust import same_site
         cfg = self.state.snapshot()
         hub = self.hub
+        origin_host = _host_of(url)
 
         class _RedirectGuard(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 new_host = _host_of(newurl)
-                d, _ = decide_host(cfg, new_host, "fetch")
+                # 规则 1：同一主域的自身跳转，放行（不询问、不记拒绝）。
+                if same_site(origin_host, new_host):
+                    return super().redirect_request(
+                        req, fp, code, msg, headers, newurl)
+                d, _cat = decide_host(cfg, new_host, "fetch")
+                # 规则 2：分享抓页用途，非 deny 的询问=静默跟随（分享链路不受名单约束）。
+                if for_share and d != "deny":
+                    return super().redirect_request(
+                        req, fp, code, msg, headers, newurl)
                 try:
                     ut2 = remember_auto_domain(cfg, new_host, "fetch")
                     if ut2 is not None and hub.state is not None:

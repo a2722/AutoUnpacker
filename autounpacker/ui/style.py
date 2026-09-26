@@ -287,11 +287,11 @@ QPushButton#danger:hover { background: $danger_hover; }
    内边距清零，20px 药丸才真正装得下文字（墨迹 13px，上下各余 3~4px）；
    横向沿用 12px，药丸宽度与底栏总高（30px）都不动。 */
 QWidget#statusBar QPushButton#danger { padding: 0 12px; }
-QPushButton#pause {
+QPushButton#pause, QPushButton#compact {
     background: $pause_bg; border: 1px solid $pause_border; border-radius: $radius_ctl;
     padding: 3px 8px; color: $pause_fg; font-weight: bold;
 }
-QPushButton#pause:hover { background: $pause_hover; }
+QPushButton#pause:hover, QPushButton#compact:hover { background: $pause_hover; }
 QPushButton#pause[paused="true"] { background: $paused_bg; border: none; color: $paused_fg; }
 QPushButton#pause[paused="true"]:hover { background: $paused_hover; }
 

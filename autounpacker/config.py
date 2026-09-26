@@ -134,6 +134,10 @@ DEFAULT_CONFIG = {
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
     "show_status_tips": True,       # 底栏滚动提示（使用提示条）；关掉不再轮播。原「幽灵键」转正
+    # ---------- 精简界面（E 方案，2026-09-26：独立小窗，与完整界面互斥） ----------
+    "ui_compact": False,            # 是否以精简界面启动 / 当前是否精简
+    "compact_on_top": False,        # 精简小窗是否置顶（D6：默认关，置顶后始终浮在最前）
+    "compact_geometry": "",         # 精简小窗 saveGeometry() 的 base64 串（位置+尺寸记忆；空=默认位置）
     "settings_wizard_done": False,  # 设置向导已跳过/已完成；True 时设置页不再显示「设置向导」入口
 }
 
@@ -290,6 +294,12 @@ def _sanitize_cfg(cfg):
         # show_status_tips 控制底栏滚动提示，但此前 DEFAULT_CONFIG / 界面都没有它，
         # 实际恒为「显示」。现补默认值与真控件（「外观与快捷键 · 底栏滚动提示」）。
         cfg["show_status_tips"] = bool(cfg.get("show_status_tips", True))
+        # 精简界面（E 方案，2026-09-26）：开关 / 置顶（D6 默认关）/ 位置尺寸记忆。
+        # compact_geometry 是 saveGeometry() 的 base64 串：坏值回退空串，并限长
+        # 4096 防脏数据（正常串约几百字节）。
+        cfg["ui_compact"] = bool(cfg.get("ui_compact", False))
+        cfg["compact_on_top"] = bool(cfg.get("compact_on_top", False))
+        cfg["compact_geometry"] = str(cfg.get("compact_geometry") or "")[:4096]
         # 设置向导「跳过后不再显示」的持久化状态（2026-09-25 D1-a）。
         cfg["settings_wizard_done"] = bool(cfg.get("settings_wizard_done", False))
         action = str(cfg.get("qr_clipboard_action", "none"))

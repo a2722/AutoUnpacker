@@ -176,6 +176,9 @@ class MainWindow(QMainWindow):
         self.show_event = show_event
         self.pauser = pauser
         self.setWindowTitle("AutoUnpacker")
+        # 精简模式（定稿·方案 E）：独立小窗 CompactWindow 与本窗**互斥显示**；
+        # 主窗自身尺寸/布局不变（规格 §11.8）。懒建：首次切换时才构造。
+        self._compact_window = None
         # M3 工作台布局（标签页 + 胶囊条 + 248px 右栏）：默认宽高按设计稿 1440×880。
         # DPI/分辨率自适应：初始尺寸按屏幕可用区（逻辑像素）收敛，见 fit_window_size。
         _aw, _ah = self._available_geometry()
@@ -351,6 +354,13 @@ class MainWindow(QMainWindow):
         self.pause_btn.setCursor(Qt.PointingHandCursor)
         self.pause_btn.clicked.connect(self._toggle_pause)
         top_lay.addWidget(self.pause_btn, 0, Qt.AlignVCenter)
+        # 完整界面 → 精简界面的入口（规格 §6.1/§7）：切过去后本窗隐藏、小窗显示。
+        # 不设 FixedWidth：「精简界面」比「暂停」宽；样式复用 #pause 那条规则。
+        # 必须用 lambda：clicked 会回传 checked(bool)，直接绑会被当成 on=False。
+        self.compact_btn = QPushButton("精简界面", top)
+        self.compact_btn.setObjectName("compact")
+        self.compact_btn.clicked.connect(lambda *_: self._toggle_compact(True))
+        top_lay.addWidget(self.compact_btn, 0, Qt.AlignVCenter)
         root.addWidget(top)
 
         # 目录胶囊条（三个页面常显）
@@ -912,6 +922,17 @@ class MainWindow(QMainWindow):
             self._show_window()
 
     def _show_window(self):
+        if self.is_compact():
+            # 精简模式（规格 §9）：热键/托盘要唤起的是**小窗**，不是主窗。
+            # 主窗此刻是隐藏的，若照原样 showNormal() 就会出现「点托盘跳出大程序」
+            # 这种与「同时只显示一个界面」相矛盾的行为。
+            cw = self._ensure_compact_window()
+            if cw is not None:
+                try:
+                    cw.show_home(raise_=True)
+                    return
+                except Exception:
+                    pass
         self.showNormal()
         self.raise_()
         self.activateWindow()
@@ -2285,6 +2306,83 @@ class MainWindow(QMainWindow):
             self.hub.log(f"界面主题已切换: {theme}")
         except Exception:
             pass
+
+    # ---------- 精简模式（定稿·方案 E：互斥显示；主窗尺寸/布局不变） ----------
+    def is_compact(self):
+        """当前是否处于精简界面（以 config 的 ui_compact 为准）。"""
+        try:
+            return bool(self.state.get("ui_compact", False))
+        except Exception:
+            return False
+
+    def _toggle_compact(self, on=None):
+        """完整界面 ⇄ 精简小窗（互斥显示，规格 §6.1/§7）。
+
+        `on=None` 表示翻转；头部按钮入口显式传 True。切换只做「隐藏一方、
+        显示另一方」——**不改动主窗尺寸/布局**（规格 §11.8），所以退出精简时
+        主窗天然回到它原来的尺寸与位置，无需任何快照/还原。
+        `ui_compact` 落 config；启动时由 `start_interface()` 按它决定初始界面。
+        """
+        want = (not self.is_compact()) if on is None else bool(on)
+        try:
+            self.state.set("ui_compact", bool(want))
+        except Exception:
+            pass
+        if want:
+            cw = self._ensure_compact_window()
+            if cw is None:
+                return
+            try:
+                self.hide()
+            except Exception:
+                pass
+            try:
+                cw.show_home()
+            except Exception:
+                pass
+        else:
+            cw = getattr(self, "_compact_window", None)
+            if cw is not None:
+                try:
+                    cw.hide()
+                except Exception:
+                    pass
+            try:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+            except Exception:
+                pass
+
+    def _ensure_compact_window(self):
+        """懒建精简小窗（规格 §12：`ui/compact/window.py` 的 CompactWindow）。"""
+        cw = getattr(self, "_compact_window", None)
+        if cw is not None:
+            return cw
+        try:
+            from .compact import CompactWindow
+        except Exception as e:
+            self._append_log(f"[精简] 精简界面组件加载失败: {e}")
+            return None
+        try:
+            cw = CompactWindow(self)
+        except Exception as e:
+            self._append_log(f"[精简] 精简界面创建失败: {e}")
+            return None
+        self._compact_window = cw
+        return cw
+
+    def start_interface(self):
+        """按 `ui_compact` 决定启动时显示哪个界面（规格 §6.1）。"""
+        if self.is_compact():
+            cw = self._ensure_compact_window()
+            if cw is not None:
+                try:
+                    cw.show_home()
+                except Exception:
+                    pass
+                return
+        self.show()
 
     # ---------- 屏幕自适应：初始几何 / 最小尺寸 / 跨屏守卫 ----------
     def _available_geometry(self, screen=None):

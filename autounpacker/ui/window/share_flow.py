@@ -100,6 +100,26 @@ def _share_code_in_window(win, surl, share_uk):
     return code, dlg
 
 
+def _compact_win(win):
+    """精简模式宿主判定（惰性）：返回可用的 CompactWindow，否则 None。
+
+    冻结条件：`win` 非空、`win._compact_window` 非空、且
+    `win.state.get("ui_compact", False)` 为真。**任何缺失/异常一律 None**——
+    既有大量离线测试用非 QWidget 桩（无 `_compact_window` / `state.get`）直接调这
+    些函数，必须继续走原浮窗路径。绝不抛异常。"""
+    if win is None:
+        return None
+    try:
+        cw = getattr(win, "_compact_window", None)
+        if cw is None:
+            return None
+        if not bool(win.state.get("ui_compact", False)):
+            return None
+        return cw
+    except Exception:
+        return None
+
+
 def _close_share_ask_dlg(win, surl=None, uk=None, url=None, note=None):
     """成功提取后关闭「属于同一分享」的缺提取码小窗（只关闭、绝不回调）。
 
@@ -115,7 +135,38 @@ def _close_share_ask_dlg(win, surl=None, uk=None, url=None, note=None):
     摘掉回调保证成功路径绝不产生第二次 decision（`_finish` 只回调一次）。同时显式
     停掉倒计时，并清空 `win._share_ask_dlg`。最后记一行**不含明文提取码**的日志。
 
+    精简模式（`_compact_win` 可用）：没有 `win._share_ask_dlg`，归属判定改用
+    `cw.code_open_for()`（复用同一「同 surl 或同 uk」口径）；命中同一分享则
+    `cw.leave_code()`（pop CODE 页回 HOME），日志语义与浮窗路径完全一致。
+    CODE 页自身的倒计时/回调由 CompactWindow 内部管理，这里绝不再产生 decision。
+
     Qt 主线程调用；返回是否真的关掉了某扇窗。绝不抛异常。"""
+    cw = _compact_win(win)
+    if cw is not None:
+        t_surl, t_uk = "", ""
+        try:
+            t_surl, t_uk = cw.code_open_for()
+        except Exception:
+            t_surl, t_uk = "", ""
+        try:
+            t_surl = str(t_surl or "").strip()
+        except Exception:
+            t_surl = ""
+        try:
+            t_uk = str(t_uk or "").strip()
+        except Exception:
+            t_uk = ""
+        surl_s = str(surl or "").strip()
+        uk_s = str(uk or "").strip()
+        same = bool((surl_s and t_surl and surl_s == t_surl)
+                    or (uk_s and t_uk and uk_s == t_uk))
+        if same:
+            try:
+                cw.leave_code()
+            except Exception:
+                pass
+            _share_log(win, note or "[分享] 已成功提取，提取码小窗已关闭（填写任务完成）")
+            return True
     dlg = getattr(win, "_share_ask_dlg", None)
     if dlg is None:
         return False
@@ -490,7 +541,19 @@ def _announce_ask_code_hidden(win, url):
 
     文案只承诺「打开主界面后可弹出小窗」，**绝不**承诺当前弹不出来的窗口（旧文案
     「请在右侧小窗填写」「已在提取码小窗等待填写」都会误导用户）。发声后置位去重
-    标记，随后 `_show_share_code_window` 的兜底提示会静默，不再重复提醒。"""
+    标记，随后 `_show_share_code_window` 的兜底提示会静默，不再重复提醒。
+
+    精简模式（`_compact_win` 可用）：主窗隐藏**不是**丢弃理由——强制显示小窗，
+    CODE 页由紧随其后的 `_show_share_code_window` 进入（那里才有 surl/share_uk），
+    绝不静默丢弃（spec §6.2 最后一条）。"""
+    cw = _compact_win(win)
+    if cw is not None:
+        try:
+            cw.show_home(raise_=True)
+        except Exception:
+            pass
+        _share_log(win, "[分享] 精简模式：主界面未显示，改为在精简小窗中填写提取码")
+        return
     _share_log(win, "[分享] 该分享缺少提取码，主界面未显示，已跳过拉起"
                     "（打开主界面后可填写，或稍后按 Alt+2/Alt+3）")
     _share_notify_via(
@@ -530,7 +593,33 @@ def _show_share_code_window(win, surl, url, share_uk, open_browser=False):
     - `open_browser`：仅在新开/复用小窗之外需要「未知分享者探针」时置真；
       已在弹小窗时不重复开浏览器；实验性开启时 pan.baidu 网址绝不显式打开。
 
+    精简模式（`_compact_win` 可用）：**不建任何浮窗**，也不走 `_share_parent_usable`
+    的「主窗不可用就丢弃」路径——强制显示 CompactWindow 并进入/复用其 CODE 页
+    （单例与 120s 倒计时由 CompactWindow 内部处理，`force_pick` 原样转交）；
+    仍返回宿主对象（CompactWindow），不是 dialog。精简分支异常时记一行并回退下方
+    原路径（非精简路径逐字不变）。
+
     任何异常都不向外抛，返回小窗对象或 None。"""
+    cw = _compact_win(win)
+    if cw is not None:
+        try:
+            cw.show_home(raise_=True)
+            _force_pick = bool(getattr(win, "_share_ask_force_pick", False))
+            cw.enter_code(surl, url, share_uk, force_pick=_force_pick,
+                          open_browser=bool(open_browser))
+            if open_browser:
+                # 未知分享者：沿用既有「浏览器打开分享页做探针」行为。
+                # UX-4：实验性开启时 pan.baidu 一律静默，绝不显式打开浏览器。
+                if not _share_pan_open_blocked(win, url):
+                    try:
+                        import webbrowser
+                        webbrowser.open(str(url), new=2)
+                        _share_log(win, f"[分享] 未知分享者，已在浏览器打开分享页: {url}")
+                    except Exception as e:
+                        _share_log(win, f"[分享] 打开分享页失败: {e}")
+            return cw
+        except Exception as e:
+            _share_log(win, f"[分享] 精简模式提取码页打开失败，回退浮窗: {e}")
     # UX-5：小窗是挂在主窗上的子工具窗——主窗不可见时不打扰用户（托盘气泡 + 日志）。
     # 去重：调用方（Alt+2/Alt+3/询问路径）若已就本次缺码动作发过提示，这里不再重复
     # 提醒——一次用户动作只有一条气泡，且文案由最先发声的一侧给出（绝不承诺弹不出的窗）。

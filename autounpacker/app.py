@@ -287,7 +287,8 @@ def main():
     # （实测这批装载约 2.0s，其中日志页整页渲染占绝大部分）。见 _deferred_initial_load。
     win = MainWindow(state, hub, show_event, pauser, defer_initial_load=True)
     if not autostart:
-        win.show()
+        # 按 ui_compact 决定初始界面：精简开启时显示小窗、主窗保持隐藏（规格 §6.1）。
+        win.start_interface()
 
     def _sync_theme_after_show():
         """显示后再纠正主题：仅当解析结果与当前不同才切；结果记进配置供下次零检测启动。"""

@@ -1630,6 +1630,38 @@ class SettingsPage(QWidget):
             "ui_theme_cached", self.theme_cached_label, "ui", "外观",
             syn=("缓存主题", "首屏", "启动")))
 
+        g = self._group(box, "精简界面")
+        self.compact_cb = self._check(
+            g, "以精简界面启动", "ui_compact",
+            "下次启动直接进精简小窗；也可在主界面右上角一键切换。",
+            syn=("精简", "小窗", "精简界面", "精简模式", "紧凑", "切换"))
+        self.compact_on_top_cb = self._check(
+            g, "精简小窗置顶", "compact_on_top",
+            "默认关闭；置顶后小窗始终浮在最前。",
+            syn=("置顶", "浮在最前", "精简小窗", "小窗"),
+            default=False, extra_keys=["compact_geometry"])
+        # compact_geometry 是窗口位置/尺寸记忆串，不单独发明编辑控件：登记在上面
+        # 的开关行（extra_keys）完成覆盖契约；另给一个按钮作为显式回退入口。
+        ch, chl = self._manual_row(g)
+        chl.addWidget(self._make_name(
+            ch, "精简窗位置记忆",
+            _SettingRow("精简窗位置记忆", "", "compact_geometry", None, "ui",
+                        "精简界面")))
+        chl.addStretch(1)
+        self.compact_reset_btn = QPushButton("重置精简窗位置", ch)
+        self.compact_reset_btn.setObjectName("ghostSm")
+        self.compact_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.compact_reset_btn.setToolTip("清空记住的小窗位置与尺寸，下次打开回到默认位置。")
+        self.compact_reset_btn.clicked.connect(
+            lambda: self._commit("compact_geometry", ""))
+        chl.addWidget(self.compact_reset_btn)
+        self._reg("compact_geometry", self.compact_reset_btn)
+        self._rows.append(_SettingRow(
+            "精简窗位置记忆",
+            "程序自动记住小窗的位置和尺寸；点右侧按钮清空，下次改用默认位置。",
+            "compact_geometry", self.compact_reset_btn, "ui", "精简界面",
+            syn=("位置", "尺寸", "记忆", "小窗", "重置")))
+
         g = self._group(box, "全局快捷键")
         self.hotkey_enable_cb = self._check(
             g, "启用全局快捷键", "hotkey_enabled",
@@ -2611,6 +2643,8 @@ class SettingsPage(QWidget):
             self._theme_pref = pref if pref in ("auto", "fluent", "devtool") else "auto"
             self.logcolor_cb.setChecked(b("log_colors_enabled", True))
             self.show_tips_cb.setChecked(b("show_status_tips", True))
+            self.compact_cb.setChecked(b("ui_compact", False))
+            self.compact_on_top_cb.setChecked(b("compact_on_top", False))
             cached = s("ui_theme_cached").lower()
             self.theme_cached_label.setText(
                 "上次实际应用：%s" % _THEME_NAMES.get(cached, "（未记录）"))

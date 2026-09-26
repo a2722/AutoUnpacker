@@ -217,6 +217,10 @@ class CompactTaskList(QWidget):
         except Exception:
             rows = []
         rows = [r for r in rows if isinstance(r, dict)]
+        # 精简窗只留「未完成」：已完成(done)会越积越多，把轻量小窗顶成一片臃肿的
+        # 历史列表（与「清爽」定位冲突）。失败 / 已取消(搁置) / 排队 / 缺码 / 进行中
+        # 都保留——它们是用户还需要看见或处理的东西。计数与视图一并按此口径。
+        rows = [r for r in rows if _task_state_key(r) != "done"]
         rows.sort(key=_sort_key)
         rows = rows[:MAX_ROWS]
 

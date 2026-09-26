@@ -6,7 +6,7 @@
 （左=图标+`AutoUnpacker`；中=状态 `● 运行中` / `队列 N`；右=`‹` `›` `⤢` `—` `✕`）。
 
 导航（规格 §4.2）：QStackedWidget 三页 + 浏览器式历史；`‹`/`›` 与 `Alt+←`/`Alt+→`；
-`Esc` 按页处理（CODE=忽略回 HOME、PW=取消回 HOME、HOME=什么都不做）。
+`Esc` 按页处理（CODE=忽略回 HOME、PW=取消回 HOME、HOME=与主界面一致：走 close_action）。
 
 红线：不弹任何子窗（CODE / PW 都在本窗换页，规格 §0 D2）；不做「同时存入永久口令本」
 （D4）；不加日志/设置/目录入口，只留一个 `⤢` 返回完整界面（D5）。
@@ -43,7 +43,7 @@ _MAX_W, _MAX_H = 460, 600          # 最大尺寸
 _EDGE = 5                          # 无边框窗的边缘缩放热区（px）
 _TITLE_H = 32                      # 自绘标题栏高
 _DEFAULT_MARGIN = 24               # 首次 / 越界回落：主屏右下角离边 24px
-_PAGE_KEYS = ("HOME", "CODE", "PW")
+_PAGE_KEYS = ("HOME", "CODE", "PW", "PICK")
 
 
 class _TitleBar(QWidget):
@@ -145,7 +145,6 @@ class CompactWindow(QWidget):
 
         # ---- 接线（页 -> 窗口）----
         self.home_page.addFilesRequested.connect(self._pick_files)
-        self.home_page.codeRequested.connect(lambda: self.enter_code("", "", ""))
         self.home_page.pwRequested.connect(self._open_pw)
         self.home_page.taskActivated.connect(self._open_task_dir)
         self.code_page.finished.connect(self.leave_code)
@@ -268,6 +267,110 @@ class CompactWindow(QWidget):
         except Exception:
             pass
         return ("", "")
+
+    # ================= 冻结接口：挑选要下载的文件（Alt+3，本窗内完成） =================
+    def _ensure_pick_page(self):
+        """懒建 PICK 页。
+
+        延迟 import + 延迟 addWidget：该页文件缺失或损坏时**绝不能**让小窗整个起不来，
+        也绝不能让 worker 静默挂死（拿不到页面就按取消唤醒它，见 enter_pick）。
+        """
+        page = getattr(self, "_pick_page", None)
+        if page is not None:
+            return page
+        try:
+            from .pages_pick import PickPage
+        except Exception as ex:
+            self._log("挑选页组件加载失败: %s" % ex)
+            return None
+        try:
+            page = PickPage(self._host, self.stack)
+            page.commitRequested.connect(self._on_pick_commit)
+            page.cancelRequested.connect(self._on_pick_cancel)
+            self.stack.addWidget(page)
+        except Exception as ex:
+            self._log("挑选页创建失败: %s" % ex)
+            return None
+        self._pick_page = page
+        return page
+
+    def enter_pick(self, req):
+        """把 worker 的挑选请求切到本窗 PICK 页（替代独立的 ShareFilesDialog）。
+
+        `req` 是 `_pick_share_worker` 推来的握手字典（prep/url/surl/event/pairs/
+        cancelled/answered）。数据层完全复用现有 `baidu_share.list_share_dir`，提交仍走
+        宿主既有的 `_on_share_pick_commit`（**提交只在 worker 线程发生**，本页不碰下载管线）。
+        取不到页面就按取消唤醒 worker，绝不静默挂死。返回是否已接管。
+        """
+        page = self._ensure_pick_page()
+        if page is None:
+            try:
+                self._host._abort_share_pick(req, "精简窗缺少挑选组件，已按取消处理")
+            except Exception:
+                pass
+            return False
+        prep = req.get("prep") or {}
+        entries = prep.get("entries") or []
+        try:
+            from ... import baidu_share as bs
+        except Exception:
+            bs = None
+
+        def _on_expand(path, _prep=prep):
+            if bs is None:
+                return (False, "缺少网盘组件")
+            return bs.list_share_dir(_prep, path)
+
+        try:
+            page.reset()
+            page.load(entries, _on_expand, subtitle=str(req.get("url") or ""))
+        except Exception as ex:
+            self._log("挑选页载入失败: %s" % ex)
+            try:
+                self._host._abort_share_pick(req, "精简窗挑选页载入失败")
+            except Exception:
+                pass
+            return False
+        self._pick_req = req
+        self._ensure_visible(True)
+        self.push_page("PICK")
+        return True
+
+    def _on_pick_commit(self, pairs):
+        """PICK 页确认：交回宿主既有提交回调（提交仍在 worker 线程完成）。"""
+        req = getattr(self, "_pick_req", None)
+        self._pick_req = None
+        if req is not None:
+            try:
+                self._host._on_share_pick_commit(req, list(pairs or []))
+            except Exception as ex:
+                self._log("挑选提交失败: %s" % ex)
+                try:
+                    self._host._abort_share_pick(req, "精简窗挑选提交失败")
+                except Exception:
+                    pass
+        self.leave_pick()
+
+    def _on_pick_cancel(self):
+        """PICK 页取消 / Esc：按取消唤醒 worker，绝不让它空等到超时。"""
+        req = getattr(self, "_pick_req", None)
+        self._pick_req = None
+        if req is not None:
+            try:
+                self._host._abort_share_pick(req, "已在精简窗取消挑选")
+            except Exception:
+                pass
+        self.leave_pick()
+
+    def leave_pick(self):
+        """离页：清空挑选页并回 HOME（与 CODE 页同款退出语义，历史重置为 [HOME]）。"""
+        page = getattr(self, "_pick_page", None)
+        if page is not None:
+            try:
+                page.reset()
+            except Exception:
+                pass
+        self.reset_history("HOME")
 
     # ================= 冻结接口：导航（测试直接使用） =================
     def push_page(self, key):
@@ -418,7 +521,8 @@ class CompactWindow(QWidget):
     # ================= 内部：页面切换 / 历史按钮 =================
     def _switch_page(self, key):
         page = {"HOME": self.home_page, "CODE": self.code_page,
-                "PW": self.pw_page}.get(str(key or ""))
+                "PW": self.pw_page,
+                "PICK": getattr(self, "_pick_page", None)}.get(str(key or ""))
         if page is not None:
             try:
                 self.stack.setCurrentWidget(page)
@@ -537,12 +641,25 @@ class CompactWindow(QWidget):
 
     # ================= 内部：Esc / 关闭 / ⤢ =================
     def _on_esc(self):
-        """Esc：CODE=忽略回 HOME；PW=取消回 HOME；HOME=什么都不做（规格 §9）。"""
+        """Esc：CODE=忽略回 HOME；PW=取消回 HOME；HOME=与主界面一致（走 close_action）。
+
+        HOME 这一支必须调 `_on_close_clicked`——它已忠实实现 `close_action`
+        （tray=隐藏到托盘 / exit=关掉整个程序 / ask=弹询问并记住选择），**不能**用
+        `self.close()`：小窗的 closeEvent 只 accept、不读 close_action，那样会把
+        「用户把 Esc 设成关闭程序」变成「只是关掉小窗」。用户要求小窗是大窗的清爽化，
+        该有的一致性都得有。
+        """
         key = self.current_page_key()
         if key == "CODE":
             self.code_page.request_ignore()
         elif key == "PW":
             self.pw_page.request_cancel()
+        elif key == "PICK":
+            page = getattr(self, "_pick_page", None)
+            if page is not None:
+                page.request_cancel()
+        else:
+            self._on_close_clicked()
 
     def _on_full_clicked(self):
         """`⤢` 返回完整界面：优先走宿主互斥切换（唯一入口，D5）。"""
@@ -597,11 +714,17 @@ class CompactWindow(QWidget):
         except Exception:
             result = None
         if not result:
-            return                       # 用户取消：小窗保持原样
+            return                       # 宿主没给出结果（异常等）：小窗保持原样
         try:
             choice, remember = result
         except Exception:
             return
+        # ⚠️ 必须单独判 None：宿主 `_ask_close_action()` 返回的是 **(结果, 是否记住)**
+        # 二元组，用户取消时是 `(None, False)`——元组本身是「真值」，上面的
+        # `if not result` 拦不住它。漏了这条，用户点「取消」会掉进下面的 else 被当成
+        # tray（隐藏到托盘），与主界面「取消=中止关闭」正好相反。
+        if choice is None:
+            return                       # 用户在询问里取消：小窗保持原样
         if remember:
             try:
                 self._host.state.set("close_action", choice)

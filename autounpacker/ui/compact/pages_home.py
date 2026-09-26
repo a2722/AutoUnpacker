@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""HOME 页：拖放落区（52px 虚线，拖动进入时高亮）+ 紧凑任务列表 + 底部三按钮。
+"""HOME 页：拖放落区（52px 虚线，拖动进入时高亮）+ 紧凑任务列表 + 底部两按钮。
 
-按钮（40px 区）：`＋ 添加文件` / `提取码` / `新增口令`——只发信号，
-具体动作（QFileDialog、进 CODE / PW 页）由 `CompactWindow` 统一处理，
-本页不直接碰宿主私有入口，便于测试与复用。
+按钮（40px 区）：`＋ 添加文件` / `新增口令`——只发信号，具体动作（QFileDialog、
+进 PW 页）由 `CompactWindow` 统一处理，本页不直接碰宿主私有入口，便于测试与复用。
+
+**刻意不放「提取码」入口**：提取码页只应在**真的需要填码**时出现（复制的 pan.baidu
+缺码、二维码指向的 pan.baidu 缺码、分享链接带的码不对……这些都由分享流程自己路由到
+CODE 页）。给一个常驻按钮等于诱导用户去手填一个与当前分享无关的码。
 """
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
@@ -18,7 +21,6 @@ class HomePage(QWidget):
     """主界面页：看队列、拖文件、进提取码 / 新增口令页。"""
 
     addFilesRequested = pyqtSignal()
-    codeRequested = pyqtSignal()
     pwRequested = pyqtSignal()
     taskActivated = pyqtSignal(int)
 
@@ -61,7 +63,7 @@ class HomePage(QWidget):
         self.task_list.taskActivated.connect(self.taskActivated)
         root.addWidget(self.task_list, 1)
 
-        # ---- 底部三按钮（40px 区）----
+        # ---- 底部两按钮（40px 区）----
         foot = QWidget(self)
         foot.setFixedHeight(40)
         foot_lay = QHBoxLayout(foot)
@@ -69,23 +71,19 @@ class HomePage(QWidget):
         foot_lay.setSpacing(6)
         self.add_btn = QPushButton("＋ 添加文件", foot)
         self.add_btn.setObjectName("primary")
-        self.code_btn = QPushButton("提取码", foot)
         self.pw_btn = QPushButton("新增口令", foot)
-        for btn in (self.add_btn, self.code_btn, self.pw_btn):
+        for btn in (self.add_btn, self.pw_btn):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setMinimumHeight(30)
             btn.setFocusPolicy(Qt.NoFocus)
         self.add_btn.setToolTip("选择压缩包（与拖拽同一条入队路径）")
-        self.code_btn.setToolTip("输入分享提取码")
         self.pw_btn.setToolTip("新增永久口令（存入口令本）")
         foot_lay.addWidget(self.add_btn, 1)
-        foot_lay.addWidget(self.code_btn, 1)
         foot_lay.addWidget(self.pw_btn, 1)
         root.addWidget(foot)
 
         # 信号转信号：clicked 会带一个 bool，不能直接连到无参信号上
         self.add_btn.clicked.connect(lambda *_: self.addFilesRequested.emit())
-        self.code_btn.clicked.connect(lambda *_: self.codeRequested.emit())
         self.pw_btn.clicked.connect(lambda *_: self.pwRequested.emit())
 
     # ---- 拖拽高亮（由 CompactWindow 的 dragMove/dragLeave 驱动）----
@@ -103,14 +101,23 @@ class HomePage(QWidget):
         """刷新任务列表与小标题；返回计数字典（供窗口状态区复用）。"""
         counts = self.task_list.refresh()
         try:
-            queue_n = int(counts.get("queue", 0) or 0)
-            history_n = int(counts.get("history", 0) or 0)
-            doing = int(counts.get("extracting", 0) or 0)
-            done = int(counts.get("done", 0) or 0)
-            if queue_n + history_n <= 0:
+            # 列表已按口径滤掉「已完成」（见 CompactTaskList.refresh），小标题也必须
+            # 一起改口：绝不能出现「写着 N 完成、列表里一个都没有」的自相矛盾。
+            queue_n = max(0, int(counts.get("queue", 0) or 0))
+            doing = max(0, int(counts.get("extracting", 0) or 0))
+            failed = max(0, int(counts.get("failed", 0) or 0))
+            waiting = max(0, queue_n - doing)
+            parts = []
+            if doing:
+                parts.append("%d 进行" % doing)
+            if waiting:
+                parts.append("%d 待处理" % waiting)
+            if failed:
+                parts.append("%d 失败" % failed)
+            if not parts:
                 self.head.hide()
             else:
-                self.head.setText("队列 · %d 进行 / %d 完成" % (doing, done))
+                self.head.setText("队列 · " + " / ".join(parts))
                 self.head.show()
         except Exception:
             pass

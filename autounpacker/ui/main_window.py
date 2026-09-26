@@ -3536,6 +3536,18 @@ class MainWindow(QMainWindow):
         投递一条托盘提示。挑选组件缺失时退化为整包提交，不让用户干等、也不改变既有
         行为。`finished`（接受/取消/×/Esc 都会触发）兜底唤醒，避免用户关闭挑选窗后
         worker 一直阻塞。"""
+        # 精简模式：挑选也必须在**本窗内**完成（规格 D2：不弹任何子窗）。把 req 直接交给
+        # 小窗的 PICK 页，并绕开下面「主窗不可见就取消」的分支——小窗开着时主窗本就是隐藏的。
+        _cw = getattr(self, "_compact_window", None)
+        if _cw is not None and self.is_compact():
+            try:
+                _cw.enter_pick(req)
+            except Exception as e:
+                try:
+                    self._abort_share_pick(req, f"精简窗挑选页打开失败: {e}")
+                except Exception:
+                    pass
+            return
         if not self.isVisible():
             self._abort_share_pick(req, "需要你选择文件：请打开主界面后重试")
             self._share_notify("分享需要选择文件",

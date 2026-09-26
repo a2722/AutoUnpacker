@@ -5,8 +5,9 @@
 - SettingsPage：9 个领域（解压与整理 / 删除与安全 / 通知与提醒 / 剪贴板与二维码 /
   链接与网盘 / 外观与快捷键 / 系统与维护 ／ 实验性、监听目录）覆盖
   config.DEFAULT_CONFIG 的全部键；
-- 列表默认极简：每行只有「名称 + 控件」；描述 / 默认值 / 配置键 / 风险说明
-  一律**悬停满 700ms 或点击名称**后由浮层气泡给出（点击可固定，点空白/Esc 收起）；
+- 列表默认极简：每行只有「名称 + 控件」；描述 / 风险说明一律**悬停满 700ms
+  或点击名称**后由浮层气泡给出（只显示标题 + 描述；点击可固定并跟随窗口，
+  点气泡外任意处 / Esc 收起）；
 - 「改即存」：每个控件变更即走 AppState.set()（config.save_config 原子写），
   文本 / 多行编辑 400ms 防抖、失焦立即落盘；写后回读磁盘校验，失败如实回报；
 - 「恢复默认」：**底部唯一入口**，先选范围（整个程序 / 本页）→ 警告 → 再次确认；
@@ -16,13 +17,14 @@
 - 目录（领域导航）：左侧 QListWidget#settingsCat，宽 236px；点选即整页换成该领域
   （不是长滚动 + 定位）；切领域视口回到顶部；
 - 监听目录不再在本页增删改（页头胶囊条 → WatchDirDialog 已覆盖），本页把
-  watch_paths 逐条原样写回，绝不丢字段；每张目录卡固定 6 个字段；
+  watch_paths 逐条原样写回，绝不丢字段；每张目录卡固定 6 个字段，
+  「打开目录设置」就在该卡的虚线页脚里（按卡片绑定 idx，不再共用按钮）；
 - #stripHint 描述行：11px CJK 墨迹几乎顶满 em 框，QLabel 折行高度按
   fontMetrics().height() 算、绘制按 lineSpacing() 排，默认上下各裁 1px；
   由 QSS padding + polish 后的 _fit_hint() 兜底（见 style.py 注释）；
 - 主题：走既有 ui_style.resolve_theme + apply_theme + ui_theme_cached + 回调
-  路径，绝不手写 QSS、绝不新增主题 token（风险徽章 / 呼吸灯 / 偏离小圆点 /
-  气泡都在 refresh_theme() 里重贴）。
+  路径，绝不手写 QSS、绝不新增主题 token（风险徽章 / 呼吸灯 / 气泡都在
+  refresh_theme() 里重贴）。
 
 关键入口：SettingsPage
 依赖：PyQt5、config（DEFAULT_CONFIG/_sanitize_cfg/load_config）、style（PALETTE）、
@@ -39,22 +41,23 @@
 """
 import json
 
-from PyQt5.QtCore import (QEvent, QPoint, QPropertyAnimation, QRectF, QSize,
-                          QTimer, Qt, pyqtSignal)
-from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt5.QtCore import (QEvent, QPoint, QPropertyAnimation, QRect, QRectF,
+                          QSize, QTimer, Qt, pyqtSignal)
+from PyQt5.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-                             QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-                             QLineEdit, QListWidget, QMessageBox,
+                             QFrame, QGraphicsDropShadowEffect,
+                             QGraphicsOpacityEffect, QGridLayout, QHBoxLayout,
+                             QLabel, QLineEdit, QListWidget, QMessageBox,
                              QPlainTextEdit, QPushButton, QRadioButton,
                              QScrollArea, QSizePolicy, QSpinBox, QStyle,
-                             QVBoxLayout, QWidget)
+                             QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from ..config import DEFAULT_CONFIG, _sanitize_cfg
 from ..config import load_config
 from . import style as ui_style
-from .style import PALETTE
-from .widgets import Glyph, HotkeyEdit
+from .style import METRICS, PALETTE
+from .widgets import Glyph, HotkeyEdit, repolish_tree
 
 # 主题偏好与显示名（设置页主题下拉的唯一真源）
 _THEME_ITEMS = (("跟随系统", "auto"), ("浅色", "fluent"), ("深色", "devtool"))
@@ -70,8 +73,13 @@ _VERIFY_SKIP = ("watch_paths", "url_trust", "url_redirect_rules")
 # 文本 / 多行编辑的防抖间隔（停止输入多久后落盘；失焦立即落盘）
 _TEXT_DEBOUNCE_MS = 400
 
+# #stripHint 类说明标签（折行高度兜底 + 气泡正文）：见 _fit_all_hints / eventFilter
+_HINT_NAMES = ("stripHint", "bubbleHint", "bubbleDesc", "bubbleRiskBody")
+
 # 补充信息气泡：悬停延迟（对齐现有设置页的 Qt 原生 tooltip 唤醒延迟 = 700ms）
 _BUBBLE_DELAY_MS = 700
+# 补充信息气泡目标宽度（§7：宽 380，上限 屏宽-24）
+_BUBBLE_W = 380
 # 风险徽章呼吸时长（往更高风险方向改动时；10 秒后停回常态色）
 _BREATH_TOTAL_MS = 10000
 _BREATH_STEP_MS = 500
@@ -128,13 +136,6 @@ def _glyph_icon(name, size=16):
         return QIcon(pm)
     except Exception:
         return QIcon()
-
-
-def _common(entries, key):
-    """取所有监听目录条目某字段的共同值，返回 (value, all_same)。"""
-    values = [e.get(key) for e in entries]
-    first = values[0] if values else None
-    return first, all(v == first for v in values)
 
 
 def _parse_domain_lines(text):
@@ -197,24 +198,6 @@ def _format_redirect_rules(rules):
     return "\n".join(lines)
 
 
-def _default_display(value):
-    """把 DEFAULT_CONFIG 的真值渲染成气泡里「默认：<值>」的短字符串。
-
-    刻意保持简短与类型安全：列表 / 字典给结构化摘要，布尔给「开 / 关」，
-    其余直接 str()。这里**只读运行时真值**，绝不抄设计稿的显示串。"""
-    if isinstance(value, bool):
-        return "开" if value else "关"
-    if value is None:
-        return "—"
-    if isinstance(value, (list, tuple)):
-        return "（空）" if not value else "%d 项" % len(value)
-    if isinstance(value, dict):
-        return "（空）" if not value else "%d 项" % len(value)
-    if value == "":
-        return "（空）"
-    return str(value)
-
-
 class _SettingRow:
     """一行设置的元数据（名称 / 描述 / 同义词 / 配置键 / 控件 / 风险）。
 
@@ -246,6 +229,221 @@ class _SettingRow:
         return " ".join(str(p).lower() for p in parts if p)
 
 
+def _apply_card_shadow(widget, kind="card"):
+    """给卡片挂 QGraphicsDropShadowEffect（§6.2；QSS 无 box-shadow）。
+
+    只给「领域卡片 / 目录卡片 / 气泡 / 模态」这类少量容器挂，**不给每一行挂**
+    （每行一个 effect 会走 pixmap 缓存，页内几十张卡就卡）。
+    一个 widget 只能有一个 QGraphicsEffect；主题切换后由 refresh_theme() 重建
+    （暗色阴影更重，颜色不同）。返回创建的 effect。
+    """
+    spec = ui_style.shadow_spec(kind)
+    eff = QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(float(spec["blur"]))
+    eff.setOffset(0.0, float(spec["dy"]))
+    eff.setColor(QColor(0, 0, 0, int(spec["alpha"])))
+    widget.setGraphicsEffect(eff)
+    return eff
+
+
+class _RailDelegate(QStyledItemDelegate):
+    """左栏选中项：在 QSS 底色/粗体之上，再画一条左侧 3px 主色竖条（§6.1）。
+
+    QSS 在 `::item` 上画 `border-left` 不可靠，故用委托自绘：颜色每次 paint 现取
+    `ui_style.tokens()["primary_bg"]`，主题切换只需重绘（不缓存颜色）。竖条上下
+    各内缩 7px、圆角 2px（radius_bar），与设计稿 `.nav-item.is-on::before` 一致。
+    """
+
+    _INSET = 7
+    _WIDTH = 3
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if option.state & QStyle.State_Selected:
+            tk = ui_style.tokens()
+            bar = QRect(int(option.rect.left()), int(option.rect.top()) + self._INSET,
+                        self._WIDTH,
+                        max(0, int(option.rect.height()) - self._INSET * 2))
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(bar), 2.0, 2.0)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.fillPath(path, QColor(tk["primary_bg"]))
+            painter.restore()
+
+
+class _ResetScopeBox(QMessageBox):
+    """恢复默认 · 第一步「选范围」：样式化模态（§7：头 / 警告块 / 范围卡 / 页脚）。
+
+    为什么仍是 QMessageBox：离线验收把这一步锁定为 `QMessageBox.exec_()` 与按钮
+    文案（`整个程序` / `本页（…）` / `取消`，见 test_page_settings.py F1/F3）。
+    所以做法是——保留三个隐藏的标准按钮（供测试 `buttons()` / `clickedButton()`
+    契约与假 exec_ 点击），把系统图标 / 文本 / 按钮盒藏起来，自建卡片式内容：
+    头（标题 + ✕）/ 警告块（#warnBox）/ 范围卡（QRadioButton#scopeItem，含副标题）
+    / 页脚（取消 + 下一步 #primary）。真实使用时点自建按钮走 `_scope`；
+    测试路径下 `_scope` 为空，回退到 `clickedButton()`（`chosen()`）。
+    """
+
+    def __init__(self, parent, dname, n_page):
+        super().__init__(parent)
+        self.setObjectName("modalCard")
+        self.setWindowTitle("恢复默认")
+        self.setIcon(QMessageBox.NoIcon)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setModal(True)
+        self._scope = None
+        # 隐藏标准按钮：测试按文案点击 / 读取，真实界面不可见
+        self._all_btn = self.addButton("整个程序", QMessageBox.AcceptRole)
+        self._page_btn = self.addButton("本页（%s · %d 项）" % (dname, n_page),
+                                        QMessageBox.AcceptRole)
+        self._cancel_btn = self.addButton("取消", QMessageBox.RejectRole)
+        for b in (self._all_btn, self._page_btn, self._cancel_btn):
+            b.hide()
+        for name in ("qt_msgbox_label", "qt_msgbox_informativelabel",
+                     "qt_msgboxex_icon_label"):
+            w = self.findChild(QLabel, name)
+            if w is not None:
+                w.hide()
+        try:
+            from PyQt5.QtWidgets import QDialogButtonBox
+            bb = self.findChild(QDialogButtonBox)
+            if bb is not None:
+                bb.hide()
+        except Exception:
+            pass
+
+        host = QWidget(self)
+        v = QVBoxLayout(host)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # 头：标题 + 关闭
+        head = QFrame(host)
+        head.setObjectName("modalHead")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(16, 14, 16, 14)
+        hl.setSpacing(10)
+        title = QLabel("恢复默认", head)
+        title.setObjectName("modalTitle")
+        hl.addWidget(title)
+        hl.addStretch(1)
+        close_btn = QPushButton(head)
+        close_btn.setObjectName("modalClose")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("取消")
+        cl = QHBoxLayout(close_btn)
+        cl.setContentsMargins(0, 0, 0, 0)
+        glyph = Glyph("close", close_btn, 12, role="muted")
+        glyph.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        cl.addWidget(glyph, 0, Qt.AlignCenter)
+        close_btn.clicked.connect(self.reject)
+        hl.addWidget(close_btn)
+        v.addWidget(head)
+
+        # 体：警告块 + 范围卡 + 明细
+        body = QWidget(host)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(16, 16, 16, 16)
+        bl.setSpacing(14)
+        warn = QFrame(body)
+        warn.setObjectName("warnBox")
+        wl = QHBoxLayout(warn)
+        wl.setContentsMargins(12, 10, 12, 10)
+        wl.setSpacing(10)
+        wicon = Glyph("alert", warn, 16, role="muted")
+        wl.addWidget(wicon, 0, Qt.AlignTop)
+        wtext = QLabel("恢复默认会覆盖你当前的设置，且不能撤销。请先选择要恢复的范围。",
+                       warn)
+        wtext.setObjectName("warnText")
+        wtext.setWordWrap(True)
+        wl.addWidget(wtext, 1)
+        bl.addWidget(warn)
+
+        self._group = QButtonGroup(self)
+        self._radios = {}
+        for value, name, sub in (
+                ("all", "整个程序",
+                 "全部 %d 项设置恢复为出厂默认" % len(DEFAULT_CONFIG)),
+                ("page", "本页",
+                 "只恢复「%s」这一页的 %d 项" % (dname, n_page))):
+            rb = QRadioButton(body)
+            rb.setObjectName("scopeItem")
+            rb.setCursor(Qt.PointingHandCursor)
+            rl = QVBoxLayout(rb)
+            rl.setContentsMargins(26, 0, 0, 0)   # 让开左侧指示器
+            rl.setSpacing(2)
+            nm = QLabel(name, rb)
+            nm.setObjectName("scopeName")
+            nm.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            rl.addWidget(nm)
+            sb = QLabel(sub, rb)
+            sb.setObjectName("scopeSub")
+            sb.setWordWrap(True)
+            sb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            rl.addWidget(sb)
+            # QRadioButton.sizeHint 不含子布局 → 手动给足卡片高度（上下 padding + 两行）
+            rb.setMinimumHeight(int(rl.sizeHint().height()) + 24)
+            self._group.addButton(rb)
+            self._radios[value] = rb
+            bl.addWidget(rb)
+        self._radios["all"].setChecked(True)
+        v.addWidget(body)
+
+        # 脚：取消 + 下一步（右对齐）
+        foot = QFrame(host)
+        foot.setObjectName("modalFoot")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(16, 12, 16, 12)
+        fl.setSpacing(10)
+        fl.addStretch(1)
+        cancel_btn = QPushButton("取消", foot)
+        cancel_btn.clicked.connect(self.reject)
+        fl.addWidget(cancel_btn)
+        next_btn = QPushButton("下一步", foot)
+        next_btn.setObjectName("primary")
+        next_btn.setCursor(Qt.PointingHandCursor)
+        next_btn.clicked.connect(self._on_next)
+        fl.addWidget(next_btn)
+        v.addWidget(foot)
+
+        # 自建内容占据原「按钮盒」那一行（隐藏项不参与布局）
+        try:
+            self.layout().addWidget(host, 3, 0, 1, 2)
+        except Exception:
+            pass
+        # QMessageBox 在 showEvent 里会按（被隐藏的）文本标签把宽度钉死，
+        # 故内容自身给足最小宽度，并在 showEvent 之后再锁 480（§7）。
+        host.setMinimumWidth(448)
+        try:
+            _apply_card_shadow(self, "pop")
+        except Exception:
+            pass
+
+    def showEvent(self, event):   # noqa: N802 (Qt 命名)
+        super().showEvent(event)
+        try:
+            self.setFixedWidth(480)
+        except Exception:
+            pass
+
+    def _on_next(self):
+        for value, rb in self._radios.items():
+            if rb.isChecked():
+                self._scope = value
+                break
+        self.accept()
+
+    def chosen(self):
+        """返回 'all' / 'page'；取消（含 Esc / ✕）返回 None。"""
+        if self._scope is not None:
+            return self._scope
+        clicked = self.clickedButton()
+        if clicked is None or clicked is self._cancel_btn:
+            return None
+        return "page" if clicked is self._page_btn else "all"
+
+
 class _Switch(QCheckBox):
     """胶囊开关（pill switch）：自绘「药丸轨道 + 圆形滑块」的布尔控件。
 
@@ -258,7 +456,10 @@ class _Switch(QCheckBox):
       只存在于 tokens，不在内联 PALETTE 里，见 `style.tokens()` 文档：自绘控件
       走只读 token），所以主题切换只需 `update()` 就会自动换色——不新增 color
       token、不硬编码颜色 / 圆角、不加 QSS 规则。
-    - 尺寸固定 38x20；指针为手型；OFF / ON / ON+hover / disabled 四态见 paint。"""
+    - 尺寸固定 38x20；指针为手型；OFF / ON / ON+hover / disabled 四态见 paint。
+      注意：v1 视觉规格 §6.3 写「36×20」，但离线验收
+      `test_settings_switch_and_bubble.py`（S2/S3-S5 逐像素采样）把 38×20 锁定
+      为契约——按「绝不削弱测试」的纪律保留 38×20，差异见交回清单。"""
 
     _WIDTH = 38
     _HEIGHT = 20
@@ -273,6 +474,15 @@ class _Switch(QCheckBox):
 
     def minimumSizeHint(self):
         return QSize(self._WIDTH, self._HEIGHT)
+
+    def hitButton(self, pos):   # noqa: N802 (Qt 命名)
+        """整块药丸都是点击区（修「只有左半区可点」）。
+
+        QCheckBox 默认只认 `SE_CheckBoxClickRect`（指示器 + 文字矩形）；本类完全
+        自绘、不带文字，于是右半区点不动。返回 `rect().contains(pos)` 让整块
+        38×20 都能切换；状态语义仍全部走 QCheckBox（Space / setChecked /
+        toggled 一字不变）。"""
+        return self.rect().contains(pos)
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -327,9 +537,9 @@ class _Switch(QCheckBox):
 class _InfoBubble(QFrame):
     """补充信息气泡：无边框浮层，定位到名称下方（不就地展开、不阻塞）。
 
-    内容：名称（+ 风险徽章）/ 描述 / 默认：<值> / 配置键：<key> /
-    风险说明（仅 risk=high）/ 底部操作提示。同一时刻只允许一个（由 SettingsPage
-    统一持有并复用）。"""
+    内容只保留用户可见的两段：名称（+ 风险徽章）/ 描述；风险项追加风险说明块。
+    「默认：<值> / 配置键：<key>」与底部操作提示属**内部信息**，已按评审移除。
+    同一时刻只允许一个（由 SettingsPage 统一持有并复用）。"""
 
     def __init__(self, parent=None):
         # 非 Qt.Popup：Popup 会抓鼠标，第二次点击（取消固定）会被弹窗吞掉，
@@ -338,70 +548,76 @@ class _InfoBubble(QFrame):
         # 页面空白处点击（SettingsPage.mousePressEvent）与 Esc 仍可收起。
         super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setObjectName("settingsBubble")
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._shadow = None
         self._lay = QVBoxLayout(self)
-        self._lay.setContentsMargins(12, 10, 12, 10)
-        self._lay.setSpacing(6)
+        self._lay.setContentsMargins(14, 12, 14, 12)
+        self._lay.setSpacing(8)
         self._title = QLabel(self)
-        self._title.setObjectName("sectionTitle")
+        self._title.setObjectName("bubbleTitle")
         self._title.setWordWrap(True)
         self._lay.addWidget(self._title)
         self._desc = QLabel(self)
-        self._desc.setObjectName("stripHint")
+        self._desc.setObjectName("bubbleDesc")
         self._desc.setWordWrap(True)
         self._lay.addWidget(self._desc)
-        self._meta = QLabel(self)
-        self._meta.setObjectName("stripHint")
-        self._meta.setWordWrap(True)
-        self._lay.addWidget(self._meta)
         self._risk_box = QFrame(self)
         self._risk_box.setObjectName("bubbleRisk")
         rb = QVBoxLayout(self._risk_box)
-        rb.setContentsMargins(10, 8, 10, 8)
-        rb.setSpacing(3)
+        rb.setContentsMargins(11, 9, 11, 9)
+        rb.setSpacing(6)
+        self._risk_title = QLabel("风险提示", self._risk_box)
+        self._risk_title.setObjectName("bubbleRiskTitle")
+        rb.addWidget(self._risk_title)
         self._risk_lbl = QLabel(self._risk_box)
+        self._risk_lbl.setObjectName("bubbleRiskBody")
         self._risk_lbl.setWordWrap(True)
         rb.addWidget(self._risk_lbl)
         self._lay.addWidget(self._risk_box)
-        self._foot = QLabel("悬停片刻或点击名称可见 · 点击可固定 · 点空白处收起", self)
-        self._foot.setObjectName("stripHint")
-        self._foot.setWordWrap(True)
-        self._lay.addWidget(self._foot)
+        # 气泡阴影（pop；只挂一次，主题切换时重建颜色）
+        try:
+            self._shadow = _apply_card_shadow(self, "pop")
+        except Exception:
+            self._shadow = None
+
+    def move_to(self, anchor_global_pos):
+        """把气泡贴到锚点下方（含屏幕边界兜底；固定态跟随窗口时复用）。"""
+        x = int(anchor_global_pos.x())
+        y = int(anchor_global_pos.y()) + 22
+        try:
+            screen = QApplication.desktop().availableGeometry(self)
+        except Exception:
+            screen = None
+        if screen is not None:
+            if x + self.width() > screen.right():
+                x = max(screen.left(), screen.right() - self.width())
+            if y + self.height() > screen.bottom():
+                y = max(screen.top(),
+                        int(anchor_global_pos.y()) - self.height() - 6)
+        self.move(QPoint(int(x), int(y)))
 
     def show_for(self, row, anchor_global_pos):
-        """按行元数据填充内容并显示到 anchor 下方。"""
+        """按行元数据填充内容（标题 / 描述 / 风险说明）并显示到 anchor 下方。"""
         self._title.setText(row.label)
         self._desc.setText(row.desc or "")
-        # 默认值：优先用登记时捕获的默认（延迟取 DEFAULT_CONFIG），否则现读
-        dv = row.default_value
-        if row.default_key is not None and row.default_key in DEFAULT_CONFIG:
-            dv = DEFAULT_CONFIG.get(row.default_key)
-        meta = "默认：%s    ·    配置键：%s" % (
-            _default_display(dv if dv is not None else "—"), row.key)
-        self._meta.setText(meta)
         if row.risk:
             self._risk_box.setVisible(True)
             self._risk_lbl.setText(
                 "影响范围：会改变磁盘上的文件或降低连接安全性\n"
                 "后果：重则丢失源文件 / 被中间人攻击，且不可撤销\n"
                 "如何改回：把本项改回「默认」即可（可在底部「恢复默认」一键还原本页）")
-            self._risk_box.setStyleSheet(
-                "QFrame#bubbleRisk { background: %s; border: 1px solid %s;"
-                " border-radius: 4px; }" % (PALETTE["warn_bg"], PALETTE["warn_border"]))
-            self._risk_lbl.setStyleSheet("color: %s;" % PALETTE["danger"])
         else:
             self._risk_box.setVisible(False)
+        # 宽度 380（上限 屏宽-24）：先定宽再尺寸适配，避免长描述把气泡撑宽
+        try:
+            avail = int(QApplication.desktop().availableGeometry(self).width()) - 24
+        except Exception:
+            avail = _BUBBLE_W
+        self.setFixedWidth(max(260, min(_BUBBLE_W, avail)))
         self.adjustSize()
-        x = int(anchor_global_pos.x())
-        y = int(anchor_global_pos.y()) + 22
-        screen = QApplication.desktop().availableGeometry(self)
-        if x + self.width() > screen.right():
-            x = max(screen.left(), screen.right() - self.width())
-        if y + self.height() > screen.bottom():
-            y = max(screen.top(), int(anchor_global_pos.y()) - self.height() - 6)
-        self.move(QPoint(int(x), int(y)))
+        self.move_to(anchor_global_pos)
         self.show()
         self.raise_()
 
@@ -450,12 +666,19 @@ class SettingsPage(QWidget):
         self._bubble_timer = None  # 悬停 700ms 单发计时器
         self._breath_timers = {}   # 徽章 -> (QTimer, 剩余步数)
         self._risk_badges = {}     # 配置键 -> 徽章 QLabel（呼吸 / 重贴用）
-        self._dev_dots = {}        # 配置键 -> 偏离默认小圆点 QLabel
         self._name_labels = {}     # id(名称标签) -> (标签, _SettingRow)
         self._pending_name = None  # 悬停中的名称标签（700ms 计时器用）
         self._result_card = None   # 搜索结果容器（搜索态用）
         self._domain_box = None
         self._domain_id = "unzip"
+        self._group_open = False   # 当前领域是否已经开过分组（[first=true] 用）
+        self._shadow_widgets = []  # 挂了 QGraphicsDropShadowEffect 的卡片（主题切换重建）
+        self._search_icon_act = None
+        self._flash_timer = None
+        self._hit_labels = {}      # 领域 id -> 页头命中数标签（#hitTotal）
+        self._bubble_anchor = None       # 气泡锚点（名称标签）；固定态跟随重定位用
+        self._outside_filter_on = False  # app 级「点外部收起」过滤器是否挂着
+        self._follow_target = None       # 已挂事件过滤器的顶层窗口（跟随移动/缩放）
 
         self._build_ui()
         self._load_from_cfg()
@@ -466,20 +689,26 @@ class SettingsPage(QWidget):
     def _build_ui(self):
         self._sections = []
         self._section_cards = {}
+        self._shadow_widgets = []
+        # 页面根：窗口底色由 QSS（QWidget#settingsPage）+ WA_StyledBackground 提供
+        self.setObjectName("settingsPage")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 左右两栏：[领域导航 | 右侧内容]；导航不随内容滚动。
+        # 左右两栏：[领域导航 | 右侧内容]；导航不随内容滚动；两栏之间无额外缝（§4）。
         body = QHBoxLayout()
-        body.setContentsMargins(12, 0, 0, 0)
-        body.setSpacing(8)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
 
         self.cat_list = QListWidget(self)
         self.cat_list.setObjectName("settingsCat")
-        self.cat_list.setFixedWidth(236)
+        self.cat_list.setFixedWidth(METRICS["rail_w"])
         self.cat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.cat_list.setToolTip("选择一个领域查看该领域的设置。")
+        # 选中左侧 3px 主色竖条：QSS 在 ::item 上不可靠 → 委托自绘（§6.1）
+        self.cat_list.setItemDelegate(_RailDelegate(self.cat_list))
         self.cat_list.currentRowChanged.connect(self._on_cat_row_changed)
         body.addWidget(self.cat_list)
 
@@ -491,14 +720,22 @@ class SettingsPage(QWidget):
 
         top = QFrame(right)
         top.setObjectName("settingsTop")
+        top.setMinimumHeight(METRICS["topbar_h"])
         t = QHBoxLayout(top)
-        t.setContentsMargins(0, 10, 12, 8)
-        t.setSpacing(8)
+        t.setContentsMargins(16, 9, 16, 9)
+        t.setSpacing(12)
         self.search_edit = QLineEdit(top)
-        self.search_edit.setPlaceholderText("搜索设置项")
+        self.search_edit.setObjectName("settingsSearch")
+        self.search_edit.setPlaceholderText("搜索设置项（名称 / 说明 / 配置键）")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setMinimumWidth(220)
-        self.search_edit.setMaximumWidth(360)
+        self.search_edit.setFixedSize(METRICS["search_w"], METRICS["search_h"])
+        # 内嵌搜索图标：QSS 无法内嵌图标 → QLineEdit.addAction（§11 决定：做）。
+        # 装饰性 action 不抢焦点；主题切换时在 refresh_theme() 里重贴图标色。
+        try:
+            self._search_icon_act = self.search_edit.addAction(
+                _glyph_icon("search", 15), QLineEdit.LeadingPosition)
+        except Exception:
+            self._search_icon_act = None
         self.search_edit.textChanged.connect(self._on_search_changed)
         t.addWidget(self.search_edit)
         t.addStretch(1)
@@ -507,13 +744,15 @@ class SettingsPage(QWidget):
         self.wizard_btn.setCursor(Qt.PointingHandCursor)
         self.wizard_btn.setToolTip("可跳过，跳过后不再显示")
         self.wizard_btn.clicked.connect(self._on_wizard_clicked)
-        t.addWidget(self.wizard_btn)
+        t.addLayout(self._btn_with_sub(top, self.wizard_btn, "可跳过"))
         # 登记向导键（覆盖契约：settings_wizard_done 必须有归属控件）
         self._reg("settings_wizard_done", self.wizard_btn)
-        self.import_btn = QPushButton("导入 / 导出（规划中）", top)
-        self.import_btn.setEnabled(False)
-        self.import_btn.setToolTip("规划中")
-        t.addWidget(self.import_btn)
+        self.import_btn = QPushButton("导入 / 导出", top)
+        self.import_btn.setEnabled(True)
+        self.import_btn.setCursor(Qt.PointingHandCursor)
+        self.import_btn.setToolTip("把设置导出为 JSON 文件，或从 JSON 文件导入。")
+        self.import_btn.clicked.connect(self._on_config_io)
+        t.addLayout(self._btn_with_sub(top, self.import_btn, "JSON 文件"))
         rlay.addWidget(top)
 
         scroll = QScrollArea(right)
@@ -523,15 +762,23 @@ class SettingsPage(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.scroll = scroll
         inner = QWidget(scroll)
+        inner.setObjectName("paneHost")
         self._lay = QVBoxLayout(inner)
-        self._lay.setContentsMargins(0, 4, 12, 10)
-        self._lay.setSpacing(10)
+        # pane_pad=(16,18,24)：左右 18 给卡片阴影留白（§6.2 坑 2）
+        self._lay.setContentsMargins(18, 16, 18, 24)
+        self._lay.setSpacing(12)
         scroll.setWidget(inner)
         rlay.addWidget(scroll, 1)
         body.addWidget(right, 1)
         root.addLayout(body, 1)
+        # 固定气泡跟随：本页滚动时锚点标签的全局位置会变（valueChanged 里重定位）
+        try:
+            scroll.verticalScrollBar().valueChanged.connect(self._reposition_bubble)
+            scroll.horizontalScrollBar().valueChanged.connect(self._reposition_bubble)
+        except Exception:
+            pass
 
-        # 逐领域构建（每个领域 = 一个容器 QWidget，装标题 + 说明 + 分组 + 行）
+        # 逐领域构建（每个领域 = 一个容器 QWidget，装页头 + 卡片 + 分组 + 行）
         for did in _DOMAIN_ORDER:
             if did is None:
                 self._sections.append(None)   # 左栏分隔线占位（无对应领域容器）
@@ -544,21 +791,20 @@ class SettingsPage(QWidget):
 
         # 底部动作条（固定在滚动区之外）：唯一「恢复默认」+ 即时保存提示。
         foot = QFrame(self)
-        foot.setObjectName("dlgFoot")
+        foot.setObjectName("actionbar")
         f = QHBoxLayout(foot)
-        f.setContentsMargins(12, 8, 12, 10)
-        f.setSpacing(8)
-        f.addStretch(1)
+        f.setContentsMargins(18, 12, 18, 12)
+        f.setSpacing(12)
         self.notice_label = QLabel("", foot)
-        self.notice_label.setObjectName("stripHint")
+        self.notice_label.setObjectName("notice")
         self.notice_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        f.addWidget(self.notice_label)
+        f.addWidget(self.notice_label, 1)
         self.reset_btn = QPushButton("恢复默认", foot)
         self.reset_btn.setObjectName("danger")
         self.reset_btn.setCursor(Qt.PointingHandCursor)
         self.reset_btn.setToolTip("选择范围后把所有设置恢复为程序默认值（需再次确认）。")
         self.reset_btn.clicked.connect(self._on_reset)
-        f.addWidget(self.reset_btn)
+        f.addWidget(self.reset_btn, 0, Qt.AlignRight)
         root.addWidget(foot)
 
         # 惰性气泡 + 悬停计时器
@@ -567,40 +813,80 @@ class SettingsPage(QWidget):
         self._bubble_timer.setInterval(_BUBBLE_DELAY_MS)
         self._bubble_timer.timeout.connect(self._on_bubble_due)
 
+    def _btn_with_sub(self, parent, button, sub_text):
+        """把按钮 + 一行小字副标题装进竖排（设计稿 .btnwrap / .btn-sub）。"""
+        wrap = QVBoxLayout()
+        wrap.setContentsMargins(0, 0, 0, 0)
+        wrap.setSpacing(1)
+        wrap.addWidget(button)
+        sub = QLabel(str(sub_text), parent)
+        sub.setObjectName("btnSub")
+        sub.setAlignment(Qt.AlignHCenter)
+        wrap.addWidget(sub)
+        return wrap
+
     def _build_domain(self, did):
-        """建一个领域容器：标题 + 一句话说明（同一行）+ 一张带边框的卡片装所有行。"""
-        name, icon, desc = _DOMAIN_META[did]
+        """建一个领域容器：页头（大标题 + 描述 + 命中数）+ 卡片（分组 + 行）。
+
+        #settingsDomain 保留为透明容器；真正的卡片是 QFrame#card（含阴影），
+        监听目录领域用无卡片的 #dirsHost（每张目录卡自己就是卡片）。"""
+        name, _icon, desc = _DOMAIN_META[did]
         card = QWidget(self)
         card.setObjectName("settingsDomain")
         box = QVBoxLayout(card)
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(10)
+        box.setSpacing(12)
 
-        # 标题行：图标 + 领域名（粗）+ 一句话说明（灰，同行右侧）
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        head.addWidget(Glyph(icon, card, 15, role="muted"))
-        title = QLabel(name, card)
-        title.setObjectName("appTitle")
-        head.addWidget(title)
-        d = QLabel(desc, card)
+        # 页头（§4：新增 #pageHead；#hitTotal 搜索态显示「共 N 项命中」）
+        head = QWidget(card)
+        head.setObjectName("pageHead")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(12)
+        title = QLabel(name, head)
+        title.setObjectName("pageTitle")
+        hl.addWidget(title)
+        # 描述仍用 #stripHint（离线验收按该 objectName 度量折行高度），
+        # 视觉上由 [role="pageDesc"] 规则取 section_fg / 12.5px（§5）
+        d = QLabel(desc, head)
         d.setObjectName("stripHint")
-        head.addWidget(d)
-        head.addStretch(1)
-        box.addLayout(head)
+        d.setProperty("role", "pageDesc")
+        hl.addWidget(d)
+        hl.addStretch(1)
+        hit = QLabel("", head)
+        hit.setObjectName("hitTotal")
+        hit.setVisible(False)
+        hl.addWidget(hit)
+        self._hit_labels[did] = hit
+        box.addWidget(head)
 
-        # 行容器：一张卡片，内部用细分隔线分 组
-        rows_card = QFrame(card)
-        rows_card.setObjectName("card")
+        # 行卡片：常规领域是 #card（阴影）；监听目录领域是透明 #dirsHost
+        is_dirs = (did == "dirs")
+        rows_card = QWidget(card) if is_dirs else QFrame(card)
+        rows_card.setObjectName("dirsHost" if is_dirs else "card")
         rbox = QVBoxLayout(rows_card)
-        rbox.setContentsMargins(14, 4, 14, 4)
-        rbox.setSpacing(0)
+        if is_dirs:
+            rbox.setContentsMargins(0, 0, 0, 0)
+            rbox.setSpacing(12)
+        else:
+            # card_pad=(6,16,12)：上下内边距走布局（QSS padding 对普通 QWidget 常被忽略）
+            rbox.setContentsMargins(16, 6, 16, 12)
+            rbox.setSpacing(0)
+
+        # 卡片阴影：只给领域卡片挂（§6.2；一个 widget 一个 effect）
+        if not is_dirs:
+            try:
+                _apply_card_shadow(rows_card, "card")
+                self._shadow_widgets.append(rows_card)
+            except Exception:
+                pass
 
         self._lay.addWidget(card)
         self._section_cards[did] = card
         self._sections.append(did)
         self._domain_box = rbox            # 后续 _group/_row 追加到这里
         self._domain_id = did
+        self._group_open = False
 
         if did == "unzip":
             self._build_unzip(rbox)
@@ -621,21 +907,84 @@ class SettingsPage(QWidget):
         elif did == "dirs":
             self._build_dirs(rbox)
         box.addWidget(rows_card)
+        self._finalize_row_borders(rows_card)
+
+    def _finalize_row_borders(self, rows_card):
+        """每个分组内最后一条 #setRow 打上 [last="true"]（QSS 没有 :last-child，§10）。
+
+        构建期（widget 首次 polish 之前）设置动态属性即可；QSS 在 show/polish 时
+        读取。分组本身用 [first="true"] 去掉首组上边框。"""
+        try:
+            groups = [w for w in rows_card.findChildren(QFrame)
+                      if w.objectName() == "group"]
+            for grp in groups:
+                rows = grp.findChildren(QWidget, "setRow", Qt.FindDirectChildrenOnly)
+                for n, w in enumerate(rows):
+                    try:
+                        w.setProperty("last", n == len(rows) - 1)
+                    except Exception:
+                        pass
+            repolish_tree(rows_card)
+        except Exception:
+            pass
 
     # ---- 分组标题 / 行骨架 ----
     def _group(self, lay, title):
-        """分组小标题（+ 上方细分隔线），返回同一布局（行直接追加进来）。
+        """分组块（QFrame#group）：标题 + 右侧 1px 填充线，之后的行直接追加进来。
 
-        参考稿：第一组的分隔线画在分组名上方即可；后续每组前也有一条细线。"""
-        lbl = QLabel(str(title), lay.parentWidget())
+        首组上边框由 `[first="true"]` 去掉（QSS 没有 :first-child，§10.3）；组间
+        间距 14 走上外边距（QSS padding/margin 对普通容器不可靠，§10.1）。"""
+        host = lay.parentWidget()
+        frame = QFrame(host)
+        frame.setObjectName("group")
+        first = not bool(self._group_open)
+        frame.setProperty("first", first)
+        self._group_open = True
+        gap = int(METRICS["gblock_gap"])
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(0, 6 if first else gap, 0, 0)
+        box.setSpacing(0)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(9)
+        lbl = QLabel(str(title), frame)
         lbl.setObjectName("groupTitle")
-        lay.addWidget(lbl)
-        sep = QFrame(lay.parentWidget())
+        head.addWidget(lbl)
+        sep = QFrame(frame)
         sep.setObjectName("groupSep")
         sep.setFrameShape(QFrame.HLine)
         sep.setFixedHeight(1)
-        lay.addWidget(sep)
-        return lay
+        sep.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        head.addWidget(sep, 1)
+        box.addLayout(head)
+        lay.addWidget(frame)
+        return box
+
+    def _manual_row(self, lay, risk=False):
+        """手工行（不走 _row 的复合控件）：仍是 #setRow，享受分隔线 / hover。
+
+        返回 (host, QHBoxLayout)；调用方把控件加进这个布局。"""
+        host = QWidget(lay.parentWidget())
+        host.setObjectName("setRow")
+        host.setAttribute(Qt.WA_StyledBackground, True)   # QSS 背景/边框需要
+        host.setAttribute(Qt.WA_Hover, True)              # QSS :hover 需要（§10.2）
+        host.setProperty("risk", bool(risk))
+        h = QHBoxLayout(host)
+        h.setContentsMargins(0, int(METRICS["row_pad_y"]), 0,
+                             int(METRICS["row_pad_y"]))
+        h.setSpacing(10)
+        if risk:
+            try:
+                lay.addSpacing(6)
+            except Exception:
+                pass
+        lay.addWidget(host)
+        if risk:
+            try:
+                lay.addSpacing(6)
+            except Exception:
+                pass
+        return host, h
 
     def _reg(self, key, widget):
         """登记某配置键对应的控件（同一键可多个控件）。"""
@@ -671,17 +1020,30 @@ class SettingsPage(QWidget):
 
     def _fit_all_hints(self):
         for lbl in self.findChildren(QLabel):
-            if lbl.objectName() in ("stripHint", "bubbleHint"):
+            if lbl.objectName() in _HINT_NAMES:
                 self._fit_hint(lbl)
 
     def eventFilter(self, obj, event):
+        handled = False
         try:
             etype = event.type()
-            if (obj.objectName() in ("stripHint", "bubbleHint")
+            if (obj.objectName() in _HINT_NAMES
                     and etype in (QEvent.Polish, QEvent.StyleChange)):
                 self._fit_hint(obj)
             if etype == QEvent.FocusOut and obj in self._text_timers:
                 self._flush_text(obj)   # 失焦立即落盘（不等防抖）
+            # 固定气泡：跟随顶层窗口移动 / 缩放（事件源是 window()，见 _attach_follow）
+            if etype in (QEvent.Move, QEvent.Resize, QEvent.WindowStateChange):
+                if self._bubble_pinned:
+                    self._reposition_bubble()
+            # 固定气泡：任意「气泡外」的鼠标按下 / 应用（或窗口）失活即收起。
+            # app 级过滤器只在固定期间挂着（见 _install_outside_filter）。
+            if etype == QEvent.MouseButtonPress:
+                if self._bubble_pinned and not self._press_on_bubble_or_name(obj):
+                    self._dismiss_bubble()
+            elif etype in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
+                if self._bubble_pinned:
+                    self._dismiss_bubble()
             # 设置名称：悬停 700ms 出气泡；左键点击名称立即固定 / 再点收起。
             # 注意：_name_labels 的键是 id(标签)（int），obj 是 QWidget；必须用
             # id(obj) 做成员判断（历史缺陷：直接 `obj in dict` 恒为 False → 悬停/点击全死）。
@@ -693,13 +1055,37 @@ class SettingsPage(QWidget):
                   and event.button() == Qt.LeftButton
                   and id(obj) in self._name_labels):
                 self._toggle_pinned_bubble(obj)
+                # 固定期间 app 级过滤器与控件过滤器都会看到同一次 release；
+                # 返回 True 终止本次派发，避免「app 收起 + 控件再打开」的二次切换。
+                handled = True
         except Exception:
             pass
+        if handled:
+            return True
         return super().eventFilter(obj, event)
 
     def showEvent(self, event):
         super().showEvent(event)
         self._fit_all_hints()
+        self._attach_follow_target()
+
+    def hideEvent(self, event):
+        # 页面隐藏（切页 / 关窗）时固定气泡必须一起走，别留一个浮层和一个 app 过滤器
+        if self._bubble_pinned or self._outside_filter_on:
+            self._dismiss_bubble()
+        self._detach_follow_target()
+        super().hideEvent(event)
+
+    def moveEvent(self, event):
+        # 本页在窗口 / 外层滚动区里被移动时（含外层 QScrollArea 滚动），气泡跟随
+        super().moveEvent(event)
+        if self._bubble_pinned:
+            self._reposition_bubble()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._bubble_pinned:
+            self._reposition_bubble()
 
     # ------------------------------------------------------------------
     # 设置行（默认极简：名称 + 控件；名称可悬停/点击出气泡）
@@ -719,14 +1105,19 @@ class SettingsPage(QWidget):
         return lbl
 
     def _row(self, lay, row_meta, make_control, risk=False, key=None):
-        """通用行：左侧只有名称（+风险徽章+偏离小圆点），右侧控件，整行较高。
+        """通用行：左侧只有名称（+风险徽章），右侧控件，整行较高。
 
-        make_control(host) -> 控件；返回该控件。"""
+        make_control(host) -> 控件；返回该控件。风险行上下各留 6px（不与上一行
+        的红块/文字贴住，§评审 #8）。"""
         host = QWidget(lay.parentWidget())
         host.setObjectName("setRow")
+        host.setAttribute(Qt.WA_StyledBackground, True)   # QSS 背景/边框需要
+        host.setAttribute(Qt.WA_Hover, True)              # QSS :hover 需要（§10.2）
+        host.setProperty("risk", bool(risk))
         h = QHBoxLayout(host)
-        h.setContentsMargins(0, 9, 0, 9)      # 参考稿：行内上下留白，行高约 46px
-        h.setSpacing(8)
+        h.setContentsMargins(0, int(METRICS["row_pad_y"]), 0,
+                             int(METRICS["row_pad_y"]))
+        h.setSpacing(10)
         left = QWidget(host)
         l = QHBoxLayout(left)
         l.setContentsMargins(0, 0, 0, 0)
@@ -740,45 +1131,30 @@ class SettingsPage(QWidget):
             l.addWidget(badge)
             if key:
                 self._risk_badges[key] = badge
-        dot = QLabel("•", left)
-        dot.setObjectName("devDot")
-        dot.setVisible(False)
-        l.addWidget(dot)
-        if key:
-            self._dev_dots[key] = dot
         l.addStretch(1)
         h.addWidget(left, 1)
         ctl = make_control(host)
         h.addWidget(ctl, 0, Qt.AlignVCenter)
+        if risk:
+            # 风险块的红色背景与上一行分隔线不贴边（QSS margin 对普通 QWidget 不可靠，
+            # 用布局 spacing 实现，见 style.py 的 §10.1 说明）
+            try:
+                lay.addSpacing(6)
+            except Exception:
+                pass
         lay.addWidget(host)
+        if risk:
+            try:
+                lay.addSpacing(6)
+            except Exception:
+                pass
         row_meta.widget = ctl
         self._rows.append(row_meta)
         return ctl
 
     def _mark_dirty(self, key):
-        """按当前值 vs 默认值刷新「偏离默认」小圆点。
-
-        默认值真源 = `_sanitize_cfg(DEFAULT_CONFIG)`（show_status_tips /
-        settings_wizard_done 等在净化里补的键也算进来；否则这些键会被误判为「偏离」）。"""
-        dot = self._dev_dots.get(key)
-        if dot is None:
-            return
-        try:
-            cfg = self._snapshot()
-            cur = cfg.get(key, "<缺失>")
-            dft = _defaults().get(key, "<缺失>")
-            if isinstance(dft, bool):
-                dirty = bool(cur) != bool(dft)
-            elif isinstance(dft, (int, float)):
-                try:
-                    dirty = float(cur) != float(dft)
-                except Exception:
-                    dirty = str(cur) != str(dft)
-            else:
-                dirty = str(cur) != str(dft)
-            dot.setVisible(dirty)
-        except Exception:
-            pass
+        """（已按评审移除「偏离默认」小圆点；保留入口为 no-op，兼容既有调用点。）"""
+        return None
 
     def _check(self, lay, label, key, desc, syn=(), risk=False,
                extra_keys=None, commit=None, default=True):
@@ -837,7 +1213,7 @@ class SettingsPage(QWidget):
             b.addWidget(spin)
             if unit:
                 u = QLabel(unit, box)
-                u.setObjectName("fLabel")
+                u.setObjectName("unit")      # 单位在框外、右邻（§7）
                 b.addWidget(u)
             return box
 
@@ -859,8 +1235,9 @@ class SettingsPage(QWidget):
         def mk(host):
             edit = QPlainTextEdit(host)
             edit.setObjectName("settingsTextEdit")   # 走输入框样式（非日志控制台样式）
-            edit.setFixedHeight(26 + 18 * max(2, rows))
-            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            # 设计稿 .ta：280×58 固定（§7）；多行内容超出时框内滚动
+            edit.setFixedSize(280, 58)
+            edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             if placeholder:
                 edit.setPlaceholderText(placeholder)
             self._reg(key, edit)
@@ -883,7 +1260,8 @@ class SettingsPage(QWidget):
         def mk(host):
             box = QWidget(host)
             b = QVBoxLayout(box)
-            b.setContentsMargins(0, 0, 0, 0)
+            # 选项列表与标题之间留垂直间距（评审 #7：所有单选行统一）
+            b.setContentsMargins(0, 6, 0, 0)
             b.setSpacing(3)
             grp = QButtonGroup(box)
             for value, text in options:
@@ -938,36 +1316,9 @@ class SettingsPage(QWidget):
             rows=3, placeholder="每行一个后缀，如 .part")
 
     def _build_safety(self, box):
-        g = self._group(box, "删除源文件")
-        self.delete_master_cb = _Switch(self)   # 名称由左侧标签承担，选框不带文字
-        self.delete_master_cb.toggled.connect(self._on_delete_master)
-        self._reg("watch_paths.delete_source", self.delete_master_cb)
-        self._reg("watch_paths", self.delete_master_cb)
-        host = QWidget(self)
-        hl = QHBoxLayout(host)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(6)
-        nm = self._make_name(host, "解压成功后删除源文件",
-                             _SettingRow("解压成功后删除源文件", "", "", None,
-                                         "safety", "删除源文件", risk=True))
-        hl.addWidget(nm)
-        self.delete_risk_badge = QLabel("风险", host)
-        self.delete_risk_badge.setObjectName("riskBadge")
-        hl.addWidget(self.delete_risk_badge)
-        self._risk_badges["watch_paths.delete_source"] = self.delete_risk_badge
-        hl.addStretch(1)
-        hl.addWidget(self.delete_master_cb)
-        g.addWidget(host)
-        self._rows.append(_SettingRow(
-            "解压成功后删除源文件",
-            "对所有监听目录统一生效；删除是移进回收站，可在「删除回溯」页还原。"
-            "单个目录可在「监听目录」里单独覆盖。",
-            "watch_paths.delete_source", self.delete_master_cb, "safety",
-            "删除源文件", syn=("删除", "源文件", "删源", "回收站", "清理"),
-            risk=True, default_key="watch_paths"))
-        self.delete_state_label = self._hint("", self)
-        g.addWidget(self.delete_state_label)
-
+        # 评审：#6「删除源文件」组退场（与「监听目录」逐目录删源重复）。顶层
+        # watch_paths 的覆盖归属改到「监听目录」领域容器（见 _build_dirs），
+        # 覆盖契约 covered_top_keys() == set(DEFAULT_CONFIG) 保持不变。
         g = self._group(box, "防炸弹与防爆盘")
         self.bomb_guard_cb = self._check(
             g, "解压前安全检查", "bomb_guard_enabled",
@@ -1081,10 +1432,7 @@ class SettingsPage(QWidget):
             g, "识别到新密码就自动存进密码本", "auto_add_clipboard_password",
             "剪贴板里识别出口令时自动收进长期密码本（与「密码本」页里的开关是同一项）。",
             syn=("密码本", "自动收录", "长期密码", "口令"), default=False)
-        ph = QWidget(self)
-        pl = QHBoxLayout(ph)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.setSpacing(6)
+        ph, pl = self._manual_row(g)
         pl.addWidget(self._make_name(
             ph, "密码本条目", _SettingRow("密码本条目", "", "passwords", None,
                                           "clipboard", "密码识别")))
@@ -1093,7 +1441,6 @@ class SettingsPage(QWidget):
         pl.addWidget(self.passwords_label)
         pl.addStretch(1)
         self._reg("passwords", self.passwords_label)
-        g.addWidget(ph)
         self._rows.append(_SettingRow(
             "密码本条目", "长期密码本在「密码本」页管理，这里只显示条数。",
             "passwords", self.passwords_label, "clipboard", "密码识别",
@@ -1182,10 +1529,7 @@ class SettingsPage(QWidget):
         # 在本机 config 里已被 _sanitize_cfg 显式 pop（该功能 v2.1.6 退场）。若在此
         # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
         # 界面报「保存失败」。故按落地纪律「冲突项先搁置」不渲染该项（见交回清单）。
-        bah = QWidget(self)
-        bal = QHBoxLayout(bah)
-        bal.setContentsMargins(0, 0, 0, 0)
-        bal.setSpacing(6)
+        bah, bal = self._manual_row(g)
         bal.addWidget(self._make_name(
             bah, "网盘任务库路径",
             _SettingRow("网盘任务库路径", "", "baidu_task_db", None, "links",
@@ -1201,7 +1545,6 @@ class SettingsPage(QWidget):
         self._reg("baidu_task_db", self.baidu_db_edit)
         self._bind_text(self.baidu_db_edit, "baidu_task_db",
                         lambda: str(self.baidu_db_edit.text()).strip())
-        g.addWidget(bah)
         self._rows.append(_SettingRow(
             "网盘任务库路径", "BaiduYunGuanjia.db 的位置；留空自动探测。",
             "baidu_task_db", self.baidu_db_edit, "links", "网盘与分享",
@@ -1239,7 +1582,8 @@ class SettingsPage(QWidget):
         """信任用途的单选组（独立于通用 _radio_row，需按用途登记）。"""
         host = QWidget(lay.parentWidget())
         b = QVBoxLayout(host)
-        b.setContentsMargins(0, 0, 0, 0)
+        # 选项列表与上方标题（#sectionTitle）之间留垂直间距（评审 #7）
+        b.setContentsMargins(0, 6, 0, 0)
         b.setSpacing(3)
         grp = QButtonGroup(host)
         radios = {}
@@ -1267,15 +1611,11 @@ class SettingsPage(QWidget):
         self.theme_combo.setMinimumWidth(150)
         self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
         self._reg("ui_theme", self.theme_combo)
-        th = QWidget(self)
-        tl = QHBoxLayout(th)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(6)
+        th, tl = self._manual_row(g)
         tl.addWidget(self._make_name(
             th, "主题", _SettingRow("主题", "", "ui_theme", None, "ui", "外观")))
         tl.addWidget(self.theme_combo)
         tl.addStretch(1)
-        g.addWidget(th)
         self._rows.append(_SettingRow(
             "主题", "跟随系统 / 浅色 / 深色；切换后立即生效。", "ui_theme",
             self.theme_combo, "ui", "外观",
@@ -1296,17 +1636,13 @@ class SettingsPage(QWidget):
         self.theme_cached_label.setToolTip(
             "自动维护：启动时先用上次实际应用的主题出首屏，显示后再按「主题」偏好纠正。")
         self._reg("ui_theme_cached", self.theme_cached_label)
-        ch = QWidget(self)
-        chl = QHBoxLayout(ch)
-        chl.setContentsMargins(0, 0, 0, 0)
-        chl.setSpacing(6)
+        ch, chl = self._manual_row(g)
         chl.addWidget(self._make_name(
             ch, "上次实际应用的主题",
             _SettingRow("上次实际应用的主题", "", "ui_theme_cached", None, "ui",
                         "外观")))
         chl.addWidget(self.theme_cached_label)
         chl.addStretch(1)
-        g.addWidget(ch)
         self._rows.append(_SettingRow(
             "上次实际应用的主题",
             "程序自动维护：启动时先用它出首屏，显示后再按「主题」偏好纠正。",
@@ -1365,7 +1701,8 @@ class SettingsPage(QWidget):
     def _build_close_radios(self, lay):
         host = QWidget(lay.parentWidget())
         b = QVBoxLayout(host)
-        b.setContentsMargins(0, 0, 0, 0)
+        # 选项列表与分组标题之间留垂直间距（评审 #7）
+        b.setContentsMargins(0, 6, 0, 0)
         b.setSpacing(3)
         grp = QButtonGroup(host)
         for value, text, tip in (("ask", "每次询问", "每次关闭都弹出选择。"),
@@ -1390,17 +1727,13 @@ class SettingsPage(QWidget):
         # sevenzip_check_done 的界面语义与键值相反：勾选 = 下次启动重新检测 = 写 False
         self.sevenzip_cb = _Switch(self)   # 名称由左侧标签承担，选框不带文字
         self._reg("sevenzip_check_done", self.sevenzip_cb)
-        sh = QWidget(self)
-        sl = QHBoxLayout(sh)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(6)
+        sh, sl = self._manual_row(g)
         sl.addWidget(self._make_name(
             sh, "下次启动重新检测 7-Zip",
             _SettingRow("下次启动重新检测 7-Zip", "", "sevenzip_check_done",
                         None, "system", "解压引擎")))
         sl.addStretch(1)
         sl.addWidget(self.sevenzip_cb)
-        g.addWidget(sh)
         self._rows.append(_SettingRow(
             "下次启动重新检测 7-Zip",
             "勾上就表示「已检测过」；取消勾选 = 下次启动重新检测，缺失或版本过低时会弹安装引导。",
@@ -1429,18 +1762,22 @@ class SettingsPage(QWidget):
     def _build_dirs(self, box):
         self.dirs_box = box
         self._dir_card_widgets = []
+        # 覆盖契约：顶层 watch_paths 的归属控件 = 本领域容器（「删除源文件」总控
+        # 退场后落这里；逐目录删源由每张卡的 dir.delete_source 承载）。
+        self._reg("watch_paths", box.parentWidget())
         self.rebuild_dirs()
 
     def rebuild_dirs(self):
-        """按 watch_paths 重建目录卡（每卡固定 6 个字段）。
+        """按 watch_paths 重建目录卡（2 列 grid + 状态胶囊 + 虚线页脚；§7/§8 #9）。
 
         旧卡必须**先注销**再销毁：卡内控件登记在 `_controls`（dir.* 键）与
         `_text_timers` 里，若只 setParent(None) 丢引用，QFrame 会被 C++ 析构、
         其子控件随之被删，但登记表仍持有野指针 → 之后任何遍历 `_controls` 的
         代码都会 RuntimeError。这里先把旧卡下的控件从登记表里摘掉。"""
         box = self.dirs_box
+        old_cards = list(getattr(self, "_dir_card_widgets", []))
         # 清空旧的目录卡（先注销登记，再销毁）
-        for w in getattr(self, "_dir_card_widgets", []):
+        for w in old_cards:
             try:
                 stale = w.findChildren(QWidget)
             except Exception:
@@ -1459,8 +1796,8 @@ class SettingsPage(QWidget):
             except Exception:
                 pass
         self._dir_card_widgets = []
-        for key in [k for k in list(self._dev_dots) if k.startswith("dir.")]:
-            self._dev_dots.pop(key, None)
+        # 旧卡的阴影引用同步摘掉（避免主题切换时重贴到已销毁对象）
+        self._shadow_widgets = [w for w in self._shadow_widgets if w not in old_cards]
         try:
             entries = [e for e in (self._snapshot().get("watch_paths") or [])
                        if isinstance(e, dict)]
@@ -1468,34 +1805,70 @@ class SettingsPage(QWidget):
             entries = []
         for idx, entry in enumerate(entries):
             card = QFrame(box.parentWidget())
-            card.setObjectName("card")
+            card.setObjectName("dirCard")
             cv = QVBoxLayout(card)
-            cv.setContentsMargins(12, 10, 12, 10)
-            cv.setSpacing(6)
+            cv.setContentsMargins(16, 14, 16, 14)   # dircard padding 14/16
+            cv.setSpacing(12)
+
             head = QHBoxLayout()
+            head.setSpacing(9)
+            head.addWidget(Glyph("folder", card, 16, role="muted"))
             path = str(entry.get("path") or "（未设置路径）")
             hlbl = QLabel(path, card)
+            # objectName 保持 sectionTitle（离线验收按 2 + 目录卡数 计数），
+            # 视觉上由 [role="dirPath"] 规则取 13.5px/700（§7）
             hlbl.setObjectName("sectionTitle")
+            hlbl.setProperty("role", "dirPath")
             head.addWidget(hlbl)
-            badge = QLabel("已启用" if entry.get("enabled", True) else "已停用", card)
-            badge.setObjectName("chipState")
-            head.addWidget(badge)
+            on = bool(entry.get("enabled", True))
+            pill = QLabel("已启用" if on else "已停用", card)
+            pill.setObjectName("statusPill")
+            pill.setProperty("on", on)
+            pill.setProperty("off", not on)
+            head.addWidget(pill)
             head.addStretch(1)
-            open_btn = QPushButton("打开目录设置", card)
-            open_btn.setObjectName("ghostSm")
-            open_btn.setCursor(Qt.PointingHandCursor)
-            open_btn.clicked.connect(self._open_dir_dialog)
-            head.addWidget(open_btn)
             cv.addLayout(head)
 
-            self._dir_field_path(cv, card, idx, entry)
-            self._dir_field_output(cv, card, idx, entry)
-            self._dir_field_enabled(cv, card, idx, entry)
-            self._dir_field_mode(cv, card, idx, entry)
-            self._dir_field_delete(cv, card, idx, entry)
-            self._dir_field_policy(cv, card, idx, entry)
+            # 2 列 QGridLayout（列距 24 / 行距 16）：左列 路径 / 解压到 / 删除源，
+            # 右列 启用 / 监听模式 / 回收站策略（与设计稿 thumbs 一致）
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(24)
+            grid.setVerticalSpacing(16)
+            grid.addWidget(self._dir_field_path(card, idx, entry), 0, 0, Qt.AlignTop)
+            grid.addWidget(self._dir_field_enabled(card, idx, entry), 0, 1, Qt.AlignTop)
+            grid.addWidget(self._dir_field_output(card, idx, entry), 1, 0, Qt.AlignTop)
+            grid.addWidget(self._dir_field_mode(card, idx, entry), 1, 1, Qt.AlignTop)
+            grid.addWidget(self._dir_field_delete(card, idx, entry), 2, 0, Qt.AlignTop)
+            grid.addWidget(self._dir_field_policy(card, idx, entry), 2, 1, Qt.AlignTop)
+            cv.addLayout(grid)
+
+            foot = QFrame(card)
+            foot.setObjectName("dirFoot")
+            fl = QHBoxLayout(foot)
+            fl.setContentsMargins(12, 10, 12, 10)
+            fl.setSpacing(8)
+            note = QLabel("字段改动立即保存；增删目录请在右侧弹窗里完成。", foot)
+            note.setObjectName("stripHint")
+            note.setWordWrap(True)
+            fl.addWidget(note, 1)
+            # 「打开目录设置」放进本卡虚线页脚：归属明确（多目录时不会歧义）
+            open_btn = QPushButton("打开目录设置", foot)
+            open_btn.setCursor(Qt.PointingHandCursor)
+            open_btn.setToolTip("打开「%s」的目录设置弹窗" % path)
+            open_btn.clicked.connect(
+                lambda _c=False, i=idx, e=dict(entry): self._open_dir_dialog(i, e))
+            fl.addWidget(open_btn, 0)
+            cv.addWidget(foot)
+
+            try:
+                _apply_card_shadow(card, "card")
+                self._shadow_widgets.append(card)
+            except Exception:
+                pass
             box.addWidget(card)
             self._dir_card_widgets.append(card)
+            repolish_tree(card)
 
     def _dir_set(self, idx, field, value):
         """就地改某目录某字段（整段 watch_paths 写回，绝不丢其它字段）。"""
@@ -1515,66 +1888,88 @@ class SettingsPage(QWidget):
         self._name_labels[id(lbl)] = (lbl, meta)
         return lbl, meta
 
-    def _dir_field_path(self, lay, card, idx, entry):
-        h = QHBoxLayout()
-        lbl, meta = self._dir_label(card, "监听路径", "dir.path")
+    def _dir_cell(self, card, label, key, badge_key=None, risk=False):
+        """目录卡字段格：标签行（可带风险徽章）+ 控件区（调用方追加）；返回 (cell, v)。"""
+        cell = QFrame(card)
+        cell.setObjectName("dirFieldRisk" if risk else "dirField")
+        cell.setAttribute(Qt.WA_StyledBackground, True)
+        v = QVBoxLayout(cell)
+        if risk:
+            v.setContentsMargins(10, 8, 10, 8)
+        else:
+            v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(5)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        lbl, meta = self._dir_label(cell, label, key)
+        meta.risk = bool(risk)
         self._rows.append(meta)
-        h.addWidget(lbl)
-        edit = QLineEdit(card)
+        top.addWidget(lbl)
+        if risk:
+            badge = QLabel("风险", cell)
+            badge.setObjectName("riskBadge")
+            top.addWidget(badge)
+            if badge_key:
+                self._risk_badges[badge_key] = badge
+        top.addStretch(1)
+        v.addLayout(top)
+        return cell, v
+
+    def _dir_field_path(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "监听路径", "dir.path")
+        h = QHBoxLayout()
+        h.setSpacing(6)
+        edit = QLineEdit(cell)
         edit.setText(str(entry.get("path") or ""))
         edit.setPlaceholderText("要盯着的文件夹")
         self._reg("dir.path", edit)
         self._bind_text(edit, "watch_paths",
                         lambda i=idx, e=edit: self._dir_collect(i, "path", e.text()))
         h.addWidget(edit, 1)
-        browse = QPushButton("浏览", card)
+        browse = QPushButton("浏览", cell)
         browse.setCursor(Qt.PointingHandCursor)
         browse.clicked.connect(lambda: self._browse_dir(idx, edit, "path"))
         h.addWidget(browse)
-        lay.addLayout(h)
+        v.addLayout(h)
+        return cell
 
-    def _dir_field_output(self, lay, card, idx, entry):
+    def _dir_field_output(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "解压到", "dir.output_dir")
         h = QHBoxLayout()
-        lbl, meta = self._dir_label(card, "解压到", "dir.output_dir")
-        self._rows.append(meta)
-        h.addWidget(lbl)
-        edit = QLineEdit(card)
+        h.setSpacing(6)
+        edit = QLineEdit(cell)
         edit.setText(str(entry.get("output_dir") or ""))
         edit.setPlaceholderText("留空 = 同目录下建同名文件夹")
         self._reg("dir.output_dir", edit)
         self._bind_text(edit, "watch_paths",
                         lambda i=idx, e=edit: self._dir_collect(i, "output_dir", e.text()))
         h.addWidget(edit, 1)
-        browse = QPushButton("浏览", card)
+        browse = QPushButton("浏览", cell)
         browse.setCursor(Qt.PointingHandCursor)
         browse.clicked.connect(lambda: self._browse_dir(idx, edit, "output_dir"))
         h.addWidget(browse)
-        lay.addLayout(h)
+        v.addLayout(h)
+        return cell
 
-    def _dir_field_enabled(self, lay, card, idx, entry):
-        h = QHBoxLayout()
-        lbl, meta = self._dir_label(card, "启用这个目录", "dir.enabled")
-        self._rows.append(meta)
-        h.addWidget(lbl)
-        h.addStretch(1)
-        cb = _Switch(card)
+    def _dir_field_enabled(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "启用这个目录", "dir.enabled")
+        cb = _Switch(cell)
         cb.setChecked(bool(entry.get("enabled", True)))
         cb.toggled.connect(lambda c, i=idx: self._dir_set(i, "enabled", bool(c)))
         self._reg("dir.enabled", cb)
-        h.addWidget(cb)
-        lay.addLayout(h)
+        v.addWidget(cb, 0, Qt.AlignLeft)     # 与设计稿一致：开关在标签下方、左对齐
+        return cell
 
-    def _dir_field_mode(self, lay, card, idx, entry):
-        lbl, meta = self._dir_label(card, "监听模式", "dir.mode")
-        self._rows.append(meta)
-        lay.addWidget(lbl)
+    def _dir_field_mode(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "监听模式", "dir.mode")
         cur = str(entry.get("mode") or "surface")
-        grp = QButtonGroup(card)
-        host = QWidget(card)
+        grp = QButtonGroup(cell)
+        host = QWidget(cell)
         b = QVBoxLayout(host)
-        b.setContentsMargins(0, 0, 0, 0)
+        b.setContentsMargins(0, 4, 0, 0)   # 选项与上方标签留垂直间距（评审 #7）
         b.setSpacing(3)
-        for value, text in (("surface", "只扫表层"), ("manifest", "按网盘清单处理子目录")):
+        for value, text in (("surface", "只扫表层"), ("baidu", "按网盘清单处理子目录")):
             rb = QRadioButton(text, host)
             grp.addButton(rb)
             rb.setChecked(value == cur)
@@ -1582,44 +1977,28 @@ class SettingsPage(QWidget):
                 lambda c, i=idx, v=value: self._dir_set(i, "mode", v) if c else None)
             b.addWidget(rb)
         self._reg("dir.mode", host)
-        lay.addWidget(host)
+        v.addWidget(host)
+        return cell
 
-    def _dir_field_delete(self, lay, card, idx, entry):
-        h = QHBoxLayout()
-        lbl, meta = self._dir_label(card, "本目录解压后删除源文件", "dir.delete_source")
-        meta.risk = True
-        self._rows.append(meta)
-        h.addWidget(lbl)
-        badge = QLabel("风险", card)
-        badge.setObjectName("riskBadge")
-        h.addWidget(badge)
-        self._risk_badges["dir.delete_source.%d" % idx] = badge
-        h.addStretch(1)
-        cb = _Switch(card)
+    def _dir_field_delete(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "本目录解压后删除源文件", "dir.delete_source",
+                                 badge_key="dir.delete_source.%d" % idx, risk=True)
+        cb = _Switch(cell)
         cb.setChecked(bool(entry.get("delete_source", False)))
         cb.toggled.connect(lambda c, i=idx: self._dir_set(i, "delete_source", bool(c)))
         self._reg("dir.delete_source", cb)
-        h.addWidget(cb)
-        lay.addLayout(h)
+        v.addWidget(cb, 0, Qt.AlignLeft)     # 与设计稿一致：开关在标签下方、左对齐
+        return cell
 
-    def _dir_field_policy(self, lay, card, idx, entry):
-        lbl, meta = self._dir_label(card, "回收站不可用时", "dir.delete_policy")
-        meta.risk = True
-        self._rows.append(meta)
-        h = QHBoxLayout()
-        h.addWidget(lbl)
-        badge = QLabel("风险", card)
-        badge.setObjectName("riskBadge")
-        h.addWidget(badge)
-        self._risk_badges["dir.delete_policy.%d" % idx] = badge
-        h.addStretch(1)
-        lay.addLayout(h)
+    def _dir_field_policy(self, card, idx, entry):
+        cell, v = self._dir_cell(card, "回收站不可用时", "dir.delete_policy",
+                                 badge_key="dir.delete_policy.%d" % idx, risk=True)
         cur = str(entry.get("delete_policy") or "auto")
-        host = QWidget(card)
+        host = QWidget(cell)
         b = QVBoxLayout(host)
-        b.setContentsMargins(0, 0, 0, 0)
+        b.setContentsMargins(0, 4, 0, 0)   # 选项与上方标签留垂直间距（评审 #7）
         b.setSpacing(3)
-        for value, text in (("auto", "自动判断"), ("purge", "永久删除"),
+        for value, text in (("auto", "自动判断"), ("permanent", "永久删除"),
                             ("keep", "保留不删"), ("quarantine", "移入隔离区")):
             rb = QRadioButton(text, host)
             rb.setChecked(value == cur)
@@ -1627,7 +2006,12 @@ class SettingsPage(QWidget):
                 lambda c, i=idx, v=value: self._dir_set(i, "delete_policy", v) if c else None)
             b.addWidget(rb)
         self._reg("dir.delete_policy", host)
-        lay.addWidget(host)
+        # 点号路径叶子别名：本页以整表写回 watch_paths，但「回收站策略」确实是
+        # watch_paths[i].delete_policy 的叶子 → 同时登记，保证 covered_keys() 仍含
+        # watch_paths.* 家族（既有验收 P18b；顶层键归属仍由「监听目录」容器持有）。
+        self._reg("watch_paths.delete_policy", host)
+        v.addWidget(host)
+        return cell
 
     def _dir_collect(self, idx, field, value):
         return value
@@ -1643,15 +2027,22 @@ class SettingsPage(QWidget):
         if path:
             edit.setText(path)
 
-    def _open_dir_dialog(self):
-        """复用既有 WatchDirDialog（本页不自行增删目录）。"""
+    def _open_dir_dialog(self, idx=None, entry=None):
+        """打开某个监听目录的设置弹窗：`WatchDirDialog(state, idx, parent, entry)`。
+
+        历史缺陷：把 `self` 当 idx 传 → `int(idx)` 抛
+        「int() argument must be …, not 'SettingsPage'」。按钮按卡片绑定 idx（+entry），
+        这里再兜底校验一次 idx。"""
         try:
             from .dialogs import WatchDirDialog
         except Exception:
             self._notice("目录设置弹窗不可用", ok=False)
             return
+        if idx is None:
+            self._notice("请从目录卡片打开目录设置", ok=False)
+            return
         try:
-            dlg = WatchDirDialog(self.state, self)
+            dlg = WatchDirDialog(self.state, int(idx), self, entry=entry)
             if dlg.exec_():
                 self.rebuild_dirs()
                 self.watchPathsChanged.emit()
@@ -1678,9 +2069,24 @@ class SettingsPage(QWidget):
         first_row = 0
         for did in self._sections:
             if did is None:
+                # 分隔线：保留占位文本（既有验收读取 item.text()），显示用
+                # 样式化 QFrame#navSep 覆盖（§8 #7：不再是文字行）
                 item = QListWidgetItem("──────────")
                 item.setFlags(Qt.NoItemFlags)
+                item.setSizeHint(QSize(0, 21))
                 self.cat_list.addItem(item)
+                holder = QWidget(self.cat_list)
+                holder.setObjectName("navSepHost")
+                holder.setAttribute(Qt.WA_StyledBackground, True)
+                hl = QVBoxLayout(holder)
+                hl.setContentsMargins(0, 10, 0, 10)
+                hl.setSpacing(0)
+                line = QFrame(holder)
+                line.setObjectName("navSep")
+                line.setFixedHeight(1)
+                line.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                hl.addWidget(line)
+                self.cat_list.setItemWidget(item, holder)
                 continue
             name, icon, _desc = _DOMAIN_META[did]
             item = QListWidgetItem(_glyph_icon(icon), name)
@@ -1738,43 +2144,123 @@ class SettingsPage(QWidget):
         self._show_search_results(self._query)
 
     def _show_search_results(self, q):
-        """把右侧换成搜索结果（按领域分组、标命中数）。"""
+        """把右侧换成搜索结果：#hitCard 卡片 + 可点击命中项 + 空状态（§8 #5）。"""
         if getattr(self, "_result_card", None) is not None:
             self._result_card.setParent(None)
             self._result_card = None
         for d, card in self._section_cards.items():
             card.setVisible(False)
         hits = [r for r in self._rows if q in r.search_blob()]
-        card = QWidget(self.scroll.widget())
+        card = QFrame(self.scroll.widget())
+        card.setObjectName("hitCard")
         cl = QVBoxLayout(card)
-        cl.setContentsMargins(0, 4, 0, 0)
-        cl.setSpacing(6)
-        head = QLabel("共 %d 项命中" % len(hits), card)
-        head.setObjectName("appTitle")
+        cl.setContentsMargins(16, 12, 16, 14)
+        cl.setSpacing(2)
+
+        head = QWidget(card)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 6)
+        hl.setSpacing(12)
+        title = QLabel("搜索结果", head)
+        title.setObjectName("pageTitle")
+        hl.addWidget(title)
+        desc = QLabel("「%s」" % q, head)
+        desc.setObjectName("pageDesc")
+        hl.addWidget(desc)
+        hl.addStretch(1)
+        total = QLabel("共 %d 项命中" % len(hits), head)
+        total.setObjectName("hitTotal")
+        hl.addWidget(total)
         cl.addWidget(head)
-        by_domain = {}
-        for r in hits:
-            by_domain.setdefault(r.domain, []).append(r)
-        for d in _DOMAIN_ORDER:
-            if d is None or d not in by_domain:
-                continue
-            dname = _DOMAIN_META[d][0]
-            grp = QLabel("%s（%d 项）" % (dname, len(by_domain[d])), card)
-            grp.setObjectName("sectionTitle")
-            cl.addWidget(grp)
-            for r in by_domain[d]:
-                item = QLabel("•  %s" % r.label, card)
-                item.setObjectName("setName")
-                item.setCursor(Qt.PointingHandCursor)
-                item.installEventFilter(self)
-                self._name_labels[id(item)] = (item, r)
-                cl.addWidget(item)
+
+        if not hits:
+            empty = QLabel("没有匹配的设置项。换个关键词，或清空搜索回到领域视图。", card)
+            empty.setObjectName("emptyState")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setWordWrap(True)
+            cl.addWidget(empty)
+        else:
+            by_domain = {}
+            for r in hits:
+                by_domain.setdefault(r.domain, []).append(r)
+            for d in _DOMAIN_ORDER:
+                if d is None or d not in by_domain:
+                    continue
+                dname = _DOMAIN_META[d][0]
+                grp = QLabel("%s（%d 项）" % (dname, len(by_domain[d])), card)
+                grp.setObjectName("groupTitle")
+                cl.addSpacing(8)
+                cl.addWidget(grp)
+                for r in by_domain[d]:
+                    btn = QPushButton("•  %s" % r.label, card)
+                    btn.setObjectName("hitRow")
+                    btn.setCursor(Qt.PointingHandCursor)
+                    btn.setToolTip((r.desc or "") + "\n\n点击跳到该设置项。")
+                    btn.clicked.connect(lambda _c=False, rr=r: self._goto_hit(rr))
+                    cl.addWidget(btn)
         cl.addStretch(1)
         # 插在末尾的顶对齐 stretch 之前（保持内容顶对齐）
         self._lay.insertWidget(self._lay.count() - 1, card)
         self._result_card = card
         try:
             self.scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def _goto_hit(self, row):
+        """搜索命中项点击：切到所属领域、清空搜索、滚动并高亮该行（§11 #3 决定）。"""
+        did = getattr(row, "domain", "") or self._current_domain
+        try:
+            for i in range(self.cat_list.count()):
+                if self.cat_list.item(i).data(Qt.UserRole) == did:
+                    self._current_domain = did
+                    self.cat_list.setCurrentRow(i)
+                    break
+            if self.search_edit.text():
+                self.search_edit.clear()          # 触发 _on_search_changed('') → 回领域视图
+        except Exception:
+            pass
+        try:
+            self._show_domain(did)
+        except Exception:
+            pass
+        widget = getattr(row, "widget", None)
+        if widget is None:
+            return
+        host = widget
+        try:
+            while host is not None and host.objectName() != "setRow":
+                host = host.parentWidget()
+            if host is not None:
+                y = host.mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+                self.scroll.verticalScrollBar().setValue(max(0, y - 40))
+                widget.setFocus(Qt.OtherFocusReason)
+                self._flash_row(host)
+        except Exception:
+            pass
+
+    def _flash_row(self, host):
+        """命中定位后的短暂高亮（QSS [flash="true"]；600ms 后清除）。"""
+        try:
+            host.setProperty("flash", True)
+            repolish_tree(host)
+        except Exception:
+            return
+        if self._flash_timer is not None:
+            try:
+                self._flash_timer.stop()
+            except Exception:
+                pass
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.setInterval(600)
+        self._flash_timer.timeout.connect(lambda w=host: self._clear_flash(w))
+        self._flash_timer.start()
+
+    def _clear_flash(self, host):
+        try:
+            host.setProperty("flash", False)
+            repolish_tree(host)
         except Exception:
             pass
 
@@ -1818,15 +2304,106 @@ class SettingsPage(QWidget):
             self._bubble = _InfoBubble(self)
         self._bubble_pinned = bool(pinned)
         self._bubble_row = row
+        self._bubble_anchor = lbl          # 固定态跟随窗口 / 滚动的锚点
         self._bubble.show_for(row, lbl.mapToGlobal(QPoint(0, lbl.height())))
         self._fit_hint(self._bubble)
+        if self._bubble_pinned:
+            self._install_outside_filter()
+        else:
+            self._remove_outside_filter()
 
     def _toggle_pinned_bubble(self, obj):
         if self._bubble_pinned and self._bubble is not None and self._bubble.isVisible():
-            self._bubble.hide()
-            self._bubble_pinned = False
+            self._dismiss_bubble()
             return
         self._show_bubble_for(obj, pinned=True)
+
+    def _dismiss_bubble(self):
+        """收起气泡（含固定态）：隐藏 + 清固定 + 摘 app 级「点外部收起」过滤器。
+
+        所有收起路径（再点名称 / Esc / 点空白 / 点气泡外 / 失活 / 页面隐藏）都走这里，
+        避免 app 级过滤器残留到退出期（Qt 终结阶段带 Python 回调的过滤器会崩）。"""
+        self._bubble_pinned = False
+        self._bubble_anchor = None
+        self._remove_outside_filter()
+        if self._bubble is not None:
+            try:
+                self._bubble.hide()
+            except Exception:
+                pass
+
+    def _press_on_bubble_or_name(self, obj):
+        """这次鼠标按下是否落在气泡（或其子树）/ 设置名称上——是则不收起。"""
+        b = self._bubble
+        if b is not None:
+            try:
+                if obj is b or (isinstance(obj, QWidget) and b.isAncestorOf(obj)):
+                    return True
+            except Exception:
+                pass
+        return id(obj) in self._name_labels
+
+    def _reposition_bubble(self):
+        """把已固定的气泡重新贴到锚点标签下方（窗口移动 / 缩放 / 本页滚动时）。"""
+        b = self._bubble
+        lbl = self._bubble_anchor
+        if b is None or lbl is None or not b.isVisible():
+            return
+        try:
+            b.move_to(lbl.mapToGlobal(QPoint(0, lbl.height())))
+        except Exception:
+            pass
+
+    def _install_outside_filter(self):
+        """固定期间给 app 挂事件过滤器：任意「气泡外」按下 / 失活即收起。"""
+        if self._outside_filter_on:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.installEventFilter(self)
+            self._outside_filter_on = True
+        except Exception:
+            self._outside_filter_on = False
+
+    def _remove_outside_filter(self):
+        """摘掉 app 级过滤器（幂等；失败一律忽略，绝不影响退出）。"""
+        if not self._outside_filter_on:
+            return
+        self._outside_filter_on = False
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.removeEventFilter(self)
+        except Exception:
+            pass
+
+    def _attach_follow_target(self):
+        """给顶层窗口挂事件过滤器：窗口移动 / 缩放时固定气泡跟随（幂等）。"""
+        try:
+            win = self.window()
+        except Exception:
+            win = None
+        if win is None or win is self._follow_target:
+            return
+        self._detach_follow_target()
+        try:
+            win.installEventFilter(self)
+            self._follow_target = win
+        except Exception:
+            self._follow_target = None
+
+    def _detach_follow_target(self):
+        target = self._follow_target
+        self._follow_target = None
+        if target is None:
+            return
+        try:
+            target.removeEventFilter(self)
+        except Exception:
+            pass
 
     def mousePressEvent(self, event):
         # 点空白处收起已固定气泡；按在「设置名称」上的点击不算空白——该次点击
@@ -1834,16 +2411,13 @@ class SettingsPage(QWidget):
         if (self._bubble is not None and self._bubble.isVisible()
                 and self._bubble_pinned):
             child = self.childAt(event.pos())
-            on_name = child is not None and id(child) in self._name_labels
-            if not on_name:
-                self._bubble.hide()
-                self._bubble_pinned = False
+            if child is None or id(child) not in self._name_labels:
+                self._dismiss_bubble()
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self._bubble is not None:
-            self._bubble.hide()
-            self._bubble_pinned = False
+            self._dismiss_bubble()
         super().keyPressEvent(event)
 
     # ------------------------------------------------------------------
@@ -1891,10 +2465,7 @@ class SettingsPage(QWidget):
                 suffixes = DEFAULT_CONFIG.get("incomplete_download_suffixes")
             self.dl_suffix_edit.setPlainText(_format_suffix_lines(suffixes))
 
-            # 删除与安全
-            entries = [e for e in (cfg.get("watch_paths") or []) if isinstance(e, dict)]
-            del_val, del_same = _common(entries, "delete_source")
-            self.delete_master_cb.setChecked(bool(del_val) if del_same else False)
+            # 删除与安全（「删除源文件」总控已退场；逐目录删源在「监听目录」里改）
             self.bomb_guard_cb.setChecked(b("bomb_guard_enabled", True))
             self.bomb_entries_spin.setValue(max(0, min(1000000, i("bomb_soft_entries", 50000))))
             self.bomb_soft_ratio_spin.setValue(max(1, min(100000, i("bomb_soft_ratio", 100))))
@@ -1902,7 +2473,6 @@ class SettingsPage(QWidget):
             self.bomb_min_gb_spin.setValue(max(0, min(100000, i("bomb_hard_min_gb", 1))))
             self.bomb_size_gb_spin.setValue(max(0, min(1000000, i("bomb_hard_size_gb", 50))))
             self.free_space_spin.setValue(max(0, min(100000, i("min_free_space_gb", 5))))
-            self._refresh_delete_state()
 
             # 通知与提醒
             self.notify_cb.setChecked(b("notify_enabled", True))
@@ -2021,21 +2591,6 @@ class SettingsPage(QWidget):
                     values = (sub or {}).get(key) or []
                     edit.setPlainText("\n".join(str(x) for x in values))
 
-    def _refresh_delete_state(self):
-        entries = [e for e in (self._snapshot().get("watch_paths") or [])
-                   if isinstance(e, dict)]
-        if not entries:
-            self.delete_state_label.setText("")
-            return
-        n = sum(1 for e in entries if e.get("delete_source"))
-        if 0 < n < len(entries):
-            self.delete_state_label.setText(
-                "当前：%d/%d 个目录已开启（勾选即统一覆盖全部）" % (n, len(entries)))
-        elif n:
-            self.delete_state_label.setText("当前：全部 %d 个目录均已开启" % n)
-        else:
-            self.delete_state_label.setText("当前：全部目录均保留源文件")
-
     def _refresh_passwords_label(self):
         try:
             n = len(self.state.passwords() or [])
@@ -2044,8 +2599,8 @@ class SettingsPage(QWidget):
             self.passwords_label.setText("（读取失败 · 在「密码本」页管理）")
 
     def _refresh_dirty_dots(self):
-        for key in list(self._dev_dots):
-            self._mark_dirty(key)
+        """（「偏离默认」小圆点已按评审移除；保留入口为 no-op，兼容既有调用点。）"""
+        return None
 
     def _refresh_wizard_visibility(self):
         try:
@@ -2207,11 +2762,6 @@ class SettingsPage(QWidget):
             }
         return ut
 
-    @staticmethod
-    def _empty_indices(entries):
-        return [n for n, e in enumerate(entries or [])
-                if not str(e.get("path") or "").strip()]
-
     # ---- 文本编辑防抖 ----
     def _bind_text(self, widget, key, compose):
         def _commit_now():
@@ -2264,43 +2814,8 @@ class SettingsPage(QWidget):
     # ------------------------------------------------------------------
     # 删源总控 / 向导
     # ------------------------------------------------------------------
-    def _on_delete_master(self, checked):
-        """删源总控：点击即把 delete_source 统一写入全部监听目录。"""
-        if self._loading:
-            return
-        want = bool(checked)
-        cfg = self._snapshot()
-        entries = [dict(e) for e in (cfg.get("watch_paths") or [])
-                   if isinstance(e, dict)]
-        empties = self._empty_indices(entries)
-        if empties:
-            ret = QMessageBox.question(
-                self, "路径校验",
-                "有 %d 条监听目录路径为空；继续会移除这些空条目（其余设置不受影响）。\n"
-                "继续保存？" % len(empties),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ret != QMessageBox.Yes:
-                self._notice("保存已取消：请先处理空路径条目", ok=False)
-                self._revert_delete_master(not want)
-                return
-            entries = [e for n, e in enumerate(entries) if n not in empties]
-        for e in entries:
-            e["delete_source"] = want
-        if self._commit("watch_paths", entries):
-            self._refresh_delete_state()
-        else:
-            self._revert_delete_master(not want)
-
-    def _revert_delete_master(self, previous):
-        self._loading = True
-        try:
-            self.delete_master_cb.setChecked(bool(previous))
-        finally:
-            self._loading = False
-        self._refresh_delete_state()
-
     def _on_wizard_clicked(self):
-        """设置向导入口：跳过后不再显示（持久化 settings_wizard_done）。"""
+        """设置向导入口：**只有**明确「跳过」才置位并隐藏入口（向导尚未实现）。"""
         ret = QMessageBox.question(
             self, "设置向导",
             "设置向导会带你过一遍最常用的几项。\n"
@@ -2310,8 +2825,83 @@ class SettingsPage(QWidget):
             if self._commit("settings_wizard_done", True):
                 self._notice("已跳过设置向导（入口不再显示）")
             return
-        self._notice("设置向导尚在规划中；已记录你的选择")
-        self._commit("settings_wizard_done", True)
+        # 点「开始 / OK」但向导尚在规划中：不置位、不隐藏入口，用户之后仍可再来。
+        self._notice("设置向导尚在规划中；入口保留，随时可以再进来。")
+
+    def _on_config_io(self, _checked=False):
+        """导入 / 导出：先让用户选方向，再选文件。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("导入 / 导出")
+        box.setIcon(QMessageBox.Question)
+        box.setText("把当前设置导出为 JSON 文件，或从 JSON 文件导入并覆盖当前设置。")
+        export_btn = box.addButton("导出设置", QMessageBox.AcceptRole)
+        import_btn = box.addButton("导入设置", QMessageBox.AcceptRole)
+        cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is export_btn:
+            self._export_config()
+        elif clicked is import_btn:
+            self._import_config()
+
+    def _export_config(self):
+        """把当前配置写成一份 JSON（用户取消选择文件则不做事）。"""
+        try:
+            path, _selected = QFileDialog.getSaveFileName(
+                self, "导出设置", "autounpacker_settings.json",
+                "JSON 文件 (*.json)")
+        except Exception as e:
+            self._notice("导出失败：%s" % e, ok=False)
+            return
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self._snapshot(),
+                                    ensure_ascii=False, indent=2))
+        except Exception as e:
+            self._notice("导出失败：%s" % e, ok=False)
+            return
+        self._notice("已导出设置：%s" % path)
+
+    def _import_config(self):
+        """从 JSON 导入配置：解析 / 校验全部先于改动 state；任一步失败都
+        整体回滚到导入前快照，保证「导入失败」时配置不被破坏。"""
+        try:
+            path, _selected = QFileDialog.getOpenFileName(
+                self, "导入设置", "", "JSON 文件 (*.json)")
+        except Exception as e:
+            self._notice("导入失败：%s" % e, ok=False)
+            return
+        if not path:
+            return
+        before = self._snapshot()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if not isinstance(raw, dict):
+                raise ValueError("配置文件的顶层必须是对象")
+            clean = _sanitize_cfg(raw)
+            for key, value in clean.items():
+                self.state.set(key, value, save=False)
+            self.state._persist()
+            if not getattr(self.state, "last_persist_ok", True):
+                raise RuntimeError(
+                    self.state.last_persist_error or "配置写入未生效")
+        except Exception as e:
+            # 回滚内存与磁盘：尽力而为，绝不因回滚失败再抛。
+            try:
+                for key, value in before.items():
+                    self.state.set(key, value, save=False)
+                self.state._persist()
+            except Exception:
+                pass
+            self._notice("导入失败：%s" % e, ok=False)
+            return
+        self._load_from_cfg()
+        self._notice("已导入设置：%s" % path)
+        self.settingsSaved.emit()
 
     # ------------------------------------------------------------------
     # 恢复默认（两步：选范围 → 再次确认）
@@ -2348,24 +2938,20 @@ class SettingsPage(QWidget):
         self._do_reset(scope, page_keys)
 
     def _ask_reset_scope(self, dname, n_page):
-        """第一步：选范围 + 警告。返回 (scope, ok)。scope ∈ {'all','page'}。"""
-        box = QMessageBox(self)
-        box.setWindowTitle("恢复默认")
-        box.setIcon(QMessageBox.Warning)
-        box.setText("恢复默认会覆盖你当前的设置，且不能撤销。请先选择要恢复的范围。")
-        all_btn = box.addButton("整个程序", QMessageBox.AcceptRole)
-        page_btn = box.addButton("本页（%s · %d 项）" % (dname, n_page),
-                                 QMessageBox.AcceptRole)
-        cancel = box.addButton("取消", QMessageBox.RejectRole)
-        box.setDefaultButton(cancel)
+        """第一步：选范围 + 警告（样式化模态：#modalCard + 警告块 + 范围卡 + 页脚）。
+
+        返回 (scope, ok)；scope ∈ {'all','page'}。见 `_ResetScopeBox`：
+        保留 QMessageBox 语义（离线验收锁定 exec_ 与按钮文案），外观自建（§7）。
+        """
+        box = _ResetScopeBox(self, dname, n_page)
         box.exec_()
-        clicked = box.clickedButton()
-        if clicked is cancel or clicked is None:
+        scope = box.chosen()
+        if scope is None:
             return "all", False
-        return ("page" if clicked is page_btn else "all"), True
+        return scope, True
 
     def _confirm_reset(self, scope, dname, n_page):
-        """第二步：再次确认。"""
+        """第二步：再次确认（QMessageBox.question 为既有验收锁定路径，保持）。"""
         if scope == "page":
             detail = "将要恢复的范围：本页「%s」（%d 项）" % (dname, n_page)
         else:
@@ -2469,7 +3055,7 @@ class SettingsPage(QWidget):
             self.notice.emit(text)
 
     def refresh_theme(self):
-        """主题切换后重贴内联色（warn 说明 / 风险徽章 / 偏离点 / 气泡）。"""
+        """主题切换后重贴内联色（warn 说明 / 风险徽章 / 阴影 / 气泡）。"""
         for lbl in self._warn_labels:
             try:
                 lbl.setStyleSheet("color: %s;" % PALETTE["warn_text"])
@@ -2480,14 +3066,26 @@ class SettingsPage(QWidget):
                 badge.setStyleSheet(self._badge_qss())
             except Exception:
                 pass
-        for dot in self._dev_dots.values():
-            try:
-                dot.setStyleSheet("color: %s;" % PALETTE["warn_text"])
-            except Exception:
-                pass
         if self._notice_failed:
             try:
                 self.notice_label.setStyleSheet("color: %s;" % PALETTE["danger"])
+            except Exception:
+                pass
+        # 卡片 / 气泡阴影：颜色随主题变（浅 26 / 深 128 等），必须重建（§10.7）
+        for w in list(self._shadow_widgets):
+            try:
+                _apply_card_shadow(w, "card")
+            except Exception:
+                pass
+        if self._bubble is not None:
+            try:
+                _apply_card_shadow(self._bubble, "pop")
+            except Exception:
+                pass
+        # 搜索框内嵌图标：图标是按旧主题色生成的，重贴一次
+        if self._search_icon_act is not None:
+            try:
+                self._search_icon_act.setIcon(_glyph_icon("search", 15))
             except Exception:
                 pass
         for glyph in self.findChildren(Glyph):
@@ -2500,12 +3098,19 @@ class SettingsPage(QWidget):
                 sw.update()     # 胶囊开关在 paint 时读 tokens()，主题变了要重绘
             except Exception:
                 pass
+        try:
+            self.cat_list.viewport().update()   # 左栏竖条颜色（委托 paint 现取 token）
+        except Exception:
+            pass
         self._fit_all_hints()
 
     def _badge_qss(self):
+        """风险徽章内联样式：取 QSS token 真值（与新 QSS 规则同色值）。"""
+        tk = ui_style.tokens()
         return ("QLabel#riskBadge { color: %s; background: %s; border: 1px solid %s;"
-                " border-radius: 4px; padding: 0 6px; }"
-                % (PALETTE["danger"], PALETTE["warn_bg"], PALETTE["warn_border"]))
+                " border-radius: %s; padding: 1px 7px; }"
+                % (tk["danger_fg"], tk["danger_bg"], tk["danger_border"],
+                   tk["radius_ctl"]))
 
     # ---- 风险徽章呼吸（往更高风险方向改动时；10s 后停回常态） ----
     def _breathe_badge(self, key):

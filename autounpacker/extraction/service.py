@@ -618,10 +618,13 @@ class ExtractService:
         shutil.move(str(src_file), str(final))
 
     def _check_size(self, dir_path, original_size):
+        ratio_limit = self._opt_number("max_size_ratio", 100.0)
+        if ratio_limit <= 0:
+            return
         total = sum(p.stat().st_size for p in dir_path.rglob("*") if p.is_file())
         if original_size > 0:
             ratio = total / original_size
-            if ratio > self.options["max_size_ratio"]:
+            if ratio > ratio_limit:
                 self.emit(f"[安全警告] 解压后大小膨胀 {ratio:.1f} 倍，可能存在 zip bomb")
 
     def _opt_number(self, key, default):

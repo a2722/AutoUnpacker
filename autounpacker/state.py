@@ -30,6 +30,11 @@ class AppState:
         self.running = True
         self._temp_passwords = []
         self._temp_ts = {}          # 密码 -> 捕获时间戳（用于按有效期过期）
+        # 落盘结果供调用方回报「保存失败」用（此前 save_config 静默吞异常，
+        # 上层无从得知；现如实记录，判断失败不改变任何写入/异常行为）。
+        self.last_persist_ok = True
+        self.last_persist_error = None
+        self.last_temp_persist_ok = True
         self._load_temp_passwords()
 
     def _temp_cfg_int(self, key, default, lo, hi):
@@ -119,7 +124,10 @@ class AppState:
         """把本次临时密码持久化到磁盘，并记录当前系统开机时间点。
 
         先写临时文件再原子替换（os.replace），避免程序在写入中途崩溃/
-        被杀软扫描时留下半截损坏的 JSON，导致重启后整个临时密码表读不出来。"""
+        被杀软扫描时留下半截损坏的 JSON，导致重启后整个临时密码表读不出来。
+
+        成功返回 True、失败吞异常返回 False（绝不抛），并把结果记到
+        self.last_temp_persist_ok；既有调用方忽略返回值，故行为不变。"""
         try:
             data = json.dumps(
                 {"boot": _boot_time(), "tick": _boot_tick(),
@@ -129,8 +137,11 @@ class AppState:
             tmp = paths.TEMP_PW_FILE.with_suffix(".tmp")
             tmp.write_text(data, encoding="utf-8")
             os.replace(tmp, paths.TEMP_PW_FILE)
+            self.last_temp_persist_ok = True
+            return True
         except Exception:
-            pass
+            self.last_temp_persist_ok = False
+            return False
 
     def _snapshot_locked(self):
         """self.cfg 的深拷贝；调用方必须已持 self.lock。"""
@@ -149,15 +160,24 @@ class AppState:
           故最后一次完成的写必然包含此前已提交的全部改动（不丢更新）；
         - 仍复用 config.save_config 的 .tmp + os.replace 原子写。
         save_config 自身不取 self.lock，因此这里不会死锁；异常一律吞掉，
-        绝不让「落盘」反向打断调用方。
+        绝不让「落盘」反向打断调用方。落盘结果如实记到 self.last_persist_ok
+        与 self.last_persist_error（成功时 None），供上层回报「保存失败」；
+        此记录不改变任何写入顺序或异常行为。
         """
+        ok = False
+        err = None
         try:
             with self._save_lock:
                 with self.lock:
                     snap = self._snapshot_locked()
-                save_config(snap)
-        except Exception:
-            pass
+                ok = bool(save_config(snap))
+            if not ok:
+                err = "save_config 返回 False（写入未生效）"
+        except Exception as e:
+            ok = False
+            err = str(e)
+        self.last_persist_ok = ok
+        self.last_persist_error = err
 
     def snapshot(self):
         with self.lock:

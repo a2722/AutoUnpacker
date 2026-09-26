@@ -23,6 +23,10 @@ LEGACY_DICT_FILE = Path.home() / ".smart_extract_password_dict.json"
 
 _lock = threading.Lock()
 
+# 最近一次「列表 / 查询」类读取失败的原始错误文本；None = 最近一次读取成功。
+# 供 UI 在列表突然为空时区分「确实没有数据」与「数据库读取出错」，不改任何函数签名。
+_LAST_ERROR = None
+
 # 已完成「老库补列」迁移的库文件路径集合：每个库文件每进程只迁移一次。
 # 所有调用 _connect() 的函数都持 _lock，因此该集合的读写受同一把锁保护。
 _migrated = set()
@@ -135,6 +139,11 @@ def _execute(sql, params=(), fetch=False):
             conn.close()
 
 
+def last_error():
+    """返回最近一次「列表 / 查询」类读取失败的错误文本；成功读取后为 None。"""
+    return _LAST_ERROR
+
+
 # ---------- 共享密码本 ----------
 def get_passwords():
     rows = _execute("SELECT password FROM passwords ORDER BY id", fetch=True)
@@ -184,15 +193,19 @@ def list_passwords():
 
     [{"id", "password", "source", "created_at", "note"}, ...]
 
-    每行的 source 是库里真实存储的来源值（老行缺省 'manual'），note 缺省 ''；任何异常返回 []。
+    每行的 source 是库里真实存储的来源值（老行缺省 'manual'），note 缺省 ''；任何异常返回 []，
+    并把错误文本记入 db.last_error()（成功读取后复位为 None）。
     """
+    global _LAST_ERROR
     try:
         rows = _execute(
             "SELECT id, password, source, created_at, note FROM passwords ORDER BY id",
             fetch=True)
+        _LAST_ERROR = None
         return [{"id": r[0], "password": r[1], "source": r[2],
                  "created_at": r[3], "note": r[4] or ""} for r in (rows or [])]
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = str(e)
         return []
 
 
@@ -483,6 +496,11 @@ def add_task(file_name, file_size=None, source_dir=None, output_dir=None,
         return 0
 
 
+def _norm_path_key(p):
+    """路径归一化：统一分隔符 / 小写 / 去尾部斜杠（仅用于比较，不改库中存储）。"""
+    return str(p or "").replace("\\", "/").rstrip("/").lower()
+
+
 def find_open_task(source_dir, file_name):
     """查该 (source_dir, file_name) 最新一条非终态任务（queued/extracting/need_password）。
 
@@ -493,16 +511,19 @@ def find_open_task(source_dir, file_name):
         name = str(file_name or "")
         if not name:
             return 0
+        want = _norm_path_key(source_dir)
         with _lock:
             conn = _connect()
             try:
                 cur = conn.execute(
-                    "SELECT id FROM tasks WHERE file_name = ? AND source_dir IS ? "
+                    "SELECT id, source_dir FROM tasks WHERE file_name = ? "
                     "AND state IN ('queued','extracting','need_password') "
-                    "ORDER BY id DESC LIMIT 1",
-                    (name, source_dir))
-                row = cur.fetchone()
-                return int(row[0]) if row else 0
+                    "ORDER BY id DESC",
+                    (name,))
+                for tid, src in cur.fetchall():
+                    if _norm_path_key(src) == want:
+                        return int(tid)
+                return 0
             finally:
                 conn.close()
     except Exception:
@@ -570,6 +591,7 @@ def list_tasks(scope="queue", result_filter=None, keyword=None, limit=500):
     result_filter="failed" 覆盖 scope，只返回 state='failed'。
     keyword：大小写不敏感子串，匹配 file_name 或 output_dir。
     """
+    global _LAST_ERROR
     if result_filter == "failed":
         states = ("failed",)
     elif scope == "history":
@@ -589,8 +611,10 @@ def list_tasks(scope="queue", result_filter=None, keyword=None, limit=500):
     params.append(int(limit or 500))
     try:
         rows = _execute(sql, tuple(params), fetch=True)
+        _LAST_ERROR = None
         return [_task_row(r) for r in (rows or [])]
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = str(e)
         return []
 
 
@@ -612,6 +636,7 @@ def count_tasks():
 
 def task_logs(task_id, limit=2000):
     """取某任务的日志索引行（ts 正序、同秒按 id 正序），供「该任务日志」视图。"""
+    global _LAST_ERROR
     try:
         tid = int(task_id or 0)
     except Exception:
@@ -623,8 +648,10 @@ def task_logs(task_id, limit=2000):
             "SELECT " + ", ".join(_LOG_COLS) + " FROM log_index "
             "WHERE task_id = ? ORDER BY ts ASC, id ASC LIMIT ?",
             (tid, int(limit or 2000)), fetch=True)
+        _LAST_ERROR = None
         return [_log_row(r) for r in (rows or [])]
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = str(e)
         return []
 
 
@@ -657,6 +684,7 @@ def query_logs(levels=None, sources=None, keyword=None, limit=1000):
     SQL 与「先取全量再按 Python 过滤」等价：级别用 IN，路径用
     `source_dir IS NULL OR source_dir IN (...)`，关键词用 instr(lower(text))。
     """
+    global _LAST_ERROR
     try:
         lv = list(levels) if levels else []
         src = list(sources) if sources else []
@@ -678,8 +706,10 @@ def query_logs(levels=None, sources=None, keyword=None, limit=1000):
         sql += " ORDER BY ts DESC, id DESC LIMIT ?"
         params.append(int(limit or 1000))
         rows = _execute(sql, tuple(params), fetch=True)
+        _LAST_ERROR = None
         return [_log_row(r) for r in (rows or [])]
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = str(e)
         return []
 
 

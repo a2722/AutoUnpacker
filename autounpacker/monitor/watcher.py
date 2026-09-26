@@ -21,7 +21,7 @@ from ..deletion import records as deletion_records
 from .. import db                          # noqa: F401
 from .. import volume_pair
 from .. import baidu_manifest             # 实验性开关判定（子目录监听/分卷递归的唯一闸门）
-from ..config import get_bool
+from ..config import get_bool, bomb_options_from_cfg
 from ..utils import (_norm_path_for_cfg, _can_open_append)
 
 # 删除前意图记录（records.mark_deleting）属本任务新增函数：trail 兼容 shim 的显式
@@ -1723,11 +1723,13 @@ class FolderWatcher(threading.Thread):
             options = {
                 "enable_nested": True,
                 "max_depth": 10,
-                "max_size_ratio": 100.0,
                 "use_dict": False,
                 "default_password": None,
                 "mode": "direct",
             }
+            # A1：防 zip bomb 配置从实时配置中心抽入 options（含 max_size_ratio），
+            # 不再硬编码 max_size_ratio=100.0；改配置无需重启即生效。
+            options.update(bomb_options_from_cfg(self.state.snapshot()))
             args = types.SimpleNamespace(
                 move_to=None,
                 delete_source=bool(wc.get("delete_source")),
@@ -1775,6 +1777,13 @@ class FolderWatcher(threading.Thread):
                 self.hub.q.put({"type": "progress_done"})
             if out is not None:
                 out["result"] = result     # 供 _split_recheck 读锚点重试的结果
+            # C2-drain：把后处理阶段新增的日志与失败原因接到运行日志（沿用当前
+            # 线程的解压任务上下文），否则删源去向/提升结果/脚本输出只留在
+            # result 内部，界面永远看不到。不改变 success 语义。
+            for _p_line in (result or {}).get("post_logs") or []:
+                self.hub.log(_p_line)
+            if (result or {}).get("post_error"):
+                self.hub.log(f"[后处理] 失败: {result['post_error']}")
             if (result and result["success"]
                     and not (result.get("incomplete") or result.get("failed_layers")
                              or result.get("split_incomplete"))):

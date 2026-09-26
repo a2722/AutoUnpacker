@@ -241,11 +241,13 @@ def apply_post_actions(result, source, output_dir, actions):
                 result["extracted_files"] = moved
                 result["logs"].append(f"已移动 {len(moved)} 个文件到 {action['target_dir']}")
             elif action["action_type"] == "delete_source":
-                delete_source(source, action.get("delete_hook"),
+                summary = delete_source(source, action.get("delete_hook"),
                               permanent_fallback=delete_policy_permanent_fallback(
                                   action.get("delete_policy")),
                               quarantine_root=action.get("quarantine_root"),
                               pre_hook=action.get("pre_hook"))
+                if summary:
+                    result["logs"].append(f"[后处理] {summary}")
             elif action["action_type"] == "promote_content":
                 res = promote_extracted_content(
                     output_dir, action["promote_to"], source,
@@ -263,6 +265,7 @@ def apply_post_actions(result, source, output_dir, actions):
                            source, output_dir, result)
         except Exception as e:
             result["logs"].append(f"[后处理] 失败: {e}")
+            result["post_error"] = str(e)
 
 
 def move_result_dir(output_dir, target_dir):
@@ -440,6 +443,22 @@ def _recycle_paths(paths, permanent_fallback=True, quarantine_root=None, quarant
         quarantine_root=quarantine_root, quarantine_out=quarantine_out)
 
 
+def _failed_outcome(failed):
+    """把 failed 列表按「路径是否仍在磁盘上」分成 (永久删除数, 保留数)。
+
+    failed 语义：回收站不可用、隔离区也未接管的残留；permanent_fallback=True 时
+    可能已被永久删除，False 时一定原样保留。只按存在与否判定、不猜策略，供
+    delete_source 汇总与 promote 备注共用。"""
+    still = 0
+    for p in failed:
+        try:
+            if Path(p).exists():
+                still += 1
+        except OSError:
+            pass
+    return len(failed) - still, still
+
+
 def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=None,
                   pre_hook=None):
     """删除源文件（含分卷）。
@@ -453,6 +472,8 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
     hook(recycled, failed, quarantine_map) 在删除后回调：recycled=已移入回收站，
     failed=回收站不可用时的残留（是否已永久删除取决于 permanent_fallback），
     quarantine_map=已移入隔离区、可还原的文件地图（无则 None）。
+    返回汇总串「源文件处理完成：移入回收站 x，隔离区 y，永久删除 z，保留 w」，
+    供后处理日志展示本次源文件的真实去向；无目标时返回全 0 汇总串。
     """
     source = Path(source)
     targets = []
@@ -467,7 +488,7 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
         if hook:
             hook([], [], None)
         print("没有需要删除的源文件")
-        return
+        return "源文件处理完成：移入回收站 0，隔离区 0，永久删除 0，保留 0"
 
     qmap = []
     if pre_hook:
@@ -479,25 +500,20 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
         hook(recycled, failed, qmap or None)
     # 按真实去向分句打印，避免在「永久删除 / 保留 / 隔离区」场景下误报「移入回收站」。
     # 隔离区条目已从 failed 中移除（见 engine._recycle_paths），故 total 不重复计数。
+    removed, kept = _failed_outcome(failed)
     parts = []
     if recycled:
         parts.append(f"移入回收站 {len(recycled)} 个")
     if qmap:
         parts.append(f"移入隔离区 {len(qmap)} 个")
-    if failed:
-        still = 0
-        for p in failed:
-            try:
-                if Path(p).exists():
-                    still += 1
-            except OSError:
-                pass
-        if len(failed) - still:
-            parts.append(f"永久删除 {len(failed) - still} 个")
-        if still:
-            parts.append(f"保留 {still} 个")
+    if removed:
+        parts.append(f"永久删除 {removed} 个")
+    if kept:
+        parts.append(f"保留 {kept} 个")
     total = len(recycled) + len(failed) + len(qmap)
     print(f"已处理源文件及分卷，共 {total} 个（{'、'.join(parts)}）")
+    return (f"源文件处理完成：移入回收站 {len(recycled)}，隔离区 {len(qmap)}，"
+            f"永久删除 {removed}，保留 {kept}")
 
 
 def _dirs_conflict(src_dir, dest):
@@ -667,7 +683,9 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     if hook:
         hook(recycled, failed, qmap or None)
 
-    note = f"已提升 {Path(promoted).name}，回收源文件与中间文件共 {len(recycled) + len(failed)} 个"
+    removed, kept = _failed_outcome(failed)
+    note = (f"已提升 {Path(promoted).name}，回收源文件与中间文件共 "
+            f"{len(recycled) + len(failed)} 个（永久删除 {removed}，保留 {kept}）")
     return {"promoted": promoted, "recycled": recycled, "hook_called": True, "note": note}
 
 

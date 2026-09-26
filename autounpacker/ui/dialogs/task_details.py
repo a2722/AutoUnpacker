@@ -9,11 +9,15 @@
 遮罩：与 WatchDirDialog 同一套实现（项目没有 dim-mask 原语）——父窗口上的一个
 rgba(0,0,0,.34) 子控件，showEvent 建、hideEvent/closeEvent 拆。主窗使用原生
 Windows 标题栏（非客户区），子控件遮罩天然只覆盖客户区，系统标题栏不受影响。
+
+点击外部关闭：仍保持模态（exec_），但显示期间装 QApplication 级事件过滤器——
+弹窗 frameGeometry 之外的按下（含遮罩上的点击）一律 reject；弹窗内部（按钮/输入
+框/滚动区）的按下原样放行。hide/close 时移除过滤器，避免拦截宿主窗口后续事件。
 """
 import os
 import time
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QDialog, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                              QPushButton, QVBoxLayout, QWidget)
@@ -67,7 +71,7 @@ def task_action_set(state, src_exists):
     s = _task_state_key({"state": state})
     acts = []
     if s == "need_password":
-        acts.append(("input_password", "输入密码…并重试", "primary"))
+        acts.append(("input_password", "跳转到密码本", "primary"))
         if src_exists:
             acts.append(("retry", "重试", ""))
         acts.append(("open_dir", "打开输出目录", ""))
@@ -111,6 +115,7 @@ class TaskDetailsDialog(QDialog):
         except Exception:
             self.task_id = 0
         self._scrim = None
+        self._filter_installed = False
         self._fields = {}
         self._actions = []
         self.setWindowTitle("任务详情")
@@ -320,7 +325,7 @@ class TaskDetailsDialog(QDialog):
             self.reject()
             return
         self.actionRequested.emit(int(self.task_id), kind)
-        if kind == "view_log":
+        if kind in ("view_log", "input_password"):
             self.reject()
             return
         self._reload()
@@ -400,16 +405,72 @@ class TaskDetailsDialog(QDialog):
         except Exception:
             pass
 
+    # ---- 点击外部关闭（仍保持模态） ----
+    def _install_app_filter(self):
+        """装上 QApplication 级过滤器（仅窗口显示期间；重复 show 不重装）。"""
+        if self._filter_installed:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.installEventFilter(self)
+        except Exception:
+            return
+        self._filter_installed = True
+
+    def _uninstall_app_filter(self):
+        """移除 QApplication 级过滤器（close/hide 都走这里）。"""
+        if not self._filter_installed:
+            return
+        self._filter_installed = False
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.removeEventFilter(self)
+        except Exception:
+            pass
+
+    def _hit_scrim(self, gp):
+        """全局坐标是否落在遮罩上（遮罩可能不存在 -> False）。"""
+        sc = self._scrim
+        if sc is None:
+            return False
+        try:
+            return bool(sc.isVisible()) and sc.rect().contains(sc.mapFromGlobal(gp))
+        except Exception:
+            return False
+
+    def eventFilter(self, obj, event):
+        """弹窗显示期间：弹窗外（含遮罩）的鼠标按下 = 关闭，返回 True 吞掉该事件。
+
+        只按全局坐标判断——frameGeometry 内的按下（按钮/输入框/滚动区）原样放行，
+        绝不误关；reject 后 hideEvent 会自行移除过滤器。
+        """
+        try:
+            if event.type() == QEvent.MouseButtonPress and self.isVisible():
+                gp = event.globalPos()
+                if not self.frameGeometry().contains(gp) or self._hit_scrim(gp):
+                    self.reject()
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
     def showEvent(self, event):
+        self._install_app_filter()
         self._ensure_scrim()
         super().showEvent(event)
         self._center_on_parent()
 
     def hideEvent(self, event):
+        self._uninstall_app_filter()
         self._destroy_scrim()
         super().hideEvent(event)
 
     def closeEvent(self, event):
+        self._uninstall_app_filter()
         self._destroy_scrim()
         super().closeEvent(event)
 

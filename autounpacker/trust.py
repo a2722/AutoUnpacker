@@ -275,9 +275,13 @@ def add_trust_entry(cfg, host, kind, purpose="open"):
     return ut2
 
 
-def trust_entry_categories(host):
-    """弹窗/设置页用：标注 host 属于哪些内置黑名单类别（供风险提示）。"""
-    cat = classify_host(host)
+def trust_entry_categories(host, resolve=True):
+    """弹窗/设置页用：标注 host 属于哪些内置黑名单类别（供风险提示）。
+
+    resolve 透传给 classify_host：UI 线程（弹窗构造）必须传 resolve=False，
+    只查缓存 / IP 字面量，绝不触发阻塞的 getaddrinfo DNS 解析。
+    """
+    cat = classify_host(host, resolve=resolve)
     if cat and cat != "public":
         return cat
     return None

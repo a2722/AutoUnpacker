@@ -30,7 +30,8 @@ from .. import baidu_manifest as bm
 from .. import db
 from .. import hub
 from ..config import (parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE,
-                      HOTKEY_ID_SHARE_PICK, MOD_NOREPEAT)
+                      HOTKEY_ID_SHARE_PICK, MOD_NOREPEAT,
+                      bomb_options_from_cfg)
 from ..trust import add_trust_entry
 from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,  # noqa: F401
                      watch_path_conflict)
@@ -45,7 +46,7 @@ from .pages import TaskPage, LogPage, StatusBar
 from .page_pwbook import PasswordBookPage
 from .page_trail import TrailPage
 from .page_settings import SettingsPage
-from .dialogs import (DeleteTrailDialog, SevenZipSetupDialog,
+from .dialogs import (SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
                       DragBehaviorDialog, TaskDetailsDialog)
 
@@ -166,10 +167,10 @@ class MainWindow(QMainWindow):
         self.show_event = show_event
         self.pauser = pauser
         self.setWindowTitle("AutoUnpacker")
-        # M3 工作台布局（标签页 + 胶囊条 + 248px 右栏）：默认宽高对齐原型 11。
+        # M3 工作台布局（标签页 + 胶囊条 + 248px 右栏）：默认宽高按设计稿 1440×880。
         # DPI/分辨率自适应：初始尺寸按屏幕可用区（逻辑像素）收敛，见 fit_window_size。
         _aw, _ah = self._available_geometry()
-        self.resize(*fit_window_size(1180, 760, _aw, _ah))
+        self.resize(*fit_window_size(1440, 880, _aw, _ah))
         self.setWindowIcon(make_tray_icon())
         self.setAcceptDrops(True)   # 支持拖入文件临时解压
         self._build_ui()
@@ -598,10 +599,12 @@ class MainWindow(QMainWindow):
                         return
                 passwords = self.state.all_passwords()
                 options = {
+                    # 防 zip bomb 阈值统一由配置抽取（含 max_size_ratio），不再硬编码；
+                    # 设置页的 6 项防 zip bomb 设置据此真实作用于拖放解压链路。
+                    **bomb_options_from_cfg(self.state.snapshot()),
                     # 「拖拽行为」：智能穿透关 = 只解第一层（最深 1 层）
                     "enable_nested": bool(drop_nested),
                     "max_depth": (10 if drop_nested else 1),
-                    "max_size_ratio": 100.0,
                     "use_dict": False,
                     "default_password": None,
                     "mode": "direct",
@@ -628,6 +631,13 @@ class MainWindow(QMainWindow):
                         progress_cb=self._progress_cb, pauser=self.pauser)
                 finally:
                     self.hub.q.put({"type": "progress_done"})
+                # C2：后处理（删除源/提升/移动/脚本）的日志与失败对用户可见。
+                # 失败只补记一行日志，绝不改变「解压成功」的既有判定与状态流转。
+                if result:
+                    for _post_line in (result.get("post_logs") or []):
+                        self.hub.log(str(_post_line))
+                    if result.get("post_error"):
+                        self.hub.log(f"[后处理] 失败: {result['post_error']}")
                 if result and result["success"]:
                     msg = (f"拖放解压完成: {path.name} 穿透 "
                            f"{result['depth_reached']} 层，共 "
@@ -874,10 +884,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.hub.log(f"添加百度网盘下载目录失败: {e}")
             QMessageBox.warning(self, "百度网盘下载目录", f"添加失败：{e}")
-
-    def _open_delete_trail(self):
-        dlg = DeleteTrailDialog(self)
-        dlg.exec_()
 
     def _remove_path(self, idx):
         cfg = self.state.snapshot()
@@ -1352,7 +1358,9 @@ class MainWindow(QMainWindow):
 
         这是队列行「从队列移除」的唯一实现：待密码/失败之外的状态
         （queued/extracting/done/canceled）同样可被用户主动清出队列——卡在
-        need_password 且源文件已删除的任务因此不会永远留在队列里。"""
+        need_password 且源文件已删除的任务因此不会永远留在队列里。
+        若被忽略的任务正在解压，顺带请求中止其卡住的子进程；abort_task 为
+        可选能力，测试桩 pauser 未实现时静默跳过，绝不因此崩溃。"""
         try:
             task = db.get_task(task_id) or {}
         except Exception:
@@ -1360,6 +1368,13 @@ class MainWindow(QMainWindow):
         if not task:
             self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
             return
+        if str(task.get("state") or "") == "extracting":
+            abort = getattr(self.pauser, "abort_task", None)
+            if callable(abort):
+                try:
+                    abort(task_id)
+                except Exception:
+                    pass
         try:
             db.update_task_state(int(task_id), "canceled",
                                  finished_at=int(time.time()))
@@ -1501,6 +1516,11 @@ class MainWindow(QMainWindow):
             "drop_delete_source": bool(snap.get("drop_delete_source", False)),
         }
         dlg = DragBehaviorDialog(current, self)
+        # 弹窗内的提示走既有日志通道（notice 未连接时其提示会被丢弃）
+        try:
+            dlg.notice.connect(self.hub.log)
+        except Exception:
+            pass
         if dlg.exec_() != QDialog.Accepted:
             return
         values = dlg.values()
@@ -2085,7 +2105,9 @@ class MainWindow(QMainWindow):
             now = time.time()
             if now - float(getattr(self, "_dpi_log_ts", 0.0)) < 1.0:
                 return
-            self._dpi_log_ts = now
+            # 时间戳在**处理完成后**再记（见本函数末尾）：处理本身（运行时图标重建 +
+            # 主题重排）可能耗时接近或超过 1 秒；若在开头记，1 秒静默期会在处理期间
+            # 就过期，紧随其后的重复信号会被再记一次（刷屏）。
             # 缩放比例变了：勾选框/单选圈/下拉箭头的运行时 PNG 是按 devicePixelRatio
             # 生成的，必须重套主题（apply_theme → _theme_extra_qss）按新 DPR 重建。
             # 同 DPR 命中 (theme, dpr) 缓存，重复信号不会重复生成。
@@ -2099,6 +2121,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 scr = None
             self._apply_screen_limits(scr)
+            # 去重窗口从「本次处理完成」起算，保证处理耗时不会吃掉 1 秒静默期。
+            self._dpi_log_ts = time.time()
         except Exception:
             pass
 

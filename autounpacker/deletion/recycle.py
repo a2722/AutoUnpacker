@@ -6,7 +6,9 @@
 - restore_record()/_restore_one()/_invoke_restore()：经 Shell.Application 从回收站还原
 依赖：标准库（os/time/ctypes）+ win32com（还原，惰性导入）+ records（记录读写）
 注意：回收站被清空或永久删除的文件无法还原；还原成功只认「实际落地的文件」，
-      原位置被占用时回收站可能落到新名字，如实上报实际落点，绝不谎报成功
+      原位置被占用时回收站可能落到新名字，如实上报实际落点，绝不谎报成功。
+      取消为协作式且只在「记录之间」生效（调用方在两次 restore_record 之间检查）；
+      本模块不中断阻塞中的 win32com InvokeVerb，也不打断单文件最长 30 秒的落地轮询。
 """
 import os
 import time
@@ -141,7 +143,9 @@ def _invoke_restore(item):
     return False
 
 
-# 还原是异步的：调用后轮询等待落地的节奏（60 × 0.5s ≈ 30 秒上限）
+# 还原是异步的：调用后轮询等待落地的节奏（60 × 0.5s ≈ 30 秒上限）。
+# 取消是协作式的，只在调用方「两条记录之间」生效；这里不会被打断：
+# win32com 的 InvokeVerb 与下面的单文件落地轮询都不感知取消。
 RESTORE_POLL_TIMES = 60
 RESTORE_POLL_INTERVAL = 0.5
 

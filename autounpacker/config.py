@@ -6,8 +6,8 @@
 - _sanitize_cfg() 净化与迁移旧版配置（旧路径密码并入全局密码本、补默认值）
 - load_config() 读取合并、损坏时备份回退默认；save_config() 原子写入
 - parse_hotkey() 把 'Ctrl+Alt+W' 解析为 (mods, vk)，供全局快捷键注册
-关键入口：get_int() / get_bool() / get_str() / load_config() / save_config() /
-          parse_hotkey() / _sanitize_cfg()
+关键入口：get_int() / get_bool() / get_str() / bomb_options_from_cfg() /
+          load_config() / save_config() / parse_hotkey() / _sanitize_cfg()
 依赖：paths（配置文件路径）、utils._norm_path_for_cfg、
       extraction.formats.INCOMPLETE_DOWNLOAD_SUFFIXES（未完成下载后缀内置默认值，
       单一真源；formats 本身不反向依赖 config）
@@ -171,6 +171,39 @@ def get_str(cfg, key, default):
     一致——键缺失取 default；键存在时一律 str()（None→"None"）。不含 strip /
     合法性校验，那些属于各键的额外策略，由调用方按需自行处理。"""
     return str(cfg.get(key, default))
+
+
+# 防 zip bomb 配置键（冻结契约的一部分：bomb_options_from_cfg 只抽这几项）。
+_BOMB_CFG_KEYS = ("bomb_guard_enabled", "bomb_soft_ratio", "bomb_soft_entries",
+                  "bomb_hard_ratio", "bomb_hard_min_gb", "bomb_hard_size_gb")
+
+
+def bomb_options_from_cfg(cfg):
+    """把防 zip bomb 配置归一后抽成解压链路 options 的冻结字典。
+
+    先经 _sanitize_cfg 归一（缺失/畸形回退默认、负数钳到 0、bool 稳定），
+    再取固定 7 键。max_size_ratio = float(bomb_soft_ratio)（软阈值 <= 0 即
+    关闭该规则时取 0.0），与旧有提取选项同名，供后续波次直接 spread 进
+    extraction options。键名与语义为冻结契约，不要改名/增删键。
+
+    只为抽取这几个纯标量键而调用 _sanitize_cfg，故传入的是这几键的子字典，
+    避免 _sanitize_cfg 对入参做就地规整而反过来改动调用方的 cfg。"""
+    subset = {}
+    if isinstance(cfg, dict):
+        for k in _BOMB_CFG_KEYS:
+            if k in cfg:
+                subset[k] = cfg[k]
+    c = _sanitize_cfg(subset)
+    soft_ratio = c.get("bomb_soft_ratio", 100)
+    return {
+        "bomb_guard_enabled": bool(c.get("bomb_guard_enabled", True)),
+        "bomb_soft_ratio": soft_ratio,
+        "bomb_soft_entries": c.get("bomb_soft_entries", 50000),
+        "bomb_hard_ratio": c.get("bomb_hard_ratio", 200),
+        "bomb_hard_min_gb": c.get("bomb_hard_min_gb", 1.0),
+        "bomb_hard_size_gb": c.get("bomb_hard_size_gb", 50.0),
+        "max_size_ratio": float(soft_ratio) if soft_ratio > 0 else 0.0,
+    }
 
 
 def _sanitize_cfg(cfg):
@@ -467,13 +500,17 @@ def parse_hotkey(combo):
 
 def save_config(cfg):
     """原子写配置：先写临时文件再 os.replace，避免程序中途崩溃/被杀软
-    扫描时留下半截损坏的 JSON（半截 JSON 会在下次启动把整个配置静默重置）。"""
+    扫描时留下半截损坏的 JSON（半截 JSON 会在下次启动把整个配置静默重置）。
+
+    成功返回 True；失败仍吞异常（绝不抛）并返回 False，供调用方按需回报
+    「保存失败」——既有调用方忽略返回值，故行为不变。"""
     try:
         data = json.dumps(cfg, ensure_ascii=False, indent=2)
         tmp = paths.CONFIG_FILE.with_name(paths.CONFIG_FILE.name + ".tmp")
         tmp.write_text(data, encoding="utf-8")
         os.replace(tmp, paths.CONFIG_FILE)
+        return True
     except Exception:
-        pass
+        return False
 
 

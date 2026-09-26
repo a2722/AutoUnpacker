@@ -2,7 +2,12 @@
 """主题系统：两套配色（fluent 浅色 / devtool 深色）+ 系统深浅色检测 + 应用/切换。
 
 职责：
-- 定义两套主题 token（颜色 + 圆角），由**同一个 QSS 模板**渲染出对应样式表；
+- 定义两套主题 token（颜色 + 圆角 + 间距 / 字号），由**同一个 QSS 模板**渲染出
+  对应样式表（v1 视觉规格 §2：颜色只改值、不新增名字；间距 / 字号 / 胶囊圆角
+  为本轮新增）；
+- `METRICS`：布局用尺寸常量（左栏宽 / 行高 / 控件尺寸；v1 视觉规格 §2）；
+- `shadow_spec()`：QGraphicsDropShadowEffect 用的阴影常量（QSS 无 box-shadow，
+  v1 视觉规格 §2 / §6.2）；
 - `PALETTE`：散落在各 UI 文件里的「内联颜色」集中在此，随主题就地更新；
 - `detect_system_theme()`：读注册表判断系统深浅色（单次约 0.03ms，无 COM/无子进程）；
 - `resolve_theme(pref)`：把配置偏好 auto/fluent/devtool 解析成具体主题；
@@ -68,23 +73,37 @@ _FLUENT = {
     # M2 追加：成功绿（模式卡「推荐」徽标文字 = base.css --success）、
     # 中性计数徽标文字（标签页徽标 = base.css --muted2）
     "success_fg": "#2e7d32", "badge_fg": "#3d4756",
+    # --- v1 视觉规格 §2：间距 / 字号 / 圆角（两套主题同值；只新增，不改名） ---
+    "space_xs": "4px", "space_sm": "8px", "space_md": "12px",
+    "space_lg": "16px", "space_xl": "24px",
+    "fs_h1": "20px",        # 页面大标题
+    "fs_h2": "14px",        # 对话框标题
+    "fs_title": "13.5px",   # 目录卡片路径
+    "fs_row": "13px",       # 设置项名称
+    "fs_body": "12.5px",    # 按钮 / 搜索 / 下拉 / 说明
+    "fs_section": "11.5px",  # 分组标题 / 单位
+    "fs_hint": "11px",      # 行内备注 / 次要说明
+    "fs_tag": "10px",       # 角标 / 风险标签
+    "radius_pill": "10px",  # 胶囊开关
+    "radius_bar": "2px",    # 左栏选中竖条
 }
 
 _DEVTOOL = {
-    "window_bg": "#1e1e1e", "window_fg": "#cccccc",
-    "card_bg": "#2d2d30", "card_border": "#3c3c3c", "radius_card": "4px",
-    "title_fg": "#4daafc", "section_fg": "#cccccc",
-    "ctl_bg": "#3c3c3c", "ctl_border": "#565656", "ctl_focus": "#007fd4",
-    "ctl_fg": "#cccccc", "radius_ctl": "2px",
+    "window_bg": "#1e1e1e", "window_fg": "#e0e0e0",
+    "card_bg": "#252526", "card_border": "#3c3c3c", "radius_card": "4px",
+    "title_fg": "#4daafc", "section_fg": "#a0a0a0",
+    "ctl_bg": "#2d2d30", "ctl_border": "#3c3c3c", "ctl_focus": "#0e639c",
+    "ctl_fg": "#e0e0e0", "radius_ctl": "2px",
     "sel_bg": "#094771", "sel_fg": "#ffffff",
-    "item_sel_bg": "#094771", "item_sel_fg": "#ffffff",
-    "btn_bg": "#3a3d41", "btn_border": "#3a3d41", "btn_fg": "#cccccc",
-    "btn_hover": "#45494e", "btn_pressed": "#2f3236",
-    "btn_dis_bg": "#2d2d30", "btn_dis_fg": "#6b6b6b", "btn_dis_border": "#3c3c3c",
+    "item_sel_bg": "rgba(14,99,156,0.32)", "item_sel_fg": "#cfe6ff",
+    "btn_bg": "#2d2d30", "btn_border": "#3c3c3c", "btn_fg": "#e0e0e0",
+    "btn_hover": "#37373d", "btn_pressed": "#2f3236",
+    "btn_dis_bg": "#2a2a2a", "btn_dis_fg": "#6b6b6b", "btn_dis_border": "#3c3c3c",
     "primary_bg": "#0e639c", "primary_hover": "#1177bb", "primary_pressed": "#0a4d7a",
     "primary_fg": "#ffffff",
-    "danger_bg": "#5a1d1d", "danger_fg": "#f48771", "danger_border": "#8a2b2b",
-    "danger_hover": "#6b2323",
+    "danger_bg": "rgba(244,135,113,0.12)", "danger_fg": "#f48771",
+    "danger_border": "rgba(244,135,113,0.45)",
+    "danger_hover": "rgba(244,135,113,0.22)",
     "pause_bg": "#4a3b12", "pause_border": "#6b5518", "pause_fg": "#e8b454",
     "pause_hover": "#5a4818",
     "paused_bg": "#0e639c", "paused_hover": "#1177bb", "paused_fg": "#ffffff",
@@ -93,22 +112,59 @@ _DEVTOOL = {
     "table_alt": "#2d2d30", "table_sel_bg": "#094771", "table_sel_fg": "#ffffff",
     "head_bg": "#2d2d30", "head_fg": "#cccccc", "head_border": "#3c3c3c",
     "log_bg": "#1b1b1b", "log_fg": "#d4d4d4", "log_border": "#3c3c3c",
-    "cat_bg": "#252526", "cat_border": "#3c3c3c", "cat_fg": "#cccccc",
-    "cat_hover": "#2a2d2e",
-    "group_border": "#3c3c3c", "group_title": "#cccccc",
+    "cat_bg": "#252526", "cat_border": "#3c3c3c", "cat_fg": "#e0e0e0",
+    "cat_hover": "#2d2d30",
+    "group_border": "#3c3c3c", "group_title": "#a0a0a0",
     "menu_bg": "#252526", "menu_border": "#454545", "menu_sel_bg": "#094771",
     "menu_sel_fg": "#ffffff", "menu_sep": "#454545",
     "tip_bg": "#252526", "tip_fg": "#cccccc", "tip_border": "#454545",
-    "sb_handle": "#424242", "sb_hover": "#4f4f4f",
+    "sb_handle": "#4a4a4a", "sb_hover": "#4f4f4f",
     "ind_bg": "#2d2d30", "ind_border": "#9a9a9a",
     # M2 新增（键集与 _FLUENT 完全一致）：chip_off_fg/nbar_err/nbar_warn/ticker_fg/accent_soft
     "chip_off_fg": "#9aa4b2", "nbar_err": "#ff6b6b", "nbar_warn": "#6b5518",
     "ticker_fg": "#9aa4b2", "accent_soft": "rgba(14,99,156,0.16)",
     # M2 追加：与 _FLUENT 同键（base.css devtool --success / --muted2）
     "success_fg": "#6fcf7f", "badge_fg": "#b8c0cc",
+    # --- v1 视觉规格 §2：间距 / 字号 / 圆角（与 _FLUENT 完全同值） ---
+    "space_xs": "4px", "space_sm": "8px", "space_md": "12px",
+    "space_lg": "16px", "space_xl": "24px",
+    "fs_h1": "20px", "fs_h2": "14px", "fs_title": "13.5px", "fs_row": "13px",
+    "fs_body": "12.5px", "fs_section": "11.5px", "fs_hint": "11px", "fs_tag": "10px",
+    "radius_pill": "10px", "radius_bar": "2px",
 }
 
 _TOKENS = {"fluent": _FLUENT, "devtool": _DEVTOOL}
+
+# ---------------------------------------------------------------------------
+# 布局尺寸常量（v1 视觉规格 §2；供页面在**布局 margins** 里使用——
+# QSS 的 padding 对普通 QWidget 常被忽略，见 §10）
+# ---------------------------------------------------------------------------
+METRICS = {
+    "rail_w": 236,            # 左栏宽度
+    "nav_item_h": 36,         # 左栏项高（QSS 里另有同名规则）
+    "search_w": 320,          # 搜索框宽
+    "search_h": 34,           # 搜索框高
+    "row_pad_y": 10,          # 行上下留白
+    "card_pad": (6, 16, 12),  # 卡片 padding (top, x, bottom)
+    "pane_pad": (16, 18, 24),  # 滚动主区 padding (top, x, bottom)
+    "gblock_gap": 14,         # 分组间距（上）
+    "topbar_h": 58,           # 顶部工具条高（约）
+    "actionbar_pad": (12, 18),  # 底部操作条 padding (y, x)
+}
+
+# 阴影（QSS 无 box-shadow → QGraphicsDropShadowEffect 用 Python 常量；§6.2）
+SHADOWS = {
+    "card": {"blur": 34, "dy": 10, "a_light": 26, "a_dark": 128},
+    "pop": {"blur": 28, "dy": 8, "a_light": 46, "a_dark": 153},
+}
+
+
+def shadow_spec(kind="card", theme=None):
+    """返回 QGraphicsDropShadowEffect 的 (blur, dy, alpha)；暗色更重（§6.2）。"""
+    cfg = SHADOWS.get(str(kind), SHADOWS["card"])
+    dark = str(theme or current_theme()).lower() == "devtool"
+    return {"blur": cfg["blur"], "dy": cfg["dy"],
+            "alpha": cfg["a_dark"] if dark else cfg["a_light"]}
 
 # ---------------------------------------------------------------------------
 # 内联颜色调色板：各 UI 文件 `from .style import PALETTE`，随主题**就地更新**
@@ -277,38 +333,233 @@ QPlainTextEdit#settingsTextEdit {
 QPlainTextEdit#settingsTextEdit:focus { border: 1px solid $ctl_focus; }
 
 QScrollArea { border: none; background: transparent; }
+
+/* ==========================================================================
+   设置页 A 方案 · v1 视觉规格（2026-09-25）
+   直落 §5 QSS 草案：左栏 / 顶部工具条 / 页头 / 卡片 / 分组 / 行 / 控件 /
+   搜索命中 / 监听目录 / 恢复默认模态 / 底部操作条。
+   颜色全部复用既有 token（只改值，不新增名字）；新增的只有间距 / 字号 /
+   圆角三类 token。作用域：能撞到其它页面的控件尺寸一律收在
+   `QWidget#settingsPage` 之下。
+   ========================================================================== */
+QWidget#settingsPage { background: $window_bg; }
+QWidget#settingsDomain { background: transparent; }
+QWidget#paneHost { background: $window_bg; }
+QScrollArea#settingsScroll { background: $window_bg; border: none; }
+
+/* ---- 左栏（236 固定宽；padding 12/10；item 高 36） ---- */
 QListWidget#settingsCat {
-    background: $cat_bg; border: 1px solid $cat_border;
-    border-radius: $radius_card; padding: 6px; outline: none; color: $cat_fg;
+    background: $cat_bg; border: none; border-right: 1px solid $cat_border;
+    padding: $space_md $space_sm; outline: 0; color: $cat_fg;
 }
 QListWidget#settingsCat::item {
-    padding: 9px 12px; border-radius: $radius_ctl; margin: 1px 0; color: $cat_fg;
+    height: 36px;                     /* METRICS["nav_item_h"] */
+    padding: 0 10px; margin: 1px 0;
+    border-radius: $radius_ctl;
+    color: $cat_fg; font-size: $fs_body;
 }
 QListWidget#settingsCat::item:hover { background: $cat_hover; }
 QListWidget#settingsCat::item:selected {
-    background: $item_sel_bg; color: $item_sel_fg; font-weight: bold;
+    background: $item_sel_bg; color: $item_sel_fg; font-weight: 700;
+}
+/* 选中左侧 3px 主色竖条：QSS 在 ::item 上不可靠 → _RailDelegate 自绘（§6.1） */
+QWidget#navSepHost { background: $cat_bg; }
+QFrame#navSep { background: $cat_border; border: none; max-height: 1px; }
+
+/* ---- 顶部工具条（高 ≈58；底部 1px 线；搜索 320×34） ---- */
+QFrame#settingsTop {
+    background: $cat_bg; border: none; border-bottom: 1px solid $cat_border;
+}
+QLineEdit#settingsSearch {
+    min-width: 320px; max-width: 320px; height: 34px;
+    padding: 0 11px; background: $ctl_bg; border: 1px solid $ctl_border;
+    border-radius: $radius_ctl; color: $ctl_fg; font-size: $fs_body;
+}
+QLineEdit#settingsSearch:focus { border-color: $ctl_focus; }
+QLabel#btnSub { color: $chip_off_fg; font-size: $fs_tag; }
+
+/* ---- 页面头（新增：大标题 + 描述 + 命中数右对齐） ---- */
+QLabel#pageTitle { font-size: $fs_h1; font-weight: 800; color: $title_fg; }
+QLabel#pageDesc  { font-size: $fs_body; color: $section_fg; }
+QLabel#hitTotal  { font-size: $fs_body; color: $chip_off_fg; }
+/* 领域描述仍用 #stripHint（离线验收按该 objectName 度量折行高度），
+   视觉上按页头描述取 section_fg / 12.5px */
+QWidget#settingsPage QLabel#stripHint[role="pageDesc"] {
+    font-size: $fs_body; color: $section_fg;
 }
 
-/* 设置页 A 方案：领域页 / 分组 / 极简行 / 补充信息气泡。
-   全部复用既有 token，不新增颜色。 */
-QLabel#groupTitle {
-    color: $group_title; font-size: 12px; font-weight: 600;
-    padding: 10px 0 6px 0;
+/* ---- 卡片 / 分组 ---- */
+QFrame#card {
+    background: $card_bg; border: 1px solid $card_border;
+    border-radius: $radius_card;
 }
-QFrame#groupSep { background: $group_border; border: none; max-height: 1px; }
-QFrame#settingsTop { background: transparent; }
-QLabel#setName { font-size: 13px; font-weight: 600; color: $window_fg; }
-QLabel#devDot { color: $badge_fg; font-size: 14px; }
+QFrame#group { background: transparent; border: none; border-top: 1px solid $group_border; }
+QFrame#group[first="true"] { border-top: none; }
+QLabel#groupTitle { font-size: $fs_section; font-weight: 800; color: $group_title; }
+QFrame#groupSep {
+    background: $group_border; border: none;
+    min-height: 1px; max-height: 1px;
+}
+
+/* ---- 行（底部分隔线 / hover / 风险底色；末行无底边） ---- */
+QWidget#setRow { border-bottom: 1px solid $group_border; background: transparent; }
+QWidget#setRow[last="true"] { border-bottom: none; }
+QWidget#setRow:hover { background: $accent_soft; }
+QWidget#setRow[risk="true"] { background: $danger_bg; border-radius: $radius_card; }
+QWidget#setRow[flash="true"] { background: $accent_soft; }
+QLabel#setName { font-size: $fs_row; font-weight: 700; color: $window_fg; }
+QLabel#rowNote { font-size: $fs_hint; color: $chip_off_fg; }
+QLabel#unit    { font-size: $fs_section; color: $chip_off_fg; }
 QLabel#riskBadge {
-    color: $danger_fg; background: $danger_bg; border: 1px solid $danger_border;
-    border-radius: 4px; padding: 0 6px; font-size: 11px;
+    font-size: $fs_tag; font-weight: 700; color: $danger_fg; background: $danger_bg;
+    border: 1px solid $danger_border; border-radius: $radius_ctl; padding: 1px 7px;
 }
+
+/* ---- 控件尺寸（对齐设计稿；作用域限定本页，避免影响其它页面） ---- */
+QWidget#settingsPage QSpinBox, QWidget#settingsPage QDoubleSpinBox {
+    min-width: 96px; max-width: 96px; min-height: 28px; max-height: 28px;
+    text-align: right; padding: 0 9px;
+}
+QWidget#settingsPage QPushButton {
+    min-height: 28px; max-height: 28px; padding: 0 12px;
+    border-radius: $radius_ctl; border: 1px solid $btn_border;
+    background: $btn_bg; color: $btn_fg; font-size: $fs_body;
+}
+QWidget#settingsPage QPushButton:hover { background: $btn_hover; }
+QWidget#settingsPage QPushButton#primary {
+    background: $primary_bg; border-color: $primary_bg; color: $primary_fg;
+    font-weight: 700;
+}
+QWidget#settingsPage QPushButton#primary:hover { background: $primary_hover; }
+QWidget#settingsPage QPushButton#danger {
+    min-height: 30px; max-height: 30px; padding: 0 16px; color: $danger_fg;
+    background: $danger_bg; border: 1px solid $danger_border; font-weight: 700;
+}
+QWidget#settingsPage QPushButton#danger:hover { background: $danger_hover; }
+QWidget#settingsPage QPushButton#ghost,
+QWidget#settingsPage QPushButton#ghostSm {
+    background: transparent; border: 1px solid transparent; color: $window_fg;
+}
+QWidget#settingsPage QPushButton#ghostSm {
+    min-height: 22px; max-height: 22px; padding: 0 8px; font-size: $fs_section;
+}
+QWidget#settingsPage QPushButton#ghost:hover,
+QWidget#settingsPage QPushButton#ghostSm:hover { background: $btn_hover; }
+QWidget#settingsPage QPushButton#hitRow {
+    min-height: 30px; max-height: 30px; padding: 0 10px;
+    background: transparent; border: none; border-radius: $radius_ctl;
+    text-align: left; color: $window_fg; font-size: $fs_body;
+}
+QWidget#settingsPage QPushButton#hitRow:hover { background: $accent_soft; }
+QWidget#settingsPage QComboBox {
+    min-width: 180px; min-height: 28px; max-height: 28px; padding: 0 8px;
+    font-size: $fs_body;
+}
+QWidget#settingsPage QPlainTextEdit#settingsTextEdit {
+    min-width: 280px; max-width: 280px; min-height: 58px; max-height: 58px;
+    padding: 7px 9px; border: 1px solid $ctl_border; border-radius: $radius_ctl;
+}
+QWidget#settingsPage QPlainTextEdit#settingsTextEdit:focus { border-color: $ctl_focus; }
+QWidget#settingsPage QLabel#roval {
+    font-size: $fs_body; color: $chip_off_fg; background: $window_bg;
+    border: 1px solid $ctl_border; border-radius: $radius_ctl; padding: 6px 11px;
+}
+QWidget#settingsPage QLabel#stripHint { color: $chip_off_fg; }
+
+/* ---- 搜索命中 / 空状态（命中项可点击） ---- */
+QFrame#hitCard {
+    background: $card_bg; border: 1px solid $card_border; border-radius: $radius_card;
+}
+QLabel#emptyState {
+    padding: 26px 14px; color: $chip_off_fg; font-size: $fs_body;
+    background: $card_bg; border: 1px dashed $card_border; border-radius: $radius_card;
+}
+
+/* ---- 监听目录卡片（2 列 grid + 状态胶囊 + 虚线页脚） ---- */
+QFrame#dirCard {
+    background: $card_bg; border: 1px solid $card_border; border-radius: $radius_card;
+}
+/* 目录路径标签 objectName 仍是 sectionTitle（离线验收计数用），视觉走 [role=dirPath] */
+QWidget#settingsPage QLabel#sectionTitle[role="dirPath"] {
+    font-size: $fs_title; font-weight: 700; color: $window_fg;
+}
+QLabel#dirPath { font-size: $fs_title; font-weight: 700; color: $window_fg; }
+QLabel#statusPill {
+    font-size: $fs_tag; font-weight: 700; border-radius: $radius_ctl; padding: 2px 9px;
+}
+QLabel#statusPill[on="true"]  { color: $success_fg; border: 1px solid $success_fg; }
+QLabel#statusPill[off="true"] {
+    color: $chip_off_fg; background: $window_bg; border: 1px solid $ctl_border;
+}
+QFrame#dirFoot {
+    background: $window_bg; border: 1px dashed $card_border;
+    border-radius: $radius_card;
+}
+QFrame#dirFieldRisk { background: $danger_bg; border-radius: $radius_card; }
+/* chipState 独立规则，不再依赖 #dirChip 父级（§8 #10） */
+QLabel#chipState {
+    font-size: $fs_tag; font-weight: 700; color: $chip_off_fg;
+    border: 1px solid $ctl_border; border-radius: $radius_ctl; padding: 1px 7px;
+}
+
+/* ---- 补充信息气泡（只留用户可见两段：标题 + 描述；风险项追加风险块） ---- */
 QFrame#settingsBubble {
     background: $card_bg; border: 1px solid $card_border;
     border-radius: $radius_card;
 }
-QFrame#bubbleRisk { border: 1px solid $danger_border; background: $danger_bg;
-    border-radius: 4px; }
+QFrame#settingsBubble[pinned="true"] { border-color: $ctl_focus; }
+QLabel#bubbleTitle { font-size: $fs_title; font-weight: 800; color: $window_fg; }
+QLabel#bubbleDesc  { font-size: $fs_body; color: $section_fg; }
+QFrame#bubbleRisk {
+    background: $danger_bg; border: 1px dashed $danger_border;
+    border-radius: $radius_card;
+}
+QLabel#bubbleRiskTitle { font-size: $fs_tag; font-weight: 800; color: $danger_fg; }
+QLabel#bubbleRiskBody  { font-size: $fs_section; color: $window_fg; }
+
+/* ---- 恢复默认：自绘模态（QMessageBox#modalCard + 自建卡内容；见 page_settings） ---- */
+QMessageBox { background: $card_bg; }
+QMessageBox QLabel { color: $window_fg; font-size: $fs_body; }
+QMessageBox#modalCard { background: $card_bg; }
+QMessageBox#modalCard QFrame#modalHead { border: none; border-bottom: 1px solid $group_border; }
+QMessageBox#modalCard QFrame#modalFoot { border: none; border-top: 1px solid $group_border; }
+QMessageBox#modalCard QLabel#modalTitle { font-size: $fs_h2; font-weight: 800; color: $window_fg; }
+QMessageBox#modalCard QPushButton#modalClose {
+    background: transparent; border: none; border-radius: $radius_ctl; padding: 0;
+}
+QMessageBox#modalCard QPushButton#modalClose:hover { background: $cat_hover; }
+QMessageBox#modalCard QFrame#warnBox {
+    background: $danger_bg; border: 1px solid $danger_border; border-radius: $radius_card;
+}
+QMessageBox#modalCard QLabel#warnText { color: $danger_fg; font-size: $fs_body; }
+QMessageBox#modalCard QRadioButton#scopeItem {
+    border: 1px solid $ctl_border; border-radius: $radius_card;
+    padding: 11px 12px; font-size: $fs_body; color: $window_fg;
+    background: $card_bg;
+}
+QMessageBox#modalCard QRadioButton#scopeItem:hover { border-color: $ctl_focus; }
+QMessageBox#modalCard QRadioButton#scopeItem:checked {
+    border-color: $title_fg; background: $accent_soft;
+}
+QMessageBox#modalCard QLabel#scopeName { font-weight: 700; color: $window_fg; }
+QMessageBox#modalCard QLabel#scopeSub { font-size: $fs_hint; color: $chip_off_fg; }
+QMessageBox#modalCard QPushButton {
+    min-height: 28px; padding: 0 12px; border-radius: $radius_ctl;
+    border: 1px solid $btn_border; background: $btn_bg; color: $btn_fg;
+    font-size: $fs_body;
+}
+QMessageBox#modalCard QPushButton:hover { background: $btn_hover; }
+QMessageBox#modalCard QPushButton#primary {
+    background: $primary_bg; border-color: $primary_bg; color: $primary_fg;
+    font-weight: 700; min-height: 30px;
+}
+QMessageBox#modalCard QPushButton#primary:hover { background: $primary_hover; }
+
+/* ---- 底部操作条 ---- */
+QFrame#actionbar {
+    background: $cat_bg; border: none; border-top: 1px solid $cat_border;
+}
+QLabel#notice { font-size: $fs_hint; color: $chip_off_fg; }
 
 QGroupBox {
     border: 1px solid $group_border; border-radius: $radius_card;
@@ -328,10 +579,11 @@ QToolTip {
     background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border; padding: 4px;
 }
 
-/* 点击日志链接后的「已复制 / 复制失败」小气泡：复用 tip_* token，无新色值 */
+/* 点击日志链接后的「已复制 / 复制失败」小气泡（§7：底 window_fg / 字 window_bg，
+   12px、padding 9/16、圆角 4） */
 QLabel#toastBubble {
-    background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border;
-    border-radius: $radius_ctl; padding: 4px 10px; font-size: 12px;
+    background: $window_fg; color: $window_bg;
+    border-radius: $radius_ctl; padding: 9px 16px; font-size: $fs_body;
 }
 
 QScrollBar:vertical { background: transparent; width: 11px; }

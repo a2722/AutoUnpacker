@@ -13,12 +13,13 @@
         经 trail.quarantine_restore 还原、trail.quarantine_purge 彻底删除；
         页头常显隔离区用量「隔离区：N 个文件 · X」
       - 空态：无记录与「筛选无结果」两种文案
-关键入口：TrailPage / record_time() / day_key() / record_reason() /
+关键入口：TrailPage / _RestoreWorker / record_time() / day_key() / record_reason() /
           record_matches() / export_rows() / quarantine_files() / has_quarantine()
 依赖：PyQt5、pages（复用 _EmptyOverlay/_ghost_button/_icon_button 家族控件）、
       widgets（SegControl/Glyph/状态文案与配色/_fmt_size）、style（PALETTE）、trail
 注意：- 页面只经 trail 模块读写记录；清空 = trail.save_records([])，绝不直接删文件
-      - 还原仅「已删除（回收站）」或「隔离区」记录可用，且需用户确认；本页不起线程、不联网
+      - 还原仅「已删除（回收站）」或「隔离区」记录可用，且需用户确认；还原在后台
+        线程逐条执行（非模态进度框、可协作取消），页面本身不联网
       - 真实记录含绝对路径：页内展示（含 tooltip）没问题，但 notice 回执文案
         绝不携带路径（避免被宿主写进日志）
       - 数据装载可用 set_records()（宿主），reload() 从 trail 模块重读（自身刷新）
@@ -27,11 +28,13 @@ import csv
 import os
 import time
 
-from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import (QAbstractTableModel, QModelIndex, QObject, Qt,
+                          QThread, QTimer, pyqtSignal)
 from PyQt5.QtGui import QBrush, QColor, QFont
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                             QMessageBox, QTableView, QVBoxLayout, QWidget)
+                             QMessageBox, QProgressDialog, QTableView,
+                             QVBoxLayout, QWidget)
 
 from .. import trail as deletion_trail
 from .pages import _EmptyOverlay, _ghost_button, _icon_button
@@ -478,6 +481,83 @@ class _TrailTable(QTableView):
 
 
 # ---------------------------------------------------------------------------
+# 还原后台线程（逐条还原移出 UI 线程，避免 N 条 × 最长 30s 的「未响应」）
+# ---------------------------------------------------------------------------
+
+class _RestoreWorker(QObject):
+    """还原 worker：在后台线程逐条还原，UI 线程只更新非模态进度框。
+
+    仍经模块属性调用后端（``deletion_trail.restore_record`` /
+    ``_quarantine_helper("quarantine_restore")``），既有测试桩保持拦截。
+    取消为协作式：只在两条记录之间检查，绝不打断进行中的单条还原
+    （win32com 的 InvokeVerb 与单文件最长 30s 落地轮询不在此处中断，
+    详见 deletion/recycle.py）。
+    """
+
+    progress = pyqtSignal(int, int)    # (done, total)
+    finished = pyqtSignal(dict)        # 聚合结果（键与旧同步循环一致）
+
+    def __init__(self, normal, quar, skipped):
+        super().__init__()
+        self._normal = list(normal or [])
+        self._quar = list(quar or [])
+        self._skipped = int(skipped or 0)
+        self._cancelled = False
+
+    def cancel(self):
+        """请求取消：下一处记录边界生效（协作式）。"""
+        self._cancelled = True
+
+    def run(self):
+        total = len(self._normal) + len(self._quar)
+        done = 0
+        ok_n, fail_n = 0, 0
+        success_msgs, first_fail = [], ""
+        for rec in self._normal:
+            if self._cancelled:
+                break
+            try:
+                ok, msg = deletion_trail.restore_record(str(rec.get("id") or ""))
+            except Exception as e:
+                ok, msg = False, str(e)
+            if ok:
+                ok_n += 1
+                success_msgs.append(str(msg))
+            else:
+                fail_n += 1
+                if not first_fail:
+                    first_fail = str(msg or "")
+            done += 1
+            self.progress.emit(done, total)
+        q_ok, q_skip, q_fail = 0, 0, 0
+        for rec in self._quar:
+            if self._cancelled:
+                break
+            n_files = len(quarantine_files(rec))
+            try:
+                result = _quarantine_helper("quarantine_restore")(
+                    str(rec.get("id") or ""))
+                r_ok, r_skip, r_fail = quarantine_result_counts(result, n_files)
+            except Exception as e:
+                r_ok, r_skip, r_fail = 0, 0, 1
+                if not first_fail:
+                    first_fail = str(e)
+            q_ok += r_ok
+            q_skip += r_skip
+            q_fail += r_fail
+            done += 1
+            self.progress.emit(done, total)
+        self.finished.emit({
+            "ok_n": ok_n, "fail_n": fail_n,
+            "success_msgs": success_msgs, "first_fail": first_fail,
+            "q_ok": q_ok, "q_skip": q_skip, "q_fail": q_fail,
+            "skipped": self._skipped,
+            "has_normal": bool(self._normal), "has_quar": bool(self._quar),
+            "cancelled": self._cancelled,
+        })
+
+
+# ---------------------------------------------------------------------------
 # 删除回溯页
 # ---------------------------------------------------------------------------
 
@@ -497,6 +577,10 @@ class TrailPage(QWidget):
         self._mode = "all"          # all | reason | date
         self._reason = "deleted"    # 原因分段当前值（mode=reason 时生效）
         self._day = "today"         # 日期分段当前值（mode=date 时生效）
+        # 后台还原线程（worker/进度框在 _start_restore_worker 里创建）
+        self._restore_thread = None
+        self._restore_worker = None
+        self._restore_progress = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 10)
@@ -853,38 +937,92 @@ class TrailPage(QWidget):
                 self, "删除回溯", ask,
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        ok_n, fail_n = 0, 0
-        success_msgs, first_fail = [], ""
-        for rec in normal:
-            try:
-                ok, msg = deletion_trail.restore_record(str(rec.get("id") or ""))
-            except Exception as e:
-                ok, msg = False, str(e)
-            if ok:
-                ok_n += 1
-                success_msgs.append(str(msg))
-            else:
-                fail_n += 1
-                if not first_fail:
-                    first_fail = str(msg or "")
-        q_ok, q_skip, q_fail = 0, 0, 0
-        for rec in quar:
-            n_files = len(quarantine_files(rec))
-            try:
-                result = _quarantine_helper("quarantine_restore")(
-                    str(rec.get("id") or ""))
-                r_ok, r_skip, r_fail = quarantine_result_counts(result, n_files)
-            except Exception as e:
-                r_ok, r_skip, r_fail = 0, 0, 1
-                if not first_fail:
-                    first_fail = str(e)
-            q_ok += r_ok
-            q_skip += r_skip
-            q_fail += r_fail
+        self._start_restore_worker(normal, quar, skipped)
+
+    # ---- 还原后台执行 ----
+    def _start_restore_worker(self, normal, quar, skipped):
+        """把逐条还原移出 UI 线程：非模态进度框 + 协作式取消。
+
+        worker 仍经模块属性调用后端（既有测试桩保持拦截）；完成后回到 UI
+        线程执行 reload 与回执（文案与旧同步实现逐字一致）。
+        """
+        total = len(normal) + len(quar)
+        self._restore_thread = QThread()
+        self._restore_worker = _RestoreWorker(normal, quar, skipped)
+        self._restore_worker.moveToThread(self._restore_thread)
+        self._restore_thread.started.connect(self._restore_worker.run)
+        self._restore_worker.progress.connect(self._on_restore_progress)
+        self._restore_worker.finished.connect(self._on_restore_finished)
+        self._restore_worker.finished.connect(self._restore_thread.quit)
+        self._restore_thread.finished.connect(self._restore_worker.deleteLater)
+        self._restore_thread.finished.connect(self._on_restore_thread_finished)
+        self.restore_btn.setEnabled(False)      # 进行中禁止再次触发
+        dlg = QProgressDialog("正在还原选中记录…", "取消", 0, total, self)
+        dlg.setWindowTitle("删除回溯")
+        dlg.setWindowModality(Qt.NonModal)      # 非模态：绝不阻塞 UI，也不 exec_()
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(self._on_restore_cancel)
+        self._restore_progress = dlg
+        dlg.show()
+        self._restore_thread.start()
+
+    def _on_restore_progress(self, done, total):
+        dlg = self._restore_progress
+        if dlg is None:
+            return
+        try:
+            dlg.setMaximum(int(total))
+            dlg.setValue(int(done))
+        except Exception:
+            pass
+
+    def _on_restore_cancel(self):
+        """取消按钮：协作式取消，仅在两条记录之间生效（不打断进行中的还原）。"""
+        worker = self._restore_worker
+        if worker is not None:
+            worker.cancel()
+
+    def _close_restore_progress(self):
+        dlg = self._restore_progress
+        self._restore_progress = None
+        if dlg is None:
+            return
+        try:
+            dlg.close()
+            dlg.deleteLater()
+        except Exception:
+            pass
+
+    def _on_restore_finished(self, result):
+        self._close_restore_progress()
+        self._finish_restore(result)
+
+    def _on_restore_thread_finished(self):
+        th = self._restore_thread
+        self._restore_thread = None
+        self._restore_worker = None
+        if th is not None:
+            th.deleteLater()
+
+    def _finish_restore(self, result):
+        """还原收尾（UI 线程）：reload + 逐步汇总回执（文案与旧实现一致）。"""
+        ok_n = int(result.get("ok_n", 0))
+        fail_n = int(result.get("fail_n", 0))
+        success_msgs = list(result.get("success_msgs") or [])
+        first_fail = str(result.get("first_fail") or "")
+        q_ok = int(result.get("q_ok", 0))
+        q_skip = int(result.get("q_skip", 0))
+        q_fail = int(result.get("q_fail", 0))
+        skipped = int(result.get("skipped", 0))
+        has_normal = bool(result.get("has_normal"))
+        has_quar = bool(result.get("has_quar"))
+        head = "已取消：" if result.get("cancelled") else ""
         self.reload()                      # 已还原的整条记录按既有语义从视图消失
-        if not quar:
+        if not has_quar:
             # 无隔离区记录：沿用既有回执语义（后端消息 / 项级计数）
-            if ok_n == 1 and fail_n == 0:
+            if ok_n == 1 and fail_n == 0 and success_msgs:
                 # 单条成功沿用后端消息（既有回执语义），仅在确有跳过项时追加说明
                 summary = success_msgs[0]
                 if skipped:
@@ -894,7 +1032,7 @@ class TrailPage(QWidget):
                 if skipped:
                     parts.append("跳过 %d 项（非「已删除」）" % skipped)
                 summary = "还原完成：" + "，".join(parts)
-            self.notice.emit(summary)
+            self.notice.emit(head + summary)
             if fail_n == 0:
                 detail = "还原成功：%d 项" % ok_n
                 if skipped:
@@ -905,11 +1043,11 @@ class TrailPage(QWidget):
                     detail += "；跳过 %d 项（非「已删除」状态）" % skipped
                 if first_fail:
                     detail += "\n首个失败：%s" % first_fail
-            QMessageBox.information(self, "还原结果", detail)
+            QMessageBox.information(self, "还原结果", head + detail)
             return
         # 含隔离区记录：文件级如实计数（成功 X 个文件 / 跳过 Y 个 / 失败 Z 个）
         parts = []
-        if normal:
+        if has_normal:
             parts.append("回收站成功 %d 项" % ok_n)
             if fail_n:
                 parts.append("回收站失败 %d 项" % fail_n)
@@ -918,12 +1056,12 @@ class TrailPage(QWidget):
         parts.append("失败 %d 个" % q_fail)
         if skipped:
             parts.append("另有 %d 项不可还原，已跳过" % skipped)
-        summary = ("还原完成：" if normal else "隔离区还原完成：") + "，".join(parts)
-        self.notice.emit(summary)
+        summary = ("还原完成：" if has_normal else "隔离区还原完成：") + "，".join(parts)
+        self.notice.emit(head + summary)
         detail = summary
         if first_fail:
             detail += "\n首个失败：%s" % first_fail
-        QMessageBox.information(self, "还原结果", detail)
+        QMessageBox.information(self, "还原结果", head + detail)
 
     def _on_purge(self):
         """彻底删除选中记录的隔离区文件（不可恢复）：逐条经 trail.quarantine_purge。

@@ -172,6 +172,8 @@ class PauseController:
         self.hub = hub
         self._event = threading.Event()   # set = 已暂停
         self._procs = set()               # 正在运行的解压子进程
+        self._aborted = set()             # 用户已中止的任务 id
+        self._by_task = {}                # task_id -> 该任务正在运行的子进程集合
         self._lock = threading.Lock()
 
     def is_paused(self):
@@ -194,18 +196,50 @@ class PauseController:
             self._event.clear()
             self._resume_all()
 
-    def register(self, proc):
-        """登记一个正在运行的解压子进程；若已暂停则立即挂起它。"""
+    def register(self, proc, task_id=None):
+        """登记一个正在运行的解压子进程；若已暂停则立即挂起它。
+
+        task_id 可选：旧调用 register(proc) 保持可用；带上 task_id 后
+        abort_task(task_id) 才能定位并杀掉该任务卡住的子进程。"""
         if proc is None:
             return
         with self._lock:
             self._procs.add(proc)
+            if task_id is not None:
+                self._by_task.setdefault(task_id, set()).add(proc)
         if self._event.is_set():
             self._suspend(proc)
 
     def unregister(self, proc):
         with self._lock:
             self._procs.discard(proc)
+            for procs in self._by_task.values():
+                procs.discard(proc)
+
+    def abort_task(self, task_id):
+        """标记任务已中止，并杀掉该任务正在运行的子进程（卡住的 7z 可被用户结束）。
+
+        只标记 + 杀进程：解压循环自己检测到中止后返回「已取消」，产物回退/保留
+        由上层决定。可重复调用（幂等）。"""
+        if task_id is None:
+            return
+        with self._lock:
+            self._aborted.add(task_id)
+            procs = list(self._by_task.get(task_id, ()))
+        for proc in procs:
+            self._kill(proc)
+
+    def is_aborted(self, task_id):
+        if task_id is None:
+            return False
+        with self._lock:
+            return task_id in self._aborted
+
+    def _kill(self, proc):
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def _suspend(self, proc):
         try:
@@ -301,6 +335,57 @@ class PythonZipEngine:
                 out.append(b)
         return out
 
+    @staticmethod
+    def _opt_number(options, key, default):
+        """读数值型安全选项：缺失/None/非法值一律回退默认值，绝不抛异常。
+
+        与 service._opt_number 同口径，保证内置引擎的 zip bomb 预检与 7z 路径
+        使用完全一致的阈值解析规则。"""
+        try:
+            value = options.get(key, default)
+            return default if value is None else float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _check_declared_bomb(self, archive, options):
+        """只读打开 ZIP 清单，按「声明解压后大小 / 膨胀比」做 zip bomb 硬阈值预检。
+
+        返回 (中文原因, 声明条目数)：命中硬阈值时原因为字符串，否则为 None。
+        阈值与文案与 service._precheck（7z 路径）同口径：绝对上限
+        bomb_hard_size_gb（默认 50 GB）、膨胀比 bomb_hard_ratio（默认 200×，
+        需同时达到 bomb_hard_min_gb，默认 1 GB）。
+
+        铁律：任何异常/未知（非 ZIP、打不开、解析不出）一律放行——加密或损坏的
+        归档本就读不出真实清单，绝不能因为探测不到就拦住正常解压。"""
+        options = options or {}
+        if not options.get("bomb_guard_enabled", True):
+            return None, 0
+        try:
+            with self._open(archive) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()]
+                declared = sum(int(i.file_size) for i in infos)
+                entries = len(infos)
+            try:
+                archive_size = Path(archive).stat().st_size
+            except OSError:
+                return None, entries
+            hard_size_gb = self._opt_number(options, "bomb_hard_size_gb", 50.0)
+            hard_ratio = self._opt_number(options, "bomb_hard_ratio", 200.0)
+            hard_min_gb = self._opt_number(options, "bomb_hard_min_gb", 1.0)
+            gib = 1024 ** 3
+            declared_gb = declared / gib
+            if declared > hard_size_gb * gib:
+                return (f"声明解压后大小 {declared_gb:.1f} GB 超过硬上限 "
+                        f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压"), entries
+            ratio = declared / archive_size if archive_size > 0 else 0.0
+            if ratio >= hard_ratio and declared_gb >= hard_min_gb:
+                return (f"声明膨胀比 {ratio:.0f}:1（解压后 {declared_gb:.2f} GB / "
+                        f"压缩包 {archive_size / 1048576:.1f} MB）达到硬阈值 "
+                        f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压"), entries
+            return None, entries
+        except Exception:
+            return None, 0
+
     def extract(self, task, options, layer):
         archive = Path(task["source_path"])
         fmt = _detect_7z_only_format(archive)
@@ -310,6 +395,13 @@ class PythonZipEngine:
             return {"success": False, "used_password": None, "encrypted": False,
                     "error": f"该格式需要 7-Zip（当前不可用）：{fmt} 无法用内置引擎解压",
                     "logs": [f"检测到 {fmt} 格式，内置 zipfile 引擎无法解压，需要 7-Zip"]}
+        blocked, entries = self._check_declared_bomb(archive, options)
+        if blocked is not None:
+            # 与 7z 路径同一失败契约：拒绝把炸弹写盘，也不创建输出目录。
+            return {"success": False, "used_password": None, "encrypted": False,
+                    "error": blocked, "raw_error": blocked,
+                    "logs": [f"{self.name} 引擎安全预检拦截（声明 {entries} 个条目）："
+                             f"{blocked}"]}
         out = Path(task["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         pauser = task.get("pauser")
@@ -429,6 +521,7 @@ class SevenZipEngine:
         out = Path(task["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         pauser = task.get("pauser")
+        task_id = task.get("id")
         progress_cb = task.get("progress_cb")
         total, encrypted = self._listing_info(archive)
         if progress_cb is not None:
@@ -472,7 +565,7 @@ class SevenZipEngine:
                 except Exception:
                     pass
             if pauser is not None:
-                pauser.register(proc)
+                pauser.register(proc, task_id)
             buf = []
 
             def _drain():
@@ -492,9 +585,17 @@ class SevenZipEngine:
             th.start()
             last_ratio = -1.0
             last_progress_t = 0.0
+            aborted = False
             try:
                 while True:
                     if pauser is not None:
+                        if task_id is not None and pauser.is_aborted(task_id):
+                            # 用户中止：杀掉卡住的 7z 并跳出等待（先于暂停等待
+                            # 判断，保证「暂停中再中止」也能立即结束）。rc =
+                            # proc.wait() 紧接其后立即返回（该等待绝不带超时）。
+                            proc.kill()
+                            aborted = True
+                            break
                         pauser.wait_if_paused()
                     if proc.poll() is not None:
                         break
@@ -512,6 +613,14 @@ class SevenZipEngine:
                 if pauser is not None:
                     pauser.unregister(proc)
             th.join(timeout=2)
+            if aborted:
+                if progress_cb is not None:
+                    progress_cb(None, layer, archive.name)
+                return {"success": False, "used_password": None,
+                        "encrypted": bool(encrypted),
+                        "error": "已取消（用户中止）",
+                        "raw_error": "用户中止解压",
+                        "logs": [f"使用 {self.name} 引擎解压已取消（用户中止）"]}
             err = "".join(buf)
             if rc == 0:
                 if progress_cb is not None:

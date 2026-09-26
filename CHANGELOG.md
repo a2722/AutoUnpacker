@@ -5,6 +5,52 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.7] - 2026-09-26
+
+> **本轮重点**：**设置页按 A 方案整页重写**并补上视觉规格（间距/字号 token、目录卡内按钮、样式化模态、搜索命中卡、卡片阴影、窗口放宽到 1440×880）；
+> 同时修掉一批「改了没用 / 静默失败 / 卡死」的真实缺陷——**防 zip bomb 的 6 项设置此前从未生效**、**监听模式与删除策略两处枚举打架**、
+> **还原删除文件会卡死界面**、**重试成功后旧任务仍留在队列**。
+
+### 新增
+
+- **设置页 A 方案全量重写**：9 领域左栏 + 全局搜索 + 悬停/点击补充信息气泡 + 胶囊开关 + 单一「恢复默认」；目录改为卡片式管理。
+- **拖拽行为固定胶囊**（主界面顶部）：拖入文件总开关 / 二维码识别 / 智能穿透 / 删除源文件，写回 `drop_*`。
+- **目录胶囊条拖拽排序**（顺序持久化）。
+- **队列 / 日志可调分屏**。
+- **配置导入 / 导出**：设置页可把整份配置导出为 JSON，也可导入（校验 + 失败回滚）。
+- **「解压前安全检查」真正生效**：`bomb_guard_enabled` 与 5 个阈值从配置接入解压引擎；无 7-Zip 时的 `PythonZipEngine` 补同等「声明体积 / 条目数」预检。
+- **设置页视觉规格落地**：新增间距 / 字号 / 圆角 token（不新增颜色名），补齐 `#settingsDomain` / `#setRow` / `#settingsScroll` 等此前「零样式」的容器；页头、左栏选中竖条、目录卡 2 列 + 状态胶囊 + 虚线页脚、卡片阴影（`QGraphicsDropShadowEffect`）。**窗口默认尺寸 1180×760 → 1440×880**。
+
+### 修复
+
+- **防 zip bomb 的 6 项设置此前全部无效**（配置从未传给解压引擎）——现已接通；`max_size_ratio` 跟随「体积膨胀预警倍数」。
+- **监听目录「按网盘清单处理子目录」选不中 / 选完回弹**：设置页写 `manifest`、后端只认 `baidu`，统一为 `baidu`（与目录弹窗一致）。
+- **监听目录「永久删除」选完变回「自动判断」**：统一为后端值 `permanent`。
+- **「设置向导」点一次就永久消失**：点 OK 不再误写 `settings_wizard_done`（仅「跳过」写）。
+- **还原删除文件时界面卡死**（最长 30s×N）：还原移入后台线程 + 非模态进度条 + 可取消。
+- **后处理失败（脚本 / 移动 / 提升）用户看不到**：后处理日志与失败现经 `post_logs` / `post_error` 外显到运行日志。
+- **设置保存失败静默丢失**：`save_config` / `state._persist` 返回并记录结果（磁盘满 / 只读时不再假报成功）。
+- **DB 出错时列表显示为空**：新增 `db.last_error()`，可区分「读取失败」与「无数据」。
+- **信任弹窗在 UI 线程做 DNS 解析**（偶发冻结）：改用 `resolve=False`，弹窗不再阻塞。
+- **卡住的 7-Zip 无法中止**：新增 `PauseController.abort_task`，忽略任务时可杀掉卡住的进程。
+- **直接模式解压失败、残留在非空目录时无标识**：写入 `.autounpacker_incomplete` 标记（不误回收用户已有文件）。
+- **回收站不可用时永久删除源文件不告知**：`delete_source` 返回「回收站 / 隔离区 / 永久删除 / 保留」摘要并外显。
+- **重试成功后旧任务仍留在队列**：`find_open_task` 的路径比较改为归一化（`\` 与 `/`、大小写、尾斜杠），重试复用同一行、成功后正常离开队列。
+- **设置页复检 9 项**：胶囊开关全宽可点（右半边此前无效）；补充信息气泡删掉内部调试行；点气泡外即收起、固定气泡随窗口移动；去掉无用的蓝点；删除与「目录设置」重复的「删除源文件」总控；单选组与风险行间距；修「打开目录设置」`int()` 崩溃并把按钮移入各目录卡内。
+- **任务详情弹窗**：点击弹窗以外区域即关闭（保持模态）；「输入密码…并重试」改为「跳转到密码本」，且点击后弹窗随之关闭。
+
+### 变更
+
+- 分享抓页遇**同一主域**跳转不再弹「未信任新域名」（仅放行同主域；黑名单与内置敏感类别仍拦截）。
+- 移除死代码 `DeleteTrailDialog`（`TrailPage` 为唯一入口）；`DragBehaviorDialog` 的通知接回运行日志。
+- `config.example.json` 与 `DEFAULT_CONFIG` 对齐（补 36 项、修正 `hotkey`、补目录 `mode` / `delete_policy`）。
+- 版本号 `2.1.6` → **`2.1.7`**（README 顶部徽章同步）。
+
+### 内部
+
+- 新增 `config.bomb_options_from_cfg()`（冻结契约）；`extraction/post.py` 增 `result["post_error"]`；`extraction/engines.py` 增 abort 与 Python 引擎预检；`db.last_error()`；`trust_entry_categories(resolve=)`。
+- 新增 / 更新离线测试：`test_a1_bomb_wiring`、`test_d3_zip_precheck`、`test_c6_abort`、`test_post_error_and_size_guard`、`test_c4_c5_db_error_trust_resolve`、`test_page_settings_io`、`test_wave2_a1_c2_c8`、`test_retry_reuse_slash`，并扩写 `test_page_settings` / `test_settings_switch_and_bubble` / `test_task_details_dialog`；串行全量 **117 项，FAILCOUNT=3**（3 项为依赖历史 HTML 素材的既有用例，与本次改动无关）。
+
 ## [2.1.6] - 2026-09-25
 
 > **本轮重点**：把「固定提取码」这条会误导操作的历史功能**整条删掉**，让 Alt+3 回归它该有的语义——**每次都能挑具体文件**；

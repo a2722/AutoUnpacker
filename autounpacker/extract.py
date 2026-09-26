@@ -43,7 +43,11 @@ from collections import deque  # noqa: F401
 from pathlib import Path
 from types import ModuleType as _ModuleType
 
-from .config import delete_policy_permanent_fallback  # noqa: F401
+from .config import (  # noqa: F401
+    bomb_options_from_cfg,
+    delete_policy_permanent_fallback,
+    load_config,
+)
 from .deletion import engine as deletion_engine  # noqa: F401
 # 密码候选/字典实现已移至 passwords/resolution.py；旧名 re-export 保留在
 # extract 命名空间，调用点与测试打桩（ex.get_dict_passwords）语义不变。
@@ -92,6 +96,10 @@ from .extraction.service import (  # noqa: F401
     CONTENT_STOP_MIN_BUCKETS, CONTENT_STOP_MIN_FILES, CONTENT_STOP_MIN_SMALL,
     ExtractService, looks_like_complete_content)
 
+# C8：解压失败且输出目录「解压前已含用户内容」（was_empty=False）时写入的
+# 「未完成」标记文件名。非空目录绝不回收/删除用户内容，只落一个可读标记。
+INCOMPLETE_MARKER_NAME = ".autounpacker_incomplete"
+
 __all__ = [
     "ARCHIVE_EXTS", "CONTENT_STOP_MIN_BUCKETS", "CONTENT_STOP_MIN_FILES",
     "CONTENT_STOP_MIN_SMALL", "CREATE_NO_WINDOW", "DICT_FILE", "DISGUISE_CARRIER_EXTS",
@@ -108,7 +116,7 @@ __all__ = [
     "_series_base", "_set_created_time", "_stage_fake_volume", "_stage_rar_volumes",
     "_stamp_output_times", "_strip_download_suffix", "_volume_base",
     "_volume_final_name", "_volume_number", "add_dict_password", "analyze_file",
-    "apply_post_actions", "argparse", "build_post_actions", "concise_error",
+    "apply_post_actions", "argparse", "bomb_options_from_cfg", "build_post_actions", "concise_error",
     "create_engine", "ctypes", "default_output_dir",
     "delete_policy_permanent_fallback", "delete_source", "deletion_engine", "deque",
     "detect_archive_format", "detect_format_by_magic", "detect_steganography",
@@ -118,7 +126,8 @@ __all__ = [
     "is_archive_open_error", "is_clean_success", "is_disguised", "is_do_not_extract",
     "is_fake_volume_name", "is_first_volume", "is_incomplete_download",
     "is_non_first_rar_part", "is_non_first_volume", "is_split_gap_error",
-    "is_volume_file", "is_volume_name", "is_zip_open_error", "load_password_dict",
+    "is_volume_file", "is_volume_name", "is_zip_open_error", "load_config",
+    "load_password_dict",
     "looks_like_complete_content", "main", "move_result_dir", "os", "parse_passwords",
     "parse_sevenzip_listing", "perform_sanitization", "print_analysis",
     "promote_extracted_content", "re", "remove_empty_dirs", "result_raw_error",
@@ -296,7 +305,14 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
     # 只有「干净的整体成功」才允许后处理（提升内容 / 删除源文件）。
     # 任何层失败都不是成功：源文件与分卷原样保留。
     if is_clean_success(result):
+        # C2：后处理阶段新增的日志（删源去向 / 提升结果 / 脚本输出 / 失败原因）
+        # 单独摘成 post_logs，供 GUI/监听链路把它们接到运行日志里，不再只留在
+        # result 内部无人看见。
+        _n0 = len(result.get("logs") or [])
         apply_post_actions(result, source, out_dir, build_post_actions(args))
+        result["post_logs"] = (result.get("logs") or [])[_n0:]
+        for _line in result["post_logs"]:
+            print(_line)
 
     if is_clean_success(result):
         print(f"=== 完成，穿透 {result['depth_reached']} 层，共 {len(result['extracted_files'])} 个文件 ===")
@@ -319,6 +335,18 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
                         print(f"已回退，中间文件已移入回收站: {out_dir}")
                     else:
                         print(f"已回退（中间文件移入回收站失败，保留原样）: {out_dir}")
+                elif out_dir.exists():
+                    # C8：输出目录解压前就含用户内容（was_empty=False）时，失败
+                    # 也绝不回收——那会连用户预先放进来的内容一起端走。改为落一个
+                    # 可读标记，提示本次未完成、目录可能只解了一半。
+                    _reason = result.get("error") or "未知错误"
+                    _marker = out_dir / INCOMPLETE_MARKER_NAME
+                    _marker.write_text(
+                        "解压未完成，本目录中的用户内容未被回收。\n"
+                        f"原因: {_reason}\n"
+                        f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                        encoding="utf-8")
+                    print(f"输出目录解压前非空，已保留用户内容并写入未完成标记: {_marker}")
             except Exception:
                 pass
     return result
@@ -360,8 +388,8 @@ def main():
     parser.add_argument("--default-password", help="兜底默认密码")
     parser.add_argument("--no-nested", action="store_true", help="禁用嵌套穿透")
     parser.add_argument("--max-depth", type=int, default=10, help="最大穿透层数（默认10）")
-    parser.add_argument("--max-size-ratio", type=float, default=100.0,
-                        help="解压大小膨胀比例上限，防 zip bomb（默认100倍）")
+    parser.add_argument("--max-size-ratio", type=float, default=None,
+                        help="解压大小膨胀比例上限，防 zip bomb（默认取配置 bomb_soft_ratio）")
     parser.add_argument("--use-password-dict", action="store_true",
                         help="自动使用/保存密码字典")
     parser.add_argument("--engine", choices=["auto", "7z", "zip"], default="auto",
@@ -409,11 +437,15 @@ def main():
     options = {
         "enable_nested": not args.no_nested,
         "max_depth": args.max_depth,
-        "max_size_ratio": args.max_size_ratio,
         "use_dict": args.use_password_dict,
         "default_password": args.default_password,
         "mode": args.mode,
     }
+    # A1：防 zip bomb 配置统一从配置中心抽入 options（含 max_size_ratio）；
+    # 显式命令行 --max-size-ratio 优先于配置（只有用户真给了才覆盖）。
+    options.update(bomb_options_from_cfg(load_config()))
+    if args.max_size_ratio is not None:
+        options["max_size_ratio"] = args.max_size_ratio
     passwords = parse_passwords(args.password)
     for a in args.archives:
         try:

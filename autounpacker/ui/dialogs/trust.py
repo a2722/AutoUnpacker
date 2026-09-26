@@ -114,7 +114,7 @@ class TrustAskDialog(QDialog):
         lay.addWidget(url_edit)
 
         # 风险标注：内置黑名单类别（内网/回环/元数据等）红色警告
-        risk = trust_entry_categories(host)
+        risk = trust_entry_categories(host, resolve=False)
         if risk and risk != "public":
             warn = QLabel(
                 "⚠ 该地址属于「内网 / 回环 / 链路本地 / 保留地址」等敏感类别，\n"

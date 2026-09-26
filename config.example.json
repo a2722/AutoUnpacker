@@ -5,26 +5,55 @@
   "drop_nested": true,
   "drop_delete_source": false,
   "notify_enabled": true,
+  "notify_share": true,
+  "notify_share_dead": true,
   "notify_archive": false,
   "notify_success": false,
   "notify_failure": true,
   "notify_error": true,
+  "notify_trayed": true,
+  "notify_already_running": true,
+  "notify_trust_pending": true,
+  "notify_baidu_done": true,
+  "notify_baidu_leftover": true,
+  "notify_baidu_dup": false,
   "qr_clipboard_action": "code",
   "qr_url_redirect": true,
   "promote_merge": true,
+  "output_time_now": true,
   "qr_url_enabled": true,
   "url_exclude_temp_password": true,
+  "temp_password_filter": false,
+  "temp_password_max": 200,
+  "temp_password_ttl_hours": 24,
   "translation_move_enabled": true,
   "log_colors_enabled": true,
   "hotkey_enabled": true,
-  "hotkey": "Alt+1",
+  "hotkey": "Ctrl+Alt+W",
+  "hotkey_share": "",
+  "hotkey_share_pick": "",
   "url_redirect_rules": [
     {
       "from": "drive.uc.cn",
       "to": "fast.uc.cn"
     }
   ],
+  "sevenzip_check_done": false,
   "poll_interval": 2,
+  "task_history_limit": 500,
+  "incomplete_download_suffixes": [
+    ".downloading",
+    ".crdownload",
+    ".download",
+    ".part",
+    ".tmp",
+    ".td",
+    ".opdownload",
+    ".uc!",
+    ".aria2",
+    ".!ut",
+    ".partial"
+  ],
   "passwords": [],
   "auto_add_clipboard_password": false,
   "watch_paths": [
@@ -32,7 +61,40 @@
       "path": "C:/example/watch",
       "enabled": true,
       "output_dir": "",
-      "delete_source": true
+      "delete_source": true,
+      "delete_policy": "auto",
+      "mode": "surface"
     }
-  ]
+  ],
+  "close_action": "ask",
+  "url_trust": {
+    "builtin_blacklist": true,
+    "open": {
+      "new_domain_action": "ask",
+      "whitelist": [],
+      "blacklist": []
+    },
+    "fetch": {
+      "new_domain_action": "ask",
+      "whitelist": [],
+      "blacklist": []
+    }
+  },
+  "tls_skip_verify": false,
+  "experimental_enabled": false,
+  "baidu_task_db": "",
+  "baidu_auto_invoke": false,
+  "share_gesture_wait_sec": 60,
+  "pair_split_enabled": true,
+  "bomb_guard_enabled": true,
+  "bomb_soft_ratio": 100,
+  "bomb_soft_entries": 50000,
+  "bomb_hard_ratio": 200,
+  "bomb_hard_min_gb": 1.0,
+  "bomb_hard_size_gb": 50.0,
+  "min_free_space_gb": 5.0,
+  "ui_theme": "auto",
+  "ui_theme_cached": "",
+  "show_status_tips": true,
+  "settings_wizard_done": false
 }

@@ -269,6 +269,11 @@ QPushButton:pressed { background: $btn_pressed; }
 QPushButton:disabled {
     background: $btn_dis_bg; color: $btn_dis_fg; border-color: $btn_dis_border;
 }
+/* 通用禁用输入：深色主题下原生禁用态几乎不可辨，统一取 btn_dis_* token
+   （实验性门控 / 通知门控禁用输入框时，禁用态必须一眼可见） */
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+    color: $btn_dis_fg; background: $btn_dis_bg; border-color: $btn_dis_border;
+}
 QPushButton#primary { background: $primary_bg; color: $primary_fg; border: none; }
 QPushButton#primary:hover { background: $primary_hover; }
 QPushButton#primary:pressed { background: $primary_pressed; }
@@ -410,6 +415,10 @@ QWidget#setRow[flash="true"] { background: $accent_soft; }
 QLabel#setName { font-size: $fs_row; font-weight: 700; color: $window_fg; }
 QLabel#rowNote { font-size: $fs_hint; color: $chip_off_fg; }
 QLabel#unit    { font-size: $fs_section; color: $chip_off_fg; }
+/* 实验性总开关关闭：整行置灰（名称 / 单位 / 行内备注），控件簇由 setEnabled 禁用 */
+QWidget#setRow[off="true"] QLabel#setName { color: $chip_off_fg; }
+QWidget#setRow[off="true"] QLabel#unit,
+QWidget#setRow[off="true"] QLabel#rowNote { color: $chip_off_fg; }
 QLabel#riskBadge {
     font-size: $fs_tag; font-weight: 700; color: $danger_fg; background: $danger_bg;
     border: 1px solid $danger_border; border-radius: $radius_ctl; padding: 1px 7px;

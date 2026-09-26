@@ -2,7 +2,7 @@
 """设置页（正式页面）：A 方案「左栏领域」——9 个领域 + 顶部常驻搜索。
 
 职责：
-- SettingsPage：9 个领域（解压与整理 / 删除与安全 / 通知与提醒 / 剪贴板与二维码 /
+- SettingsPage：9 个领域（解压与整理 / 解压安全 / 通知与提醒 / 剪贴板与二维码 /
   链接与网盘 / 外观与快捷键 / 系统与维护 ／ 实验性、监听目录）覆盖
   config.DEFAULT_CONFIG 的全部键；
 - 列表默认极简：每行只有「名称 + 控件」；描述 / 风险说明一律**悬停满 700ms
@@ -34,7 +34,10 @@
 注意：集成（把本页装进主窗口标签壳）由集成步骤完成；本模块只提供页面与信号：
       settingsSaved / settingsReset / watchPathsChanged / hotkeyChanged(str) /
       themeChanged(str) / notice(str)。
-注意：本模块不联网、不起线程、不重启应用；所有异常都转成页内 notice 提示。
+注意：本模块**只有「版本与更新」的手动「检查更新」会联网**（用户点一次才触发，
+      后台线程查询、结果经 QTimer 回主线程，绝不自动轮询）；发现新版时可「立即更新」
+      一键自更新（新版启动成功后由更新执行器提交，失败自动回滚并重启旧版）；
+      其余一切仍不联网、不起线程；所有异常都转成页内提示。
 注意（allow: SIZE_OK）：按任务要求「单文件承载全部设置表单、不得新建兄弟模块」，
       9 个领域 + 全部顶层键覆盖 + 全部私有助手必然内聚于此；不拆分是为了让
       「键 -> 控件 -> 即时保存」的覆盖契约在一个文件里可直接审计。
@@ -70,11 +73,23 @@ _CLIP_ACTIONS = ((0, "none"), (1, "code"), (2, "url"))
 # 落盘回读校验时跳过的复合键（列表/字典无法逐值比对，另有专门断言）
 _VERIFY_SKIP = ("watch_paths", "url_trust", "url_redirect_rules")
 
+
+def _current_version():
+    """当前程序版本号（延迟 import，避免模块级循环依赖）。"""
+    try:
+        from .. import __version__
+        return str(__version__)
+    except Exception:
+        return "0.0.0"
+
 # 文本 / 多行编辑的防抖间隔（停止输入多久后落盘；失焦立即落盘）
 _TEXT_DEBOUNCE_MS = 400
 
 # #stripHint 类说明标签（折行高度兜底 + 气泡正文）：见 _fit_all_hints / eventFilter
 _HINT_NAMES = ("stripHint", "bubbleHint", "bubbleDesc", "bubbleRiskBody")
+
+# 实验性门控提示（气泡补充说明；实验性总开关关闭时这些行整行置灰 + 控件禁用）
+_EXP_NOTE = "该功能需开启「实验性」后方可使用。"
 
 # 补充信息气泡：悬停延迟（对齐现有设置页的 Qt 原生 tooltip 唤醒延迟 = 700ms）
 _BUBBLE_DELAY_MS = 700
@@ -91,7 +106,7 @@ _DOMAIN_ORDER = ("unzip", "safety", "notify", "clipboard", "links", "ui",
 # 领域元信息：id -> (显示名, 图标, 一句话说明)
 _DOMAIN_META = {
     "unzip": ("解压与整理", "archive", "压缩包怎么解、产物怎么摆"),
-    "safety": ("删除与安全", "shield", "会不会丢文件、会不会被压缩包撑爆"),
+    "safety": ("解压安全", "shield", "会不会丢文件、会不会被压缩包撑爆"),
     "notify": ("通知与提醒", "alert", "什么时候弹提示"),
     "clipboard": ("剪贴板与二维码", "search", "复制粘贴与扫码识别"),
     "links": ("链接与网盘", "bolt", "打开 / 下载外部链接、网址信任、网盘"),
@@ -205,7 +220,7 @@ class _SettingRow:
     SettingsPage._controls；本对象负责搜索索引与气泡内容。"""
 
     __slots__ = ("label", "desc", "syn", "key", "widget", "domain", "group",
-                 "risk", "default_key", "default_value", "unit")
+                 "risk", "default_key", "default_value", "unit", "host", "note")
 
     def __init__(self, label, desc, key, widget, domain, group,
                  syn=(), risk=False, default_key=None, default_value=None,
@@ -221,6 +236,8 @@ class _SettingRow:
         self.default_key = default_key
         self.default_value = default_value
         self.unit = unit
+        self.host = None   # 承载本行的 #setRow（实验性门控整行置灰用）
+        self.note = None   # 气泡补充说明（实验性门控提示；不参与搜索）
 
     def search_blob(self):
         """搜索用的小写文本（名称 + 描述 + 同义词 + 键名）。"""
@@ -599,9 +616,12 @@ class _InfoBubble(QFrame):
         self.move(QPoint(int(x), int(y)))
 
     def show_for(self, row, anchor_global_pos):
-        """按行元数据填充内容（标题 / 描述 / 风险说明）并显示到 anchor 下方。"""
+        """按行元数据填充内容（标题 / 描述 / 补充说明 / 风险说明）并显示到 anchor 下方。"""
         self._title.setText(row.label)
-        self._desc.setText(row.desc or "")
+        # 补充说明（如实验性门控提示）追加在描述之后；非门控行 note 为 None，正文不变
+        self._desc.setText(
+            (row.desc or "")
+            + (("\n\n" + row.note) if getattr(row, "note", None) else ""))
         if row.risk:
             self._risk_box.setVisible(True)
             self._risk_lbl.setText(
@@ -631,7 +651,9 @@ class SettingsPage(QWidget):
     MainWindow._register_hotkey / MainWindow.on_theme_changed。
 
     信号：settingsSaved() / settingsReset() / watchPathsChanged() /
-          hotkeyChanged(str) / themeChanged(str) / notice(str)。
+          hotkeyChanged(str) / themeChanged(str) / notice(str)
+          （另有 _updateChecked/_updateProgress/_updateApplied 三个内部信号，
+            只用于把更新任务的工作线程结果投递回主线程）。
     """
 
     settingsSaved = pyqtSignal()
@@ -640,6 +662,12 @@ class SettingsPage(QWidget):
     hotkeyChanged = pyqtSignal(str)
     themeChanged = pyqtSignal(str)
     notice = pyqtSignal(str)
+    # 更新任务的「工作线程 -> 主线程」桥：跨线程发信号是队列投递，可靠。
+    # 绝不在工作线程里用 QTimer.singleShot —— 那个线程没有事件循环，定时器
+    # 永远不触发、回调不执行（旧表现：一直卡在「正在检查更新…」且不报错）。
+    _updateChecked = pyqtSignal(str, object, object, str)
+    _updateProgress = pyqtSignal(str)
+    _updateApplied = pyqtSignal(str, str)
 
     def __init__(self, state, hub=None, parent=None, on_hotkey_change=None,
                  on_theme_change=None):
@@ -652,6 +680,9 @@ class SettingsPage(QWidget):
         self._sections = []        # 领域标题（保持插入顺序，与左栏一一对应）
         self._section_cards = {}   # 领域 id -> 承载该领域行的 QWidget
         self._rows = []            # _SettingRow 列表（搜索索引 + 气泡内容）
+        self._exp_gate = []        # [(host, 控件簇)] 实验性行：整行置灰 + 只禁用控件簇
+        self._hotkey_reason_labels = {}  # 热键配置键 -> 行内失败原因 QLabel
+        self._hotkey_states = {}   # 热键配置键 -> (state, msg)（测试 / 重贴用）
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
         self._theme_pref = "auto"
         self._notice_failed = False
@@ -742,9 +773,11 @@ class SettingsPage(QWidget):
         self.wizard_btn = QPushButton("设置向导", top)
         self.wizard_btn.setObjectName("primary")
         self.wizard_btn.setCursor(Qt.PointingHandCursor)
-        self.wizard_btn.setToolTip("可跳过，跳过后不再显示")
+        self.wizard_btn.setToolTip("跳过后不再显示")
         self.wizard_btn.clicked.connect(self._on_wizard_clicked)
-        t.addLayout(self._btn_with_sub(top, self.wizard_btn, "可跳过"))
+        # 副标题留空（不显示「可跳过」），但仍占一行，保证与右侧「导入 / 导出」
+        # 按钮纵向对齐。
+        t.addLayout(self._btn_with_sub(top, self.wizard_btn, ""))
         # 登记向导键（覆盖契约：settings_wizard_done 必须有归属控件）
         self._reg("settings_wizard_done", self.wizard_btn)
         self.import_btn = QPushButton("导入 / 导出", top)
@@ -752,7 +785,7 @@ class SettingsPage(QWidget):
         self.import_btn.setCursor(Qt.PointingHandCursor)
         self.import_btn.setToolTip("把设置导出为 JSON 文件，或从 JSON 文件导入。")
         self.import_btn.clicked.connect(self._on_config_io)
-        t.addLayout(self._btn_with_sub(top, self.import_btn, "JSON 文件"))
+        t.addLayout(self._btn_with_sub(top, self.import_btn, "偏好设置"))
         rlay.addWidget(top)
 
         scroll = QScrollArea(right)
@@ -1149,6 +1182,7 @@ class SettingsPage(QWidget):
             except Exception:
                 pass
         row_meta.widget = ctl
+        row_meta.host = host
         self._rows.append(row_meta)
         return ctl
 
@@ -1157,8 +1191,8 @@ class SettingsPage(QWidget):
         return None
 
     def _check(self, lay, label, key, desc, syn=(), risk=False,
-               extra_keys=None, commit=None, default=True):
-        """一行复选框（默认极简）。"""
+               extra_keys=None, commit=None, default=True, experimental=False):
+        """一行复选框（默认极简）。experimental=True 时纳入实验性门控。"""
         meta = _SettingRow(label, desc, key, None, self._domain_id,
                            "一般", syn=syn, risk=risk, default_key=key,
                            default_value=default)
@@ -1174,6 +1208,9 @@ class SettingsPage(QWidget):
 
         cb = self._row(lay, meta, mk, risk=risk, key=key)
         meta.widget = cb
+        if experimental:
+            self._exp_gate.append((meta.host, cb))
+            meta.note = _EXP_NOTE
         return cb
 
     def _spin(self, minimum, maximum):
@@ -1191,8 +1228,10 @@ class SettingsPage(QWidget):
         return spin
 
     def _spin_row(self, lay, label, key, desc, minimum, maximum, syn=(),
-                  unit=None, risk=False, default=0, dbl=False):
-        """一行「名称 + 数值框 [+ 单位]」。返回内部 spinbox（dbl=True 时是浮点框）。"""
+                  unit=None, risk=False, default=0, dbl=False, experimental=False):
+        """一行「名称 + 数值框 [+ 单位]」。返回内部 spinbox（dbl=True 时是浮点框）。
+
+        experimental=True 时纳入实验性门控（禁用整个控件簇，名称标签保持可用）。"""
         meta = _SettingRow(label, desc, key, None, self._domain_id, "一般",
                            syn=syn, risk=risk, default_key=key,
                            default_value=default, unit=unit)
@@ -1217,9 +1256,12 @@ class SettingsPage(QWidget):
                 b.addWidget(u)
             return box
 
-        self._row(lay, meta, mk, risk=risk, key=key)
+        box = self._row(lay, meta, mk, risk=risk, key=key)
         spin = holder.get("spin")
         meta.widget = spin
+        if experimental:
+            self._exp_gate.append((meta.host, box))
+            meta.note = _EXP_NOTE
         return spin
 
     def _text_row(self, lay, label, key, desc, parse, syn=(), rows=4,
@@ -1387,23 +1429,24 @@ class SettingsPage(QWidget):
         self.notify_share_cb = self._check(
             g, "分享相关通知", "notify_share",
             "分享手势、链接解析、拉起客户端、下载结果的统一开关。",
-            syn=("分享", "网盘分享", "解析", "手势"))
+            syn=("分享", "网盘分享", "解析", "手势"), experimental=True)
         self.notify_share_dead_cb = self._check(
             g, "分享链接已失效", "notify_share_dead",
             "链接被取消 / 过期 / 违规时当场提醒（需与上面开关同时打开）。",
-            syn=("失效", "过期", "取消", "违规", "死链"))
+            syn=("失效", "过期", "取消", "违规", "死链"), experimental=True)
         self.notify_baidu_done_cb = self._check(
             g, "网盘下载批次完成", "notify_baidu_done",
             "实验性功能开启时：一个下载批次全部完成时提示。",
-            syn=("网盘", "批次", "下载完成", "百度"))
+            syn=("网盘", "批次", "下载完成", "百度"), experimental=True)
         self.notify_baidu_leftover_cb = self._check(
             g, "启动时有没下完的网盘任务", "notify_baidu_leftover",
             "实验性功能开启时：启动发现还有未完成任务时提示。",
-            syn=("网盘", "未完成", "残留", "启动"))
+            syn=("网盘", "未完成", "残留", "启动"), experimental=True)
         self.notify_baidu_dup_cb = self._check(
             g, "新任务与历史重复", "notify_baidu_dup",
             "实验性功能开启时：新任务和以前下载过的一样时提示（默认关，避免打扰）。",
-            syn=("重复", "去重", "历史下载", "网盘"), default=False)
+            syn=("重复", "去重", "历史下载", "网盘"), default=False,
+            experimental=True)
 
         self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
                              self.notify_failure_cb, self.notify_error_cb,
@@ -1520,20 +1563,22 @@ class SettingsPage(QWidget):
             g, "分享等待时长", "share_gesture_wait_sec",
             "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
             5, 600, syn=("分享", "手势", "等待", "超时", "解析中"),
-            unit="秒", default=60)
+            unit="秒", default=60, experimental=True)
         self.baidu_auto_invoke_cb = self._check(
             g, "检测到分享链接时自动拉起客户端下载", "baidu_auto_invoke",
             "复制到百度网盘分享链接时，自动交给网盘客户端下载（整包）。会自动触发下载，请确认来源可信。",
-            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False)
+            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
+            experimental=True)
         # 注意：方案 §5.5 的「分享下载前先让我挑选文件」(baidu_pick_before_download)
         # 在本机 config 里已被 _sanitize_cfg 显式 pop（该功能 v2.1.6 退场）。若在此
         # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
         # 界面报「保存失败」。故按落地纪律「冲突项先搁置」不渲染该项（见交回清单）。
         bah, bal = self._manual_row(g)
-        bal.addWidget(self._make_name(
-            bah, "网盘任务库路径",
-            _SettingRow("网盘任务库路径", "", "baidu_task_db", None, "links",
-                        "网盘与分享")))
+        db_meta = _SettingRow("网盘任务库路径", "", "baidu_task_db", None, "links",
+                              "网盘与分享")
+        db_meta.host = bah
+        db_meta.note = _EXP_NOTE
+        bal.addWidget(self._make_name(bah, "网盘任务库路径", db_meta))
         self.baidu_db_edit = QLineEdit(bah)
         self.baidu_db_edit.setPlaceholderText("留空 = 自动探测网盘客户端任务库")
         self.baidu_db_edit.setToolTip("BaiduYunGuanjia.db 路径；留空自动探测。")
@@ -1545,10 +1590,15 @@ class SettingsPage(QWidget):
         self._reg("baidu_task_db", self.baidu_db_edit)
         self._bind_text(self.baidu_db_edit, "baidu_task_db",
                         lambda: str(self.baidu_db_edit.text()).strip())
-        self._rows.append(_SettingRow(
+        db_row = _SettingRow(
             "网盘任务库路径", "BaiduYunGuanjia.db 的位置；留空自动探测。",
             "baidu_task_db", self.baidu_db_edit, "links", "网盘与分享",
-            syn=("任务库", "数据库", "路径", "探测", "百度")))
+            syn=("任务库", "数据库", "路径", "探测", "百度"))
+        db_row.host = bah
+        db_row.note = _EXP_NOTE
+        self._rows.append(db_row)
+        # 手工行的控件簇（编辑框 + 浏览按钮）纳入实验性门控
+        self._exp_gate.append((bah, (self.baidu_db_edit, self.baidu_db_browse_btn)))
         self.share_nologin_hint = self._hint(
             "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
             "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
@@ -1658,17 +1708,17 @@ class SettingsPage(QWidget):
             syn=("唤起", "主界面", "显示窗口", "热键"))
         self.hotkey_share_edit = self._hotkey_row(
             g, "分享下载", "hotkey_share", "用客户端下载最近一次分享；留空 = 不设置。",
-            syn=("分享", "下载", "热键", "最近分享"))
+            syn=("分享", "下载", "热键", "最近分享"), experimental=True)
         self.hotkey_share_pick_edit = self._hotkey_row(
             g, "挑选文件下载", "hotkey_share_pick",
             "用「先挑选文件」的方式下载最近一次分享；留空 = 不设置。",
-            syn=("挑选", "选择文件", "分享", "热键"))
+            syn=("挑选", "选择文件", "分享", "热键"), experimental=True)
 
         g = self._group(box, "关闭行为")
         self._close_rbs = {}
         self._build_close_radios(g)
 
-    def _hotkey_row(self, lay, label, key, desc, syn=()):
+    def _hotkey_row(self, lay, label, key, desc, syn=(), experimental=False):
         meta = _SettingRow(label, desc, key, None, "ui", "全局快捷键", syn=syn,
                            default_key=key)
 
@@ -1687,15 +1737,25 @@ class SettingsPage(QWidget):
             self._reg(key, edit)
             b.addWidget(edit, 1)
             b.addWidget(clear)
+            # 注册失败原因就地显示（默认隐藏：隐藏控件不占布局，行高不变）
+            reason = QLabel("", box)
+            reason.setObjectName("rowNote")
+            reason.hide()
+            b.addWidget(reason)
+            self._hotkey_reason_labels[key] = reason
             return box
 
-        self._row(lay, meta, mk, key=key)
+        box = self._row(lay, meta, mk, key=key)
         # 抓回 HotkeyEdit（回填 / 读取用）
         edit = None
         for w in self._controls.get(key, []):
             if isinstance(w, HotkeyEdit):
                 edit = w
         meta.widget = edit
+        if experimental:
+            # 禁用目标取整个 box（HotkeyEdit + 清除按钮）；meta.widget 随后只留 HotkeyEdit
+            self._exp_gate.append((meta.host, box))
+            meta.note = _EXP_NOTE
         return edit
 
     def _build_close_radios(self, lay):
@@ -1749,6 +1809,64 @@ class SettingsPage(QWidget):
             "只清理已结束的任务，进行中的永不删除；磁盘上的旧数据在下次启动时清理。",
             1, 100000, syn=("历史", "记录", "条数", "上限", "清理"),
             unit="条", default=500)
+        self._build_update_group(box)
+
+    def _build_update_group(self, box):
+        """版本与更新：当前版本 + 手动「检查更新」（本页唯一联网点）+ 更新动作，**同一排**。
+
+        不再单起一行「检查更新」标题（与按钮文字重复）；版本号、检查按钮、
+        更新动作与状态并排。本组**不登记任何配置键**：覆盖契约要求
+        covered_top_keys() 恰为 DEFAULT_CONFIG 顶层键（不多不少），而版本 /
+        检查结果都是只读展示与一次性动作，不落配置。"""
+        # 工作线程 -> 主线程的桥（见类顶信号说明）：只连一次
+        self._updateChecked.connect(self._on_check_update_done)
+        self._updateProgress.connect(self._set_update_status)
+        self._updateApplied.connect(self._on_apply_update_done)
+
+        g = self._group(box, "版本与更新")
+        self.version_label = QLabel(_current_version(), self)
+        self.version_label.setObjectName("roval")
+        self.check_update_btn = QPushButton("检查更新", self)
+        self.check_update_btn.setObjectName("ghost")
+        self.check_update_btn.setCursor(Qt.PointingHandCursor)
+        self.check_update_btn.setToolTip("手动点一次才联网查询 GitHub 最新版本。")
+        self.check_update_btn.clicked.connect(self._on_check_update)
+        self.open_release_btn = QPushButton("前往下载更新", self)
+        self.open_release_btn.setObjectName("primary")
+        self.open_release_btn.setCursor(Qt.PointingHandCursor)
+        self.open_release_btn.setToolTip("在浏览器打开 GitHub 发布页，下载最新版。")
+        self.open_release_btn.clicked.connect(self._open_release_page)
+        self.open_release_btn.hide()
+        self.install_update_btn = QPushButton("立即更新", self)
+        self.install_update_btn.setObjectName("primary")
+        self.install_update_btn.setCursor(Qt.PointingHandCursor)
+        self.install_update_btn.setToolTip(
+            "一键下载并安装新版本；新版启动失败会自动回滚并重启旧版。")
+        self.install_update_btn.clicked.connect(self._on_apply_update)
+        self.install_update_btn.hide()
+        self._update_latest = ""
+        self.update_status = QLabel("", self)
+        self.update_status.setObjectName("rowNote")
+        # 同一排：名称 + 当前版本号 + 检查更新 + (立即更新) + (前往下载更新) + 状态
+        rh, rl = self._manual_row(g)
+        rl.addWidget(self._make_name(
+            rh, "当前版本",
+            _SettingRow("当前版本",
+                        "程序当前安装的版本号；「检查更新」手动联网查询最新版本。",
+                        "", None, "system", "版本与更新")))
+        rl.addWidget(self.version_label)
+        rl.addWidget(self.check_update_btn)
+        rl.addWidget(self.install_update_btn)
+        rl.addWidget(self.open_release_btn)
+        rl.addWidget(self.update_status)
+        rl.addStretch(1)
+        self._rows.append(_SettingRow(
+            "当前版本",
+            "程序当前安装的版本号；「检查更新」手动联网查询最新版本，发现新版本时"
+            "可一键更新或前往发布页下载。",
+            "", self.check_update_btn, "system", "版本与更新",
+            syn=("版本", "版本号", "当前版本", "更新", "检查更新", "升级",
+                 "新版", "下载")))
 
     def _build_lab(self, box):
         g = self._group(box, "总开关")
@@ -2042,7 +2160,12 @@ class SettingsPage(QWidget):
             self._notice("请从目录卡片打开目录设置", ok=False)
             return
         try:
-            dlg = WatchDirDialog(self.state, int(idx), self, entry=entry)
+            # 弹窗必须挂在**顶层窗口**上，不能挂在设置页本身：Qt 样式表沿父子链
+            # 下传，挂在 #settingsPage 下会让弹窗内的 QPushButton 命中
+            # `QWidget#settingsPage QPushButton { min/max-height:28px }`，把监听模式
+            # 的两张平铺卡压成 28px（文字被裁光，实测 30px vs 58px）；挂顶层窗口
+            # 同时让遮罩覆盖整窗，而不是只盖住设置页。
+            dlg = WatchDirDialog(self.state, int(idx), self.window(), entry=entry)
             if dlg.exec_():
                 self.rebuild_dirs()
                 self.watchPathsChanged.emit()
@@ -2206,6 +2329,37 @@ class SettingsPage(QWidget):
             self.scroll.verticalScrollBar().setValue(0)
         except Exception:
             pass
+
+    def show_domain(self, did):
+        """公开入口：切到某个领域（供宿主从日志动作链接跳转，如 app://settings/ui）。
+
+        落点逻辑与 _goto_hit 一致：选中左栏对应项（触发 _on_cat_row_changed 完成
+        域切换）并清空搜索；找不到该领域返回 False。"""
+        did = str(did or "").strip()
+        if not did:
+            return False
+        row = -1
+        try:
+            for i in range(self.cat_list.count()):
+                if self.cat_list.item(i).data(Qt.UserRole) == did:
+                    row = i
+                    break
+        except Exception:
+            return False
+        if row < 0:
+            return False
+        try:
+            self._current_domain = did
+            self.cat_list.setCurrentRow(row)
+            if self.search_edit.text():
+                self.search_edit.clear()      # 触发 _on_search_changed('') → 回领域视图
+        except Exception:
+            return False
+        try:
+            self._show_domain(did)
+        except Exception:
+            pass
+        return True
 
     def _goto_hit(self, row):
         """搜索命中项点击：切到所属领域、清空搜索、滚动并高亮该行（§11 #3 决定）。"""
@@ -2636,6 +2790,16 @@ class SettingsPage(QWidget):
         hotkey_error = ""
         if key in ("hotkey", "hotkey_share", "hotkey_share_pick", "hotkey_enabled"):
             hotkey_error = self._apply_hotkey_change()
+        if key == "experimental_enabled":
+            # 实验性总开关是这些功能的**主开关**：立即重贴门控（置灰 / 禁用），
+            # 并直接重注册全局热键——不能走 _apply_hotkey_change()（热键元组没变时
+            # 它会提前返回，实验性单独变化就不会重新注册）。
+            self._sync_experimental()
+            if self._hotkey_cb is not None:
+                try:
+                    self._hotkey_cb()
+                except Exception:
+                    pass
         if key == "incomplete_download_suffixes":
             self._apply_incomplete_suffixes()
         if not self._verify_saved({key: value}):
@@ -2660,6 +2824,163 @@ class SettingsPage(QWidget):
                 self._snapshot().get("incomplete_download_suffixes"))
         except Exception:
             pass
+
+    # ---- 版本与更新（唯一联网点：用户手动点击才查） ----
+    def _set_update_status(self, text, ok=True):
+        """更新状态行：成功用中性色，失败复用既有 PALETTE danger（不新增 token）。"""
+        try:
+            self.update_status.setText(str(text or ""))
+        except Exception:
+            return
+        try:
+            self.update_status.setStyleSheet(
+                "" if ok else "color: %s;" % PALETTE["danger"])
+        except Exception:
+            pass
+
+    def _on_check_update(self):
+        """手动检查更新：后台线程联网查询，结果经 QTimer 回主线程（绝不阻塞界面）。"""
+        if getattr(self, "_update_busy", False):
+            return
+        self._update_busy = True
+        try:
+            self.check_update_btn.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.open_release_btn.hide()
+            self.install_update_btn.hide()
+        except Exception:
+            pass
+        self._set_update_status("正在检查更新…")
+        import threading
+        try:
+            threading.Thread(target=self._check_update_worker,
+                             daemon=True).start()
+        except Exception as e:
+            self._update_busy = False
+            try:
+                self.check_update_btn.setEnabled(True)
+            except Exception:
+                pass
+            self._set_update_status("检查更新失败：%s" % e, ok=False)
+
+    def _check_update_worker(self):
+        """后台线程体：只调 updater，绝不触碰任何控件；结果经信号回主线程。"""
+        try:
+            from .. import updater
+            status, latest = updater.check_latest_version()
+            cmp = (updater.compare_versions(_current_version(), latest)
+                   if latest else None)
+            err = ""
+        except Exception as e:
+            status, latest, cmp, err = "failed", None, None, str(e)
+        self._updateChecked.emit(status, latest, cmp, err)
+
+    def _on_check_update_done(self, status, latest, cmp, err=""):
+        """主线程：按查询结果更新状态文案与「前往下载更新」按钮。
+
+        按钮可见性严格跟随**本次**结果：只有「确实更新」时才出现，其余结局
+        （失败 / 已最新 / 线上更旧）一律收起，避免上次的结果残留误导。"""
+        self._update_busy = False
+        try:
+            self.check_update_btn.setEnabled(True)
+        except Exception:
+            pass
+        has_update = (status == "ok" and bool(latest) and cmp == 1)
+        self._update_latest = str(latest) if has_update else ""
+        try:
+            self.open_release_btn.setVisible(bool(has_update))
+            self.install_update_btn.setVisible(bool(has_update))
+        except Exception:
+            pass
+        if has_update:
+            self._set_update_status(
+                "发现新版本 %s（当前 %s）" % (latest, _current_version()))
+            return
+        if status != "ok" or not latest:
+            self._set_update_status("无法连接 GitHub，请检查网络后重试", ok=False)
+            return
+        cur = _current_version()
+        if cmp == 0:
+            self._set_update_status("当前已是最新版本（%s）" % cur)
+        else:
+            self._set_update_status("当前版本 %s 比线上 %s 更新" % (cur, latest))
+
+    def _open_release_page(self):
+        """在浏览器打开 GitHub 发布页（只下载，绝不自动改动本机文件）。"""
+        try:
+            from .. import updater
+            url = str(updater.releases_url() or "")
+        except Exception:
+            url = ""
+        if not url:
+            self._set_update_status("无法获取发布页地址", ok=False)
+            return
+        try:
+            from PyQt5.QtCore import QUrl
+            from PyQt5.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception as e:
+            self._set_update_status("打开浏览器失败：%s" % e, ok=False)
+
+    def _on_apply_update(self):
+        """一键自更新：后台线程下载/校验/启动执行器；成功后本进程退出交给执行器。"""
+        if getattr(self, "_update_busy", False):
+            return
+        tag = str(getattr(self, "_update_latest", "") or "")
+        if not tag:
+            self._set_update_status("请先点击「检查更新」", ok=False)
+            return
+        self._update_busy = True
+        try:
+            self.check_update_btn.setEnabled(False)
+            self.install_update_btn.setEnabled(False)
+            self.open_release_btn.setEnabled(False)
+        except Exception:
+            pass
+        self._set_update_status("正在下载更新包…")
+        import threading
+        try:
+            threading.Thread(target=self._apply_update_worker, args=(tag,),
+                             daemon=True).start()
+        except Exception as e:
+            self._update_busy = False
+            try:
+                self.check_update_btn.setEnabled(True)
+                self.install_update_btn.setEnabled(True)
+                self.open_release_btn.setEnabled(True)
+            except Exception:
+                pass
+            self._set_update_status("更新失败：%s" % e, ok=False)
+
+    def _apply_update_worker(self, tag):
+        """后台线程体：只调 updater.apply_update，进度/结果经信号回主线程。"""
+        try:
+            from .. import updater
+            status, msg = updater.apply_update(
+                tag, progress_cb=lambda text: self._updateProgress.emit(str(text)))
+        except Exception as e:
+            status, msg = "failed", str(e)
+        self._updateApplied.emit(status, msg)
+
+    def _on_apply_update_done(self, status, msg):
+        """主线程：成功提示并退出（执行器接管重启）；失败恢复按钮并如实提示。"""
+        if status == "ok":
+            self._set_update_status(msg or "更新已开始，程序即将重启")
+            try:
+                QApplication.instance().quit()
+            except Exception:
+                pass
+            return
+        self._update_busy = False
+        try:
+            self.check_update_btn.setEnabled(True)
+            self.install_update_btn.setEnabled(True)
+            self.open_release_btn.setEnabled(True)
+        except Exception:
+            pass
+        self._set_update_status(msg or "更新失败", ok=False)
 
     def _apply_hotkey_change(self):
         cfg = self._snapshot()
@@ -2801,15 +3122,55 @@ class SettingsPage(QWidget):
     # ------------------------------------------------------------------
     # 联动禁用
     # ------------------------------------------------------------------
-    def _sync_notify_enabled(self):
-        on = bool(self.notify_cb.isChecked())
+    def _apply_gates(self):
+        """统一门控：实验性总开关 + 通知总开关（两套开关互不干扰，交集行取 AND）。
+
+        实验性行：整行打 [off] 动态属性置灰（名称标签保持可用，悬停气泡可达），
+        只禁用控件簇；同时受通知总开关约束的行（notify_share / notify_share_dead /
+        notify_baidu_*）必须两个总开关都开才可用。"""
+        exp = bool(self.experimental_cb.isChecked())
+        ntf = bool(self.notify_cb.isChecked())
+        for w in self._exp_subs:
+            w.setEnabled(exp)
         for w in self._notify_subs + tuple(self._notify_labels):
-            w.setEnabled(on)
+            w.setEnabled(ntf)
+        notify_ids = {id(w) for w in self._notify_subs}
+        for host, cluster in self._exp_gate:
+            if host is not None:
+                host.setProperty("off", not exp)
+                repolish_tree(host)
+            widgets = cluster if isinstance(cluster, (tuple, list)) else (cluster,)
+            for w in widgets:
+                if w is None:
+                    continue
+                w.setEnabled(exp and ntf if id(w) in notify_ids else exp)
+
+    def _sync_notify_enabled(self):
+        self._apply_gates()
 
     def _sync_experimental(self):
-        on = bool(self.experimental_cb.isChecked())
-        for w in self._exp_subs:
-            w.setEnabled(on)
+        self._apply_gates()
+
+    def set_hotkey_status(self, key, state, msg=""):
+        """把某个全局热键的注册状态贴到对应行（失败原因就地显示；其余状态隐藏）。
+
+        state: ok / unset / disabled / skipped / busy / badhandle / invalid / error。
+        只有错误态（busy / badhandle / invalid / error）显示原因；成功 / 未配置 /
+        未启用 / 跳过一律清空隐藏。未知键 / 标签缺失静默忽略，绝不抛异常。"""
+        key = str(key)
+        self._hotkey_states[key] = (state, msg)
+        lbl = self._hotkey_reason_labels.get(key)
+        if lbl is None:
+            return
+        try:
+            if state in ("busy", "badhandle", "invalid", "error"):
+                lbl.setText(str(msg or ""))
+                lbl.show()
+            else:
+                lbl.setText("")
+                lbl.hide()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 删源总控 / 向导

@@ -44,7 +44,8 @@
   （旧路径 baidu_*.py 为兼容别名 shim，sys.modules 直接指向本子包对应模块）
 
 更新 / 界面
-  updater.py                  GitHub Releases 版本检查 + 下载/校验/update.bat
+  updater.py                  GitHub Releases 版本检查 + 下载/校验 + 启动自更新执行器
+  _update_runner.py           自更新执行器（独立运行：覆盖、握手自证、提交或回滚）
   ui/main_window.py           主窗口、托盘、监听卡片列表、日志面板
   ui/dialogs.py               设置对话框（各页）、更新页、网盘任务库诊断
   ui/widgets.py               通用控件（WatchCard 监听卡片、热键输入、托盘图标等）
@@ -62,7 +63,7 @@ from .hub import Hub, StdoutCapture
 from .utils import (_boot_tick, _boot_time, _norm_path_for_cfg,
                     _can_open_append, _install_crash_log)
 
-__version__ = "2.1.7"
+__version__ = "2.1.8"
 __all__ = [
     "PROJECT_ROOT", "DATA_DIR", "CONFIG_FILE", "TEMP_PW_FILE", "CRASH_LOG",
     "LOGS_DIR", "WORKERS_DIR", "SINGLE_INSTANCE_EVENT",

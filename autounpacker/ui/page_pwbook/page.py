@@ -248,6 +248,14 @@ class PasswordBookPage(QWidget):
         except Exception:
             return False
 
+    def refresh_if_changed(self):
+        """宿主切回本页时的装载入口：数据签名变了才重装（不无条件重建）。
+
+        与页内 2s 实时刷新（_live_tick）和 showEvent 即时校验共用同一份
+        _data_signature/_live_signature 判定，绝不新增第二份真相；
+        显式刷新（刷新按钮等）仍走 reload()。"""
+        self._live_tick()
+
     def _live_tick(self):
         """实时刷新 tick：数据签名变了才重载（保留选中 / 滚动位置）。"""
         if self._modal_open():

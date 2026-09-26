@@ -574,6 +574,7 @@ class TrailPage(QWidget):
         super().__init__(parent)
         self._records = []
         self._visible = []
+        self._loaded_sig = None     # 上次装载对应的记录文件指纹（切页据此跳过重读）
         self._mode = "all"          # all | reason | date
         self._reason = "deleted"    # 原因分段当前值（mode=reason 时生效）
         self._day = "today"         # 日期分段当前值（mode=date 时生效）
@@ -699,6 +700,7 @@ class TrailPage(QWidget):
         self._refresh_counts()
         self._refresh_quarantine_summary()
         self.apply_filters()
+        self._loaded_sig = self._trail_signature()   # 装载即对齐数据源指纹
 
     def reload(self):
         """从 trail 模块重读记录并刷新（刷新按钮 / 还原 / 清空后调用）。"""
@@ -707,6 +709,23 @@ class TrailPage(QWidget):
         except Exception:
             rows = []
         self.set_records(rows)
+
+    def _trail_signature(self):
+        """数据源廉价指纹：记录文件 (mtime_ns, size)；读不到（不存在/无权限）返回 None。"""
+        try:
+            st = deletion_trail.TRAIL_FILE.stat()
+            return (int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            return None
+
+    def refresh_if_changed(self):
+        """宿主切回本页时的重读入口：记录文件指纹变了才重读并重装。
+
+        指纹由 set_records()/reload() 装载时对齐（与数据源同一份真相）；页内操作
+        （还原 / 彻底删除 / 清空）已自行 reload()，显式刷新仍走 reload()。"""
+        if self._trail_signature() == self._loaded_sig:
+            return
+        self.reload()
 
     def refresh_theme(self):
         """主题切换后重绘表格（状态色在 data() 里现取调色板，重绘即生效）。"""

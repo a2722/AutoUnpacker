@@ -546,10 +546,17 @@ class TaskPage(QWidget):
             self.set_log_scope("task")
 
     def _set_task_buttons(self, enabled):
+        """选中态联动：三个操作按钮**未选中时隐藏**（不是变灰占位），选中才显示且可用。
+
+        「全部」视图（未选任何队列）下方本就没有可作用的对象，留三个点不动的灰按钮
+        只会误导；隐藏后头部行右侧自然收拢。菜单里的同义项（打开输出目录 / 重试）
+        保持「禁用但不隐藏」——下拉菜单里留位比凭空消失更稳定（菜单项顺序不变）。"""
+        on = bool(enabled)
         for btn in (self.retry_btn, self.open_btn, self.copy_btn):
-            btn.setEnabled(bool(enabled))
+            btn.setEnabled(on)
+            btn.setVisible(on)
         for act in (self.act_open_dir, self.act_retry):
-            act.setEnabled(bool(enabled))
+            act.setEnabled(on)
 
     def set_log_empty(self, empty, text=None):
         self.log_empty.set_empty(empty, text)
@@ -576,8 +583,26 @@ class TaskPage(QWidget):
         self._result_failed = (str(data) == "failed")
         self.resultFilterChanged.emit(self._result_failed)
 
+    def _clear_task_selection(self):
+        """取消选中：清空队列表的选中 / 当前项，再收起「当前任务」态。
+
+        表格清选本身**不会**发 taskDeselected（_on_current_row 对无效索引直接 return），
+        所以必须在这里自己把页面态收回未选中：文件名徽标与三个操作按钮一起隐藏、
+        日志范围回「全部」——绝不依赖信号回路。"""
+        try:
+            sm = self.table.selectionModel()
+            if sm is not None:
+                sm.clearSelection()
+                sm.clearCurrentIndex()
+        except Exception:
+            pass
+        self.set_current_task(None)
+
     def _on_log_scope(self, data):
         self._log_scope = "all" if str(data) == "all" else "task"
+        if self._log_scope == "all":
+            # 「全部」= 未选中队列：文件名、操作按钮、队列表选中一并收回。
+            self._clear_task_selection()
         self.logScopeChanged.emit(self._log_scope)
 
     def _emit_action(self, kind):
@@ -596,7 +621,9 @@ class LogPage(QWidget):
     信号：filtersChanged()（宿主据此重查 db）/ taskActivated(task_id) /
           actionTriggered(task_id, kind) / notice(text)（导出等用户可见回执）。
     显示层折叠：7-Zip 原始输出块（起始/收尾标记之间）在视图里折成一行、点击展开；
-    日志文件与生产者不动，过滤/搜索仍作用于原始行（折叠是过滤之后的显示变换）。
+    不在块内的连续相同日志行（>=_REPEAT_FOLD_MIN 条，正文 = 去掉时间戳 + [第N层]
+    前缀）同样合成一行、点击展开。日志文件与生产者不动，过滤/搜索仍作用于原始行
+    （折叠是过滤之后的显示变换）。
     """
 
     filtersChanged = pyqtSignal()
@@ -771,11 +798,22 @@ class LogPage(QWidget):
         except Exception:
             pass
 
+    def _base_rows(self, rows):
+        """级别计数的口径基础集：合法行按「路径 + 搜索」过滤（不看级别，计数分母即它）。"""
+        return [r for r in (rows or [])
+                if isinstance(r, dict)
+                and log_matches(r, None, self.sources(), self.keyword())]
+
+    def recount_levels(self, rows):
+        """只重算级别分段计数、不重画视图（视图已由实时追加保持最新时的廉价路径）。
+
+        与 reload() 的计数口径共用 _base_rows：计数口径永远只有一份。"""
+        self.set_level_counts(self._base_rows(rows))
+
     def reload(self, rows):
         """按「路径+搜索」取基础集算级别计数，再按「级别」过滤后渲染（时间正序）。"""
         rows = [r for r in (rows or []) if isinstance(r, dict)]
-        base = [r for r in rows
-                if log_matches(r, None, self.sources(), self.keyword())]
+        base = self._base_rows(rows)
         self.set_level_counts(base)
         picked = [r for r in base
                   if log_matches(r, self.levels(), None, None)]
@@ -931,14 +969,15 @@ class LogPage(QWidget):
         self.fold_ctl.rerender_view()
 
     def _on_fold_timeout(self):
-        """超时安全阀：起始行起 10 秒仍未见收尾行 -> 缓冲原样吐出（绝不吞行）。"""
+        """超时安全阀：缓冲到期（7-Zip 块 10s / 重复串 60s）-> 原样吐出或结算，绝不吞行。"""
         self.fold_ctl.on_timeout()
 
     def export_text(self):
         """导出文本：折叠块按原始行完整展开（导出是诊断材料，绝不因折叠少行）。
 
         视图里折叠行只占一行，但导出/复制出去的内容必须与落盘日志同量级：这里按
-        视图模型重建「未折叠」文本（起始行 + 全部原始行 + 收尾行）。"""
+        视图模型重建「未折叠」文本（7-Zip 块 = 起始行 + 全部原始行 + 收尾行；重复
+        折叠 = 全部原始行）。"""
         return self.fold_ctl.export_text()
 
     # ---- 内部 ----

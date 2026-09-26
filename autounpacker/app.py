@@ -113,6 +113,19 @@ def _setup_high_dpi():
         pass
 
 
+def _write_update_handshake():
+    """自更新自证：把 pending 更新标记写成 handshake（供更新执行器判定提交）。
+
+    在事件循环启动、主窗口创建后由定时器调用一次；无 pending 时 no-op。
+    任何异常都吞掉——绝不因写握手而影响程序运行。
+    """
+    try:
+        from . import updater
+        updater.write_update_handshake()
+    except Exception:
+        pass
+
+
 def main():
     if sys.platform != "win32":
         print("此程序仅支持 Windows")
@@ -303,6 +316,11 @@ def main():
     if not QR_AVAILABLE:
         win.log_box.appendPlainText(
             "[信息] 二维码识别功能依赖缺失（已禁用二维码，临时密码捕获不受影响）")
+
+    # 自动更新自证：启动 2s 后（晚于 900ms/1200ms 启动定时器）写握手，证明新版
+    # 已成功导入、主窗口已建、事件循环已在运行；更新执行器据此提交而非回滚。
+    # 必须用定时器——--autostart 是隐藏到托盘启动，不能依赖 win.show() 已调用。
+    QTimer.singleShot(2000, _write_update_handshake)
 
     sys.exit(app.exec_())
 

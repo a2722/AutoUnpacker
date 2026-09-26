@@ -7,9 +7,11 @@
 - WatchDirDialog 目录设置弹窗（对应原型 12；监听模式为两张平铺卡，严禁下拉框）
 - DragBehaviorDialog 拖拽行为设置弹窗（固定胶囊打开；拖入文件后做什么）
 - TaskDetailsDialog 任务详情弹窗（队列行「详细信息」/ 双击行；按状态给出出路动作）
+- Scrim 任务详情弹窗的暗化遮罩：遮罩本身是 ApplicationModal 顶层窗口（负责阻塞
+  主窗），TaskDetailsDialog 挂在它下面（模态窗口的子窗不受阻塞）
 关键入口：SevenZipSetupDialog / TrustAskDialog /
           ShareCodeAskDialog / WatchDirDialog / DragBehaviorDialog /
-          TaskDetailsDialog
+          TaskDetailsDialog / Scrim
 依赖：PyQt5、trail、sevenzip、trust、widgets
 注意：7-Zip 安装/卸载在后台线程执行（_SevenZipOp），UI 仅投递任务
 """
@@ -26,6 +28,7 @@
 #   watch_dir.py     WatchDirDialog
 #   drag_behavior.py DragBehaviorDialog（拖拽行为设置）
 #   task_details.py  TaskDetailsDialog（任务详情 + 状态相关动作）
+#   scrim.py         Scrim（覆盖主窗的模态暗化遮罩；TaskDetailsDialog 的宿主窗口）
 # 注意：QDialog / QMessageBox / QPlainTextEdit 的重导出只为保持旧模块的属性表面
 #      （既有测试会对 dialogs.QMessageBox / dialogs.QPlainTextEdit 打桩，
 #       对应子模块在调用点从包属性动态再导入以保证打桩生效）。
@@ -43,6 +46,7 @@ from .delete_policy import DeletePolicyAskDialog  # noqa: F401
 from .watch_dir import WatchDirDialog  # noqa: F401
 from .drag_behavior import DragBehaviorDialog  # noqa: F401
 from .task_details import TaskDetailsDialog  # noqa: F401
+from .scrim import Scrim  # noqa: F401
 
 __all__ = [
     "TRAIL_STATUS_TEXT", "TRAIL_STATUS_ORDER", "TRASH_HINT_NORMAL",
@@ -51,5 +55,5 @@ __all__ = [
     "_SevenZipOp", "SevenZipSetupDialog",
     "CloseActionDialog", "TrustAskDialog",
     "ShareCodeAskDialog", "DeletePolicyAskDialog", "WatchDirDialog",
-    "DragBehaviorDialog", "TaskDetailsDialog",
+    "DragBehaviorDialog", "TaskDetailsDialog", "Scrim",
 ]

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""版本检查与自动更新：查询 GitHub Releases、下载新版并生成 update.bat 自更新。
+"""版本检查与自动更新：查询 GitHub Releases、下载新版并交由独立执行器完成覆盖/回滚。
 
 职责：- check_latest_version() 查询最新 tag；compare_versions() 语义化版本比较
 - download_release_zip()/verify_release_zip() 下载并校验更新包（SHA256 校验和 + 防 zip slip）
-- apply_update() 生成 update.bat：结束进程 → 备份旧代码 → 覆盖新代码 → 重启程序
+- apply_update() 下载校验后写 pending.json 并启动独立执行器（_update_runner.py）：
+  执行器负责备份旧代码、覆盖新版、以握手自证启动成功，进而提交或自动回滚
+- write_update_handshake() 供新版本启动成功后写下握手，执行器据此判定提交
 关键入口：check_latest_version() / apply_update() / compare_versions()
 依赖：urllib.request、zipfile、GitHub API（a2722/AutoUnpacker，无认证 60 次/小时）
 注意：绝不主动拉取（仅用户点击按钮触发）；config.json/toolbox.db/logs/backup 等数据文件绝不覆盖
@@ -13,7 +15,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import urllib.request
 import uuid
 import zipfile
@@ -27,6 +31,15 @@ RELEASE_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/lates
 CHECK_TIMEOUT = 8
 # 下载超时（秒）：新版 zip 可能几十 MB，给更长时间
 DOWNLOAD_TIMEOUT = 120
+
+# 自更新执行器状态目录名（位于 backup 下；覆盖时被排除，故执行器自身可存活）
+UPDATE_DIR_NAME = ".update"
+# 新版启动后等待握手的最长时间（秒）：超时未收到即回滚
+HANDSHAKE_TIMEOUT = 45
+# 旧进程退出后、覆盖前的稳定等待（秒）：让单实例事件被系统释放
+SETTLE_SECONDS = 2
+# 等待旧进程自行退出的最长时间（秒）：超时按 PID 强制结束
+APP_EXIT_TIMEOUT = 20
 
 # 返回码：结果状态
 STATUS_OK = "ok"             # 成功获取到最新版本
@@ -305,13 +318,80 @@ def _project_root():
     return Path(paths.PROJECT_ROOT)
 
 
-def _backup_dir():
-    """更新前备份目录：backup\\update_before_<时间戳>（仅时间戳，不含 tag）。"""
-    from . import paths
-    bk = Path(paths.PROJECT_ROOT) / "backup" / \
-        f"update_before_{time_str()}"
-    bk.mkdir(parents=True, exist_ok=True)
-    return bk
+def _interpreter():
+    """挑选用于重启/执行更新的解释器：优先与当前解释器同目录的 pythonw.exe。
+
+    顺序：sys.executable 同级 pythonw.exe（存在时）→ sys.executable →
+    PYTHONW 环境变量 → PATH 上的 pythonw → sys.prefix\\pythonw.exe。
+    绝不硬编码 C:\\Windows\\pyw.exe（该文件通常不存在）。
+    """
+    exe = getattr(sys, "executable", "") or ""
+    if exe:
+        sibling = Path(exe).with_name("pythonw.exe")
+        if sibling.exists():
+            return str(sibling)
+        return exe
+    env = os.environ.get("PYTHONW")
+    if env:
+        return env
+    found = shutil.which("pythonw")
+    if found:
+        return found
+    return str(Path(sys.prefix) / "pythonw.exe")
+
+
+def update_state_dir():
+    """自更新状态目录：<root>\\backup\\.update（承载 pending/handshake/runner/日志）。"""
+    d = _project_root() / "backup" / UPDATE_DIR_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def copy_runner(state_dir, token):
+    """把自包含执行器复制到状态目录（覆盖时该目录被排除，执行器得以存活）。"""
+    src = Path(__file__).resolve().with_name("_update_runner.py")
+    dst = Path(state_dir) / ("runner_%s.py" % str(token)[:8])
+    shutil.copy2(src, dst)
+    return dst
+
+
+def write_update_handshake():
+    """新版启动成功后写 handshake.json（读取 pending.json；无 pending 则 no-op）。
+
+    原子写：先写 .tmp 再 os.replace，避免执行器读到半截 JSON。任何异常都吞掉
+    并返回 False —— 绝不因写握手失败而影响新版启动。返回是否写过。
+    """
+    try:
+        state_dir = update_state_dir()
+        pending = state_dir / "pending.json"
+        if not pending.exists():
+            return False
+        data = json.loads(pending.read_text(encoding="utf-8"))
+        token = str((data or {}).get("token") or "")
+        if not token:
+            return False
+        handshake = state_dir / "handshake.json"
+        payload = {
+            "token": token,
+            "tag": str(data.get("tag") or ""),
+            "version": _local_version(),
+            "pid": os.getpid(),
+            "ts": time.time(),
+        }
+        tmp = handshake.with_name(handshake.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(handshake))
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        return True
+    except Exception:
+        return False
 
 
 def time_str():
@@ -345,92 +425,23 @@ def _overwrite_tree(src_dir, dst_dir, progress_cb=None):
     return copied
 
 
-def write_update_bat(stage_dir, tag):
-    """生成 update.bat（更新执行脚本）。
-
-    流程：结束当前进程 → 备份旧代码到 backup 快照 → 用新版覆盖（跳过用户
-    数据；检查 robocopy 返回值，>= 8 视为失败）→ 成功则清理临时目录并重启；
-    失败则用备份快照自动回滚（同样跳过用户数据），回滚成功也重启（恢复到
-    更新前的可用状态），回滚本身失败则保留备份与更新包并提示手动恢复。
-    覆盖/回滚过程与错误写入 <备份目录>\\update.log，便于排查。
-    返回 bat 文件路径。
-    """
-    root = _project_root()
-    bk = _backup_dir()
-    stage = Path(stage_dir)
-    bat = root / "update.bat"
-    # 用当前 pythonw 启动（与用户自启一致）
-    pythonw = Path(os.environ.get("PYTHONW") or
-                   r"C:\Windows\pyw.exe")
-    script = f"""@echo off
-chcp 65001 >nul
-echo [AutoUnpacker] 正在更新到 {tag} ...
-rem 1. 结束当前程序进程（通过 update.bat 独立运行，程序已自行退出）
-taskkill /IM pythonw.exe /F >nul 2>&1
-timeout /t 2 /nobreak >nul
-rem 2. 备份旧代码到 backup 目录（布局与安装目录一致，失败时据此回滚）
-if not exist "{bk}" mkdir "{bk}"
-if exist "{root}\\autounpacker" robocopy "{root}\\autounpacker" "{bk}\\autounpacker" /E /NFL /NDL /NJH /NJS >nul 2>&1
-if exist "{root}\\main.py" copy /Y "{root}\\main.py" "{bk}\\main.py" >nul 2>&1
-if exist "{root}\\requirements.txt" copy /Y "{root}\\requirements.txt" "{bk}\\requirements.txt" >nul 2>&1
-if exist "{root}\\README.md" copy /Y "{root}\\README.md" "{bk}\\README.md" >nul 2>&1
-if exist "{root}\\CHANGELOG.md" copy /Y "{root}\\CHANGELOG.md" "{bk}\\CHANGELOG.md" >nul 2>&1
-if exist "{root}\\LICENSE" copy /Y "{root}\\LICENSE" "{bk}\\LICENSE" >nul 2>&1
-if exist "{root}\\.gitignore" copy /Y "{root}\\.gitignore" "{bk}\\.gitignore" >nul 2>&1
-if exist "{root}\\config.example.json" copy /Y "{root}\\config.example.json" "{bk}\\config.example.json" >nul 2>&1
-rem 3. 用新版覆盖（跳过数据文件：config/toolbox.db/temp_passwords/deletion_trail/logs/backup）
-rem    robocopy 返回值 >= 8 即失败；输出写入日志便于排查（不回显到控制台）
-echo [%date% %time%] overwrite start: {stage} root={root} > "{bk}\\update.log"
-robocopy "{stage}" "{root}" /E /NFL /NDL /NJH /NJS /XD logs backup /XF config.json toolbox.db temp_passwords.json deletion_trail.json crash.log >>"{bk}\\update.log" 2>&1
-if %ERRORLEVEL% GEQ 8 goto :rollback
-rem 4. 覆盖成功：清理临时目录
-if exist "{root}\\.update_stage" rmdir /S /Q "{root}\\.update_stage" >nul 2>&1
-rem 5. 重启程序
-start "" "{pythonw}" "{root}\\main.py" --autostart
-echo [AutoUnpacker] 更新完成，程序已重启。
-goto :end
-
-:rollback
-echo.
-echo [AutoUnpacker] 更新失败！正在用备份回滚到更新前的版本 ...
-echo [AutoUnpacker] 失败详情见日志: "{bk}\\update.log"
-echo [%date% %time%] rollback start: {bk} root={root} >> "{bk}\\update.log"
-if not exist "{bk}\\autounpacker" goto :rollback_failed
-robocopy "{bk}\\autounpacker" "{root}\\autounpacker" /E /NFL /NDL /NJH /NJS /XD logs backup /XF config.json toolbox.db temp_passwords.json deletion_trail.json crash.log >>"{bk}\\update.log" 2>&1
-if %ERRORLEVEL% GEQ 8 goto :rollback_failed
-if exist "{bk}\\main.py" copy /Y "{bk}\\main.py" "{root}\\main.py" >nul 2>&1
-if exist "{bk}\\requirements.txt" copy /Y "{bk}\\requirements.txt" "{root}\\requirements.txt" >nul 2>&1
-if exist "{bk}\\README.md" copy /Y "{bk}\\README.md" "{root}\\README.md" >nul 2>&1
-if exist "{bk}\\CHANGELOG.md" copy /Y "{bk}\\CHANGELOG.md" "{root}\\CHANGELOG.md" >nul 2>&1
-if exist "{bk}\\LICENSE" copy /Y "{bk}\\LICENSE" "{root}\\LICENSE" >nul 2>&1
-if exist "{bk}\\.gitignore" copy /Y "{bk}\\.gitignore" "{root}\\.gitignore" >nul 2>&1
-if exist "{bk}\\config.example.json" copy /Y "{bk}\\config.example.json" "{root}\\config.example.json" >nul 2>&1
-echo [%date% %time%] rollback ok >> "{bk}\\update.log"
-echo [AutoUnpacker] 已回滚到更新前的版本，程序将重启。
-rem 失败时保留更新包：{stage}（便于排查，不删除）
-start "" "{pythonw}" "{root}\\main.py" --autostart
-goto :end
-
-:rollback_failed
-echo.
-echo [AutoUnpacker] 警告：回滚失败！程序可能无法正常启动。
-echo [AutoUnpacker] 更新前的备份完好保存在: "{bk}"
-echo [AutoUnpacker] 更新包保留在: {stage}
-echo [AutoUnpacker] 程序未重启（代码状态未知），请用备份手动恢复。
-echo [%date% %time%] rollback FAILED >> "{bk}\\update.log"
-goto :end
-
-:end
-"""
-    bat.write_text(script, encoding="utf-8")
-    return str(bat)
+def _remove_pending(pending_path):
+    """清理尚未被执行器消费的 pending.json（失败路径用；绝不抛异常）。"""
+    try:
+        if pending_path:
+            Path(pending_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def apply_update(tag, progress_cb=None):
-    """执行自动更新：下载 → SHA256 校验 → 解压 → 生成 bat → 启动 bat。
+    """执行自动更新：下载 → SHA256 校验 → 解压 → 写 pending → 启动独立执行器。
 
+    本函数只负责「下载与准备」；真正的覆盖、自证、提交或回滚由
+    backup\\.update\\runner_<token8>.py 以独立进程完成（本进程随后由 UI 退出）。
+    任一步骤失败都返回失败且**绝不动 live 代码树**。
     返回 (status, message)：
-      (STATUS_OK, "更新已完成，程序即将重启") —— 成功
+      (STATUS_OK, "更新已开始，程序即将重启") —— 成功进入执行阶段
       (STATUS_FAILED, "错误信息")             —— 任一步骤失败
     """
     def _progress(done, total):
@@ -451,17 +462,52 @@ def apply_update(tag, progress_cb=None):
     ok, stage, err = verify_release_zip(zip_path, expected_sha256=want)
     if not ok:
         return STATUS_FAILED, err or "更新包校验失败"
-    # 3. 生成 update.bat
+    # 3. 组装状态（单份 JSON 交给独立执行器；失败即中止且不触碰 live）
+    root = _project_root()
+    pending_path = None
     try:
-        bat = write_update_bat(stage, tag)
+        state_dir = update_state_dir()
+        token = uuid.uuid4().hex
+        t8 = token[:8]
+        handshake = state_dir / "handshake.json"
+        log_path = state_dir / f"update_{t8}.log"
+        try:
+            top_files = sorted(p.name for p in Path(stage).iterdir())
+        except Exception:
+            top_files = []
+        state = {
+            "root": str(root),
+            "package": "autounpacker",
+            "stage": str(stage),
+            "tag": str(tag),
+            "token": token,
+            "app_pid": os.getpid(),
+            "interpreter": _interpreter(),
+            "state_dir": str(state_dir),
+            "previous_dir": str(root / "backup" / "previous"),
+            "rollback_dir": str(root / "backup" / f"rollback_{t8}"),
+            "handshake": str(handshake),
+            "log": str(log_path),
+            "top_files": top_files,
+            "timeout_start": HANDSHAKE_TIMEOUT,
+            "settle": SETTLE_SECONDS,
+        }
+        pending_path = state_dir / "pending.json"
+        pending_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        runner = copy_runner(state_dir, token)
     except Exception as e:
-        return STATUS_FAILED, f"生成更新脚本失败: {e}"
-    # 4. 启动 update.bat（独立于本进程运行）并退出
+        _remove_pending(pending_path)
+        return STATUS_FAILED, f"准备更新状态失败: {e}"
+    # 4. 启动独立执行器（分离运行；本进程随后退出，由执行器接管重启）
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+             | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         subprocess.Popen(
-            ["cmd.exe", "/c", bat],
-            cwd=str(_project_root()),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            [state["interpreter"], str(runner), "--state", str(pending_path)],
+            cwd=str(root), creationflags=flags, close_fds=True)
     except Exception as e:
-        return STATUS_FAILED, f"启动更新脚本失败: {e}"
-    return STATUS_OK, "更新已开始，程序将自动重启"
+        _remove_pending(pending_path)
+        return STATUS_FAILED, f"启动更新执行器失败: {e}"
+    return STATUS_OK, "更新已开始，程序即将重启"

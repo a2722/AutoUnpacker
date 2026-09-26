@@ -33,6 +33,66 @@ def _find_log_urls(text):
     return split_urls(text)
 
 
+# 应用内「动作链接」：日志里出现这些短语时渲染成可点击锚点，点击**跳转**（不是复制）。
+# 关键约束：显示文本 = 短语本身（与 block 纯文本逐字一致）——QPlainTextEdit 没有
+# anchorClicked，定位靠 block 纯文本 / fragment；若显示文本与存储文本不一致，
+# _rerender_log_view（用 block.text() 重画）会让锚点在主题切换后丢失。
+_APP_LINK_PREFIX = "app://"
+# 主热键注册失败时日志里给出的「打开设置页」动作短语（显示文本即短语本身）。
+_APP_LINK_SETTINGS_LABEL = "打开设置-外观与快捷键"
+_APP_LINK_SETTINGS_TARGET = "app://settings/ui"
+_LOG_ACTIONS = (
+    (_APP_LINK_SETTINGS_LABEL, _APP_LINK_SETTINGS_TARGET),
+)
+
+
+def _find_log_actions(text):
+    """返回 [(start, end, href)]：text 里所有动作短语及其跳转目标。
+
+    短语的显示文本就是它本身（_LOG_ACTIONS 的键）：渲染期按区间包锚点、
+    点击期按 fragment.anchorHref 判定，重载 / 主题重绘都能稳定复现。"""
+    out = []
+    body = str(text or "")
+    for phrase, href in _LOG_ACTIONS:
+        if not phrase:
+            continue
+        pos = 0
+        while True:
+            i = body.find(phrase, pos)
+            if i < 0:
+                break
+            out.append((i, i + len(phrase), href))
+            pos = i + len(phrase)
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _app_anchor_of_block(block, offset):
+    """点击偏移处的 fragment 是否带 app:// 动作锚点：是则返回 (start, end, href)。
+
+    动作链接的显示文本与 block 纯文本逐字一致，渲染期已包成 <a href="app://…">；
+    点击期直接读 fragment 的 anchorHref 最稳（不必按短语在点击侧重新解析）。
+    刻意做成**模块级**函数（与 _fold_href_of_block 同风格）：点击管线不新增实例
+    属性，宿主桩只需绑定 MainWindow 既有方法即可继续工作。"""
+    try:
+        it = block.begin()
+        while not it.atEnd():
+            fr = it.fragment()
+            it += 1
+            if not fr.isValid():
+                continue
+            fs = fr.position() - block.position()
+            fe = fs + fr.length()
+            if fs <= offset < fe:
+                href = str(fr.charFormat().anchorHref() or "")
+                if href.startswith(_APP_LINK_PREFIX):
+                    return fs, fe, href
+                return None
+    except Exception:
+        pass
+    return None
+
+
 def _log_value_spans(text):
     """返回 [(start, end)]：text 里应被渲染成「值 chip」的区间。
 
@@ -65,7 +125,8 @@ def _render_log_html(msg, color, degraded=None):
     2. 行内容按级别着色（info 用中性默认色，不再用蓝色）；
     3. 捕获类日志的值用等宽字体 + 淡底 chip（log_value_bg/log_value_fg），
        不使用级别色，也不加下划线；
-    4. 全行只有 http(s)/www 链接是蓝色 + 下划线 + 手型光标（点击一次即复制并降级）。
+    4. 全行只有 http(s)/www 链接是蓝色 + 下划线 + 手型光标（点击一次即复制并降级）；
+    动作短语（见 _LOG_ACTIONS）同样是蓝色 + 下划线，但点击是**跳转**（不复制、不降级）。
     degraded：正文坐标下「已经点击复制过」的链接区间；命中即渲染成普通暗色
     （log_ts、无下划线、无 anchor）——重载/主题重绘后已复制链接绝不复活。
     逐片段 html.escape（链接单独 escape），QPlainTextEdit 解析后 block 纯文本仍
@@ -75,13 +136,17 @@ def _render_log_html(msg, color, degraded=None):
     ts = m.group(0) if m else ""
     body = msg[len(ts):]
     url_spans = _find_log_urls(body)
+    action_spans = _find_log_actions(body)
     degraded_spans = set(degraded or ())
     value_spans = []
     for s, e in _log_value_spans(body):
         if any(not (e <= us or s >= ue) for us, ue, _u in url_spans):
             continue          # 值 chip 与链接重叠：链接优先（唯一可交互文本）
+        if any(not (e <= ax or s >= ay) for ax, ay, _h in action_spans):
+            continue          # 值 chip 与动作短语重叠：动作优先
         value_spans.append((s, e))
     marks = [(s, e, "url", url) for s, e, url in url_spans]
+    marks += [(s, e, "action", href) for s, e, href in action_spans]
     marks += [(s, e, "value", None) for s, e in value_spans]
     marks.sort(key=lambda t: t[0])
     parts = []
@@ -100,6 +165,13 @@ def _render_log_html(msg, color, degraded=None):
                 parts.append(
                     f'<a href="{esc}" style="color:{PALETTE["log_link"]};'
                     f'text-decoration:underline">{esc}</a>')
+        elif kind == "action":
+            # 动作链接：href 是 app:// 目标，显示文本仍是原文短语（与 block 纯文本
+            # 逐字一致，主题重绘按 block.text() 也能重新识别）。点击只跳转、绝不降级。
+            parts.append(
+                f'<a href="{html.escape(url, quote=True)}"'
+                f' style="color:{PALETTE["log_link"]};text-decoration:underline">'
+                f'{html.escape(body[s:e])}</a>')
         else:
             parts.append(
                 f'<span style="font-family:Consolas,\'Cascadia Mono\',monospace;'
@@ -115,15 +187,23 @@ def _render_log_html(msg, color, degraded=None):
 
 
 # ---------------------------------------------------------------------------
-# 日志视图折叠（显示层）：7-Zip 原始输出整块折成一行，点击展开 / 收起
+# 日志视图折叠（显示层）：7-Zip 原始输出整块折成一行、连续相同的日志行合成一行，
+# 点击展开 / 收起。
 #
 # 只影响「视图」：日志文件与生产者一行都不动（折叠不落盘、不裁剪、不改任何数据）。
-# 块边界靠生产者契约的两行标记（中间每行都带 hub 时间戳前缀，标记是唯一边界）：
+# 7-Zip 块边界靠生产者契约的两行标记（中间每行都带 hub 时间戳前缀，标记是唯一边界）：
 #   起始：含 "--- 7-Zip 原始输出 ---"
 #   收尾：含 "--- 7-Zip 原始输出结束（共 N 行）---"（N = 原始行数）
 # 安全阀：未收尾的块（旧版本日志 / 写入中断）按行数上限或超时原样吐出，绝不吞行。
 # 另有两道「绝不吞行」的闸门：块内再见起始标记（把上一个块按隐式收尾折起来）、
 # 有限快照收尾（重载/重装视图结束即把仍在缓冲的块原样吐出）。
+#
+# 重复串折叠（kind="repeat"）：不在块内时，连续两条「正文完全相同」的行（正文 =
+# 去掉时间戳 + [第N层] 前缀后的文本，见 _fold_line_head）建立候选——第 2 条先藏起，
+# 第 3 条起整串都不再显示（并收回已经显示过的第 1 条）；正文变化 / 遇到起始标记 /
+# 超时 / 快照收尾时结算：>= _REPEAT_FOLD_MIN 条合成一条折叠行，否则把尚未显示的
+# 原始行原样吐回。两条以内的相同行不折（原样显示）。与 7-Zip 块严格互斥，绝不跨块
+# 边界折叠；块内的相同行仍按 7-Zip 块整块折叠，绝不单独折成重复串。
 # ---------------------------------------------------------------------------
 
 _FOLD_START_MARK = "--- 7-Zip 原始输出 ---"
@@ -139,6 +219,13 @@ _FOLD_LAYER_RE = re.compile(r"^(\[[^\[\]]*?层\]\s*)")
 # 必须高于真实块——否则块还没收尾就被冲掉，折叠对真实场景失效；10 秒超时仍是主兜底。
 _FOLD_MAX_LINES = 2000
 _FOLD_TIMEOUT_SEC = 10.0
+# 重复串折叠：阈值 3 行——1~2 条相同行折起来反而更难读，不折（原样显示，绝不吞行）。
+_REPEAT_FOLD_MIN = 3
+# 重复串超时：轮询类重复可持续几分钟（实测 115 条 / 约 4 分钟），兜底间隔用 60s，
+# 长串绝不被切碎；不足阈值（成不了折）的候选仍用普通 10s，尽早把藏起的行原样吐回。
+_REPEAT_TIMEOUT_SEC = 60.0
+# 单个重复串的缓冲上限（与 7-Zip 块同思路的安全阀）：宁可多分几折，绝不无界增长。
+_REPEAT_MAX_LINES = 20000
 # 视图模型（_view_items）上限：只留最近这么多项，长时间运行也绝不无界增长。
 _VIEW_ITEMS_MAX = 3000
 # 置顶折叠条（置顶 = 已展开的块滚过头后，折叠头钉在视图顶部）：
@@ -184,18 +271,23 @@ def _fold_href_of_block(block):
 
 
 def _fold_head_text(fold, expanded, affordance=True):
-    """折叠头行文本：保留原时间戳 + [第N层] 前缀，形如
-    "[21:48:43] [第3层] 7-Zip 原始输出（739 行）—— 点击展开"。
+    """折叠头行文本：保留原时间戳 + [第N层] 前缀，按 kind 区分两种折叠。
 
-    affordance=False（搜索/级别过滤中整块展开）时只留「（N 行）」摘要，不给
-    「点击收起」入口——那种状态下收起会藏住命中的行。"""
+    7-Zip 块："[21:48:43] [第3层] 7-Zip 原始输出（739 行）—— 点击展开"；
+    重复串（kind="repeat"）："[21:48:43] [第3层] <正文>（重复 115 次）—— 点击展开"。
+
+    affordance=False（搜索/级别过滤中整块展开）时只留摘要，不给「点击收起」入口——
+    那种状态下收起会藏住命中的行。"""
     ts = str(fold.get("ts") or "")
     layer = str(fold.get("layer") or "")
     try:
         count = max(0, int(fold.get("count") or 0))
     except Exception:
         count = 0
-    text = "%s%s7-Zip 原始输出（%d 行）" % (ts, layer, count)
+    if str(fold.get("kind") or "") == "repeat":
+        text = "%s%s%s（重复 %d 次）" % (ts, layer, str(fold.get("body") or ""), count)
+    else:
+        text = "%s%s7-Zip 原始输出（%d 行）" % (ts, layer, count)
     if affordance:
         text += "—— 点击收起" if expanded else "—— 点击展开"
     return text
@@ -210,7 +302,7 @@ def _anchor_fold_affordance(block, text, href):
 
 
 def _fold_tip_text(fold):
-    """折叠行悬停提示（紧凑一行）。
+    """折叠行悬停提示（紧凑一行），按 kind 区分。
 
     隐式收尾的块（旧版本日志没有收尾标记）只在**提示**里说明一句；折叠行本身的
     文字与正常块完全一致（不给视图文字加任何特例）。"""
@@ -218,6 +310,10 @@ def _fold_tip_text(fold):
         count = max(0, int(fold.get("count") or 0))
     except Exception:
         count = 0
+    if str(fold.get("kind") or "") == "repeat":
+        if bool(fold.get("expanded")):
+            return "已展开 %d 行重复日志；点击收起" % count
+        return "已折叠 %d 行重复日志；点击展开" % count
     if bool(fold.get("expanded")):
         return "已展开 %d 行 7-Zip 原始输出；点击收起" % count
     if fold.get("implicit"):
@@ -226,19 +322,38 @@ def _fold_tip_text(fold):
 
 
 class LogFold:
-    """「7-Zip 原始输出」块的显示层折叠缓冲（纯 Python，无 Qt 依赖，离线可测）。
+    """日志视图的显示层折叠缓冲（纯 Python，无 Qt 依赖，离线可测）。
 
-    feed() 逐行吃入，返回本次应渲染的显示项：("line", 原文) 或 ("fold", 折叠项)。
-    块内原始行先缓冲、收尾行到达才吐出一条折叠项；块内再见起始标记 = 上一个块结束
-    （旧版本日志没有收尾标记）→ 按「隐式收尾」折成一行，本行重新开块。实时路径的
-    两个安全阀（行数上限 / 超时）与快照收尾 finish() 一律把未收尾块原样吐出——
-    缓冲绝不吞掉任何一行，更不吞后续无关日志。折叠头显示的行数恒等于实际缓冲行数。
+    feed() 逐行吃入，返回本次应渲染的显示项：
+      ("line", 原文)    原样渲染一行；
+      ("fold", 折叠项)  折叠头行（7-Zip 块 或 重复串，见折叠项的 kind 字段）；
+      ("retract", n)    把视图里最近 n 条原始行收回（重复折叠「第 1 条已显示」的追溯
+                        收起——由 FoldController 落到视图模型上）。
+
+    两种缓冲互斥，绝不跨边界混合：
+    1) 7-Zip 原始输出块：块内原始行先缓冲、收尾行到达才吐出一条折叠项；块内再见起始
+       标记 / 行数上限 / 超时 / 快照收尾 finish() 一律把未收尾块原样吐出——缓冲绝不
+       吞掉任何一行，更不吞后续无关日志。折叠头显示的行数恒等于实际缓冲行数。
+    2) 重复串候选：不在块内时，第 2 条「正文完全相同」（正文 = 去掉时间戳 + [第N层]
+       前缀，见 _fold_line_head）的行建立候选——它先藏起，第 1 条保持可见（还不能
+       确定后面是否继续重复）；第 3 条确认成串时收回已显示的第 1 条、整串不再显示。
+       正文变化 / 起始标记 / 超时 / finish() 时结算：长度 >= repeat_min 吐出一条
+       repeat 折叠项；否则把尚未显示的原始行原样吐回（第 1 条本来就可见，绝不重复
+       吐、绝不吞）。第 2 条候选的兜底是普通 timeout（尽快吐回），成串后换更长的
+       repeat_timeout（长串绝不被切碎）。
     """
 
-    def __init__(self, max_lines=_FOLD_MAX_LINES, timeout=_FOLD_TIMEOUT_SEC):
+    def __init__(self, max_lines=_FOLD_MAX_LINES, timeout=_FOLD_TIMEOUT_SEC,
+                 repeat_min=_REPEAT_FOLD_MIN, repeat_timeout=_REPEAT_TIMEOUT_SEC,
+                 repeat_max_lines=_REPEAT_MAX_LINES):
         self.max_lines = int(max_lines)
         self.timeout = float(timeout)
-        self.pending = None      # 正在缓冲的折叠项（None = 不在块内）
+        self.repeat_min = int(repeat_min)
+        self.repeat_timeout = float(repeat_timeout)
+        self.repeat_max_lines = int(repeat_max_lines)
+        self.pending = None      # 正在缓冲的 7-Zip 块（None = 不在块内）
+        self.repeat = None       # 正在缓冲的重复串候选（None = 无）
+        self.last = None         # 最近一条已显示、仍可与后续行配对的普通行
         self._seq = 0
 
     def feed(self, line, now=None):
@@ -247,22 +362,25 @@ class LogFold:
         now = time.time() if now is None else float(now)
         if self.pending is not None:
             return self._feed_in_block(text, now)
+        if self.repeat is not None:
+            return self._feed_repeat(text, now)
         if _FOLD_START_MARK in text:
+            self.last = None     # 块内整块隐藏：块前的普通行不再参与重复配对
             self._seq += 1
             ts, layer = _fold_line_head(text)
             self.pending = {"id": self._seq, "ts": ts, "layer": layer,
                             "start": text, "lines": [], "count": 0,
                             "expanded": False, "at": now}
             return []
-        return [("line", text)]
+        return self._feed_plain(text, now)
 
     def flush(self):
-        """安全阀：把缓冲原样吐出（起始行 + 已缓冲原始行），绝不吞行。"""
+        """安全阀：结算重复候选，并把 7-Zip 缓冲原样吐出（起始行 + 已缓冲原始行）。"""
+        out = self._close_repeat()
         pend, self.pending = self.pending, None
-        if pend is None:
-            return []
-        out = [("line", pend.get("start") or "")]
-        out += [("line", ln) for ln in pend.get("lines") or ()]
+        if pend is not None:
+            out.append(("line", pend.get("start") or ""))
+            out.extend(("line", ln) for ln in pend.get("lines") or ())
         return out
 
     def finish(self):
@@ -273,14 +391,101 @@ class LogFold:
         return self.flush()
 
     def stale(self, now=None):
-        """缓冲是否已超时（宿主定时器据此决定要不要 flush）。"""
-        if self.pending is None:
+        """缓冲是否已超时（宿主定时器据此决定要不要 flush）；超时秒数按缓冲类型区分。"""
+        item = self.pending if self.pending is not None else self.repeat
+        if item is None:
             return False
         now = time.time() if now is None else float(now)
         try:
-            return (now - float(self.pending.get("at") or now)) > self.timeout
+            return (now - float(item.get("at") or now)) > self._timeout_for(item)
         except Exception:
             return False
+
+    def pending_arm(self):
+        """当前缓冲的定时器武装信息 (键, 超时秒)：宿主据此武装/重启定时器。
+
+        键 None = 没有需要兜底的缓冲（不必武装）。7-Zip 块整块用普通 timeout；
+        重复候选在成串（可折）前用普通 timeout（成不了折、尽快原样吐回），成串后
+        换更长的 repeat_timeout（长重复串绝不被切碎）。键或秒数变化 = 重新计时。"""
+        if self.pending is not None:
+            return ("zip", id(self.pending)), self.timeout
+        run = self.repeat
+        if run is not None:
+            foldable = len(run.get("lines") or ()) >= self.repeat_min
+            return ("repeat", run.get("id"), foldable), self._timeout_for(run)
+        return None, None
+
+    def _timeout_for(self, item):
+        """该缓冲适用的兜底秒数：重复串成串后用更长的 repeat_timeout。"""
+        if str(item.get("kind") or "") == "repeat":
+            if len(item.get("lines") or ()) >= self.repeat_min:
+                return self.repeat_timeout
+        return self.timeout
+
+    def _feed_plain(self, text, now):
+        """不在任何缓冲内的一行：与上一条已显示的普通行比对，开启/继续重复串。"""
+        ts, layer = _fold_line_head(text)
+        body = text[len(ts) + len(layer):]
+        last = self.last
+        if last is not None and last.get("body") == body:
+            # 第 2 条相同：建立候选（本条先藏起；第 1 条暂留视图，等第 3 条确认成串）
+            self._seq += 1
+            self.repeat = {"id": self._seq, "kind": "repeat",
+                           "ts": last.get("ts") or "",
+                           "layer": last.get("layer") or "",
+                           "body": body,
+                           "lines": [last.get("line") or "", text],
+                           "count": 0, "expanded": False, "at": now,
+                           "head_visible": True}
+            self.last = None
+            return []
+        self.last = {"body": body, "ts": ts, "layer": layer, "line": text}
+        return [("line", text)]
+
+    def _feed_repeat(self, text, now):
+        """重复串候选中的一行：同正文继续攒；起始标记/异正文先结算再交给正常路径。"""
+        run = self.repeat
+        if _FOLD_START_MARK in text:
+            # 块边界优先：先结算重复候选，起始标记重新开 7-Zip 块（绝不跨块折叠）。
+            return self._close_repeat(now) + self.feed(text, now)
+        ts, layer = _fold_line_head(text)
+        body = text[len(ts) + len(layer):]
+        if body == run.get("body"):
+            run["lines"].append(text)
+            self.last = None
+            out = []
+            if run.get("head_visible") and len(run["lines"]) >= self.repeat_min:
+                # 第 3 条确认成串：收回已显示的第 1 条，从此整串不再显示（计数不撒谎）
+                run.pop("head_visible", None)
+                run["at"] = now
+                out.append(("retract", 1))
+            if len(run["lines"]) > self.repeat_max_lines or self.stale(now):
+                out.extend(self._close_repeat(now))
+            return out
+        return self._close_repeat(now) + self._feed_plain(text, now)
+
+    def _close_repeat(self, now=None):
+        """结算重复串候选：够阈值吐一条 repeat 折叠项，否则把尚未显示的原始行吐回。"""
+        run, self.repeat = self.repeat, None
+        if run is None:
+            return []
+        lines = list(run.get("lines") or ())
+        if len(lines) >= self.repeat_min:
+            run["count"] = len(lines)
+            run["expanded"] = False
+            run.pop("head_visible", None)
+            run.pop("at", None)
+            self.last = None
+            return [("fold", run)]
+        head_visible = bool(run.pop("head_visible", False))
+        outgoing = lines[1:] if head_visible else lines
+        if lines:
+            # 候选串短于阈值：第 1 条已显示过，只补吐还没显示的；并把它作为新的可配对尾行
+            last_line = lines[-1]
+            ts, layer = _fold_line_head(last_line)
+            self.last = {"body": run.get("body") or "", "ts": ts,
+                         "layer": layer, "line": last_line}
+        return [("line", ln) for ln in outgoing]
 
     def _feed_in_block(self, text, now):
         pend = self.pending
@@ -313,11 +518,13 @@ class LogFold:
 
 
 class FoldController(QObject):
-    """「7-Zip 原始输出」折叠控制器（一套折叠机制服务多个日志视图）。
+    """日志视图折叠控制器（一套折叠机制服务多个日志视图）。
 
     拥有：折叠缓冲（LogFold）、视图模型（view_items）、id 映射（folds）、超时定时器、
-    展开态、命中判定（fold_at）、点击/悬停处理与置顶折叠条。渲染由宿主注入
-    render(view, msg)——着色/链接管线只有一份实现，本类绝不另造一套。
+    展开态、命中判定（fold_at）、点击/悬停处理与置顶折叠条。两种折叠共用同一套视图：
+    7-Zip 原始输出块 与 连续相同行（kind="repeat"）；重复折叠的「追溯收起」由
+    ("retract", n) 显示项落到视图模型上（收回已画出的原始行再画折叠头）。
+    渲染由宿主注入 render(view, msg)——着色/链接管线只有一份实现，本类绝不另造一套。
     事件过滤器只消费「折叠相关」事件（命中折叠头的移动/点击、置顶条上的点击），
     其余事件一律返回 False：链接悬停/点击复制/拖选行为完全不受影响。
     """
@@ -363,18 +570,27 @@ class FoldController(QObject):
     def feed(self, msg):
         """喂一行日志：只有缓冲吐出的显示项才渲染（块内原始行先攒着）。
 
-        超时定时器在块「刚开始」时武装（不随每行重启）：块起 10 秒仍未见收尾行就
-        原样吐出——慢慢滴的旧版本块也绝不无限吞行；上一个块被新起始标记冲掉后，
-        新块重新计时（两个块各有各的兜底）。"""
+        超时定时器按缓冲类型武装/重启：7-Zip 块起 10 秒仍未见收尾行就原样吐出（不随
+        每行重启）；重复串在成串前用普通间隔（藏起的行要尽快吐回），成串后换更长的
+        间隔（长串绝不被切碎）。两者的武装信息都由缓冲的 pending_arm() 给出，定时器
+        只在「缓冲代次或间隔」变化时重启（不是每行重启）。"""
         for line in (str(msg).splitlines() or [""]):
-            before = self.buffer.pending
-            before_id = before.get("id") if isinstance(before, dict) else None
+            before_key, before_secs = self.buffer.pending_arm()
             for item in self.buffer.feed(line):
                 self.append_item(item)
-            after = self.buffer.pending
-            after_id = after.get("id") if isinstance(after, dict) else None
-            if after_id is not None and after_id != before_id:
-                self.timer.start()
+            after_key, after_secs = self.buffer.pending_arm()
+            if after_key is not None and (after_key != before_key
+                                          or after_secs != before_secs):
+                self.arm_timer(after_secs)
+
+    def arm_timer(self, secs):
+        """按缓冲当前类型给出的间隔（重新）武装兜底定时器（单发、到点走 on_timeout）。"""
+        try:
+            self.timer.stop()
+            self.timer.setInterval(max(1, int(float(secs) * 1000)))
+            self.timer.start()
+        except Exception:
+            pass
 
     def finish(self):
         """有限快照收尾（重载 / 重装该任务日志）：停表并把缓冲原样吐出。
@@ -393,7 +609,8 @@ class FoldController(QObject):
             self.append_item(item)
 
     def on_timeout(self):
-        """超时安全阀：起始行起 10 秒仍未见收尾行 -> 缓冲原样吐出（绝不吞行）。"""
+        """超时安全阀：缓冲到期 -> 未收尾的 7-Zip 块原样吐出 / 重复串结算（折或原样吐出），
+        绝不吞行。"""
         try:
             items = self.buffer.flush()
         except Exception:
@@ -413,7 +630,13 @@ class FoldController(QObject):
         return bool(fold.get("expanded")) or self.force_open()
 
     def append_item(self, item):
-        """记入视图模型并渲染；模型只留最近若干项，避免长时间运行无界增长。"""
+        """记入视图模型并渲染；模型只留最近若干项，避免长时间运行无界增长。
+
+        ("retract", n) 是显示层的追溯收起（重复折叠第 1 条已画出的情形）：把最近 n 条
+        原始行从视图模型收回并重画——绝不针对折叠头/其他项，n 只会收回原始行。"""
+        if item[0] == "retract":
+            self.retract_items(item[1])
+            return
         self.view_items.append(item)
         if item[0] == "fold":
             try:
@@ -425,6 +648,51 @@ class FoldController(QObject):
             self.prune_folds()
         self.render_item(item)
         self.update_pin()
+
+    def retract_items(self, n):
+        """收回视图里最近 n 条已渲染的原始行（重复折叠的追溯收起）。
+
+        只从编辑器**末尾**删掉这 n 个块（O(n)），绝不整页重画：本视图的重画是
+        着色级的 O(总行数) 操作——日志刷新时每个重复串都触发一次，会让「打开/关闭
+        详情」这类强制刷新变得极慢（实测 1600 行日志一次刷新 = 4 次整页重画、
+        3910 次着色行渲染，是唯一重画时的 3.4 倍）。定点删除失败才退回整页重画。"""
+        try:
+            n = max(0, int(n))
+        except Exception:
+            return
+        removed = 0
+        while removed < n and self.view_items and self.view_items[-1][0] == "line":
+            self.view_items.pop()
+            removed += 1
+        if not removed:
+            return
+        if not self._remove_tail_blocks(removed):
+            self.rerender_view()
+            return
+        self.invalidate_pin()
+        self.update_pin()
+
+    def _remove_tail_blocks(self, n):
+        """从编辑器末尾删除 n 个块（原始行各占一块），不碰 view_items、不整页重画。
+
+        追溯收起的行必定是「刚渲染的最后几行」（见 LogFold 的成串时序），所以定点
+        删末尾块与整页重画在视图上等价，但代价从 O(总行数) 降为 O(n)。返回是否成功。"""
+        try:
+            doc = self.view.document()
+            if doc.blockCount() < n:
+                return False
+            cur = QTextCursor(doc)
+            cur.movePosition(QTextCursor.End)
+            cur.beginEditBlock()
+            for _ in range(int(n)):
+                cur.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+                cur.removeSelectedText()
+                if not cur.atStart():
+                    cur.deletePreviousChar()
+            cur.endEditBlock()
+            return True
+        except Exception:
+            return False
 
     def prune_folds(self):
         """丢弃已不在视图模型里的折叠项（id 映射绝不无界增长）。"""
@@ -536,10 +804,14 @@ class FoldController(QObject):
         """导出/复制文本：折叠块按原始行完整展开（绝不因折叠少行）。
 
         视图里折叠行只占一行，但导出/复制出去的内容必须与落盘日志同量级：按视图
-        模型重建「未折叠」文本（起始行 + 全部原始行 + 收尾行）。"""
+        模型重建「未折叠」文本。7-Zip 块 = 起始行 + 全部原始行 + 收尾行；重复串
+        （kind="repeat"）= 全部原始行（原始行里本来就带时间戳，不再补任何东西）。"""
         out = []
         for kind, payload in self.view_items:
             if kind == "fold":
+                if str(payload.get("kind") or "") == "repeat":
+                    out.extend(str(ln) for ln in payload.get("lines") or ())
+                    continue
                 out.append(str(payload.get("start") or ""))
                 out.extend(str(ln) for ln in payload.get("lines") or ())
                 if payload.get("end"):

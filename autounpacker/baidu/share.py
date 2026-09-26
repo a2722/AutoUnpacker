@@ -58,6 +58,12 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # 分享链接路径段（/s/<surl_full>）；提取码从查询串取。
 _SURL_RE = re.compile(r"/s/([A-Za-z0-9_-]+)")
+# 百度「安全验证」页形态：/share/init?surl=<裸 surl>（前导 1 已被百度去掉）。
+# 剪贴板里经常正是这种形态（如 …/share/init?surl=0S6Avqw…&pwd=abcd），它和
+# `/s/1<surl>` 指向同一个分享；`manifest.parse_share_url` 早已两种都认
+# （所以「已记录」能成功），这里必须跟上，否则拉起步（_parse_share）会误报
+# 「不是有效的百度分享链接」。
+_SURL_QUERY_RE = re.compile(r"[?&]surl=([A-Za-z0-9_-]+)")
 
 # 新版分享的提取码是强制必填项：空码去提交必然失败。`prepare_share` 在死链判定之后、
 # 任何 tplconfig/verify 请求之前就此短路，把原因交回上层去询问用户（供测试/上层引用）。
@@ -182,16 +188,26 @@ def _post(op, url, data, referer):
 def _parse_share(share_url, pwd):
     """把分享链接拆成 (surl_full, surl, pwd)。
 
-    - surl_full = `/s/` 之后的完整段（`/share/tplconfig` 用）；
+    两种链接形态都要认（同一分享的两种写法，端到端等价）：
+    - `/s/<surl_full>` 形态：surl_full = `/s/` 之后的完整段；
+    - `/share/init?surl=<裸 surl>` 形态（百度「安全验证」页，剪贴板里最常见）：
+      查询串里的值就是**裸 surl**（前导 1 已被百度去掉），据此还原
+      surl_full = `1` + 裸 surl（与日志里 `/s/1<surl>` 的重建口径一致）。
+
+    - surl_full = 上述完整段（`/share/tplconfig` 用）；
     - surl      = 去掉开头一个 `1`（`/share/verify`、`/share/list` 用）；
     - pwd       = 参数优先，其次 URL 查询串里的 `pwd`。
     解析不出路径段时抛 ValueError（由外层统一转成 (False, …)）。
     """
     u = str(share_url or "").strip()
     m = _SURL_RE.search(u)
-    if not m:
-        raise ValueError("不是有效的百度分享链接")
-    surl_full = m.group(1)
+    if m:
+        surl_full = m.group(1)
+    else:
+        m2 = _SURL_QUERY_RE.search(u)
+        if not m2:
+            raise ValueError("不是有效的百度分享链接")
+        surl_full = "1" + m2.group(1)
     surl = surl_full[1:] if surl_full.startswith("1") else surl_full
     if not pwd:
         try:

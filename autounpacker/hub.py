@@ -292,8 +292,9 @@ class Hub:
         line = f"[通知] {title}: {msg}"
         self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}")
         # 通知文本也进 log_index（级别固定 info），让新版日志页能过滤到
+        now = int(time.time())
         try:
-            db.add_log_index(int(time.time()), "info", line)
+            db.add_log_index(now, "info", line)
         except Exception:
             pass
         if self.state is not None:
@@ -309,7 +310,7 @@ class Hub:
                 if k and not cfg.get(k, True):
                     return
         try:
-            self.q.put({"type": "notify", "title": title, "msg": msg})
+            self.q.put({"type": "notify", "title": title, "msg": msg, "ts": now})
         except Exception:
             pass
 

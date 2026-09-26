@@ -48,7 +48,7 @@ from .page_trail import TrailPage
 from .page_settings import SettingsPage
 from .dialogs import (SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
-                      DragBehaviorDialog, TaskDetailsDialog)
+                      DragBehaviorDialog, TaskDetailsDialog, Scrim)
 
 # ---------------------------------------------------------------------------
 # Stage 6f：模块级常量与助手已拆分到 .window 包（consts/logview/share_flow/chrome）。
@@ -73,6 +73,7 @@ from .window.chrome import (  # noqa: F401
     _cycle_key, fit_window_size, fit_min_size, _PageScroll,
     _make_scrollable_page)
 from .window.logview import (  # noqa: F401
+    _APP_LINK_PREFIX, _APP_LINK_SETTINGS_LABEL, _app_anchor_of_block,
     _find_log_urls, _log_value_spans, _render_log_html, _copy_toast, _log_body,
     _record_degraded_link, _degraded_spans_for, _pop_degraded_link,
     _restore_link_span, _restore_degraded_in_view, _rerender_log_view,
@@ -210,6 +211,9 @@ class MainWindow(QMainWindow):
         # 全局热键的**真实注册结果**（None=未尝试/不适用，True=已注册，False=失败）。
         # 底栏据此诚实标注「（未生效）」，不再拿配置值冒充已生效（见 _sync_hotkey_display）。
         self._hotkey_ok = {"main": None, "share": None, "share_pick": None}
+        # 每个热键的注册状态 (state, msg)：供设置页对应行就地显示失败原因
+        # （state: ok / unset / disabled / skipped / busy / badhandle / invalid / error）
+        self._hotkey_state = {"main": None, "share": None, "share_pick": None}
         QTimer.singleShot(600, self._register_hotkey)
         # 主界面快捷键：Esc / Ctrl+W 触发关闭（走 close_action 逻辑：
         # 询问弹窗 / 隐藏到托盘 / 关闭程序）。仅主界面激活时生效，
@@ -269,7 +273,11 @@ class MainWindow(QMainWindow):
         # 新日志、滤镜变化、清空、显式刷新都会置脏（见 _append_log/_mark_log_dirty）。
         self._log_cache_sig = None
         self._log_cache_dirty = True
+        self._log_counts_dirty = True     # 级别分段计数需重算（视图由实时追加保持最新）
         self._meta_cache_dirty = True
+        # 任务表缓存：任务写入路径经 _emit_tasks_changed / 生命周期定时器刷新并清脏；
+        # 切回任务页只在脏时重建（没有任务变化就不重查重画）。
+        self._tasks_dirty = True
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -399,36 +407,139 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- 拖放临时解压 ----------
+    @staticmethod
+    def _drop_http_urls(mime):
+        """拖入内容里的 http(s) 链接（浏览器拖图片元素给的是远端地址，不是本地文件）。"""
+        out = []
+        try:
+            for u in mime.urls():
+                s = str(u.toString() or "")
+                low = s.lower()
+                if low.startswith("http://") or low.startswith("https://"):
+                    out.append(s)
+        except Exception:
+            pass
+        return out
+
     def dragEnterEvent(self, e):
-        """只接受拖入的文件（含多个），目录或链接不接受。"""
-        if e.mimeData().hasUrls():
-            urls = e.mimeData().urls()
-            if urls and any(u.isLocalFile() for u in urls):
+        """接受：本地文件（含多个）、浏览器拖来的图片数据、http(s) 图片链接。
+
+        仍**拒绝**纯文本 mime 与非 http(s) 的远端链接（如 ftp）：那是既有契约
+        （只处理文件与可抓取的 http(s) 图片），不是遗漏。"""
+        mime = e.mimeData()
+        try:
+            if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
                 e.acceptProposedAction()
                 return
+            if mime.hasImage() or self._drop_http_urls(mime):
+                e.acceptProposedAction()
+                return
+        except Exception:
+            pass
         e.ignore()
 
     def dropEvent(self, e):
-        """拖入一个或多个文件：每个文件在后台线程做智能解压。
+        """拖入落地：本地文件走智能解压；图片数据 / http(s) 链接走二维码识别。
 
         - 只处理拖入的文件本身；同目录其他文件不处理（除非是它自己的分卷兄弟）
         - 输出到文件所在目录（default_output_dir 自动建同名目录）
         - 分卷：拖入首卷（.001）正常处理；拖入非首卷（.002）提示跳过，
           等待首卷；伪装分卷名的完整包正常处理
+        - 图片数据与链接都指向「识别二维码」（不解压、不落任务行）；两者同时存在时
+          优先用本地图片数据（不联网、不重复解码）。
         """
+        mime = e.mimeData()
         paths = []
-        for u in e.mimeData().urls():
-            if u.isLocalFile():
-                from pathlib import Path
-                p = Path(u.toLocalFile())
-                if p.is_file():
-                    paths.append(p)
-        if not paths:
+        try:
+            for u in mime.urls():
+                if u.isLocalFile():
+                    from pathlib import Path
+                    p = Path(u.toLocalFile())
+                    if p.is_file():
+                        paths.append(p)
+        except Exception:
+            pass
+        urls = self._drop_http_urls(mime)
+        image = None
+        try:
+            if mime.hasImage():
+                image = mime.imageData()
+        except Exception:
+            image = None
+        if not paths and not urls and image is None:
             e.ignore()
             return
         e.acceptProposedAction()
         for p in paths:
             self._handle_drop_file(p)
+        if image is not None:
+            self._handle_drop_image(image)
+        elif urls:
+            for u in urls:
+                self._handle_drop_url(u)
+
+    def _drop_qr_allowed(self):
+        """拖入的网址 / 图片是否允许做二维码识别（与拖入图片文件同一组开关）。"""
+        try:
+            cfg = self.state.snapshot()
+        except Exception:
+            return False
+        return bool(cfg.get("drop_enabled", True)
+                    and cfg.get("drop_qr_recognize", True))
+
+    def _handle_drop_url(self, url):
+        """拖入的 http(s) 图片链接：交给二维码管线抓取解码（不落任务、不解压）。
+
+        复用剪贴板那条链路（QRMonitor._maybe_process_url）：自带「下载识别」信任门、
+        16MB 上限、魔数判图片、子进程解码。force=True：这是用户显式拖入的动作。"""
+        if not self._drop_qr_allowed():
+            self._append_log("[拖放] 二维码识别已在「拖拽行为」中关闭，忽略拖入的网址")
+            return
+        mon = getattr(self.hub, "qr_monitor", None)
+        if mon is None:
+            self._append_log("[拖放] 二维码识别不可用（依赖缺失），忽略拖入的网址")
+            return
+        self._append_log(f"[拖放] 识别拖入网址的二维码: {url}")
+
+        def _work():
+            try:
+                mon._maybe_process_url(str(url), force=True)
+            except Exception as ex:
+                self._append_log(f"[拖放] 网址二维码识别出错: {ex}")
+
+        import threading
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _handle_drop_image(self, image):
+        """拖入的原始图片数据（浏览器图片元素）：存临时 PNG 后走同一条识别链路。"""
+        if not self._drop_qr_allowed():
+            self._append_log("[拖放] 二维码识别已在「拖拽行为」中关闭，忽略拖入的图片")
+            return
+        mon = getattr(self.hub, "qr_monitor", None)
+        if mon is None:
+            self._append_log("[拖放] 二维码识别不可用（依赖缺失），忽略拖入的图片")
+            return
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.gettempdir()) / ("autounpacker_drop_qr_%d.png"
+                                             % int(time.time() * 1000))
+        try:
+            saved = bool(image.save(str(tmp), "PNG"))
+        except Exception as ex:
+            saved = False
+            self._append_log(f"[拖放] 拖入图片保存失败: {ex}")
+        if not saved:
+            return
+        self._append_log("[拖放] 识别拖入图片的二维码")
+
+        def _work():
+            try:
+                mon.feed_image_file(str(tmp), force=True)
+            except Exception as ex:
+                self._append_log(f"[拖放] 图片二维码识别出错: {ex}")
+
+        import threading
+        threading.Thread(target=_work, daemon=True).start()
 
     def _handle_drop_file(self, path):
         """后台线程处理单个拖入文件（不阻塞界面）。
@@ -817,6 +928,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._sync_hotkey_display()
+        # 实验性总开关可能刚被切换：分享菜单项可见性立即跟随
+        try:
+            self._refresh_share_menu()
+        except Exception:
+            pass
 
     def _add_path(self):
         """「添加目录」：新建空条目并直接打开目录设置弹窗；取消/关闭则回收空条目。"""
@@ -1011,13 +1127,14 @@ class MainWindow(QMainWindow):
             self.task_page.set_tasks(rows, counts, preserve_view=preserve_view)
         except Exception:
             pass
+        self._tasks_dirty = False      # 本次装载即为最新：清脏（切页不再重复重建）
         try:
             self.statusbar.set_failed_count(int(counts.get("failed", 0) or 0))
         except Exception:
             pass
 
     def _on_tasks_refresh_timer(self):
-        """防抖定时器到点：执行一次保留视图的任务表刷新。"""
+        """防抖定时器到点：执行一次保留视图的任务表刷新（并清脏）。"""
         try:
             self._refresh_tasks(preserve_view=True)
         except Exception:
@@ -1028,7 +1145,9 @@ class MainWindow(QMainWindow):
 
         若定时器已在计时则不重启——保证连续事件流下刷新率有上界（约每 250ms 一次），
         且首个事件后 250ms 必刷一次（不会因事件连绵而饿死）。
+        置脏：定时器到点前若用户切回任务页，也必须看到最新行（见 _on_nav_changed）。
         """
+        self._tasks_dirty = True
         t = getattr(self, "_tasks_refresh_timer", None)
         if t is None:
             return
@@ -1042,7 +1161,8 @@ class MainWindow(QMainWindow):
         """上报任务生命周期事件（尽力而为）：Hub 实现 tasks_changed 才投递。
 
         供主窗口自身的任务写路径（拖放解压 / 忽略任务）复用；测试桩 Hub 未实现时静默跳过。
-        """
+        无论 Hub 是否实现，任务数据已变 -> 置脏（切回任务页必重建）。"""
+        self._tasks_dirty = True
         try:
             cb = getattr(self.hub, "tasks_changed", None)
             if cb is not None:
@@ -1107,9 +1227,14 @@ class MainWindow(QMainWindow):
     def _reload_log_page(self, force=False):
         """按日志页当前三滤镜重查 db 并整页重载（全局行永不被路径挡住由 db/页面保证）。
 
-        M3-QA：滤镜签名未变且没有新日志时直接跳过——重复切到日志页不再打 DB、
-        不再整页重画（重复切换实测个位数毫秒）；新日志/滤镜变化/清空/
-        显式刷新会置脏或改变签名，从而触发重查。"""
+        缓存分两级（视图与计数各一份脏标记）：
+        - 滤镜签名未变且无整页脏（_log_cache_dirty=False）时，重复切回日志页绝不重画：
+          视图已由 _append_log 的实时追加保持最新（append_line 与重载走同一分支规则），
+          新日志只把 _log_counts_dirty 置真——此时只重查基础集算级别分段计数
+          （recount_levels），不 clear / 不 re-feed；计数也干净则直接返回。
+        - 整页重建只在 _log_cache_dirty 为真（滤镜变化 / 清空 / _mark_log_dirty）或
+          force=True（_refresh_all / 路径集合变化）时发生。绝不丢数据、绝不换显示口径。
+        """
         lp = getattr(self, "log_page", None)
         if lp is None:
             return
@@ -1121,6 +1246,20 @@ class MainWindow(QMainWindow):
         if (not force and sig is not None
                 and not getattr(self, "_log_cache_dirty", True)
                 and sig == getattr(self, "_log_cache_sig", None)):
+            if not getattr(self, "_log_counts_dirty", False):
+                return
+            # 视图无需重画：只重算级别分段计数（基础集口径与 reload 完全一致）。
+            try:
+                rows = db.query_logs(levels=None, sources=(lp.sources() or None),
+                                     keyword=(lp.keyword() or None),
+                                     limit=self._log_limit()) or []
+            except Exception:
+                rows = []
+            try:
+                lp.recount_levels(rows)
+            except Exception:
+                pass
+            self._log_counts_dirty = False
             return
         try:
             rows = db.query_logs(levels=None, sources=(lp.sources() or None),
@@ -1134,10 +1273,12 @@ class MainWindow(QMainWindow):
             pass
         self._log_cache_sig = sig
         self._log_cache_dirty = False
+        self._log_counts_dirty = False
 
     def _mark_log_dirty(self):
         """置脏：下一次切回日志页时重查一次（清空按钮等显式动作调用）。"""
         self._log_cache_dirty = True
+        self._log_counts_dirty = True
 
     def _refill_task_log(self):
         """重装「该任务日志」视图：当前任务 -> db.task_logs；全部 -> 全局日志流。"""
@@ -1240,21 +1381,57 @@ class MainWindow(QMainWindow):
             self._ignore_task(task_id)
 
     def _open_task_details(self, task_id):
-        """打开任务详情弹窗：弹窗动作信号接回本窗动作路由器；关闭后统一刷新。
-
-        用原生模态（parent=self，exec_），遮罩由弹窗自身挂在父窗客户区上；
-        任何动作（含软取消/硬删除）后弹窗自行重读，宿主这里统一次刷新队列/徽标。"""
+        """打开任务详情弹窗：遮罩（Scrim）当模态窗口、弹窗当它的子窗。"""
+        scrim = None
         try:
-            dlg = TaskDetailsDialog(task_id, self)
+            scrim = Scrim(self)
+            dlg = TaskDetailsDialog(task_id, scrim)
         except Exception as e:
+            if scrim is not None:      # 弹窗构造失败时绝不留下一个吃满模态的遮罩
+                try:
+                    scrim.hide()
+                    scrim.deleteLater()
+                except Exception:
+                    pass
             self._append_log(f"[任务] 打开详情失败: {e}")
             return
-        dlg.actionRequested.connect(self._on_task_action)
-        dlg.notice.connect(self._append_log)
-        try:
-            dlg.exec_()
-        finally:
-            self._refresh_all()
+        scrim.set_dismiss(dlg.reject)
+        # 只有真的动过手（点了动作）或留下过提示，关闭后才需要整页刷新；单纯
+        # 「双击打开看一眼再关掉」不做任何落库改动，却会触发一次全量刷新
+        # （任务表 + 日志页 + 该任务日志，各自最多 3000 行的着色重渲染）——这正是
+        # 「打开/关闭详情就卡、多点几次点不动」的代价。用一个共享标记跳过白刷新。
+        changed = {"v": False}
+
+        def _route(tid, kind):
+            changed["v"] = True
+            self._on_task_action(tid, kind)
+
+        def _note(msg):
+            changed["v"] = True
+            self._append_log(msg)
+
+        dlg.actionRequested.connect(_route)
+        dlg.notice.connect(_note)
+        self._task_details_dlg = dlg          # 防被 GC；关闭时清
+
+        def _done(*_a):
+            self._task_details_dlg = None
+            dlg.hide()
+            scrim.hide()          # 顶层窗口，隐藏是 OS 级、不等父窗重绘
+            dlg.deleteLater()
+            scrim.deleteLater()
+            try:
+                self.activateWindow()
+            except Exception:
+                pass
+            if changed["v"]:
+                QTimer.singleShot(0, self._refresh_all)   # 重活延后到暴露重绘之后
+
+        dlg.finished.connect(_done)
+        scrim.show()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _retry_task(self, task_id):
         """重试 failed / need_password / canceled 任务。
@@ -1450,20 +1627,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if str(key) == "tasks":
-            self._refresh_tasks()
+            # 任务表由生命周期事件/写入路径保持最新并清脏：脏了才重建（无变化不重查重画）。
+            if getattr(self, "_tasks_dirty", True):
+                self._refresh_tasks()
         elif str(key) == "log":
             self._refresh_meta()
             self._reload_log_page()
         elif str(key) == "password":
             self._refresh_badges()
             try:
-                self.password_page.reload()     # 切回重查：新捕获的口令立即可见
+                # 数据签名变了才重查（与页内 2s 实时刷新共用同一判定，不造第二份真相）
+                self.password_page.refresh_if_changed()
             except Exception:
                 pass
         elif str(key) == "trail":
             self._refresh_badges()
             try:
-                self.trail_page.reload()        # 切回重读回溯记录
+                # 回溯记录文件变了才重读（add/restore/clear 后由页内 reload 对齐签名）
+                self.trail_page.refresh_if_changed()
             except Exception:
                 pass
 
@@ -1644,6 +1825,16 @@ class MainWindow(QMainWindow):
             self.statusbar.hotkey_label.setToolTip(tip)
         except Exception:
             pass
+        # 三个热键的注册状态就地贴到设置页对应行（失败原因显示 / 成功即隐藏）
+        page = getattr(self, "settings_page", None)
+        if page is not None:
+            states = getattr(self, "_hotkey_state", {})
+            for key in ("hotkey", "hotkey_share", "hotkey_share_pick"):
+                state, msg = states.get(key) or ("skipped", "")
+                try:
+                    page.set_hotkey_status(key, state, msg)
+                except Exception:
+                    pass
 
     def _repolish_dynamic(self):
         """主题切换后重算动态属性选择器（Qt 不会自动重算，必须显式 repolish）。"""
@@ -1701,8 +1892,9 @@ class MainWindow(QMainWindow):
         """
         # 主线程独有的日志行（未经 Hub.log 路由）也写入 log_index；已由 Hub.log
         # 落库的行带 "[HH:MM:SS] " 前缀（_drain 转发），跳过以免重复计数。
-        # 新日志 = 日志页/右栏统计都可能变：置脏，下一次装载时重查（缓存失效点）。
-        self._log_cache_dirty = True
+        # 新日志 = 右栏统计/级别计数都会变，但**视图**已由下面的实时追加保持最新：
+        # 只置计数脏（下次切页只重算级别分段计数、不整页重画）；整页缓存不置脏。
+        self._log_counts_dirty = True
         self._meta_cache_dirty = True
         if record is None and not _HUB_LOG_PREFIX.match(msg):
             try:
@@ -1747,6 +1939,9 @@ class MainWindow(QMainWindow):
         cursor = box.cursorForPosition(pos)
         block = cursor.block()
         offset = cursor.positionInBlock()
+        app_hit = _app_anchor_of_block(block, offset)
+        if app_hit is not None:
+            return block, app_hit[0], app_hit[1], app_hit[2]
         for s, e, url in _find_log_urls(block.text()):
             if s <= offset < e:
                 if self._block_span_has_anchor(block, s, e):
@@ -1809,6 +2004,26 @@ class MainWindow(QMainWindow):
             pass
         return False
 
+    def _on_log_action(self, url):
+        """日志里的应用内动作链接：app://settings/<domain> -> 跳转设置页对应领域。
+
+        动作链接只跳转：不复制、不降级（它永远可再点，与 http 链接「点一次即复制并
+        灰掉」的语义不同）。"""
+        target = str(url or "")[len(_APP_LINK_PREFIX):]
+        if not target.startswith("settings"):
+            return
+        try:
+            self._goto_page("settings")
+        except Exception:
+            pass
+        dom = target.split("/", 1)[1] if "/" in target else ""
+        if not dom:
+            return
+        try:
+            self.settings_page.show_domain(dom)
+        except Exception:
+            pass
+
     def _on_log_link_clicked(self, block, start, end, url, pos=None, box=None):
         """点击未使用链接：立即降级为普通文本色（即时反馈）并请求监控线程静默复制。
 
@@ -1818,6 +2033,10 @@ class MainWindow(QMainWindow):
         复制本身是异步的（worker 线程写剪贴板，避免被本程序当成新输入）：投递成功
         即弹「已复制」，连请求都投不出去则弹「复制失败」并回滚链接；异步失败的回执
         同样会弹「复制失败」并恢复可点样式（见 _drain 的 clip_done 分支）。"""
+        if str(url or "").startswith(_APP_LINK_PREFIX):
+            # 动作链接（如打开设置页）：只跳转，不复制、不降级——永远可再点。
+            self._on_log_action(url)
+            return
         self._degrade_log_link(block, start, end, url)
         rec = _record_degraded_link(self, box, (block, start, end, url))
         try:
@@ -2218,6 +2437,22 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "tray"):
                     self.tray.showMessage(
                         item["title"], item["msg"], QSystemTrayIcon.Information, 4000)
+                # 通知行已由 Hub.notify 直写 log_index（没有对应的 log 队列事件）：
+                # 这里按同一实时追加管线补一次，让「视图 == 库快照」始终成立——
+                # 否则日志页跳过整页重建后，该行要等显式重建才上屏（与切页契约不符）。
+                # 文本按落库行的 ts 组成 "[HH:MM:SS] [通知] ..."，与 task_log_line 完全同形。
+                try:
+                    _n_text = "[通知] %s: %s" % (item.get("title", ""),
+                                                 item.get("msg", ""))
+                    _n_ts = item.get("ts")
+                    _n_ts = int(_n_ts) if _n_ts is not None else int(time.time())
+                    _n_msg = (time.strftime("[%H:%M:%S] ", time.localtime(_n_ts))
+                              + _n_text)
+                    self._append_log(_n_msg, {"text": _n_text, "level": "info",
+                                              "source_dir": None, "task_id": None,
+                                              "link": None, "ts": _n_ts})
+                except Exception:
+                    pass
             elif item["type"] == "dir_state":
                 # 监听线程的目录状态：映射到胶囊 / 筛选灯（规范化路径回查条目索引）
                 try:
@@ -3441,43 +3676,66 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- 全局快捷键 ----------
+    def _hotkey_reason_exc(self, e):
+        """把 RegisterHotKey 异常翻译成 (状态, 原因文案)。
+
+        1409 = 该组合键已被其他程序占用；1400 = 窗口句柄尚未就绪（启动瞬间偶发）。
+        其余异常按 error 原样带出。"""
+        try:
+            code = int(e.args[0])
+        except Exception:
+            code = None
+        if code == 1409:
+            return ("busy", "该组合键已被其他程序占用")
+        if code == 1400:
+            return ("badhandle", "窗口尚未就绪（无效句柄）")
+        return ("error", str(e))
+
     def _register_hotkey(self, _retry=0):
         if not isinstance(_retry, int):
             _retry = 0
         self._unregister_hotkey()
         self._hotkey_ok["main"] = None   # 本轮结果未知：未配置/未启用都按「不适用」处理
+        self._hotkey_state["main"] = ("skipped", "")
         if win32gui is None:
             return
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
+                self._hotkey_state["main"] = ("disabled", "")
                 return
             combo = str(self.state.snapshot().get("hotkey", "")).strip()
             if not combo or combo.lower() in ("无", "none", "null"):
+                self._hotkey_state["main"] = ("unset", "")
                 return
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"快捷键配置无效，未注册: {combo}")
                 self._hotkey_ok["main"] = False
+                self._hotkey_state["main"] = ("invalid", "快捷键配置无效")
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
                 self._hotkey_ok["main"] = False
+                self._hotkey_state["main"] = ("badhandle", "窗口尚未就绪（无效句柄）")
                 return
             # pywin32 的 RegisterHotKey 成功时返回 None（不是 True），
             # 所以不依赖返回值：没有抛异常即注册成功。
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk)
             self._hotkey_ok["main"] = True
+            self._hotkey_state["main"] = ("ok", "")
             self.hub.log(f"全局快捷键已注册: {combo}")
         except Exception as e:
             self._hotkey_ok["main"] = False
+            self._hotkey_state["main"] = self._hotkey_reason_exc(e)
             # 启动瞬间偶发失败（例如窗口句柄尚未就绪，error 1400 "无效的窗口句柄"）。
             # 稍后重试：最多 3 次，避免「偶发注册不上」让热键长期失效。
             if _retry < 3:
                 self.hub.log(f"全局快捷键注册失败，稍后重试({_retry + 1}/3): {e}")
                 QTimer.singleShot(1200, lambda: self._register_hotkey(_retry + 1))
             else:
-                self.hub.log(f"全局快捷键注册失败: {e}")
+                self.hub.log(
+                    f"全局快捷键注册失败: {e}。{_APP_LINK_SETTINGS_LABEL}")
         finally:
             # 主热键无论走哪条分支（含上面的提前 return），都顺带注册两个分享热键
             self._register_share_hotkey()
@@ -3490,63 +3748,93 @@ class MainWindow(QMainWindow):
         """注册「用客户端下载最近分享」的全局热键（可选，默认不设置）。
 
         与主热键不同：分享热键是可选功能，注册失败不重试、不打扰；未启用
-        全局热键、未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
+        全局热键、未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。
+        实验性总开关关闭时整条链路不注册（状态 skipped，不显示错误）。"""
         if win32gui is None:
+            self._hotkey_state["share"] = ("skipped", "")
             return
         self._hotkey_ok["share"] = None
+        self._hotkey_state["share"] = ("skipped", "")
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
+                self._hotkey_state["share"] = ("disabled", "")
+                return
+            if not self.state.snapshot().get("experimental_enabled"):
+                # 实验性总开关关闭：分享热键属实验性功能，不注册、不报错
+                self._hotkey_ok["share"] = None
+                self._hotkey_state["share"] = ("skipped", "")
                 return
             combo = str(self.state.snapshot().get("hotkey_share", "")).strip()
             if not combo or combo.lower() in ("无", "none", "null"):
+                self._hotkey_state["share"] = ("unset", "")
                 return
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"分享快捷键配置无效，未注册: {combo}")
                 self._hotkey_ok["share"] = False
+                self._hotkey_state["share"] = ("invalid", "快捷键配置无效")
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
                 self._hotkey_ok["share"] = False
+                self._hotkey_state["share"] = ("badhandle", "窗口尚未就绪（无效句柄）")
                 return
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE, mods | MOD_NOREPEAT, vk)
             self._hotkey_ok["share"] = True
+            self._hotkey_state["share"] = ("ok", "")
             self.hub.log(f"分享快捷键已注册: {combo}")
         except Exception as e:
             self._hotkey_ok["share"] = False
-            self.hub.log(f"分享快捷键注册失败: {e}")
+            self._hotkey_state["share"] = self._hotkey_reason_exc(e)
+            self.hub.log(
+                f"分享快捷键注册失败: {e}。{_APP_LINK_SETTINGS_LABEL}")
 
     def _register_share_pick_hotkey(self):
         """注册「挑选文件下载最近分享」的全局热键（可选，默认不设置）。
 
         与分享热键同口径：可选功能，注册失败不重试、不打扰；未启用全局热键、
-        未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。"""
+        未配置（空 / 无 / none / null）时静默跳过。异常一律吞掉。
+        实验性总开关关闭时整条链路不注册（状态 skipped，不显示错误）。"""
         if win32gui is None:
+            self._hotkey_state["share_pick"] = ("skipped", "")
             return
         self._hotkey_ok["share_pick"] = None
+        self._hotkey_state["share_pick"] = ("skipped", "")
         try:
             if not self.state.snapshot().get("hotkey_enabled", True):
+                self._hotkey_state["share_pick"] = ("disabled", "")
+                return
+            if not self.state.snapshot().get("experimental_enabled"):
+                # 实验性总开关关闭：挑选下载热键属实验性功能，不注册、不报错
+                self._hotkey_ok["share_pick"] = None
+                self._hotkey_state["share_pick"] = ("skipped", "")
                 return
             combo = str(self.state.snapshot().get("hotkey_share_pick", "")).strip()
             if not combo or combo.lower() in ("无", "none", "null"):
+                self._hotkey_state["share_pick"] = ("unset", "")
                 return
             parsed = parse_hotkey(combo)
             if parsed is None:
                 self.hub.log(f"挑选手势快捷键配置无效，未注册: {combo}")
                 self._hotkey_ok["share_pick"] = False
+                self._hotkey_state["share_pick"] = ("invalid", "快捷键配置无效")
                 return
             mods, vk = parsed
             hwnd = int(self.winId())
             if not hwnd:
                 self._hotkey_ok["share_pick"] = False
+                self._hotkey_state["share_pick"] = ("badhandle", "窗口尚未就绪（无效句柄）")
                 return
             win32gui.RegisterHotKey(hwnd, HOTKEY_ID_SHARE_PICK, mods | MOD_NOREPEAT, vk)
             self._hotkey_ok["share_pick"] = True
+            self._hotkey_state["share_pick"] = ("ok", "")
             self.hub.log(f"挑选手势快捷键已注册: {combo}")
         except Exception as e:
             self._hotkey_ok["share_pick"] = False
-            self.hub.log(f"挑选手势快捷键注册失败: {e}")
+            self._hotkey_state["share_pick"] = self._hotkey_reason_exc(e)
+            self.hub.log(
+                f"挑选手势快捷键注册失败: {e}。{_APP_LINK_SETTINGS_LABEL}")
 
     def _unregister_hotkey(self):
         if win32gui is None:

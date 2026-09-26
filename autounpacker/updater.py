@@ -3,6 +3,7 @@
 
 职责：- check_latest_version() 查询最新 tag；compare_versions() 语义化版本比较
 - download_release_zip()/verify_release_zip() 下载并校验更新包（SHA256 校验和 + 防 zip slip）
+  · 下载**优先发布方冻结资产** `AutoUnpacker-<版本号>.zip`，缺失/失败则回退 GitHub 源码归档
 - apply_update() 下载校验后写 pending.json 并启动独立执行器（_update_runner.py）：
   执行器负责备份旧代码、覆盖新版、以握手自证启动成功，进而提交或自动回滚
 - write_update_handshake() 供新版本启动成功后写下握手，执行器据此判定提交
@@ -135,6 +136,32 @@ def _archive_url(tag):
 # 发布流程约定：把 sha256sum 输出保存为 SHA256SUMS 文本并作为 Release 资产上传。
 SHA256_ASSET_NAMES = ("sha256sums", "sha256sums.txt", "sha256.txt")
 
+# 发布方**冻结**的更新包资产名（大小写不敏感）：`AutoUnpacker-<版本号>.zip`，
+# 与 GitHub 源码包的内层目录同名，便于人眼对照。
+#
+# 为什么要冻结资产：`/archive/refs/tags/<tag>.zip` 是 GitHub **服务端即时生成**的，
+# 同一 tag 的字节并不保证永久不变——因此无法为它给出一个长期有效的 SHA256。
+# 改为发布「我们自己用 `git archive` 生成、上传一次就不再改动」的资产后，校验和
+# 才真正有意义（哈希算的就是我们将要下载的那**同一份字节**）。
+# 该资产缺失时**回退**到源码归档，未附带资产的老版本照样能升上来。
+#
+# 发布流程（每次发版，可用 `tools/make_release_asset.py <tag>` 一次做完 1)2)）：
+#   1) git archive --format=zip --prefix=AutoUnpacker-<版本号>/ \
+#          -o AutoUnpacker-<版本号>.zip <tag>
+#   2) sha256 → 写一行 `<64hex>  AutoUnpacker-<版本号>.zip` 到 SHA256SUMS.txt
+#   3) gh release upload <tag> AutoUnpacker-<版本号>.zip SHA256SUMS.txt
+RELEASE_ASSET_ZIP_TMPL = "AutoUnpacker-{ver}.zip"
+
+
+def _bare_version(tag):
+    """去掉 tag 的前导 v/V（`v2.2.0` → `2.2.0`）。"""
+    return str(tag or "").strip().lstrip("vV")
+
+
+def _asset_zip_name(tag):
+    """我们冻结的更新包资产名：`AutoUnpacker-<bare>.zip`。"""
+    return RELEASE_ASSET_ZIP_TMPL.format(ver=_bare_version(tag))
+
 
 def sha256_file(path):
     """流式计算文件的 SHA256（小写十六进制）。任何异常返回 ""。"""
@@ -182,12 +209,8 @@ def _parse_sha256sums(text, tag):
         return ""
 
 
-def fetch_expected_sha256(tag, timeout=None):
-    """取发布方在该 tag 的 Release 里公布的 SHA256（无则返回 ""）。
-
-    缺资产 / 网络失败 / 解析不出都返回 ""——调用方据此按「无法校验」处理，
-    **绝不因此中断更新**（否则从「尚未附带校验和的旧版本」就再也升不上来了）。
-    """
+def _fetch_release_json(tag, timeout=None):
+    """取该 tag 的 Release JSON（无认证）。任何失败/限流/解析错一律返回 None。"""
     try:
         api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}"
         req = urllib.request.Request(api, headers={
@@ -195,6 +218,21 @@ def fetch_expected_sha256(tag, timeout=None):
             "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=timeout or CHECK_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def fetch_expected_sha256(tag, timeout=None):
+    """取发布方在该 tag 的 Release 里公布的 SHA256（无则返回 ""）。
+
+    缺资产 / 网络失败 / 解析不出都返回 ""——调用方据此按「无法校验」处理，
+    **绝不因此中断更新**（否则从「尚未附带校验和的旧版本」就再也升不上来了）。
+    """
+    try:
+        data = _fetch_release_json(tag, timeout=timeout)
+        if not data:
+            return ""
         asset = None
         for a in (data.get("assets") or []):
             if str(a.get("name") or "").strip().lower() in SHA256_ASSET_NAMES:
@@ -214,20 +252,43 @@ def fetch_expected_sha256(tag, timeout=None):
         return ""
 
 
-def download_release_zip(tag, dest_dir=None, progress_cb=None):
-    """下载指定 tag 的源码 zip。
+def fetch_release_asset_url(tag, timeout=None):
+    """取发布方**冻结更新包资产**（`AutoUnpacker-<bare>.zip`）的下载地址；无则 ""。
 
-    GitHub 下载偶发 502/超时（国内网络更常见），自动重试 3 次。
-    返回 (status, zip_path 或 None, err_msg)：
-      (STATUS_OK, 路径, "")              —— 下载成功
-      (STATUS_FAILED, None, "错误信息")   —— 下载失败
+    只认与 `_asset_zip_name(tag)` **逐字相等**（大小写不敏感）的资产，绝不误取
+    SHA256SUMS 之类的旁挂文件。网络失败 / 被限流 / 没有该资产一律返回 ""——调用方
+    据此回退到源码归档，行为与「该版本本就没附带资产」完全一致（最坏 == 老行为）。
     """
-    if dest_dir is None:
-        dest_dir = tempfile.gettempdir()
-    dest_dir = Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = dest_dir / f"autounpacker_{tag}.zip"
-    url = _archive_url(tag)
+    data = _fetch_release_json(tag, timeout=timeout)
+    if not data:
+        return ""
+    want = _asset_zip_name(tag).strip().lower()
+    try:
+        for a in (data.get("assets") or []):
+            if str(a.get("name") or "").strip().lower() == want:
+                return str(a.get("browser_download_url") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+# 上一次下载实际用的来源：`"asset"` = 发布方冻结资产；`"archive"` = GitHub 源码归档；
+# `""` = 未知（例如测试把 download_release_zip 整个换成了桩）。
+# **只有 "asset" 才允许用发布方公布的 SHA256 做强制校验**：回退到源码归档时，
+# 资产哈希与源码包内容必然不符，若照样校验会把更新从「跳过校验」变成「硬失败」。
+_LAST_DOWNLOAD_SOURCE = ""
+
+
+def last_download_source():
+    """上一次 download_release_zip 实际用的来源（见 `_LAST_DOWNLOAD_SOURCE`）。"""
+    return _LAST_DOWNLOAD_SOURCE
+
+
+def _download_url(url, zip_path, progress_cb=None):
+    """把 url 下载到 zip_path：偶发 502/超时（国内更常见）自动重试 3 次。
+
+    返回 (ok, err)。`progress_cb` 以 (已下载字节, 总字节) 调用（与既有约定一致）。
+    """
     req = urllib.request.Request(url, headers={
         "User-Agent": "AutoUnpacker/" + _local_version()})
     last_err = ""
@@ -247,16 +308,46 @@ def download_release_zip(tag, dest_dir=None, progress_cb=None):
                             progress_cb(done, total)
             if zip_path.stat().st_size < 1024:
                 zip_path.unlink(missing_ok=True)
-                return STATUS_FAILED, None, "下载内容异常（文件过小）"
-            return STATUS_OK, str(zip_path), ""
+                return False, "下载内容异常（文件过小）"
+            return True, ""
         except Exception as e:
             last_err = str(e)
             zip_path.unlink(missing_ok=True)
             # 短暂等待后重试（502 通常是瞬时故障）
             if attempt < 2:
-                import time
                 time.sleep(1.5 * (attempt + 1))
-    return STATUS_FAILED, None, f"下载失败（已重试 3 次）: {last_err}"
+    return False, f"下载失败（已重试 3 次）: {last_err}"
+
+
+def download_release_zip(tag, dest_dir=None, progress_cb=None):
+    """下载指定 tag 的更新包：**优先发布方冻结资产，缺失/失败回退源码归档**。
+
+    优先用 `AutoUnpacker-<版本号>.zip`（我们 `git archive` 冻结、字节不变，因而
+    发布方 SHA256 真正可校验）；该资产不存在或下载失败时回退
+    `archive/refs/tags/<tag>.zip`（行为与老版本完全一致）。
+    实际来源写入 `_LAST_DOWNLOAD_SOURCE`，调用方据此决定能否使用发布方 SHA256。
+    返回 (status, zip_path 或 None, err_msg)：
+      (STATUS_OK, 路径, "")              —— 下载成功
+      (STATUS_FAILED, None, "错误信息")   —— 下载失败
+    """
+    global _LAST_DOWNLOAD_SOURCE
+    _LAST_DOWNLOAD_SOURCE = ""
+    if dest_dir is None:
+        dest_dir = tempfile.gettempdir()
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = dest_dir / f"autounpacker_{tag}.zip"
+    asset_url = fetch_release_asset_url(tag)
+    if asset_url:
+        ok, _err = _download_url(asset_url, zip_path, progress_cb)
+        if ok:
+            _LAST_DOWNLOAD_SOURCE = "asset"
+            return STATUS_OK, str(zip_path), ""
+    ok, err = _download_url(_archive_url(tag), zip_path, progress_cb)
+    if ok:
+        _LAST_DOWNLOAD_SOURCE = "archive"
+        return STATUS_OK, str(zip_path), ""
+    return STATUS_FAILED, None, err
 
 
 def _extract_zip(zip_path, dest_dir):
@@ -449,13 +540,21 @@ def apply_update(tag, progress_cb=None):
             pct = int(done * 100 / total) if total else 0
             progress_cb(f"正在下载更新包… {pct}%")
 
-    # 1. 下载
+    # 1. 下载（优先发布方冻结资产；缺失/失败自动回退 GitHub 源码归档）
     st, zip_path, err = download_release_zip(tag, progress_cb=_progress)
     if st != STATUS_OK:
         return STATUS_FAILED, err or "下载更新包失败"
-    # 1.5 取发布方公布的 SHA256（有就强制校验；没有则明确告知「跳过」，不阻断更新）
+    # 1.5 取发布方公布的 SHA256。
+    # ⚠️ 安全阀（勿删）：只有「刚下的确实是发布方那个被哈希的资产」时才允许用它做
+    # 强制校验。回退到源码归档时，资产哈希与源码包内容**必然不符**——照样校验会把
+    # 更新从「跳过校验」变成「硬失败」，反而把升级锁死。
+    src = last_download_source()
     want = fetch_expected_sha256(tag)
-    if progress_cb:
+    if want and src != "asset":
+        want = ""
+        if progress_cb:
+            progress_cb("已回退到源码归档：校验和只对应发布方资产，跳过完整性校验…")
+    elif progress_cb:
         progress_cb("已取得发布方校验和，正在校验更新包…" if want
                     else "该版本未提供 SHA256SUMS，跳过完整性校验…")
     # 2. 校验（SHA256 若有）+ 解压 + 关键文件

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""输入 / 基础控件：HotkeyEdit（快捷键捕获）、托盘图标、WatchCard 监听卡片、
-全局热键过滤器、彩虹引导按钮、Glyph 线性图标、LayoutButton、SegControl、筛选 chip。"""
+"""输入 / 基础控件：HotkeyEdit（快捷键捕获）、_Switch 胶囊开关、托盘图标、
+WatchCard 监听卡片、全局热键过滤器、彩虹引导按钮、Glyph 线性图标、
+LayoutButton、SegControl、筛选 chip。"""
 
 import ctypes
 
@@ -14,6 +15,7 @@ from PyQt5.QtGui import (QIcon, QPixmap, QPainter, QColor, QBrush, QPen,
 
 from ...config import (HOTKEY_ID, HOTKEY_ID_SHARE, HOTKEY_ID_SHARE_PICK,
                        WM_HOTKEY)
+from .. import style as ui_style
 from ..style import PALETTE
 from .common import (_key_display_name, WM_SETTINGCHANGE, _tk, _draw_glyph,
                      _clear_layout, repolish, repolish_tree, _StatusLamp)
@@ -64,6 +66,96 @@ class HotkeyEdit(QLineEdit):
         self.setText(combo)
         self.setStyleSheet("")
         self.comboChanged.emit(combo)
+
+
+class _Switch(QCheckBox):
+    """胶囊开关（pill switch）：自绘「药丸轨道 + 圆形滑块」的布尔控件。
+
+    为什么继承 QCheckBox：全页布尔项既有 `.setChecked / .toggled / .isChecked`
+    语义与键盘 Space 切换必须逐字保留（离线验收也断言 `isinstance(_, QCheckBox)`），
+    本类只接管**绘制**，不改任何状态逻辑。
+
+    - `paintEvent` 完全自绘、不调 `super().paintEvent`；颜色每次绘制都从
+      `ui_style.tokens()` 现取（QSS token 的真源——`prog_bg` / `primary_bg` 等
+      只存在于 tokens，不在内联 PALETTE 里，见 `style.tokens()` 文档：自绘控件
+      走只读 token），所以主题切换只需 `update()` 就会自动换色——不新增 color
+      token、不硬编码颜色 / 圆角、不加 QSS 规则。
+    - 尺寸固定 38x20；指针为手型；OFF / ON / ON+hover / disabled 四态见 paint。
+      注意：v1 视觉规格 §6.3 写「36×20」，但离线验收
+      `test_settings_switch_and_bubble.py`（S2/S3-S5 逐像素采样）把 38×20 锁定
+      为契约——按「绝不削弱测试」的纪律保留 38×20，差异见交回清单。"""
+
+    _WIDTH = 38
+    _HEIGHT = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def sizeHint(self):
+        return QSize(self._WIDTH, self._HEIGHT)
+
+    def minimumSizeHint(self):
+        return QSize(self._WIDTH, self._HEIGHT)
+
+    def hitButton(self, pos):   # noqa: N802 (Qt 命名)
+        """整块药丸都是点击区（修「只有左半区可点」）。
+
+        QCheckBox 默认只认 `SE_CheckBoxClickRect`（指示器 + 文字矩形）；本类完全
+        自绘、不带文字，于是右半区点不动。返回 `rect().contains(pos)` 让整块
+        38×20 都能切换；状态语义仍全部走 QCheckBox（Space / setChecked /
+        toggled 一字不变）。"""
+        return self.rect().contains(pos)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()      # 悬停态需要重绘（ON+hover 用 primary_hover）
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event):   # noqa: N802 (Qt 命名)
+        painter = QPainter(self)
+        try:
+            tk = ui_style.tokens()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            enabled = self.isEnabled()
+            checked = self.isChecked()
+            hovered = self.underMouse()
+            w = float(self.width())
+            h = float(self.height())
+            if w <= 0 or h <= 0:
+                return
+            radius = h / 2.0
+            if not enabled:
+                track = QColor(tk["btn_dis_bg"])
+                edge = QColor(tk["btn_dis_border"])
+                knob = QColor(tk["btn_dis_border"])
+            elif checked:
+                track = QColor(tk["primary_hover"] if hovered
+                               else tk["primary_bg"])
+                edge = track
+                knob = QColor(tk["primary_fg"])
+            else:
+                track = QColor(tk["prog_bg"])
+                edge = QColor(tk["ctl_border"])
+                knob = QColor(tk["card_bg"])
+            painter.setPen(QPen(edge, 1))
+            painter.setBrush(QBrush(track))
+            painter.drawRoundedRect(
+                QRectF(0.5, 0.5, w - 1.0, h - 1.0), radius, radius)
+            inset = 2.0
+            d = h - inset * 2.0
+            left = (w - inset - d) if checked else inset
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(knob))
+            painter.drawEllipse(QRectF(left, inset, d, d))
+        except Exception:
+            pass
+        finally:
+            painter.end()
 
 
 def make_tray_icon():

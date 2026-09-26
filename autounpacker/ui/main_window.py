@@ -1091,14 +1091,16 @@ class MainWindow(QMainWindow):
             ent = dict(e)
             key = _norm_path_for_cfg(str(e.get("path") or ""))
             cached = self._dir_states.get(key)
-            if cached is not None:
+            if not e.get("enabled", True):
+                # 关闭监听的目录一律显示「已暂停」：运行时缓存（可能仍是旧的
+                # listening/extracting）不得覆盖 enabled=False 的配置事实。
+                ent["state"] = "paused"
+            elif cached is not None:
                 ent["state"] = cached[0]
                 if cached[1] is not None:
                     ent["progress"] = cached[1]
                 if cached[2]:
                     ent["name"] = cached[2]
-            elif not e.get("enabled", True):
-                ent["state"] = "paused"
             else:
                 ent["state"] = "listening"
             entries.append(ent)
@@ -1423,8 +1425,8 @@ class MainWindow(QMainWindow):
             self._on_needs_action(task_id, kind)
         elif kind == "delete":
             self._delete_task(task_id)
-        elif kind == "view_log":
-            self._on_need_task_activated(task_id)
+        elif kind == "mark_done":
+            self._mark_task_done(task_id)
 
     def _on_need_task_activated(self, task_id):
         """「需要处理」整行点击：跳到任务页并选中该任务（只看它自己的日志）。"""
@@ -1626,6 +1628,46 @@ class MainWindow(QMainWindow):
             pass
         self._emit_tasks_changed()
         self._append_log(f"[任务] 已忽略: {task.get('file_name') or task_id}")
+        self._refresh_all()
+
+    def _mark_task_done(self, task_id):
+        """「忽略」：把失败 / 队列中的条目**手动转为完成**（done 终态）。
+
+        与「从队列移除」的软取消（canceled）不同：这里用户明确认定该条目无需再
+        处理，直接以**完成**收尾。既然是人工判定、并非真解压产出，必须在**该任务
+        的日志**里补一条注明「人工转换」的记录（按 task_id 归属，见 hub.log），
+        绝不冒充真实解压结果——将来翻日志能一眼分辨。
+
+        正在解压的条目先请求中止其子进程（与 _ignore_task 同口径），否则解压线程
+        随后写回的终态会与这次人工判定打架。"""
+        try:
+            task = db.get_task(task_id) or {}
+        except Exception:
+            task = {}
+        if not task:
+            self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
+            return
+        if str(task.get("state") or "") == "extracting":
+            abort = getattr(self.pauser, "abort_task", None)
+            if callable(abort):
+                try:
+                    abort(task_id)
+                except Exception:
+                    pass
+        name = str(task.get("file_name") or task_id)
+        try:
+            db.update_task_state(int(task_id), "done",
+                                 finished_at=int(time.time()))
+        except Exception:
+            pass
+        try:
+            self.hub.log(
+                f"[任务] 手动转为完成（忽略）：{name}（人工转换，非解压产出）",
+                task_id=int(task_id))
+        except Exception:
+            pass
+        self._emit_tasks_changed()
+        self._append_log(f"[任务] 已忽略（转为完成）: {name}")
         self._refresh_all()
 
     def _delete_task(self, task_id):

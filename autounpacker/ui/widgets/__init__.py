@@ -61,7 +61,7 @@ from .common import (  # noqa: F401
 from .inputs import (  # noqa: F401
     HotkeyEdit, make_tray_icon, WatchCard, _HotkeyFilter, RainbowBorderButton,
     Glyph, LayoutButton, RainbowLayoutButton, SegControl, _ElideLabel,
-    _FilterChip, FilterChipStrip)
+    _FilterChip, FilterChipStrip, _Switch)
 from .nav import (  # noqa: F401
     TRAIL_STATUS_TEXT, TRAIL_STATUS_COLORS, TRAIL_STATUS_ORDER,
     DIR_STATE_TEXT, DEFAULT_TIPS, DirChip, DirChipStrip, _TAB_ICONS,

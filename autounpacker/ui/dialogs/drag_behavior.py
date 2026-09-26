@@ -20,7 +20,7 @@ DROP_DEFAULTS = {
 class DragBehaviorDialog(QDialog):
     """拖拽行为设置（对应目录胶囊条上的固定「拖拽行为」胶囊）。
 
-    结构：头部（图标 + 标题 + 关闭）/ 表单（总开关 + 三个行为开关 + 固定行为说明，
+    结构：头部（图标 + 标题）/ 表单（总开关 + 三个行为开关 + 固定行为说明，
     读写 QCheckBox 自带的状态）/ 底部（取消 / 保存）。保存只 accept()，由宿主写回
     配置并刷新胶囊状态——弹窗绝不直接碰配置。
 
@@ -88,16 +88,6 @@ class DragBehaviorDialog(QDialog):
         sub.setObjectName("dlgPath")
         lay.addWidget(sub)
         lay.addStretch(1)
-        close_btn = QPushButton(head)
-        close_btn.setObjectName("iconBtn")
-        close_btn.setFixedSize(30, 30)
-        close_btn.setToolTip("关闭")
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_lay = QHBoxLayout(close_btn)
-        close_lay.setContentsMargins(0, 0, 0, 0)
-        close_lay.addWidget(Glyph("close", close_btn, 16), 0, Qt.AlignCenter)
-        close_btn.clicked.connect(self.reject)
-        lay.addWidget(close_btn)
         return head
 
     def _build_body(self, lay, values):

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """WatchDirDialog：目录设置弹窗（监听路径/解压到/模式/开关/删除策略/当前任务）。"""
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QPushButton, QCheckBox, QDialog,
+                             QLineEdit, QPushButton, QDialog,
                              QRadioButton, QButtonGroup, QFrame, QFileDialog,
                              QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -12,7 +12,7 @@ from ...config import DELETE_POLICY_DEFAULT
 from ...utils import watch_path_conflict
 from ..style import PALETTE
 from ..widgets import (Glyph, LayoutButton, ModeSelector, DIR_STATE_TEXT,
-                       dir_state_key)
+                       dir_state_key, _Switch)
 from .common import TRASH_HINT_NORMAL, TRASH_HINT_NO_BIN
 from .delete_policy import DeletePolicyAskDialog
 
@@ -23,7 +23,7 @@ class WatchDirDialog(QDialog):
     由目录胶囊点击后打开：`WatchDirDialog(state, idx, parent, entry=None)`；entry 为
     宿主（MainWindow._dir_entries）解析后的条目（含运行时 state/progress/name），
     状态徽标据此显示真实状态，不再拿配置里不存在的 state 冒充「监听中」。结构：
-    - 头部：目录图标 + 标题 + 等宽路径 + 实时状态徽标 + 关闭；
+    - 头部：目录图标 + 标题 + 等宽路径 + 实时状态徽标（关闭走标题栏 × / Esc / 取消）；
     - 表单：监听路径 / 解压到 / 监听模式（**两张平铺卡，严禁 QComboBox**）/
       启用监听 + 解压成功后删除源文件 / 回收站说明 /「当前正在处理」卡片；
     - 底部：移除目录（危险，左）+ 取消 / 保存（右）。
@@ -128,16 +128,6 @@ class WatchDirDialog(QDialog):
         self.state_badge = QLabel(head)
         self.state_badge.setObjectName("dlgState")
         lay.addWidget(self.state_badge)
-        close_btn = QPushButton(head)
-        close_btn.setObjectName("iconBtn")
-        close_btn.setFixedSize(30, 30)
-        close_btn.setToolTip("关闭")
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_lay = QHBoxLayout(close_btn)
-        close_lay.setContentsMargins(0, 0, 0, 0)
-        close_lay.addWidget(Glyph("close", close_btn, 16), 0, Qt.AlignCenter)
-        close_btn.clicked.connect(self.reject)
-        lay.addWidget(close_btn)
         return head
 
     def _build_body(self, lay):
@@ -187,13 +177,15 @@ class WatchDirDialog(QDialog):
         row4 = QHBoxLayout()
         row4.setSpacing(9)
         row4.addWidget(self._field_label("开关"))
-        self.enabled_cb = QCheckBox("启用监听", self)
+        self.enabled_cb = _Switch(self)
         self.enabled_cb.setChecked(bool(self._orig.get("enabled", True)))
+        row4.addWidget(QLabel("启用监听", self))
         row4.addWidget(self.enabled_cb)
         row4.addSpacing(14)
-        self.del_cb = QCheckBox("解压成功后删除源文件", self)
+        self.del_cb = _Switch(self)
         self.del_cb.setChecked(bool(self._orig.get("delete_source", False)))
         self.del_cb.stateChanged.connect(self._on_delete_toggled)
+        row4.addWidget(QLabel("解压成功后删除源文件", self))
         row4.addWidget(self.del_cb)
         row4.addStretch(1)
         lay.addLayout(row4)

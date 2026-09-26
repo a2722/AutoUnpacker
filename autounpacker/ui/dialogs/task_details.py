@@ -35,6 +35,21 @@ _EDIT_KEYS = ("file", "source_dir", "out")
 _MODE_TEXT = {"surface": "表层", "baidu": "百度清单（含子目录）"}
 
 
+def _fit_cjk(w):
+    """把文本控件的最小高度抬到 lineSpacing() + 2（CJK 顶/底 1px 裁切兜底）。
+
+    与 page_settings._fit_hint 同一配方：QLabel 折行高度按 fontMetrics().height()
+    算、绘制按 lineSpacing() 排，默认上下各裁约 1px。幂等（只抬不降、与当前文本
+    无关）、异常安全（字体度量未就绪时静默跳过）。
+    """
+    try:
+        need = int(w.fontMetrics().lineSpacing()) + 2
+        if w.minimumHeight() < need:
+            w.setMinimumHeight(need)
+    except Exception:
+        pass
+
+
 def _fmt_ts(value):
     """时间戳 -> 本地时间文本；空/非法/非正数一律「—」。"""
     try:
@@ -65,7 +80,14 @@ def task_action_set(state, src_exists):
     """按状态 + 源文件是否存在计算动作集合 -> [(kind, label, role)]。
 
     role: "primary" / "danger" / ""（默认样式）。不变量：任何输入都至少返回
-    一个动作——未知状态兜底为「从队列移除 + 删除记录」，任务永远不会无处可去。
+    一个动作——未知状态兜底为「从队列移除」，任务永远不会无处可去。
+
+    出路语义（2026-09-26 起）：
+    - 「从队列移除」(ignore) = **软取消**：置 canceled 终态，**保留**记录与日志；
+    - 「忽略」(mark_done) = **手动转为完成**：把失败 / 队列中的条目置 done 终态，
+      并在该任务日志里补一条注明「人工转换」的记录（绝不冒充真实解压产出）；
+    - 原先的「删除记录」(delete) 硬删除入口已按要求从本弹窗移除。宿主侧的
+      `delete` 处理器**仍然保留**（硬删除能力不丢，只是界面不再暴露入口）。
     """
     s = _task_state_key({"state": state})
     acts = []
@@ -75,29 +97,25 @@ def task_action_set(state, src_exists):
             acts.append(("retry", "重试", ""))
         acts.append(("open_dir", "打开输出目录", ""))
         acts.append(("ignore", "从队列移除", "danger"))
-        acts.append(("delete", "删除记录", "danger"))
     elif s == "failed":
         if src_exists:
             acts.append(("retry", "重试", ""))
         acts.append(("copy_error", "复制错误", ""))
         acts.append(("open_dir", "打开输出目录", ""))
+        acts.append(("mark_done", "忽略", ""))
         acts.append(("ignore", "从队列移除", "danger"))
-        acts.append(("delete", "删除记录", "danger"))
     elif s in ("queued", "extracting"):
         acts.append(("open_dir", "打开输出目录", ""))
+        acts.append(("mark_done", "忽略", ""))
         acts.append(("ignore", "从队列移除", "danger"))
-        acts.append(("delete", "删除记录", "danger"))
     elif s == "done":
         acts.append(("open_dir", "打开输出目录", ""))
         acts.append(("copy_output", "复制输出去向", ""))
-        acts.append(("delete", "删除记录", "danger"))
     elif s == "canceled":
         if src_exists:
             acts.append(("retry", "重试", ""))
-        acts.append(("delete", "删除记录", "danger"))
     if not acts:
-        acts = [("ignore", "从队列移除", "danger"),
-                ("delete", "删除记录", "danger")]
+        acts = [("ignore", "从队列移除", "danger")]
     return acts
 
 
@@ -143,9 +161,11 @@ class TaskDetailsDialog(QDialog):
         lay.addWidget(Glyph("info", head, 20, role="accent"))
         title = QLabel("任务详情", head)
         title.setObjectName("dTitle")
+        _fit_cjk(title)
         lay.addWidget(title)
         self.head_badge = QLabel(head)
         self.head_badge.setObjectName("dlgState")
+        _fit_cjk(self.head_badge)
         self.head_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         lay.addWidget(self.head_badge)
         lay.addStretch(1)
@@ -170,6 +190,7 @@ class TaskDetailsDialog(QDialog):
             lbl = QLabel(text, self)
             lbl.setObjectName("fLabel")
             lbl.setFixedWidth(62)
+            _fit_cjk(lbl)
             grid.addWidget(lbl, i, 0, Qt.AlignTop)
             if key in _EDIT_KEYS:
                 val = QLineEdit(self)
@@ -178,12 +199,14 @@ class TaskDetailsDialog(QDialog):
                 val = QLabel("—", self)
                 val.setTextInteractionFlags(Qt.TextSelectableByMouse)
                 val.setWordWrap(True)
+                _fit_cjk(val)
             grid.addWidget(val, i, 1)
             self._fields[key] = val
         row = len(_ROWS)
         err_cap = QLabel("错误", self)
         err_cap.setObjectName("fLabel")
         err_cap.setFixedWidth(62)
+        _fit_cjk(err_cap)
         grid.addWidget(err_cap, row, 0, Qt.AlignTop)
         self.err_box = QPlainTextEdit(self)
         self.err_box.setReadOnly(True)
@@ -192,6 +215,7 @@ class TaskDetailsDialog(QDialog):
         log_cap = QLabel("最近日志", self)
         log_cap.setObjectName("fLabel")
         log_cap.setFixedWidth(62)
+        _fit_cjk(log_cap)
         grid.addWidget(log_cap, row + 1, 0, Qt.AlignTop)
         self.log_box = QPlainTextEdit(self)
         self.log_box.setReadOnly(True)
@@ -213,13 +237,14 @@ class TaskDetailsDialog(QDialog):
         row.setSpacing(8)
         self.feedback = QLabel("", foot)
         self.feedback.setObjectName("dlgHint")
+        _fit_cjk(self.feedback)
         row.addWidget(self.feedback, 1)
-        for text, kind in (("查看该任务日志", "view_log"),
-                           ("复制文件路径", "copy_path")):
-            btn = QPushButton(text, foot)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, k=kind: self._act(k))
-            row.addWidget(btn)
+        # 页脚固定按钮：「查看该任务日志」已移除——双击队列行进入本弹窗时该任务
+        # 已被选中、日志已在下方显示；保留「复制文件路径」与「关闭」。
+        btn = QPushButton("复制文件路径", foot)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, k="copy_path": self._act(k))
+        row.addWidget(btn)
         close_btn = QPushButton("关闭", foot)
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setDefault(True)
@@ -307,7 +332,7 @@ class TaskDetailsDialog(QDialog):
         self.act_row.addStretch(1)
 
     def action_kinds(self):
-        """当前状态动作的 kind 列表（断言用；不含查看日志/复制/关闭）。"""
+        """当前状态动作的 kind 列表（断言用；不含复制/关闭/头部）。"""
         return [k for k, _label, _role in self._actions]
 
     # ---- 动作 ----

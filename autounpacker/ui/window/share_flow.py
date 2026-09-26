@@ -436,8 +436,8 @@ def _share_already_launched(win, key):
     return key in (getattr(win, "_share_launched_surls", None) or ())
 
 
-def _manual_reinvoke_guard(win, surl, url):
-    """手动手势（Alt+2）重复拉起拦截：需「再按一次」才强制拉起。
+def _manual_reinvoke_guard(win, surl, url, hotkey="Alt+2"):
+    """手动手势（Alt+2/Alt+3）重复拉起拦截：需「再按一次」才强制拉起。
 
     同一分享本次运行已拉起过时：第一次按压只记一行 + 弹「重复」托盘提醒并进入
     「待确认」，**绝不拉起**；在再确认窗口内再按一次同一手势才强制拉起一次。
@@ -445,26 +445,32 @@ def _manual_reinvoke_guard(win, surl, url):
     直接再下载」正是误触重复下载的根因；确需重下的人只需再按一次，比弹模态框更轻，
     也不打断连续操作。**未拉起过则一律放行**（首次拉起行为完全不变）。
 
+    `hotkey`：本次手势的名字，只影响文案与「待确认」归属——只有**同一手势**的第二
+    次按压才算确认；异手势按压视为它自己的第一次（布防改归它），绝不会替别的手势
+    放行。默认 "Alt+2" 时文案逐字不变。
+
     返回 True = 已拦截（调用方必须立即 return，不拉起）；False = 放行。
     """
     key = str(surl or "").strip()
     if not key or not _share_already_launched(win, key):
         return False
+    hk = str(hotkey or "Alt+2")
     now = time.time()
     armed = getattr(win, "_manual_reinvoke_armed", None)
     if (isinstance(armed, dict) and armed.get("surl") == key
+            and str(armed.get("hotkey") or "Alt+2") == hk
             and (now - float(armed.get("at") or 0)) <= MANUAL_REARM_SEC):
         win._manual_reinvoke_armed = None
-        _share_log(win, f"[分享] 已确认（第二次 Alt+2），强制再次拉起: {key}")
+        _share_log(win, f"[分享] 已确认（第二次 {hk}），强制再次拉起: {key}")
         return False
-    win._manual_reinvoke_armed = {"surl": key, "at": now}
+    win._manual_reinvoke_armed = {"surl": key, "at": now, "hotkey": hk}
     _share_log(win,
                f"[分享] 该分享本次运行已拉起过，已拦下（不重复下载）；"
-               f"如确需再拉一次，请在 {MANUAL_REARM_SEC} 秒内再按一次 Alt+2: {key}")
+               f"如确需再拉一次，请在 {MANUAL_REARM_SEC} 秒内再按一次 {hk}: {key}")
     _share_notify_via(
         win, "重复的分享链接",
         f"{url}\n本次运行已拉起过该分享，已拦下避免重复下载。"
-        f"如确需强制再拉一次，请再按一次 Alt+2 确认。")
+        f"如确需强制再拉一次，请再按一次 {hk} 确认。")
     return True
 
 

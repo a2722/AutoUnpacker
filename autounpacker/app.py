@@ -283,7 +283,9 @@ def main():
         _theme0 = _cached if _cached in ui_style.THEMES else ui_style.DEFAULT_THEME
     ui_style.apply_theme(app, _theme0)
 
-    win = MainWindow(state, hub, show_event, pauser)
+    # 首屏优先：窗口先 show（约 0.25s），首批数据装载延后到事件循环空闲时执行
+    # （实测这批装载约 2.0s，其中日志页整页渲染占绝大部分）。见 _deferred_initial_load。
+    win = MainWindow(state, hub, show_event, pauser, defer_initial_load=True)
     if not autostart:
         win.show()
 

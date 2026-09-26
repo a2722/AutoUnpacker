@@ -183,6 +183,20 @@ class AppState:
         with self.lock:
             return self._snapshot_locked()
 
+    def get(self, key, default=None):
+        """读**单个**配置键：与 `snapshot().get(key, default)` 同值，但不做整份深拷贝。
+
+        热路径专用（如日志渲染每行都要读一次 `log_colors_enabled`）：原实现每行都
+        走 `snapshot()` 的 JSON 深拷贝，启动重放 3000 行日志时白烧约 0.3s。
+        锁语义与 `snapshot()` 一致（持同一把锁取一次）；标量值按值返回，容器类值
+        返回的还是内部对象，调用方**只读**即可。绝不抛异常（异常一律回退 default）。
+        """
+        try:
+            with self.lock:
+                return self.cfg.get(key, default)
+        except Exception:
+            return default
+
     def set(self, key, value, save=True):
         with self.lock:
             self.cfg[key] = value

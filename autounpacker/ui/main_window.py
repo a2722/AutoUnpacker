@@ -161,7 +161,15 @@ def push_pending_trust(requests, req):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, state, hub, show_event=None, pauser=None):
+    def __init__(self, state, hub, show_event=None, pauser=None,
+                 defer_initial_load=False):
+        """`defer_initial_load`：把「首批数据装载」延后到主窗 show 之后的空闲时刻。
+
+        实测冷启动约 2.26s，其中约 2.05s 全在 __init__（日志页整页渲染约 1.4s、
+        任务卡与「该任务日志」约 1.0s）。True 时窗口先出现（约 0.25s），装载随后在
+        事件循环空闲时完成；默认 False = 原先的同步装载（全部离线测试与直接构造走
+        这条路径，行为逐字不变）。
+        """
         super().__init__()
         self.state = state
         self.hub = hub
@@ -185,8 +193,12 @@ class MainWindow(QMainWindow):
         self._tasks_refresh_timer.setSingleShot(True)
         self._tasks_refresh_timer.setInterval(250)
         self._tasks_refresh_timer.timeout.connect(self._on_tasks_refresh_timer)
-        self.rebuild_cards()
-        self._refresh_all()
+        self._initial_load_done = False
+        if defer_initial_load:
+            # 首屏优先：装载延后到 show 之后的空闲时刻（见 _deferred_initial_load）。
+            QTimer.singleShot(0, self._deferred_initial_load)
+        else:
+            self._do_initial_load()
         # 先按当前（已被屏幕收敛的）宽度做紧凑化，再算最小尺寸：装饰收起后
         # minimumSizeHint 才是放大 200% 时真实需要的下限。
         self._apply_chrome_compact()
@@ -258,6 +270,41 @@ class MainWindow(QMainWindow):
         # 抢占任务行终态。键在起线程前置位、worker 的 finally 里必定移除（异常也不漏）。
         self._drop_inflight = {}
         self._drop_inflight_lock = threading.Lock()
+
+    # ---------- 首批数据装载（首屏优先：可延后到 show 之后） ----------
+    def _do_initial_load(self):
+        """首批装载：目录胶囊 + 任务表 + 徽标/统计 + 日志页 + 该任务日志。
+
+        原先这里是 `rebuild_cards()` 紧跟 `_refresh_all()`：两者都会
+        `_reload_log_page(force=True)`（rebuild_cards 因 `_strip_sig` 首见必变，
+        _refresh_all 又强制一次），于是**同一份日志整页渲染两遍**。首次装载只需
+        一遍——`rebuild_cards()` 内那次已带正确的路径与滤镜，故这里显式展开
+        `_refresh_all()` 的四步、省掉重复的那一遍。其余调用方仍走 `_refresh_all()`。
+        """
+        if self._initial_load_done:
+            return
+        self._initial_load_done = True
+        self.rebuild_cards()
+        self._refresh_tasks()
+        self._refresh_meta(force=True)
+        self._refill_task_log()
+
+    def _deferred_initial_load(self):
+        """show 之后由定时器调用：跑首批装载，再按内容重算布局下限。"""
+        try:
+            self._do_initial_load()
+        except Exception:
+            pass
+        # 装载后布局最小尺寸会随内容变化：空内容下算出的下限偏小，
+        # 内容到位后按同口径重算一次，避免长内容把窗口顶到屏外。
+        try:
+            self._apply_chrome_compact()
+        except Exception:
+            pass
+        try:
+            self._apply_screen_limits()
+        except Exception:
+            pass
 
     def _build_ui(self):
         """M3 工作台：NavTabs + DirChipStrip + 页面栈（任务/日志/密码本/回溯/设置）+ StatusBar。
@@ -502,10 +549,30 @@ class MainWindow(QMainWindow):
         self._append_log(f"[拖放] 识别拖入网址的二维码: {url}")
 
         def _work():
+            # A：与「队列输入」同口径登记一次「分享输入在途」——拖入的网址此前直接
+            # 调 _maybe_process_url（绕过 _enqueue），手势（Alt+2/Alt+3）便判定不出
+            # 「正在解析」→ 立刻回退上一条旧记录（正是「按了手势却拉起上一条」的根因）。
+            # 用 monitor 既有的防御性包装；桩 / 缺依赖（无此方法）按「无能力」跳过，
+            # 绝不抛异常——这条路径的历史宿主不一定具备该方法。
+            _begin = getattr(mon, "_share_input_begin", None)
+            _end = getattr(mon, "_share_input_end", None)
+            _begun = False
+            if callable(_begin):
+                try:
+                    _begin()
+                    _begun = True
+                except Exception:
+                    _begun = False
             try:
                 mon._maybe_process_url(str(url), force=True)
             except Exception as ex:
                 self._append_log(f"[拖放] 网址二维码识别出错: {ex}")
+            finally:
+                if _begun and callable(_end):
+                    try:
+                        _end()
+                    except Exception:
+                        pass
 
         import threading
         threading.Thread(target=_work, daemon=True).start()
@@ -2731,6 +2798,10 @@ class MainWindow(QMainWindow):
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
             self._pending_share_gesture = None
+            # C：重复拉起拦截（Alt+3）——与 Alt+2 快路径同口径：本次运行已拉起过该
+            # 分享时，第一次只提醒不拉起，30 秒内再按一次 Alt+3 才强制再下载。
+            if _manual_reinvoke_guard(self, surl, url, hotkey="Alt+3"):
+                return
             _mark_gesture_launch(self, surl)
             _call_start_share_pick(self, url, surl, code, manual=True,
                                    force_pick=True)
@@ -2767,11 +2838,16 @@ class MainWindow(QMainWindow):
                     return
             from .. import baidu_task as bt
             rec = bt.last_share()
+            # B：解码期补登记移到 `if not rec` **之外**——拖入网址 / 图片正在解码时，
+            # 即便已存在上一条分享记录，也绝不回退到它（与上面的在途分支同一条防线；
+            # 拖入网址走的特殊路径曾绕过在途计数，只靠解码期计数兜住）。
+            # 无在途输入、不在解码期时返回 False，与原先行为逐字一致。
+            # getattr 守卫：既有轻量宿主桩不绑定该增强助手，缺它就按「无此能力」
+            # 跳过（与 module 级助手的既有防御口径一致），绝不因这条增强分支抛错。
+            _reg = getattr(self, "_register_pending_share", None)
+            if callable(_reg) and _reg("share"):
+                return
             if not rec:
-                # 手势落空但二维码正在解码中 → 共享助手登记预定任务（Alt+2=share）；
-                # 返回 False（不在解码期/实验性关）时保持原提示逐字不变。
-                if self._register_pending_share("share"):
-                    return
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
             self._append_log(
@@ -2878,11 +2954,16 @@ class MainWindow(QMainWindow):
                     return
             from .. import baidu_task as bt
             rec = bt.last_share()
+            # B：解码期补登记移到 `if not rec` **之外**——拖入网址 / 图片正在解码时，
+            # 即便已存在上一条分享记录，也绝不回退到它（与上面的在途分支同一条防线；
+            # 拖入网址走的特殊路径曾绕过在途计数，只靠解码期计数兜住）。
+            # 无在途输入、不在解码期时返回 False，与原先行为逐字一致。
+            # getattr 守卫：既有轻量宿主桩不绑定该增强助手，缺它就按「无此能力」
+            # 跳过（与 module 级助手的既有防御口径一致），绝不因这条增强分支抛错。
+            _reg = getattr(self, "_register_pending_share", None)
+            if callable(_reg) and _reg("share_code"):
+                return
             if not rec:
-                # 手势落空但二维码正在解码中 → 共享助手登记预定任务（Alt+3=share_code）；
-                # 返回 False（不在解码期/实验性关）时保持原提示逐字不变。
-                if self._register_pending_share("share_code"):
-                    return
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
             self._append_log(
@@ -2926,7 +3007,14 @@ class MainWindow(QMainWindow):
                 return
             # 手势成功拉到：清掉可能残留的预定任务，避免事后重复拉起（与 Alt+2 一致）。
             self._pending_share_gesture = None
-            _mark_gesture_launch(self, rec.get("surl") or rec.get("url"))
+            _rec_surl = rec.get("surl") or rec.get("url")
+            # C：重复拉起拦截（Alt+3）——「沿用最近记录」这一路此前完全没有这层，
+            # 于是按了手势就再次拉起上一条旧分享（本次运行已拉过也不拦）。与 Alt+2
+            # 的沿用记录路径同口径：第一次只提醒，30 秒内再按一次 Alt+3 才强制再下载。
+            if _manual_reinvoke_guard(self, _rec_surl, rec.get("url"),
+                                      hotkey="Alt+3"):
+                return
+            _mark_gesture_launch(self, _rec_surl)
             # 计数已移入 _start_share_pick：手动路径同样计入（明确同意）。
             # Alt+3 = 挑选手势：强制进管线打开文件挑选窗（force_pick=True）。
             _call_start_share_pick(self, rec.get("url"), rec.get("surl"), code,

@@ -1389,8 +1389,15 @@ def _append_log_html(win, box, msg):
 
     module 级实现：既有测试直接以非 QWidget 桩调用 MainWindow._append_log，
     桩上不会绑定实例方法，故渲染助手不能依赖 self. 查找。"""
+    # 每行都要读一次该配置：优先走 `state.get()`（单键、不深拷贝），旧桩没有该
+    # 访问器时退回 `snapshot()`（语义相同，只是慢）。原先每行都做一次整份配置的
+    # JSON 深拷贝 —— 启动重放 3000 行时白烧约 0.3s（实测 5664 次 snapshot）。
     try:
-        colored = bool(win.state.snapshot().get("log_colors_enabled", True))
+        _get = getattr(win.state, "get", None)
+        if callable(_get):
+            colored = bool(_get("log_colors_enabled", True))
+        else:
+            colored = bool(win.state.snapshot().get("log_colors_enabled", True))
     except Exception:
         colored = True
     if not colored:

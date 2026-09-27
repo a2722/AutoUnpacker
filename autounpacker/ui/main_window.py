@@ -293,11 +293,25 @@ class MainWindow(QMainWindow):
         self._refill_task_log()
 
     def _deferred_initial_load(self):
-        """show 之后由定时器调用：跑首批装载，再按内容重算布局下限。"""
-        try:
-            self._do_initial_load()
-        except Exception:
-            pass
+        """show 之后由定时器调用：跑首批装载，再按内容重算布局下限。
+
+        精简模式只补小窗真正要显示的东西（队列计数 + 紧凑列表），主窗那套首批装载
+        （目录胶囊 / 任务全表 / 元信息 / **日志页整页渲染**）一概不做——小窗里一行都
+        看不到，却要点掉约两秒（实测小窗与完整模式启动耗时几乎相同，正是这个原因）。
+        切回完整界面时由 `_toggle_compact(False)` 再补跑（`_do_initial_load` 自带幂等）。
+        """
+        if self.is_compact():
+            try:
+                cw = getattr(self, "_compact_window", None)
+                if cw is not None:
+                    cw.refresh_tasks()
+            except Exception:
+                pass
+        else:
+            try:
+                self._do_initial_load()
+            except Exception:
+                pass
         # 装载后布局最小尺寸会随内容变化：空内容下算出的下限偏小，
         # 内容到位后按同口径重算一次，避免长内容把窗口顶到屏外。
         try:
@@ -892,10 +906,15 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(make_tray_icon(), self)
         self.tray.setToolTip("AutoUnpacker")
         menu = QMenu()
+        self.tray_menu = menu          # 存下来：_refresh_share_menu 要按模式改可见性
         show = menu.addAction("显示主界面")
         show.triggered.connect(self._show_window)
         hide = menu.addAction("隐藏到托盘")
         hide.triggered.connect(self._hide_window)
+        # 精简模式专用：一键回到完整界面（仅精简模式下可见，见 _refresh_share_menu）
+        self._return_full_action = menu.addAction("返回完整界面")
+        self._return_full_action.triggered.connect(
+            lambda *_: self._toggle_compact(False))
         # 2.F「用客户端下载最近分享」：整条链路属实验性功能，未开启时整项隐藏。
         self._open_share_action = menu.addAction("用客户端打开最近分享")
         self._open_share_action.triggered.connect(self._open_recent_share)
@@ -939,6 +958,18 @@ class MainWindow(QMainWindow):
         self._process_pending_trust()
 
     def _hide_window(self):
+        """隐藏到托盘。**精简模式下要藏的是小窗**：主窗本来就是隐藏的，照原样
+        `self.hide()` 会退化成空操作——这正是「小窗模式点托盘-隐藏到托盘没反应」的原因
+        （`_show_window` 早已有 `is_compact()` 分支，这里是漏掉的另一半）。"""
+        if self.is_compact():
+            cw = getattr(self, "_compact_window", None)
+            if cw is not None:
+                try:
+                    if cw.isVisible():
+                        cw.hide()
+                        return
+                except Exception:
+                    pass
         self.hide()
 
     def _quit(self):
@@ -2353,6 +2384,17 @@ class MainWindow(QMainWindow):
                 self.activateWindow()
             except Exception:
                 pass
+            # 精简模式下启动时跳过了首批装载：切回完整界面后再补（放到事件循环空闲，
+            # 先让窗口出来再缓缓填，与启动时 defer_initial_load 同一思路；幂等）。
+            try:
+                QTimer.singleShot(0, self._do_initial_load)
+            except Exception:
+                pass
+        # 托盘菜单里「返回完整界面」只在精简模式有意义：切完立刻同步一次可见性
+        try:
+            self._refresh_share_menu()
+        except Exception:
+            pass
 
     def _ensure_compact_window(self):
         """懒建精简小窗（规格 §12：`ui/compact/window.py` 的 CompactWindow）。"""
@@ -2789,6 +2831,9 @@ class MainWindow(QMainWindow):
                 self._open_share_action.setVisible(visible)
             if hasattr(self, "_open_share_pick_action"):
                 self._open_share_pick_action.setVisible(visible)
+            # 「返回完整界面」只在精简模式下有意义（完整模式下点了等于原地不动）
+            if hasattr(self, "_return_full_action"):
+                self._return_full_action.setVisible(self.is_compact())
         except Exception:
             pass
 

@@ -31,7 +31,7 @@ from ... import db
 from .. import style as ui_style
 from ..style import PALETTE
 from ..widgets import make_tray_icon
-from ..widgets.inputs import _ElideLabel
+from ..widgets.inputs import Glyph, _ElideLabel
 from .nav import NavHistory
 from .pages_code import CodePage
 from .pages_home import HomePage
@@ -1018,7 +1018,14 @@ class CompactWindow(QWidget):
         self.back_btn.clicked.connect(lambda *_: self.back())
         self.fwd_btn = self._title_button(bar, "›", "前进（Alt+→）", "compactNav")
         self.fwd_btn.clicked.connect(lambda *_: self.forward())
-        self.full_btn = self._title_button(bar, "⤢", "返回完整界面", "compactCtl")
+        # 图标用 QPainter 自绘的 `Glyph`，**不用字符 "⤢"(U+2922)**：该码位不在默认
+        # UI 字体（Segoe UI）里，Qt 会回退到符号字体，其 ascent/descent 与相邻的 —/✕
+        # 不同 → 视觉上不与它俩同一条水平线（用户实测）。自绘图标与字体度量无关，
+        # 且 `external` 正是「打开到外部 / 返回完整界面」的语义。
+        self.full_btn = self._title_button(bar, "", "返回完整界面", "compactCtl")
+        _full_lay = QHBoxLayout(self.full_btn)
+        _full_lay.setContentsMargins(0, 0, 0, 0)
+        _full_lay.addWidget(Glyph("external", self.full_btn, 13, role="muted"))
         self.full_btn.clicked.connect(lambda *_: self._on_full_clicked())
         self.min_btn = self._title_button(bar, "—", "最小化到任务栏", "compactCtl")
         self.min_btn.clicked.connect(lambda *_: self.showMinimized())

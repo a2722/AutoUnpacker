@@ -51,7 +51,11 @@ def _candidate_dbs():
     if install:
         roots.append(install / "users")
     for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
-                 os.environ.get("LOCALAPPDATA")):
+                 os.environ.get("LOCALAPPDATA"),
+                 # 实测（Win11 + 百度网盘 8.8.8.101）：新版客户端会装到
+                 # %APPDATA%\baidu\BaiduNetdisk（Roaming），并不在 Program Files 下。
+                 # 平时靠协议关联的注册表兜住，但注册表缺失时这里必须也能命中。
+                 os.environ.get("APPDATA")):
         if base:
             roots.append(Path(base) / "Baidu" / "BaiduNetdisk" / "users")
     out = []

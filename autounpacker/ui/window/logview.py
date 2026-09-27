@@ -41,8 +41,13 @@ _APP_LINK_PREFIX = "app://"
 # 主热键注册失败时日志里给出的「打开设置页」动作短语（显示文本即短语本身）。
 _APP_LINK_SETTINGS_LABEL = "打开设置-外观与快捷键"
 _APP_LINK_SETTINGS_TARGET = "app://settings/ui"
+# 解压需要 7-Zip 却没有（或版本过低）时，日志里给出的「一键安装」动作短语：
+# 点了直接开 7-Zip 安装引导（等价于「设置 → 解压引擎 → 7-Zip 管理…」）。
+_APP_LINK_SEVENZIP_LABEL = "安装 7-Zip"
+_APP_LINK_SEVENZIP_TARGET = "app://sevenzip/manage"
 _LOG_ACTIONS = (
     (_APP_LINK_SETTINGS_LABEL, _APP_LINK_SETTINGS_TARGET),
+    (_APP_LINK_SEVENZIP_LABEL, _APP_LINK_SEVENZIP_TARGET),
 )
 
 
@@ -545,6 +550,12 @@ class FoldController(QObject):
         self._pin_fold_id = None         # 置顶条当前指向的折叠 id
         self._pin_cache = (None, None)   # (firstVisibleBlock 号, 解析出的折叠项)
         self._pin_count = None           # 上次解析时的块数（变小 = 发生过裁剪）
+        self._head_blocks = {}           # 折叠 id -> 头 block 句柄（定点编辑用，绝不整页扫描）
+        # 已展开折叠项的整数计数：不变量 = 恰等于 folds 里 expanded 为真的条数。所有写入
+        # fold["expanded"] 的路径（toggle 翻转、prune_folds 剔除、reset 清空）都必须同步；
+        # pin_fold / _refresh_pin_after_toggle 靠它 O(1) 短路，绝不每次遍历 folds。
+        self._expanded_count = 0
+        self._prune_tick = 0             # 距上次全量 prune_folds 的追加次数（安全网节流）
         self._tip_key = None
         try:
             self.view.viewport().installEventFilter(self)
@@ -564,6 +575,9 @@ class FoldController(QObject):
         self.buffer = LogFold()
         self.folds = {}
         self.view_items = []
+        self._head_blocks = {}
+        self._expanded_count = 0         # folds 已清空：展开计数同步归零
+        self._prune_tick = 0
         self.invalidate_pin()
         self.update_pin()
 
@@ -643,9 +657,23 @@ class FoldController(QObject):
                 self.folds[int(item[1].get("id"))] = item[1]
             except Exception:
                 pass
-        if len(self.view_items) > _VIEW_ITEMS_MAX:
-            del self.view_items[:len(self.view_items) - _VIEW_ITEMS_MAX]
-            self.prune_folds()
+        overflow = len(self.view_items) - _VIEW_ITEMS_MAX
+        if overflow > 0:
+            # 增量裁剪：只处理真正被挤掉的前 overflow 项——其中是折叠项的，直接剔除它的
+            # id（清头句柄 + 同步展开计数），绝不回扫整个视图模型。未溢出时不付任何代价。
+            for kind, payload in self.view_items[:overflow]:
+                if kind == "fold":
+                    try:
+                        self._discard_fold(int(payload.get("id")))
+                    except Exception:
+                        pass
+            del self.view_items[:overflow]
+            # 全量 prune_folds 退为「罕跑的安全网」：每 64 次裁剪兜一次（正常路径已无泄漏，
+            # 它只在边界情况下补刀），不再是每次追加都 O(_VIEW_ITEMS_MAX) 的固定税。
+            self._prune_tick += 1
+            if self._prune_tick >= 64:
+                self._prune_tick = 0
+                self.prune_folds()
         self.render_item(item)
         self.update_pin()
 
@@ -694,8 +722,18 @@ class FoldController(QObject):
         except Exception:
             return False
 
+    def _discard_fold(self, fid):
+        """从 id 映射里剔除一个折叠项（增量裁剪用）：清头句柄并同步展开计数。"""
+        fold = self.folds.pop(fid, None)
+        if fold is not None and bool(fold.get("expanded")):
+            self._expanded_count = max(0, self._expanded_count - 1)
+        self._head_blocks.pop(fid, None)
+
     def prune_folds(self):
-        """丢弃已不在视图模型里的折叠项（id 映射绝不无界增长）。"""
+        """丢弃已不在视图模型里的折叠项（id 映射绝不无界增长）。
+
+        正常路径已由 append_item 增量剔除被裁掉的折叠 id；这里退为罕跑的安全网，
+        万一有漏网的才整表重建——重建时同步扣掉被丢弃的展开计数，守住不变量。"""
         live = set()
         for kind, payload in self.view_items:
             if kind == "fold":
@@ -704,7 +742,18 @@ class FoldController(QObject):
                 except Exception:
                     pass
         if len(self.folds) > len(live) + 64:
-            self.folds = {k: v for k, v in self.folds.items() if k in live}
+            kept = {}
+            dropped_expanded = 0
+            for k, v in self.folds.items():
+                if k in live:
+                    kept[k] = v
+                elif bool(v.get("expanded")):
+                    dropped_expanded += 1
+            self.folds = kept
+            self._head_blocks = {k: v for k, v in self._head_blocks.items()
+                                 if k in self.folds}
+            if dropped_expanded:
+                self._expanded_count = max(0, self._expanded_count - dropped_expanded)
 
     def render_item(self, item):
         kind, payload = item
@@ -718,6 +767,7 @@ class FoldController(QObject):
         force = self.force_open()
         text = _fold_head_text(fold, self.is_open(fold), affordance=not force)
         self.render_line(text)                # 走宿主既有管线（着色/纯文本都一致）
+        self._remember_head(fold)             # 记录头 block：定点展开/收起据此回查
         if not force and self.view is not None:
             # 只给「—— 点击展开/收起」片段套锚点：整行可点，样式仍像原生日志
             try:
@@ -767,18 +817,221 @@ class FoldController(QObject):
                 return payload
         return None
 
+    # ---- 定点展开/收起（只改该折叠自身的行，代价 O(折叠行数)）----
+    def _fold_id(self, fold):
+        """折叠项 id（整数）；不可用时 None。"""
+        try:
+            return int(fold.get("id"))
+        except Exception:
+            return None
+
+    def _host_owner(self):
+        """注入的渲染回调的宿主对象（生产路径 = MainWindow），供复用其着色/降级判定。"""
+        try:
+            return getattr(self._render, "__self__", None)
+        except Exception:
+            return None
+
+    def _colors_enabled(self):
+        """宿主当前是否开启日志着色（纯文本模式下定点编辑也必须照样插入纯文本）。"""
+        owner = self._host_owner()
+        try:
+            get = getattr(owner.state, "get", None)
+            if callable(get):
+                return bool(get("log_colors_enabled", True))
+            return bool(owner.state.snapshot().get("log_colors_enabled", True))
+        except Exception:
+            return True
+
+    def _line_html(self, msg):
+        """一行日志的渲染结果：与宿主着色/链接/降级管线逐字一致（复用同一实现）。
+
+        宿主回调只负责「追加到文档末尾」（_append_log_html），定点编辑需要能插到
+        任意位置的同一份 HTML，故就地复用宿主的颜色/降级判定 + _render_log_html：
+        颜色（_log_color_for）与降级区间（_degraded_spans_for）与重画时完全同源。"""
+        if not self._colors_enabled():
+            return html.escape(str(msg))
+        owner = self._host_owner()
+        try:
+            color = owner._log_color_for(msg)
+        except Exception:
+            color = PALETTE.get("log_fg") or PALETTE.get("fg") or "#d4d4d4"
+        try:
+            degraded = _degraded_spans_for(owner, self.view, msg)
+        except Exception:
+            degraded = []
+        return _render_log_html(msg, color, degraded)
+
+    def _remember_head(self, fold):
+        """记录折叠头当前的 block 句柄（定点编辑据此回查，绝不整页扫描）。"""
+        try:
+            fid = self._fold_id(fold)
+            if fid is None or self.view is None:
+                return
+            self._head_blocks[fid] = self.view.document().lastBlock()
+        except Exception:
+            pass
+
+    def _head_block_for(self, fold):
+        """该折叠头当前对应的 block；句柄缺失/失效/被裁剪（href 不再匹配）时返回 None。"""
+        try:
+            block = self._head_blocks.get(self._fold_id(fold))
+        except Exception:
+            block = None
+        href = _fold_href(fold)
+        if block is None or not href:
+            return None
+        try:
+            if block.isValid() and _fold_href_of_block(block) == href:
+                return block
+        except Exception:
+            pass
+        return None
+
+    def _replace_head_text(self, head, text, href, force):
+        """就地重写折叠头行的文字（重套 fold:// 锚点），不新增/删除 block。"""
+        try:
+            cur = QTextCursor(head)
+            cur.setPosition(head.position())
+            cur.setPosition(head.position() + max(0, head.length() - 1),
+                            QTextCursor.KeepAnchor)
+            cur.insertHtml(self._line_html(text))
+        except Exception:
+            return
+        if not force:
+            try:
+                _anchor_fold_affordance(head, text, href)
+            except Exception:
+                pass
+
+    def _remove_fold_body(self, head, n):
+        """删除折叠头后紧随的 n 个 block（折叠体的原始行），头自身绝不动。"""
+        try:
+            n = int(n)
+        except Exception:
+            return
+        if n <= 0:
+            return
+        doc = head.document()
+        if doc is None:
+            return
+        last = head
+        for _ in range(n):
+            last = last.next()
+            if not last.isValid():
+                raise RuntimeError("fold body structure changed")
+        cur = QTextCursor(doc)
+        cur.setPosition(head.position() + head.length())
+        if last.next().isValid():
+            # 折叠体后面还有内容：选到下一块开头（含各块的段落分隔符）
+            cur.setPosition(last.next().position(), QTextCursor.KeepAnchor)
+        else:
+            # 折叠体就是文档末尾：连同头后的分隔符一起删，避免留下空块
+            cur.setPosition(head.position() + head.length() - 1, QTextCursor.KeepAnchor)
+            cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        cur.removeSelectedText()
+        if not last.next().isValid():
+            # Qt 删到 End 会保留一个空尾块：一并清掉（头仍保留）
+            trailing = doc.lastBlock()
+            if (trailing.isValid() and trailing is not head
+                    and trailing.length() == 1 and trailing.position() > 0):
+                c2 = QTextCursor(doc)
+                c2.setPosition(trailing.position() - 1)
+                c2.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+                c2.removeSelectedText()
+
+    def _toggle_fold_in_place(self, fold):
+        """定点展开/收起：只改该折叠头与它自己的行，不整页重画。返回是否成功。
+
+        成功 = 文档已按当前展开态就地改好（O(折叠行数)）；失败 = 头句柄失效 / 结构
+        异常，调用方退回 rerender_view()（整页重画兜底）。展开触发 3000 行上限自动
+        裁剪时仍按 Qt 既有语义处理，但头句柄不再可信，从记录里剔除，后续走兜底。"""
+        head = self._head_block_for(fold)
+        if head is None or not head.isValid():
+            return False
+        doc = head.document()
+        if doc is None:
+            return False
+        lines = list(fold.get("lines") or ())
+        expanded = bool(fold.get("expanded"))
+        force = self.force_open()
+        text = _fold_head_text(fold, expanded, affordance=not force)
+        href = _fold_href(fold)
+        fid = self._fold_id(fold)
+        before = doc.blockCount()
+        try:
+            self.view.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        ok = True
+        try:
+            if expanded:
+                self._replace_head_text(head, text, href, force)
+                if lines:
+                    # 单次 insertHtml 批量插入：每个 <p> 一个 block，与逐行 appendHtml
+                    # 的块格式/文字/锚点逐字一致，但把 O(n) 次文档编辑并成 1 次。
+                    cur.setPosition(head.position() + max(0, head.length() - 1))
+                    cur.insertBlock()
+                    cur.insertHtml("".join("<p>%s</p>" % self._line_html(ln)
+                                           for ln in lines))
+            else:
+                self._remove_fold_body(head, len(lines))
+                self._replace_head_text(head, text, href, force)
+        except Exception:
+            ok = False
+        finally:
+            try:
+                cur.endEditBlock()
+            except Exception:
+                pass
+            try:
+                self.view.setUpdatesEnabled(True)
+            except Exception:
+                pass
+        if not ok:
+            return False
+        try:
+            if expanded and before + len(lines) > doc.blockCount():
+                # 展开触发了 3000 行上限裁剪：本次展开是就地完成的（与旧行为一致），
+                # 但再收起必须按模型整页重画才能恢复被裁掉的旧行——故丢弃头句柄，
+                # 让下一次 toggle 走 rerender_view 兜底（批量重画，仍比旧实现快）。
+                self._head_blocks.pop(fid, None)
+            else:
+                self._head_blocks[fid] = head
+        except Exception:
+            pass
+        return True
+
     def toggle(self, fold):
-        """展开/收起一个折叠块并整页重画（视图有 3000 行上限，重画很便宜）。"""
+        """展开/收起一个折叠块：只就地改该块（O(折叠行数)），不再整页重画。
+
+        句柄失效 / 结构异常时退回 rerender_view()（整页重画兜底），行为与旧实现一致。"""
         if not isinstance(fold, dict):
             return False
         if self.force_open():
             return False      # 搜索/级别过滤中：保持展开，绝不藏住命中行
+        fid = self._fold_id(fold)
+        tracked = fid is not None and self.folds.get(fid) is fold
         fold["expanded"] = not bool(fold.get("expanded"))
-        self.rerender_view()
+        if tracked:
+            # 同步展开计数（不变量见 __init__）：置位 +1、复位 -1。
+            self._expanded_count += 1 if fold["expanded"] else -1
+            if self._expanded_count < 0:
+                self._expanded_count = 0
+        if not self._toggle_fold_in_place(fold):
+            self.rerender_view()
+        else:
+            self.invalidate_pin()
+            self._refresh_pin_after_toggle(fold)
         return True
 
     def rerender_view(self):
-        """按当前展开态整页重画（视图模型不动；滚动位置尽力保留）。"""
+        """按当前展开态整页重画（视图模型不动；滚动位置尽力保留）。
+
+        clear()+replay 整体放进一个编辑块并关掉重绘：整页重画只在兜底/重载路径发生，
+        合并成一次文档编辑避免每行一次重排（调用方与语义都不变）。"""
         sb = None
         value = 0
         try:
@@ -787,11 +1040,26 @@ class FoldController(QObject):
         except Exception:
             sb = None
         try:
-            self.view.clear()
+            self.view.setUpdatesEnabled(False)
         except Exception:
             pass
-        for item in self.view_items:
-            self.render_item(item)
+        try:
+            cur = QTextCursor(self.view.document())
+            cur.beginEditBlock()
+            try:
+                self.view.clear()
+            except Exception:
+                pass
+            for item in self.view_items:
+                self.render_item(item)
+            cur.endEditBlock()
+        except Exception:
+            pass
+        finally:
+            try:
+                self.view.setUpdatesEnabled(True)
+            except Exception:
+                pass
         try:
             if sb is not None:
                 sb.setValue(min(value, sb.maximum()))
@@ -838,8 +1106,8 @@ class FoldController(QObject):
         try:
             if not self.view.isVisible() or self.view.blockCount() <= 0:
                 return None
-            if not any(bool(f.get("expanded")) for f in self.folds.values()):
-                return None      # 没有任何展开块：置顶条不可能出现（省一次向上回溯）
+            if self._expanded_count <= 0:
+                return None      # 没有任何展开块：置顶条不可能出现（O(1) 计数短路）
             first = self.view.firstVisibleBlock()
             if not first.isValid():
                 return None
@@ -887,7 +1155,13 @@ class FoldController(QObject):
             if self._pin_count is not None and count < self._pin_count:
                 self.invalidate_pin()   # 触发过 3000 行裁剪：块号整体位移，缓存作废
             self._pin_count = count
-            fold = self.pin_fold()
+            self._show_pin(self.pin_fold())
+        except Exception:
+            pass
+
+    def _show_pin(self, fold):
+        """按解析结果（None = 不置顶）显示/隐藏置顶折叠条。"""
+        try:
             if fold is None:
                 self._pin_fold_id = None
                 if self._pin is not None and self._pin.isVisible():
@@ -912,6 +1186,57 @@ class FoldController(QObject):
             pin.raise_()
         except Exception:
             pass
+
+    def _pin_fold_from_heads(self, first_num):
+        """first_num 处所在的已展开折叠项：只查渲染期记录的折叠头句柄。
+
+        定点编辑（点击展开/收起）后刷新置顶条专用：避免 _header_above 的最多
+        3000 步逐块回溯；判定口径与 _resolve_pin_fold 完全一致（最近的折叠头，
+        且顶部落在其块体内）。句柄失效（被裁剪）的折叠自动跳过。"""
+        best_num = -1
+        best_fold = None
+        for f in self.folds.values():
+            block = self._head_block_for(f)
+            if block is None:
+                continue
+            try:
+                num = block.blockNumber()
+            except Exception:
+                continue
+            if num <= first_num and num > best_num:
+                best_num = num
+                best_fold = f
+        if best_fold is None or not bool(best_fold.get("expanded")):
+            return None
+        if 0 < first_num - best_num <= len(best_fold.get("lines") or ()):
+            return best_fold
+        return None
+
+    def _refresh_pin_after_toggle(self, fold):
+        """定点编辑后的置顶条刷新：只用已记录的折叠头判定，绝不逐块回溯文档。"""
+        try:
+            self.ensure_pin()   # 惰性控件与旧路径一致地就位（隐藏，不影响可见结果）
+        except Exception:
+            pass
+        try:
+            count = self.view.blockCount()
+            if self._pin_count is not None and count < self._pin_count:
+                self.invalidate_pin()
+            self._pin_count = count
+        except Exception:
+            count = 0
+        resolved = None
+        try:
+            if self.view.isVisible() and count > 0:
+                if self._expanded_count > 0:
+                    first = self.view.firstVisibleBlock()
+                    if first.isValid():
+                        num = first.blockNumber()
+                        resolved = self._pin_fold_from_heads(num)
+                        self._pin_cache = (num, resolved)
+        except Exception:
+            resolved = None
+        self._show_pin(resolved)
 
     def ensure_pin(self):
         """惰性创建置顶折叠条（QLabel 子控件；主题切换由 refresh_theme 重贴色）。"""
@@ -983,7 +1308,10 @@ class FoldController(QObject):
             pass
 
     def fold_header_block(self, fold):
-        """按 fold:// 锚点在文档里回查折叠头 block（重画后 href 仍随折叠项走）。"""
+        """折叠头 block：优先用渲染期记录的头句柄（O(1)），句柄失效/不匹配才回退整篇扫描。"""
+        block = self._head_block_for(fold)
+        if block is not None:
+            return block
         href = _fold_href(fold)
         if not href:
             return None

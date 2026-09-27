@@ -86,6 +86,7 @@ _FLUENT = {
     "fs_tag": "10px",       # 角标 / 风险标签
     "radius_pill": "10px",  # 胶囊开关
     "radius_bar": "2px",    # 左栏选中竖条
+    "radius_tag": "2px",    # 角标圆角：两套主题同值（角标不能随主题变形状）
 }
 
 _DEVTOOL = {
@@ -131,6 +132,7 @@ _DEVTOOL = {
     "fs_h1": "20px", "fs_h2": "14px", "fs_title": "13.5px", "fs_row": "13px",
     "fs_body": "12.5px", "fs_section": "11.5px", "fs_hint": "11px", "fs_tag": "10px",
     "radius_pill": "10px", "radius_bar": "2px",
+    "radius_tag": "2px",    # 角标圆角：两套主题同值（角标不能随主题变形状）
 }
 
 _TOKENS = {"fluent": _FLUENT, "devtool": _DEVTOOL}
@@ -421,7 +423,7 @@ QWidget#setRow[off="true"] QLabel#unit,
 QWidget#setRow[off="true"] QLabel#rowNote { color: $chip_off_fg; }
 QLabel#riskBadge {
     font-size: $fs_tag; font-weight: 700; color: $danger_fg; background: $danger_bg;
-    border: 1px solid $danger_border; border-radius: $radius_ctl; padding: 1px 7px;
+    border: 1px solid $danger_border; border-radius: $radius_tag; padding: 1px 7px;
 }
 
 /* ---- 控件尺寸（对齐设计稿；作用域限定本页，避免影响其它页面） ---- */
@@ -494,7 +496,7 @@ QWidget#settingsPage QLabel#sectionTitle[role="dirPath"] {
 }
 QLabel#dirPath { font-size: $fs_title; font-weight: 700; color: $window_fg; }
 QLabel#statusPill {
-    font-size: $fs_tag; font-weight: 700; border-radius: $radius_ctl; padding: 2px 9px;
+    font-size: $fs_tag; font-weight: 700; border-radius: $radius_tag; padding: 2px 9px;
 }
 QLabel#statusPill[on="true"]  { color: $success_fg; border: 1px solid $success_fg; }
 QLabel#statusPill[off="true"] {
@@ -505,11 +507,14 @@ QFrame#dirFoot {
     border-radius: $radius_card;
 }
 QFrame#dirFieldRisk { background: $danger_bg; border-radius: $radius_card; }
-/* chipState 独立规则，不再依赖 #dirChip 父级（§8 #10） */
+/* chipState 独立规则，不再依赖 #dirChip 父级（§8 #10）；角标圆角用
+   主题不变 token $radius_tag（角标不能随主题变形状） */
 QLabel#chipState {
     font-size: $fs_tag; font-weight: 700; color: $chip_off_fg;
-    border: 1px solid $ctl_border; border-radius: $radius_ctl; padding: 1px 7px;
+    border: 1px solid $ctl_border; border-radius: $radius_tag; padding: 1px 7px;
 }
+/* 胶囊内说明文字（说明性文案，不是状态角标；故无描边、无内边距、无圆角） */
+QLabel#chipText { font-size: $fs_tag; color: $chip_off_fg; }
 
 /* ---- 补充信息气泡（只留用户可见两段：标题 + 描述；风险项追加风险块） ---- */
 QFrame#settingsBubble {
@@ -595,14 +600,26 @@ QLabel#toastBubble {
     border-radius: $radius_ctl; padding: 9px 16px; font-size: $fs_body;
 }
 
-QScrollBar:vertical { background: transparent; width: 11px; }
+/* 滚动条：每个子控件都必须显式覆盖，否则非 100% DPI 下 Qt 会对未覆盖的
+   子控件回退到原生 windowsvista 绘制（浅色主题下是一层白格花纹）。 */
+QScrollBar:vertical {
+    background: transparent; border: none; margin: 0; width: 11px;
+}
 QScrollBar::handle:vertical { background: $sb_handle; border-radius: 5px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: $sb_hover; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal { background: transparent; height: 11px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0; background: transparent; border: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal {
+    background: transparent; border: none; margin: 0; height: 11px;
+}
 QScrollBar::handle:horizontal { background: $sb_handle; border-radius: 5px; min-width: 24px; }
 QScrollBar::handle:horizontal:hover { background: $sb_hover; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0; background: transparent; border: none;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
 /* =======================================================================
    M2 新组件：目录胶囊 / 标签页 / 分段 / 日志筛选 / 模式卡 / 任务表 /
@@ -769,13 +786,26 @@ QProgressBar#thinProg::chunk { background: $prog_chunk; border-radius: 2px; }
 """)
 
 
+# build_style 的渲染结果缓存：token 两套在运行期只读、恒定不变（没有任何代码
+# 会改 _FLUENT / _DEVTOOL 的值），故同一主题名渲染出的 QSS 必然逐字相同，可安全
+# 按主题名缓存——切主题时省掉每次重跑 ~550 行 Template.substitute。键与取值都是
+# 字符串，绝不存放任何随运行期变化的状态。
+_STYLE_CACHE = {}
+
+
 def build_style(theme=DEFAULT_THEME):
-    """按主题名渲染 QSS；未知主题回退 fluent。"""
-    tk = _TOKENS.get(str(theme or "").lower(), _FLUENT)
+    """按主题名渲染 QSS；未知主题回退 fluent（结果按主题名缓存）。"""
+    key = str(theme or "").lower()
+    cached = _STYLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tk = _TOKENS.get(key, _FLUENT)
     try:
-        return _QSS.substitute(**tk)
+        out = _QSS.substitute(**tk)
     except Exception:
-        return _QSS.substitute(**_FLUENT)
+        out = _QSS.substitute(**_FLUENT)
+    _STYLE_CACHE[key] = out
+    return out
 
 
 # 兼容旧引用（app.py 等）：等价于浅色主题

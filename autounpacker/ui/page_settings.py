@@ -606,6 +606,7 @@ class SettingsPage(QWidget):
         self._hotkeys_at_load = (None, None, None, None)  # 热键变更检测基线
         self._current_domain = "unzip"
         self._query = ""           # 当前搜索词（非空则显示结果列表、隐藏恢复默认）
+        self._search_shown = ""    # 当前结果卡对应的搜索词（防抖尾随去重用）
         self._bubble = None        # 当前唯一气泡（惰性创建、复用）
         self._bubble_pinned = False
         self._bubble_row = None
@@ -682,6 +683,14 @@ class SettingsPage(QWidget):
                 _glyph_icon("search", 15), QLineEdit.LeadingPosition)
         except Exception:
             self._search_icon_act = None
+        # 搜索防抖：键盘连续输入停顿 250ms 后只重建一次结果卡（与日志页
+        # _search_timer 同规格）；程序性 setText / clear 仍同步立即出结果。
+        self._search_user_edit = False
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._flush_search)
+        self.search_edit.textEdited.connect(self._on_search_edited)
         self.search_edit.textChanged.connect(self._on_search_changed)
         t.addWidget(self.search_edit)
         t.addStretch(1)
@@ -1766,6 +1775,23 @@ class SettingsPage(QWidget):
         # 语义反转：勾选 -> False（重检）；不勾 -> True（已检测）
         self.sevenzip_cb.toggled.connect(
             lambda checked: self._commit("sevenzip_check_done", not bool(checked)))
+        # 「7-Zip 管理…」入口：查看状态 / 安装隔离版·全局版 / 卸载隔离版 / 重新检测。
+        # 只放普通控件与按钮，**不登记任何配置键、不新增 _SettingRow** —— 覆盖契约
+        # 要求 covered_top_keys() 恰为 DEFAULT_CONFIG 顶层键（不多不少），做法同
+        # _build_update_group。按钮的最终状态展示由弹窗自己后台检测。
+        mh, ml = self._manual_row(g)
+        manage_name = QLabel("7-Zip 管理", mh)
+        manage_name.setToolTip("查看当前 7-Zip 状态，或安装/卸载隔离版、全局版。")
+        self.sevenzip_manage_btn = QPushButton("7-Zip 管理…", mh)
+        self.sevenzip_manage_btn.setObjectName("ghost")
+        self.sevenzip_manage_btn.setCursor(Qt.PointingHandCursor)
+        self.sevenzip_manage_btn.setToolTip(
+            "打开 7-Zip 管理：查看版本状态、安装隔离版/全局版、"
+            "卸载隔离版、重新检测。不登记任何配置项。")
+        self.sevenzip_manage_btn.clicked.connect(self._open_sevenzip_manage)
+        ml.addWidget(manage_name)
+        ml.addStretch(1)
+        ml.addWidget(self.sevenzip_manage_btn)
         g = self._group(box, "历史")
         self.task_limit_spin = self._spin_row(
             g, "任务历史保留条数", "task_history_limit",
@@ -1830,6 +1856,23 @@ class SettingsPage(QWidget):
             "", self.check_update_btn, "system", "版本与更新",
             syn=("版本", "版本号", "当前版本", "更新", "检查更新", "升级",
                  "新版", "下载")))
+
+    def _open_sevenzip_manage(self):
+        """「7-Zip 管理…」按钮：打开管理对话框（查看/安装/卸载/重新检测）。
+
+        与日志里的「安装 7-Zip」动作链接共用同一个公开入口
+        `dialogs.sevenzip.open_sevenzip_manage()`；只在本机操作、不登记配置键，
+        真正的检测与安装都在对话框的后台线程里完成，这里只负责模态打开。"""
+        try:
+            from .dialogs.sevenzip import open_sevenzip_manage
+        except Exception as e:
+            try:
+                if self.hub:
+                    self.hub.log(f"打开 7-Zip 管理失败: {e}")
+            except Exception:
+                pass
+            return
+        open_sevenzip_manage(self.state, self.hub, self)
 
     def _build_lab(self, box):
         g = self._group(box, "总开关")
@@ -2224,13 +2267,32 @@ class SettingsPage(QWidget):
         # 搜索时隐藏「恢复默认」（D3-1）
         self.reset_btn.setVisible(not self._query)
         if not self._query:
+            self._search_timer.stop()
             self._hide_search_results()
             self._show_domain(self._current_domain)
             return
+        if self._search_user_edit:
+            # 键盘连续输入：只更新搜索词，停顿 250ms 后由 _flush_search 重建一次结果卡
+            self._search_user_edit = False
+            self._search_timer.start()
+            return
+        # 程序性变更（setText / clear / 回填）：保持同步立即出结果，语义不变
+        self._search_timer.stop()
         self._show_search_results(self._query)
+
+    def _on_search_edited(self, _text):
+        """记录「本次变更来自键盘输入」：textEdited 先于 textChanged 触发，且
+        程序性 setText 不发 textEdited（Qt 文档语义），据此合并输入突发。"""
+        self._search_user_edit = True
+
+    def _flush_search(self):
+        """防抖窗口结束：关键词在窗口内又变过才重建结果卡（避免重复重建）。"""
+        if self._query and self._query != self._search_shown:
+            self._show_search_results(self._query)
 
     def _show_search_results(self, q):
         """把右侧换成搜索结果：#hitCard 卡片 + 可点击命中项 + 空状态（§8 #5）。"""
+        self._search_shown = str(q or "")   # 防抖尾随去重：当前结果卡对应的词
         if getattr(self, "_result_card", None) is not None:
             self._result_card.setParent(None)
             self._result_card = None
@@ -3298,15 +3360,17 @@ class SettingsPage(QWidget):
                 for k in page_keys:
                     if "." in k and not k.startswith("dir."):
                         top = k.split(".")[0]
-                        self.state.set(top, _deepcopy(defaults.get(top)))
+                        self.state.set(top, _deepcopy(defaults.get(top)), save=False)
                     elif k.startswith("dir."):
                         top = "watch_paths"
-                        self.state.set(top, _deepcopy(defaults.get(top)))
+                        self.state.set(top, _deepcopy(defaults.get(top)), save=False)
                     else:
-                        self.state.set(k, _deepcopy(defaults.get(k)))
+                        self.state.set(k, _deepcopy(defaults.get(k)), save=False)
             else:
                 for key, value in defaults.items():
-                    self.state.set(key, _deepcopy(value))
+                    self.state.set(key, _deepcopy(value), save=False)
+            # 全部键先只改内存，最后统一落盘一次（磁盘结果与逐键写一致）
+            self.state._persist()
         except Exception as e:
             self._notice("恢复默认失败：%s" % e, ok=False)
             return
@@ -3333,7 +3397,10 @@ class SettingsPage(QWidget):
         if pref not in ("auto", "fluent", "devtool"):
             pref = "auto"
         try:
-            self.state.set("ui_theme", pref)
+            # 两次 set 合并为一次落盘：ui_theme 先只改内存（save=False，现有能力），
+            # 随后的 ui_theme_cached 写入把两个键一并原子落盘；成功路径最终磁盘内容
+            # 与原来的「写两次」逐字节一致，只是少一次 json.dumps + os.replace。
+            self.state.set("ui_theme", pref, save=False)
             want = ui_style.resolve_theme(pref)
             ui_style.apply_theme(QApplication.instance(), want)
             self.state.set("ui_theme_cached", want)
@@ -3428,15 +3495,21 @@ class SettingsPage(QWidget):
             self.cat_list.viewport().update()   # 左栏竖条颜色（委托 paint 现取 token）
         except Exception:
             pass
-        self._fit_all_hints()
+        # 主题切换**不**重跑 _fit_all_hints()：它按 fontMetrics().lineSpacing() 抬
+        # 最小高度，而两套主题的 fs_* 字号 token 逐值相同、apply_theme 也不改字体，
+        # 故字体几何恒定、兜底高度无需重算；_HINT_NAMES 四个白名单标签在 QSS 重套
+        # 时由 eventFilter 的 Polish/StyleChange 分支自动重贴，showEvent 与
+        # _show_domain 也仍会整体兜底。省掉一次全页 findChildren(QLabel) 文本测量。
 
     def _badge_qss(self):
-        """风险徽章内联样式：取 QSS token 真值（与新 QSS 规则同色值）。"""
+        """风险徽章内联样式：取 QSS token 真值（与新 QSS 规则同色值）。
+
+        圆角用主题不变的 radius_tag——角标不能随主题变形状。"""
         tk = ui_style.tokens()
         return ("QLabel#riskBadge { color: %s; background: %s; border: 1px solid %s;"
                 " border-radius: %s; padding: 1px 7px; }"
                 % (tk["danger_fg"], tk["danger_bg"], tk["danger_border"],
-                   tk["radius_ctl"]))
+                   tk["radius_tag"]))
 
     # ---- 风险徽章呼吸（往更高风险方向改动时；10s 后停回常态） ----
     def _breathe_badge(self, key):

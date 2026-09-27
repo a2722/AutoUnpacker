@@ -41,7 +41,11 @@ def main():
         print(f"__OPEN_ERROR__ {e}", file=sys.stderr)
         return 3
     try:
-        from qr_decode import decode_qr_image
+        try:
+            from autounpacker.qr_decode import decode_qr_image
+        except ImportError:
+            # 独立脚本 / 源码运行：包不可导入时退回顶层 qr_decode（sys.path hack 兜底）。
+            from qr_decode import decode_qr_image
         results = decode_qr_image(image)
     except Exception as e:
         print(f"__DECODE_ERROR__ {e}", file=sys.stderr)

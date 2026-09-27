@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_state   ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_tasks_source  ON tasks(source_dir);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
+-- find_open_task 按 (file_name, state) 过滤后按 id 逆序取最新一条；没有这条索引时
+-- 只能全表扫 tasks（随历史增长）。旧库下次启动由 _SCHEMA 幂等补建。
+CREATE INDEX IF NOT EXISTS idx_tasks_file    ON tasks(file_name, state);
 
 CREATE TABLE IF NOT EXISTS log_index (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -721,6 +724,24 @@ def prune_logs(before_ts):
             try:
                 cur = conn.execute("DELETE FROM log_index WHERE ts < ?",
                                    (int(before_ts),))
+                conn.commit()
+                return max(0, int(cur.rowcount or 0))
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
+def clear_logs():
+    """清空全部日志索引行（DELETE FROM log_index），返回删除行数（失败返回 0）。
+
+    与 prune_logs 同一把锁 / 同一连接与提交习惯：只动 log_index，tasks 表、
+    passwords 等其他数据一律不碰；空库调用返回 0（幂等）。"""
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute("DELETE FROM log_index")
                 conn.commit()
                 return max(0, int(cur.rowcount or 0))
             finally:

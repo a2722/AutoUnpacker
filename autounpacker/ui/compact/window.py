@@ -18,6 +18,7 @@
     host._toggle_compact(False)
 """
 import os
+import time
 import webbrowser
 from pathlib import Path
 
@@ -44,6 +45,8 @@ _EDGE = 5                          # 无边框窗的边缘缩放热区（px）
 _TITLE_H = 32                      # 自绘标题栏高
 _DEFAULT_MARGIN = 24               # 首次 / 越界回落：主屏右下角离边 24px
 _PAGE_KEYS = ("HOME", "CODE", "PW", "PICK")
+_TASKS_IDLE_TTL = 2.0              # 无宿主事件钩子：空闲最短重查间隔（秒）
+_TASKS_IDLE_TTL_HOOKED = 10.0      # 已接宿主事件：仅作安全网（事件本就会立即刷新）
 
 
 class _TitleBar(QWidget):
@@ -164,6 +167,21 @@ class CompactWindow(QWidget):
         self._refresh_timer.setInterval(1000)
         self._refresh_timer.timeout.connect(self._on_tick)
 
+        # ---- 任务数据节流：宿主任务变化经事件（主窗合并事件的防抖定时器到点）立即
+        #      刷新；1s tick 只在数据过期时兜底重查，空闲时不再每秒盲查整表 ----
+        self._tasks_refresh_at = 0.0
+        self._tasks_hooked = False
+        self._counts_cache = None      # 最近一次 db.count_tasks()（状态标签直接复用）
+        try:
+            host_timer = getattr(host, "_tasks_refresh_timer", None)
+            if host_timer is not None:
+                host_timer.timeout.connect(self._on_host_tasks_refresh)
+                self._tasks_hooked = True
+        except Exception:
+            self._tasks_hooked = False
+        self._tasks_idle_ttl = (_TASKS_IDLE_TTL_HOOKED if self._tasks_hooked
+                                else _TASKS_IDLE_TTL)
+
         # ---- 几何记忆（saveGeometry/restoreGeometry 自带越界钳制）----
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)
@@ -193,11 +211,7 @@ class CompactWindow(QWidget):
         except Exception:
             pass
         self._switch_page("HOME")
-        try:
-            self.home_page.refresh_tasks()
-        except Exception:
-            pass
-        self._refresh_status()
+        self.refresh_tasks()
 
     def set_on_top(self, flag):
         """置顶开关 + 持久化 `compact_on_top`；可见时改 flags 后需重新 show。"""
@@ -408,12 +422,20 @@ class CompactWindow(QWidget):
 
     # ================= 状态刷新（供宿主可选接线） =================
     def refresh_tasks(self):
-        """宿主任务变化时可主动调用；1s 轮询是兜底（宿主只实现 hub 队列，无信号）。"""
-        self._refresh_status()
+        """立即重查任务数据（宿主事件 / 显式动作调用）。
+
+        1s tick 只是兜底：宿主有 `_tasks_refresh_timer`（MainWindow 合并任务事件的
+        防抖定时器）时，其到点即接事件强制刷新；没有钩子时按 TTL 节流，空闲时不再
+        每秒盲查整表。列表刷新顺带返回计数，状态区直接复用（同一轮不重复查库）。
+        """
+        self._tasks_refresh_at = 0.0
+        counts = None
         try:
-            self.home_page.refresh_tasks()
+            counts = self.home_page.refresh_tasks()
         except Exception:
-            pass
+            counts = None
+        self._refresh_status(counts)
+        self._tasks_refresh_at = time.monotonic()
 
     # ================= 拖放（整窗接收，规格 §6.3 / §14.3） =================
     @staticmethod
@@ -775,20 +797,43 @@ class CompactWindow(QWidget):
 
     # ================= 内部：状态区 / 轮询 =================
     def _on_tick(self):
-        self._refresh_status()
-        if self.current_page_key() == "HOME":
-            try:
-                self.home_page.refresh_tasks()
-            except Exception:
-                pass
+        """1s tick：暂停态每拍跟手；任务数据只在过期时兜底重查（事件即时刷新）。"""
+        if self._tasks_cache_stale():
+            self.refresh_tasks()
+        else:
+            self._refresh_status()
 
-    def _refresh_status(self):
-        """标题栏状态：`● 运行中` / `● 已暂停`（队列 N 有余量时追加）。"""
-        counts = {}
+    def _tasks_cache_stale(self):
+        """距上次真实查询是否已过 TTL（取不到时间戳按过期处理，绝不漏刷）。"""
         try:
-            counts = db.count_tasks() or {}
+            return ((time.monotonic() - self._tasks_refresh_at)
+                    >= self._tasks_idle_ttl)
         except Exception:
-            counts = {}
+            return True
+
+    def _on_host_tasks_refresh(self):
+        """宿主任务变化通知：可见就立即重查；不可见只作废缓存（show 时再刷）。"""
+        self._tasks_refresh_at = 0.0
+        try:
+            if self.isVisible():
+                self.refresh_tasks()
+        except Exception:
+            pass
+
+    def _refresh_status(self, counts=None):
+        """标题栏状态：`● 运行中` / `● 已暂停`（队列 N 有余量时追加）。
+
+        counts：调用方刚查到的 `db.count_tasks()`；不传则复用上次结果（仅首次
+        无缓存时才自查）。无参调用只重渲染标签（暂停态每 tick 跟手），不碰数据库。
+        """
+        if counts is not None:
+            self._counts_cache = counts
+        elif self._counts_cache is None:
+            try:
+                self._counts_cache = db.count_tasks() or {}
+            except Exception:
+                self._counts_cache = {}
+        counts = self._counts_cache or {}
         queue_n = 0
         try:
             queue_n = int(counts.get("queue", 0) or 0)
@@ -819,12 +864,7 @@ class CompactWindow(QWidget):
             self._refresh_timer.start()
         except Exception:
             pass
-        self._refresh_status()
-        if self.current_page_key() == "HOME":
-            try:
-                self.home_page.refresh_tasks()
-            except Exception:
-                pass
+        self.refresh_tasks()
 
     def hideEvent(self, event):
         try:

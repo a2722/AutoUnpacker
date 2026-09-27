@@ -469,13 +469,27 @@ class WatchDirDialog(QDialog):
         fields = ["path", "output_dir", "mode", "enabled", "delete_source"]
         if self._policy_editable():
             fields.append("delete_policy")
-        for field in fields:
-            value = cur.get(field)
-            if value != self._orig.get(field):
+        changed = [(field, cur.get(field)) for field in fields
+                   if cur.get(field) != self._orig.get(field)]
+        # 多字段一起改时：先只改内存（save=False），最后一个字段统一落盘一次——
+        # 磁盘结果与逐字段落盘一致，只省去 N-1 次 json.dumps + os.replace。
+        for field, value in changed[:-1]:
+            try:
+                self.state.update_path(self.idx, field, value, save=False)
+            except TypeError:
+                # 旧测试桩只接受三参：退回原调用（兼容离线验收）
                 try:
                     self.state.update_path(self.idx, field, value)
                 except Exception:
                     pass
+            except Exception:
+                pass
+        if changed:
+            field, value = changed[-1]
+            try:
+                self.state.update_path(self.idx, field, value)
+            except Exception:
+                pass
         try:
             self.saved.emit(self.idx)
         except Exception:

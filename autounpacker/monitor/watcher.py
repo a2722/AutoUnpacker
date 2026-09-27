@@ -102,6 +102,16 @@ def _restored_exempt(fp):
         return False
 
 
+def _state_get(state, key, default=None):
+    """读单个配置键：优先用 State.get（只取该键，不做整份深拷贝）；仅对只实现
+    snapshot() 的轻量 state 替身（测试桩）回退到整份快照。生产环境的 State 始终
+    走前一分支，因此轮询热路径不再每 tick 深拷贝整份配置。"""
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return state.snapshot().get(key, default)
+
+
 class FolderWatcher(threading.Thread):
     """多路径监听线程（只监听目录表面，不递归子孙文件夹）"""
 
@@ -420,20 +430,23 @@ class FolderWatcher(threading.Thread):
     def run(self):
         # stdout 捕获由进程入口（app.main）统一幂等安装，这里不再改进程级全局。
         while True:
-            cfg = self.state.snapshot()
-            interval = max(1, int(cfg.get("poll_interval", 2)))
+            # 只读本轮用到的两个键，不再对整份配置做深拷贝（旧实现每轮走一次
+            # snapshot 的 JSON round-trip）；watch_paths 取一次供本轮暂停/启用
+            # 两个分支共用，与 snapshot().get(key, default) 的取值一致。
+            interval = max(1, int(_state_get(self.state, "poll_interval", 2)))
+            watch_paths = _state_get(self.state, "watch_paths", [])
             # 暂停 = 原「停止监听」：不再轮询、不再检测新文件，恢复后重新扫描
             if not self.state.running or (self.pauser is not None
                                           and self.pauser.is_paused()):
                 # 暂停期间所有（启用的）监听路径上报 paused；_set_dir_state 自带
                 # 「值不变不重复发」，所以每 2s 空转也不会刷屏。
-                for wc in cfg.get("watch_paths", []):
+                for wc in watch_paths:
                     if wc.get("enabled") and wc.get("path"):
                         self._set_dir_state(wc["path"], "paused")
                 time.sleep(interval)
                 continue
             enabled = {}
-            for wc in cfg.get("watch_paths", []):
+            for wc in watch_paths:
                 if wc.get("enabled") and wc.get("path"):
                     enabled[self._norm_path(wc["path"])] = wc
             for key in list(self.seen):
@@ -824,7 +837,7 @@ class FolderWatcher(threading.Thread):
         # 目录」的豁免，避免根目录里的安装包/脚本把整个根禁掉。
         watch_roots = {root}
         try:
-            for _wcp in (self.state.snapshot().get("watch_paths") or []):
+            for _wcp in (_state_get(self.state, "watch_paths") or []):
                 _wp = _wcp.get("path")
                 if _wp:
                     watch_roots.add(self._norm_path(_wp))
@@ -924,8 +937,7 @@ class FolderWatcher(threading.Thread):
         - 大文件夹先到：小文件夹一出现就归位；
         - 小文件夹先到：进入 5 分钟监控窗口，期间大文件夹出现即归位，超时放弃；
           超时放弃后按 json 身份记住，文件变化前不再重试。"""
-        cfg = self.state.snapshot()
-        if not cfg.get("translation_move_enabled", True):
+        if not _state_get(self.state, "translation_move_enabled", True):
             return
         try:
             dirs = [d for d in watch.iterdir()

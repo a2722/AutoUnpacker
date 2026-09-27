@@ -2,10 +2,10 @@
 """7-Zip 管理：版本发现/检测、隔离版与全局版的下载安装、卸载。
 
 职责：- get_version()/check_version_ok() 读取 7z 版本并判断是否达 stdin 传密码门槛（18.00+），结果按路径缓存
-- install_isolated()/install_global() 从官网下载并静默安装（免提权走 Windows 自带 tar 解 extra 包，否则 UAC）
+- install_isolated() 优先走免提权路径（就地取用/下载本仓库的免安装 zip，标准库 zipfile 解到隔离目录），失败才回退官方安装器（弹一次 UAC）；install_global() 装到系统，始终需 UAC
 - uninstall_isolated()/uninstall_system() 卸载（隔离版绝不被系统版卸载误伤）
 关键入口：check_environment() / install_isolated() / install_global() / uninstall_isolated()
-依赖：urllib.request、ctypes（UAC 提权）、Windows 自带 tar.exe
+依赖：urllib.request、zipfile（解免安装包）、ctypes（UAC 提权）
 注意：隔离版装在 %APPDATA%\\AutoUnpacker\\7z，不污染项目与全局；低于 MIN_VERSION 的 7-Zip 无法经 stdin 传密码，一律需升级
 """
 import ctypes
@@ -13,10 +13,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -25,6 +27,17 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _APPDATA = os.environ.get("APPDATA") or str(Path.home())
 ISOLATED_DIR = Path(_APPDATA) / "AutoUnpacker" / "7z"
 ISOLATED_BIN = ISOLATED_DIR / "bin" / "7z.exe"
+
+# 免安装小包：由维护者把官方 7z.exe + 7z.dll（含 License/readme）打成一个普通 zip，
+# 作为本仓库的 release 资产发布（tools/make_7zip_bundle.py 生成）。
+# 普通 zip 用标准库 zipfile 就能解，所以隔离版安装全程不需要管理员权限；
+# 而官方 -extra.7z 是 LZMA 压缩，Windows 自带 tar.exe 没有 LZMA codec，解不了。
+BUNDLE_NAME = "AutoUnpacker-7zip.zip"
+BUNDLE_URL = ("https://github.com/a2722/AutoUnpacker/releases/latest/download/"
+              + BUNDLE_NAME)
+
+# 免安装包内只允许这几个顶层文件落到隔离 bin 目录（其余一律忽略）
+_BUNDLE_WHITELIST = frozenset({"7z.exe", "7z.dll", "License.txt", "readme.txt"})
 
 # 支持 stdin 传密码的最低 7-Zip 版本（18.00 起）
 MIN_VERSION = (18, 0, 0)
@@ -156,7 +169,8 @@ def latest_release():
     """从官网获取最新版本信息。
 
     返回 (version_tuple, installer_url, extra_url)；失败抛异常。
-    extra 包（7z.exe + 7z.dll 免安装控制台版）用于免提权的隔离安装。"""
+    installer_url 是官方安装器（requireAdministrator），仅在免提权免安装包路径
+    失败时作为回退，届时会弹出一次 UAC。"""
     req = urllib.request.Request(SEVEN_ZIP_DL, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -214,56 +228,136 @@ def _is_admin():
         return False
 
 
-def _extract_with_tar(extra, dest_dir):
-    """用 Windows 自带 tar.exe（libarchive，支持 7z）解压 extra 包，免管理员权限。"""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(["tar", "-xf", str(extra), "-C", str(dest_dir)],
-                       timeout=180, creationflags=CREATE_NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError(f"tar 解压 extra 包失败（退出码 {r.returncode}）")
+def _app_dir():
+    """程序自身目录：冻结(PyInstaller)时是 exe 所在目录，否则是项目根目录。
+
+    免安装包可以放在这里（便携/绿色用户的常见做法，或安装器随包分发），
+    安装时优先就地取用，无需联网。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _find_local_bundle():
+    """本地免安装包：优先隔离目录，其次程序目录。不存在返回 None。"""
+    for base in (ISOLATED_DIR, _app_dir()):
+        cand = base / BUNDLE_NAME
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _extract_bundle(bundle, tmp_dir):
+    """用标准库 zipfile 解免安装包，只把白名单文件按其 basename 放进隔离 bin。
+
+    只解到私有临时目录、且只认归档成员的 basename（绝不使用归档内路径），
+    借此杜绝 zip-slip：形如 `..\\evil.txt` / `sub/evil.txt` / `other.dll` 的
+    成员一律被忽略。"""
+    extract_dir = tmp_dir / "unpack"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    dest = ISOLATED_BIN.parent
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle) as zf:
+        for member in zf.namelist():
+            name = Path(member).name          # 只取 basename，防 zip-slip
+            if member.endswith("/") or name not in _BUNDLE_WHITELIST:
+                continue
+            target = extract_dir / name
+            with zf.open(member) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+            shutil.copy2(target, dest / name)
 
 
 def install_isolated(progress=None):
-    """下载并静默安装隔离版到 %APPDATA%\\AutoUnpacker\\7z\\bin。
+    """安装隔离版到 %APPDATA%\\AutoUnpacker\\7z\\bin，返回 7z.exe 路径。
 
-    注意：7-Zip 官方安装器 manifest 为 requireAdministrator，即使安装到用户
-    目录也会弹出一次 UAC 授权。确认后经 /S /D= 静默安装到隔离目录，
-    不污染项目目录，也不会写入 Program Files。返回 7z.exe 路径。"""
-    version, installer_url, _extra = latest_release()
-
+    优先走免提权路径：就地取用（隔离目录/程序目录）或下载本仓库的免安装 zip
+    （内含官方 7z.exe + 7z.dll），用标准库 zipfile 解到隔离目录，全程无需管理员
+    授权、不弹 UAC。仅当该路径未产出 7z.exe 时，才回退到官方安装器
+    （requireAdministrator，会弹出一次 UAC）。两种方式都只写入隔离目录，不污染
+    项目目录，也不写入 Program Files。"""
     def _msg(s):
         if progress:
             progress(s)
 
     ISOLATED_DIR.mkdir(parents=True, exist_ok=True)
-    installer = ISOLATED_DIR / f"7z-setup-{uuid.uuid4().hex[:6]}.exe"
-    _msg(f"正在下载 7-Zip {version[0]}.{version[1]:02d}（官网，HTTPS）…")
-    _download(installer_url, installer)
-    _msg("正在安装到隔离目录（若弹出 UAC 请点「是」）…")
-    dest = str(ISOLATED_BIN.parent)
-    need_runas = False
+
+    # latest_release() 会联网，只有确实需要时才调用（本地包场景零网络）
+    _rel = {}
+
+    def _release():
+        if not _rel:
+            v, iu, _bu = latest_release()
+            _rel["version"] = v
+            _rel["installer_url"] = iu
+        return _rel["version"], _rel["installer_url"]
+
+    # ---- 路径一（首选，零 UAC）：本地/下载的免安装 zip + 标准库 zipfile ----
+    local = _find_local_bundle()
+    downloaded = None
+    tmp_dir = None
     try:
-        subprocess.run([str(installer), "/S", f"/D={dest}"],
-                       timeout=300, creationflags=CREATE_NO_WINDOW)
-    except OSError:
-        need_runas = True  # 非提权环境：CreateProcess 返回 740
-    except subprocess.TimeoutExpired:
-        need_runas = True
-    if need_runas:
-        _shell_runas(installer, f"/S /D={dest}")
-    for _ in range(180):  # 最多等 90 秒（提权安装是异步的）
-        if ISOLATED_BIN.exists():
-            break
-        time.sleep(0.5)
-    for _ in range(10):  # 清理安装器（提权进程可能短暂占用）
+        if local is not None:
+            _msg(f"正在使用本地 7-Zip 免安装包（不需要管理员授权）：{local}")
+            bundle = local
+        else:
+            version, _iu = _release()
+            _msg(f"正在下载 7-Zip {version[0]}.{version[1]:02d} 免安装包"
+                 f"（免管理员权限，HTTPS）…")
+            downloaded = ISOLATED_DIR / f"7z-bundle-{uuid.uuid4().hex[:6]}.zip"
+            bundle = _download(BUNDLE_URL, downloaded)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="7z-unpack-", dir=str(ISOLATED_DIR)))
+        _msg("正在解压到隔离目录（不需要管理员授权）…")
+        _extract_bundle(bundle, tmp_dir)
+    except Exception:
+        # 取包/下载/解压任一环节失败都视为首选路径不可用，交给安装器回退
+        pass
+    finally:
+        # 无论成败都清理下载的 zip 与临时解压目录，不留残渣（本地包不删）
+        if downloaded is not None:
+            try:
+                downloaded.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ---- 路径二（回退）：官方安装器（requireAdministrator，会弹一次 UAC） ----
+    if not ISOLATED_BIN.exists():
+        _msg("免管理员安装包不可用，改用官方安装器（可能弹出一次 UAC，请点「是」）…")
+        _version, installer_url = _release()
+        installer = ISOLATED_DIR / f"7z-setup-{uuid.uuid4().hex[:6]}.exe"
+        _download(installer_url, installer)
+        dest = str(ISOLATED_BIN.parent)
+        need_runas = False
         try:
-            installer.unlink(missing_ok=True)
-            break
+            subprocess.run([str(installer), "/S", f"/D={dest}"],
+                           timeout=300, creationflags=CREATE_NO_WINDOW)
         except OSError:
-            time.sleep(1)
+            need_runas = True  # 非提权环境：CreateProcess 返回 740
+        except subprocess.TimeoutExpired:
+            need_runas = True
+        if need_runas:
+            _shell_runas(installer, f"/S /D={dest}")
+        for _ in range(180):  # 最多等 90 秒（提权安装是异步的）
+            if ISOLATED_BIN.exists():
+                break
+            time.sleep(0.5)
+        for _ in range(10):  # 清理安装器（提权进程可能短暂占用）
+            try:
+                installer.unlink(missing_ok=True)
+                break
+            except OSError:
+                time.sleep(1)
+
     invalidate_cache()
     if not ISOLATED_BIN.exists():
-        raise RuntimeError("安装未完成，未生成 7z.exe（UAC 未确认或安装失败）")
+        raise RuntimeError(
+            "隔离版安装未完成：免安装包不可用，官方安装器也未生成 7z.exe"
+            "（UAC 未确认或安装失败）")
     if not check_version_ok(ISOLATED_BIN):
         raise RuntimeError(f"安装成功但版本异常（{version_text(ISOLATED_BIN)}）")
     _msg(f"隔离版安装成功：{ISOLATED_BIN}")

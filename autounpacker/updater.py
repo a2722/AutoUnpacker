@@ -535,6 +535,11 @@ def apply_update(tag, progress_cb=None):
       (STATUS_OK, "更新已开始，程序即将重启") —— 成功进入执行阶段
       (STATUS_FAILED, "错误信息")             —— 任一步骤失败
     """
+    # 冻结（PyInstaller）运行：本函数依赖源码树 + 真实 Python 解释器来覆盖并
+    # 重启，无法就地修补打包产物。直接按既有失败形状拒绝，提示整体替换新版。
+    if getattr(sys, "frozen", False):
+        return STATUS_FAILED, ("当前为打包版本，无法就地自动更新；"
+                               "请下载新版安装包并整体替换。")
     def _progress(done, total):
         if progress_cb:
             pct = int(done * 100 / total) if total else 0

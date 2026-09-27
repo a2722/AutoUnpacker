@@ -394,7 +394,8 @@ class PythonZipEngine:
             # 7-Zip，而不是让 zipfile 抛 BadZipFile 后误报"不是有效的 ZIP 文件"。
             return {"success": False, "used_password": None, "encrypted": False,
                     "error": f"该格式需要 7-Zip（当前不可用）：{fmt} 无法用内置引擎解压",
-                    "logs": [f"检测到 {fmt} 格式，内置 zipfile 引擎无法解压，需要 7-Zip"]}
+                    "logs": [f"检测到 {fmt} 格式，内置 zipfile 引擎无法解压，需要 7-Zip。"
+                             f"安装 7-Zip"]}
         blocked, entries = self._check_declared_bomb(archive, options)
         if blocked is not None:
             # 与 7z 路径同一失败契约：拒绝把炸弹写盘，也不创建输出目录。

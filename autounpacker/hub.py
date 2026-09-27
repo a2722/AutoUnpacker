@@ -221,6 +221,30 @@ class Hub:
         except Exception:
             pass
 
+    def clear_log_files(self):
+        """删除本程序落盘的全部每日日志（paths.LOGS_DIR 下的 *.log），返回删除个数。
+
+        与 `_cleanup_old_logs` 同域：只删程序自己的 `*.log` 文件，**绝不删 logs/
+        目录本身**（目录可能还承载别的运行时文件），也绝不动 crash.log / cache /
+        updates。与 `_write_file` 共用同一把 `_log_lock`：清空进行中不会有追加写
+        插入到遍历中间；目录不存在或已清空时返回 0（幂等）。任何异常都不向 UI 抛。
+        """
+        n = 0
+        try:
+            d = paths.LOGS_DIR
+            if not d.exists():
+                return 0
+            with self._log_lock:
+                for p in d.glob("*.log"):
+                    try:
+                        p.unlink()
+                        n += 1
+                    except OSError:
+                        pass
+        except Exception:
+            n = 0
+        return n
+
     def _write_file(self, line):
         try:
             d = paths.LOGS_DIR

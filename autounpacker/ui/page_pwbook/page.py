@@ -44,6 +44,7 @@ class PasswordBookPage(QWidget):
         self._data = _PwData(state)
         self._rows = []
         self._keyword = ""
+        self._search_applied = ""      # 已生效的搜索词（防抖尾随去重用）
         self._filter = "all"
         # 视图排序状态：默认按命中次数降序（命中多的排最前）；仅重排显示，不写库
         self._sort_col = _PwModel.COL_HITS
@@ -135,6 +136,14 @@ class PasswordBookPage(QWidget):
         self.search = QLineEdit(self)
         self.search.setPlaceholderText("搜索口令 / 来源 / 备注")
         self.search.setFixedWidth(230)
+        # 搜索防抖：键盘连续输入停顿 250ms 后统一过滤一次（与日志页 _search_timer
+        # 同规格）；程序性 setText / clear 仍同步立即生效（见 _on_search_changed）。
+        self._search_user_edit = False
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._flush_search)
+        self.search.textEdited.connect(self._on_search_edited)
         self.search.textChanged.connect(self._on_search_changed)   # 内存过滤，实时生效
         row.addWidget(self.search)
         self.seg_filter = SegControl(self)
@@ -336,6 +345,7 @@ class PasswordBookPage(QWidget):
         return sorted(out, key=key, reverse=(order == Qt.DescendingOrder))
 
     def _apply_filters(self, keep_scroll=False):
+        self._search_applied = self._keyword   # 记录本次已生效的搜索词（防抖尾随用）
         base = [r for r in self._rows if _row_matches(r, self._keyword)]
         picked = [r for r in base if _passes_filter(r, self._filter)]
         picked = self._sorted_rows(picked)
@@ -378,7 +388,24 @@ class PasswordBookPage(QWidget):
     # ---- 交互 ----
     def _on_search_changed(self, text):
         self._keyword = str(text).strip()
+        if self._search_user_edit:
+            # 键盘连续输入：只更新关键词，停顿 250ms 后由 _flush_search 统一过滤一次
+            self._search_user_edit = False
+            self._search_timer.start()
+            return
+        # 程序性变更（setText / clear / 回填）：保持同步立即生效，语义不变
+        self._search_timer.stop()
         self._apply_filters()
+
+    def _on_search_edited(self, _text):
+        """记录「本次变更来自键盘输入」：textEdited 先于 textChanged 触发，且
+        程序性 setText 不发 textEdited（Qt 文档语义），据此合并输入突发。"""
+        self._search_user_edit = True
+
+    def _flush_search(self):
+        """防抖窗口结束：关键词在窗口内又变过才重新过滤（避免重复重建）。"""
+        if self._keyword != self._search_applied:
+            self._apply_filters()
 
     def _on_filter_changed(self, data):
         key = str(data or "all")

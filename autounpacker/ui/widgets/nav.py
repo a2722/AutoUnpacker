@@ -237,7 +237,6 @@ class DirChipStrip(QWidget):
 
     dirActivated = pyqtSignal(int)
     addRequested = pyqtSignal()
-    netdiskRequested = pyqtSignal()
     orderChanged = pyqtSignal(list)      # 拖拽重排：新槽位 -> 原条目索引（排列）
     dragBehaviorRequested = pyqtSignal()  # 点「拖拽行为」固定胶囊（开设置弹窗）
 
@@ -250,6 +249,7 @@ class DirChipStrip(QWidget):
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._chips = []
         self._highlight = -1
+        self._dir_sig = ()           # 上一次 set_dirs 的路径签名（判定是否需要重建）
         self._drag_chip = None       # 正在拖拽的胶囊（None=没有）
         self._anim = None            # 进行中的位移动画组（持引用防被 GC）
         self._drag_enabled = True    # 「拖拽行为」开关态（宿主 set_drag_state 同步）
@@ -284,7 +284,7 @@ class DirChipStrip(QWidget):
         drag_lay.setSpacing(7)
         drag_lay.addWidget(Glyph("bolt", self.drag_btn, 13, role="muted"))
         drag_label = QLabel("拖拽行为", self.drag_btn)
-        drag_label.setObjectName("chipState")   # 复用胶囊小字样式（跟着主题走）
+        drag_label.setObjectName("chipText")    # 说明性文案，不是状态角标（无描边）
         drag_lay.addWidget(drag_label)
         self.drag_state = QLabel("开", self.drag_btn)
         self.drag_state.setObjectName("chipState")
@@ -300,22 +300,24 @@ class DirChipStrip(QWidget):
         lay.addWidget(self._chips_box)
 
         lay.addStretch(1)
-        hint = QLabel("点目录可临时改设置 · 也可把压缩包直接拖进窗口", self)
-        hint.setObjectName("stripHint")
-        lay.addWidget(hint)
-        self.netdisk_btn = LayoutButton(self)
-        self.netdisk_btn.setObjectName("ghostSm")
-        self.netdisk_btn.setCursor(Qt.PointingHandCursor)
-        net_lay = QHBoxLayout(self.netdisk_btn)
-        net_lay.setContentsMargins(0, 0, 0, 0)
-        net_lay.setSpacing(6)
-        net_lay.addWidget(Glyph("download", self.netdisk_btn, 13, role="muted"))
-        net_lay.addWidget(QLabel("网盘下载目录", self.netdisk_btn))
-        self.netdisk_btn.clicked.connect(self.netdiskRequested.emit)
-        lay.addWidget(self.netdisk_btn)
 
     def set_dirs(self, entries):
-        """按 entries（path/enabled/state/progress/name/…）整体重建胶囊。"""
+        """按 entries（path/enabled/state/progress/name/…）整体重建胶囊。
+
+        路径集合与数量都没变时（典型：主题切换、周期性刷新）**不销毁重建**：
+        原地对各胶囊调 set_state 刷新状态灯/状态词/进度即可，既省掉整套 DirChip
+        的析构+重造与布局重排，也保留「在这里」高亮（_highlight 不动）。
+        只有路径集合或数量真的变了才走原来的 clear+重建路径，行为逐字不变。
+        """
+        items = [e for e in (entries or []) if isinstance(e, dict)]
+        sig = tuple(str(e.get("path") or "") for e in items)
+        if sig == self._dir_sig and len(self._chips) == len(items):
+            # 原地刷新：name 传空串（而非 None）以与重建路径一致地清掉旧状态词
+            for chip, entry in zip(self._chips, items):
+                chip.set_state(entry.get("state"), entry.get("progress"),
+                               str(entry.get("name") or ""))
+            return
+        self._dir_sig = sig
         self._stop_chip_anim()       # 旧胶囊即将销毁：先停掉引用它们的动画
         self._drag_chip = None
         _clear_layout(self._chip_lay)

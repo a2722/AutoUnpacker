@@ -284,7 +284,8 @@ class TaskPage(QWidget):
     只持有状态与控件；任务/日志数据的装载由宿主 MainWindow 完成（便于打桩测试）。
     信号：taskActivated(task_id) / taskDoubleClicked(task_id) / taskDeselected() /
           actionTriggered(task_id, kind) / copyRequested() / scopeChanged(scope) /
-          resultFilterChanged(failed) / logScopeChanged(scope) / refreshRequested()
+          resultFilterChanged(failed) / logScopeChanged(scope) / refreshRequested() /
+          clearLogRequested()
     """
 
     taskActivated = pyqtSignal(int)
@@ -296,6 +297,7 @@ class TaskPage(QWidget):
     resultFilterChanged = pyqtSignal(bool)
     logScopeChanged = pyqtSignal(str)
     refreshRequested = pyqtSignal()
+    clearLogRequested = pyqtSignal()      # 「清除日志」：宿主确认后真正清空
 
     def __init__(self, log_view, parent=None):
         super().__init__(parent)
@@ -407,6 +409,10 @@ class TaskPage(QWidget):
         self.copy_btn = _ghost_button("复制", self.split_handle)
         self.copy_btn.clicked.connect(self.copyRequested.emit)
         head.addWidget(self.copy_btn, 0, Qt.AlignVCenter)
+        # 「清除日志」：常显（与选中态无关），宿主确认后统一清空两处视图 + 库 + 文件
+        self.clear_log_btn = _ghost_button("清除日志", self.split_handle)
+        self.clear_log_btn.clicked.connect(self.clearLogRequested.emit)
+        head.addWidget(self.clear_log_btn, 0, Qt.AlignVCenter)
 
         root.addWidget(self.splitter, 1)
         self._split_sized = False
@@ -619,7 +625,8 @@ class LogPage(QWidget):
     """运行日志页：路径多选 + 级别 + 搜索三滤镜（可叠加），右栏统计与「需要处理」。
 
     信号：filtersChanged()（宿主据此重查 db）/ taskActivated(task_id) /
-          actionTriggered(task_id, kind) / notice(text)（导出等用户可见回执）。
+          actionTriggered(task_id, kind) / notice(text)（导出等用户可见回执）/
+          clearRequested()（「清除日志」按钮 -> 宿主确认后统一清空）。
     显示层折叠：7-Zip 原始输出块（起始/收尾标记之间）在视图里折成一行、点击展开；
     不在块内的连续相同日志行（>=_REPEAT_FOLD_MIN 条，正文 = 去掉时间戳 + [第N层]
     前缀）同样合成一行、点击展开。日志文件与生产者不动，过滤/搜索仍作用于原始行
@@ -630,6 +637,7 @@ class LogPage(QWidget):
     taskActivated = pyqtSignal(int)
     actionTriggered = pyqtSignal(int, str)
     notice = pyqtSignal(str)
+    clearRequested = pyqtSignal()         # 「清除日志」：宿主确认后真正清空
 
     _VIEW_ITEMS_MAX = _VIEW_ITEMS_MAX   # 兼容旧引用；折叠模型上限归 FoldController
 
@@ -675,8 +683,11 @@ class LogPage(QWidget):
         self.export_btn = _ghost_button("导出", self)
         self.export_btn.clicked.connect(self._on_export)
         row.addWidget(self.export_btn)
-        self.clear_btn = _ghost_button("清空", self)
-        self.clear_btn.clicked.connect(self._on_clear)
+        self.clear_btn = _ghost_button("清除日志", self)
+        # 只发请求：真正的清空（含确认框）由宿主 clear_logs() 统一执行——本页
+        # _on_clear 仍是视图级清空唯一实现，由宿主在确认后调用，行为不变。
+        # 按钮点击 -> clearRequested 的接线由宿主完成（确认链路须排在旧
+        # _mark_log_dirty 接线之后，见 MainWindow._build_ui）。
         row.addWidget(self.clear_btn)
         root.addLayout(row)
 

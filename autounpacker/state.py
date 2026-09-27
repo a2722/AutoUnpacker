@@ -203,11 +203,17 @@ class AppState:
         if save:
             self._persist()
 
-    def update_path(self, idx, field, value):
+    def update_path(self, idx, field, value, save=True):
+        """改单个监听目录字段；save=False 时只改内存（批量写多字段后统一落盘一次）。
+
+        与 set 同一约定：默认 True 保持原语义（改一次落盘一次）；批量场景先全部
+        save=False，最后一次调用不带 save=False（或显式 _persist）统一写出全部改动，
+        磁盘结果与逐次落盘逐字节一致，只省去 N-1 次 json.dumps + os.replace。"""
         with self.lock:
             if 0 <= idx < len(self.cfg["watch_paths"]):
                 self.cfg["watch_paths"][idx][field] = value
-        self._persist()
+        if save:
+            self._persist()
 
     def set_path(self, idx, entry):
         with self.lock:

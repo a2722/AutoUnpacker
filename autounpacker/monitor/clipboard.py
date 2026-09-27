@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .. import paths
 from ..config import get_bool
+from ..workers import worker_command
 from ..trust import (_host_of, decide_host, remember_auto_domain)
 # 网址边界识别统一走 utils（正向字符集 + 尾部标点规则只有一份）：剪贴板文本
 # 「网址 + 中文说明/提取码」的截断见 utils.split_urls 的文档。
@@ -279,6 +280,16 @@ def _should_capture_temp_password(text, cfg):
         return False
 
 
+def _state_get(state, key, default=None):
+    """读单个配置键：优先用 State.get（只取该键，不做整份深拷贝）；仅对只实现
+    snapshot() 的轻量 state 替身（测试桩）回退到整份快照。生产环境的 State 始终
+    走前一分支，因此轮询热路径不再每 tick 深拷贝整份配置。"""
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return state.snapshot().get(key, default)
+
+
 class QRMonitor(threading.Thread):
     """剪贴板监控：轮询线程只「检测 + 入队」，单独工作线程串行执行阻塞 I/O。
 
@@ -322,7 +333,13 @@ class QRMonitor(threading.Thread):
         # 执行，保证本轮询循环每 0.5s 都能持续检测剪贴板变化。
         threading.Thread(target=self._worker_loop, daemon=True).start()
         while True:
-            cfg = self.state.snapshot()
+            # 只读本轮真正用到的两个开关，不再对整份配置做深拷贝
+            # （旧实现每 0.5s 走一次 snapshot 的 JSON round-trip）。
+            # 缺键时 state.get 返回 None，与 snapshot().get(key) 的取值一致。
+            cfg = {
+                "qr_url_enabled": _state_get(self.state, "qr_url_enabled"),
+                "qr_enabled": _state_get(self.state, "qr_enabled"),
+            }
             self._poll_once(cfg)
             time.sleep(0.5)
 
@@ -367,7 +384,9 @@ class QRMonitor(threading.Thread):
                             and self._qr_deps_ready()):
                         if wc.IsClipboardFormatAvailable(wc.CF_DIB):
                             image = ig.grabclipboard()
-                            if image is not None:
+                            # 仅处理真实 PIL 图片：CF_HDROP（如资源管理器复制文件）时
+                            # grabclipboard() 返回文件路径字符串列表而非图像，直接跳过。
+                            if image is not None and hasattr(image, "save"):
                                 self._process(image)
             except Exception as e:
                 self.hub.log(f"剪贴板监控出错: {e}")
@@ -518,7 +537,14 @@ class QRMonitor(threading.Thread):
                     return None
                 self.last_text = text
                 self._recent_texts.append((time.time(), text[:200]))
-            cfg = self.state.snapshot()
+            # 只读本判定用到的两个开关，避免整份配置深拷贝（见 State.get）。
+            # bool(...) 与 get_bool 语义一致：缺省分别取 True / False。
+            cfg = {
+                "url_exclude_temp_password":
+                    bool(_state_get(self.state, "url_exclude_temp_password", True)),
+                "temp_password_filter":
+                    bool(_state_get(self.state, "temp_password_filter", False)),
+            }
             # 是否记录为临时密码：受「智能过滤」「网址排除」两个开关控制
             if _should_capture_temp_password(text, cfg):
                 added = self.state.add_temp_password(text)
@@ -543,7 +569,7 @@ class QRMonitor(threading.Thread):
         import subprocess
         try:
             proc = subprocess.run(
-                [sys.executable, str(self.clipboard_worker_path)],
+                worker_command("clipboard"),
                 timeout=8, input=text.encode("utf-8"),
                 capture_output=True, creationflags=0x08000000,  # CREATE_NO_WINDOW
             )
@@ -623,7 +649,15 @@ class QRMonitor(threading.Thread):
         """轮询线程侧：剪贴板图片按 md5 去重后入队，解码交给工作线程。
 
         去重必须留在轮询线程：否则未变化的剪贴板图片会每 0.5s 重复入队，很快
-        淹没 task_q。仅在图片确实变化（哈希不同）时入队一次。"""
+        淹没 task_q。仅在图片确实变化（哈希不同）时入队一次。
+
+        防御性收口：Pillow 的 grabclipboard() 在 Windows 上返回
+        Image.Image | list[str] | None；剪贴板为文件引用（CF_HDROP，如资源管理器
+        复制文件）时返回文件路径字符串列表（它同时通告了 CF_DIB 缩略图，故能绕过
+        调用点的 CF_DIB 判断）。非真实图片（None / list 等无 save 方法者）直接返回，
+        避免 image.save 抛 'list' object has no attribute 'save'。"""
+        if image is None or not hasattr(image, "save"):
+            return
         import hashlib
         from io import BytesIO
         buf = BytesIO()
@@ -910,7 +944,7 @@ class QRMonitor(threading.Thread):
         try:
             try:
                 proc = subprocess.run(
-                    [sys.executable, str(self.qr_worker_path), path],
+                    worker_command("qr", path),
                     timeout=20, capture_output=True,
                     creationflags=0x08000000,  # CREATE_NO_WINDOW
                 )

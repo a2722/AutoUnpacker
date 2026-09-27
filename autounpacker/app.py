@@ -26,13 +26,15 @@ from .monitors import FolderWatcher, QRMonitor, QR_AVAILABLE
 # 解码引擎（cv2 / pyzbar）惰性探测的公共入口（只 find_spec，不 import 原生库）
 from .monitor.clipboard import ensure_qr_deps
 
-# 把项目根目录加入 DLL 搜索路径（pyzbar 依赖 libzbar-64.dll / libiconv.dll，
-# DLL 位于项目根目录）
+# 把原生 DLL 所在目录加入 DLL 搜索路径（pyzbar 依赖 libzbar-64.dll /
+# libiconv.dll）：源码运行是项目根目录；冻结运行时为 PyInstaller 解包目录与
+# exe 所在目录（paths.dll_dirs() 逐个给出，逐目录吞掉失败）。
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-    try:
-        os.add_dll_directory(str(paths.PROJECT_ROOT))
-    except OSError:
-        pass
+    for _dll_dir in paths.dll_dirs():
+        try:
+            os.add_dll_directory(str(_dll_dir))
+        except OSError:
+            pass
 
 
 def _ensure_qt_platform_plugins():
@@ -127,6 +129,23 @@ def _write_update_handshake():
 
 
 def main():
+    # 冻结运行下的 worker 自律式分发：PyInstaller 打包后 sys.executable 是本程序
+    # exe，worker_command() 以 [exe, "--run-worker", name, *args] 拉起子进程；这里
+    # 必须在任何 Qt 导入、单实例检测、crash.log 安装之前转交给对应 worker，否则
+    # 子进程会重开 GUI。未命中时 argv 原样保留，源码运行路径完全不受影响。
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run-worker":
+        _worker_name = sys.argv[2]
+        sys.argv = [sys.argv[0], *sys.argv[3:]]
+        if _worker_name == "qr":
+            from .workers import qr_worker as _worker
+        elif _worker_name == "clipboard":
+            from .workers import clipboard_worker as _worker
+        else:
+            print(f"未知工作进程: {_worker_name}")
+            sys.exit(2)
+        _worker_rc = _worker.main()
+        sys.exit(0 if _worker_rc is None else _worker_rc)
+
     if sys.platform != "win32":
         print("此程序仅支持 Windows")
         return 1
@@ -306,8 +325,10 @@ def main():
     QTimer.singleShot(900, _sync_theme_after_show)
 
     # 首次启动：后台检测 7-Zip（仅首次或手动「立即检查」，其他时间不检查以免阻塞）
+    # 注意：这里**不预先**置 sevenzip_check_done；是否算「已检测」由引导结束时的
+    # 结果决定（探测 ok / 显式跳过 / 直接关闭 / 安装成功才置 True；安装失败保持
+    # False，下次启动再问）。语义见 _first_run_7z_check / _sevenzip_should_mark_done。
     if not cfg.get("sevenzip_check_done", False):
-        state.set("sevenzip_check_done", True)
         QTimer.singleShot(1200, lambda: _first_run_7z_check(state, hub, win))
 
     # 二维码解码引擎（cv2 / pyzbar）是惰性探测的：这里显式探测一次，让下面这条

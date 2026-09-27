@@ -18,8 +18,8 @@ import threading
 import time
 import types
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QSystemTrayIcon, QMenu, QShortcut, QMessageBox, QStackedWidget, QDialog, QScrollArea, QFrame)  # noqa: F401
-from PyQt5.QtCore import Qt, QTimer, QEvent
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QSystemTrayIcon, QMenu, QShortcut, QMessageBox, QStackedWidget, QDialog, QScrollArea, QFrame, QLabel)  # noqa: F401
+from PyQt5.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QTextCursor, QTextCharFormat, QColor, QCursor
 
 from .. import extract as smart_extract    # noqa: F401
@@ -38,14 +38,14 @@ from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,  # noqa: 
 from .widgets import (WatchCard,  # noqa: F401  （M3 起主界面不再创建，保留给目录弹窗/后续里程碑）
                       RainbowBorderButton,  # noqa: F401  （M3 起主界面不再使用，保留导入）
                       make_tray_icon, _HotkeyFilter, NavTabs, DirChipStrip,
-                      show_toast)
+                      show_toast, Glyph)
 from . import style as ui_style
 from .style import PALETTE
 from . import pages as ui_pages
 from .pages import TaskPage, LogPage, StatusBar
 from .page_pwbook import PasswordBookPage
 from .page_trail import TrailPage
-from .page_settings import SettingsPage
+from .page_settings import SettingsPage, _apply_card_shadow
 from .dialogs import (SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
                       DragBehaviorDialog, TaskDetailsDialog, Scrim)
@@ -158,6 +158,150 @@ def push_pending_trust(requests, req):
     if dropped:
         out = out[dropped:]
     return out, dropped
+
+
+class _ClearLogsConfirmBox(QMessageBox):
+    """「清除日志」自绘确认模态（QMessageBox#modalCard，与「恢复默认」同一套自绘卡）。
+
+    保留 QMessageBox.exec_() 语义，外观自建：头（标题 + ✕）/ 警告块（清除范围）/
+    说明行（QLabel#stripHint）/ 页脚（取消 + 清除日志 #primary）。确认返回 True；
+    取消 / Esc / ✕ 返回 False。样式全部来自既有 QSS（#modalCard / #warnBox /
+    #warnText / #primary），不硬编码任何颜色。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("modalCard")
+        self.setWindowTitle("清除日志")
+        self.setIcon(QMessageBox.NoIcon)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setModal(True)
+        self._confirmed = False
+        # 隐藏标准按钮（保留 QMessageBox 契约：buttons()/clickedButton() 仍可用）
+        self._ok_btn = self.addButton("清除日志", QMessageBox.AcceptRole)
+        self._cancel_btn = self.addButton("取消", QMessageBox.RejectRole)
+        for b in (self._ok_btn, self._cancel_btn):
+            b.hide()
+        for name in ("qt_msgbox_label", "qt_msgbox_informativelabel",
+                     "qt_msgboxex_icon_label"):
+            w = self.findChild(QLabel, name)
+            if w is not None:
+                w.hide()
+        try:
+            from PyQt5.QtWidgets import QDialogButtonBox
+            bb = self.findChild(QDialogButtonBox)
+            if bb is not None:
+                bb.hide()
+        except Exception:
+            pass
+
+        host = QWidget(self)
+        v = QVBoxLayout(host)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # 头：标题 + 关闭
+        head = QFrame(host)
+        head.setObjectName("modalHead")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(16, 14, 16, 14)
+        hl.setSpacing(10)
+        title = QLabel("清除日志", head)
+        title.setObjectName("modalTitle")
+        hl.addWidget(title)
+        hl.addStretch(1)
+        close_btn = QPushButton(head)
+        close_btn.setObjectName("modalClose")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("取消")
+        cl = QHBoxLayout(close_btn)
+        cl.setContentsMargins(0, 0, 0, 0)
+        glyph = Glyph("close", close_btn, 12, role="muted")
+        glyph.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        cl.addWidget(glyph, 0, Qt.AlignCenter)
+        close_btn.clicked.connect(self.reject)
+        hl.addWidget(close_btn)
+        v.addWidget(head)
+
+        # 体：警告块 + 范围说明
+        body = QWidget(host)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(16, 16, 16, 16)
+        bl.setSpacing(12)
+        warn = QFrame(body)
+        warn.setObjectName("warnBox")
+        wl = QHBoxLayout(warn)
+        wl.setContentsMargins(12, 10, 12, 10)
+        wl.setSpacing(10)
+        wicon = Glyph("alert", warn, 16, role="muted")
+        wl.addWidget(wicon, 0, Qt.AlignTop)
+        wtext = QLabel("清除日志会删除全部运行日志与落盘日志文件，且不能撤销。",
+                       warn)
+        wtext.setObjectName("warnText")
+        wtext.setWordWrap(True)
+        wl.addWidget(wtext, 1)
+        bl.addWidget(warn)
+        hint = QLabel("只清除日志：任务记录、密码本、设置与删除回溯不受影响。", body)
+        hint.setObjectName("stripHint")
+        hint.setWordWrap(True)
+        bl.addWidget(hint)
+        v.addWidget(body)
+
+        # 脚：取消 + 清除日志（右对齐；#primary 走 QSS 主题色）
+        foot = QFrame(host)
+        foot.setObjectName("modalFoot")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(16, 12, 16, 12)
+        fl.setSpacing(10)
+        fl.addStretch(1)
+        cancel_btn = QPushButton("取消", foot)
+        cancel_btn.clicked.connect(self.reject)
+        fl.addWidget(cancel_btn)
+        clear_btn = QPushButton("清除日志", foot)
+        clear_btn.setObjectName("primary")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.clicked.connect(self._on_confirm)
+        fl.addWidget(clear_btn)
+        v.addWidget(foot)
+
+        # 自建内容占据原「按钮盒」那一行（隐藏项不参与布局）
+        try:
+            self.layout().addWidget(host, 3, 0, 1, 2)
+        except Exception:
+            pass
+        host.setMinimumWidth(448)
+        try:
+            _apply_card_shadow(self, "pop")
+        except Exception:
+            pass
+
+    def showEvent(self, event):   # noqa: N802 (Qt 命名)
+        super().showEvent(event)
+        try:
+            self.setFixedWidth(480)
+        except Exception:
+            pass
+
+    def _on_confirm(self):
+        self._confirmed = True
+        self.accept()
+
+    def confirmed(self):
+        """确认返回 True；取消 / Esc / ✕ / 未作选择返回 False。"""
+        if self._confirmed:
+            return True
+        return self.clickedButton() is self._ok_btn
+
+    @classmethod
+    def ask(cls, parent=None):
+        """弹出确认并返回布尔；构造/执行失败一律按「取消」处理（绝不抛进 UI）。"""
+        try:
+            box = cls(parent)
+            box.exec_()
+            return bool(box.confirmed())
+        except Exception:
+            return False
 
 
 class MainWindow(QMainWindow):
@@ -381,7 +525,6 @@ class MainWindow(QMainWindow):
         self.chip_strip = DirChipStrip(central)
         self.chip_strip.dirActivated.connect(self._on_chip_dir_activated)
         self.chip_strip.addRequested.connect(self._add_path)
-        self.chip_strip.netdiskRequested.connect(self._add_baidu_download_dir)
         self.chip_strip.orderChanged.connect(self._on_chip_order_changed)
         self.chip_strip.dragBehaviorRequested.connect(
             self._open_drag_behavior_dialog)
@@ -414,6 +557,8 @@ class MainWindow(QMainWindow):
         self.task_page.resultFilterChanged.connect(self._set_failed_filter)
         self.task_page.logScopeChanged.connect(lambda _s: self._refill_task_log())
         self.task_page.refreshRequested.connect(self._refresh_all)
+        # 任务页「该任务日志」头部的「清除日志」：与运行日志页同一个宿主入口
+        self.task_page.clearLogRequested.connect(self._on_clear_logs_requested)
         self.pages.addWidget(_make_scrollable_page(self.task_page))
 
         self.log_page = LogPage(self._append_log_to, self.pages)
@@ -421,9 +566,17 @@ class MainWindow(QMainWindow):
         self.log_page.taskActivated.connect(self._on_need_task_activated)
         self.log_page.actionTriggered.connect(self._on_needs_action)
         self.log_page.notice.connect(self._append_log)
-        # 「清空」是显式动作：下一次切回日志页时重查一次（保持既有行为）
+        # 「清除日志」：旧「清空」接线保留（下一次切回日志页仍会重查一次，兼容既有
+        # 行为）；真正清空走确认框 -> clear_logs()（两个按钮共用同一个宿主入口）。
+        # 两个 clicked 槽按顺序接线：_mark_log_dirty 先跑、确认链路后跑——clear_logs()
+        # 总在最后执行，缓存标记收尾一致，切页不会再用旧行重画。
         try:
             self.log_page.clear_btn.clicked.connect(self._mark_log_dirty)
+        except Exception:
+            pass
+        try:
+            self.log_page.clear_btn.clicked.connect(self.log_page.clearRequested.emit)
+            self.log_page.clearRequested.connect(self._on_clear_logs_requested)
         except Exception:
             pass
         # 运行日志页也接入同一套悬停/点击管线（渲染器已共用，事件过滤在这里补齐）
@@ -615,7 +768,7 @@ class MainWindow(QMainWindow):
         tmp = Path(tempfile.gettempdir()) / ("autounpacker_drop_qr_%d.png"
                                              % int(time.time() * 1000))
         try:
-            saved = bool(image.save(str(tmp), "PNG"))
+            saved = bool(hasattr(image, "save") and image.save(str(tmp), "PNG"))
         except Exception as ex:
             saved = False
             self._append_log(f"[拖放] 拖入图片保存失败: {ex}")
@@ -1173,7 +1326,7 @@ class MainWindow(QMainWindow):
             pass
 
     def rebuild_cards(self):
-        """兼容旧入口（_add_path/_remove_path/_add_baidu_download_dir/主题切换都会调）：
+        """兼容旧入口（_add_path/_remove_path/主题切换都会调）：
 
         M3 起不再创建 WatchCard 卡列表，改为刷新目录胶囊条与日志页筛选 chips；
         只有路径集合变化时才重建 chips（主题切换等场景不丢用户的选择）。"""
@@ -1439,6 +1592,95 @@ class MainWindow(QMainWindow):
             tp.set_log_empty(not rows, tp.log_empty_copy())
         except Exception:
             pass
+
+    def _on_clear_logs_requested(self):
+        """两个「清除日志」按钮的唯一宿主入口：先自绘确认，确认后才真正清空。
+
+        确认框只在这一层；`clear_logs()` 自身不弹窗（可被脚本/托盘路径直接调用）。"""
+        if getattr(self, "_logs_clearing", False):
+            return
+        if _ClearLogsConfirmBox.ask(self):
+            self.clear_logs()
+
+    def clear_logs(self):
+        """真正清空日志（不经确认框，可独立调用）：两处视图 + 折叠态 + 库 + 落盘文件。
+
+        清空范围（只动日志，其他一律不碰）：
+        - 运行日志页：复用 `LogPage._on_clear()`（视图 + 折叠 + `_records` + 空态），
+          并把级别分段计数立即归零；
+        - 「该任务日志」：`log_box_folds.reset()` + `log_box.clear()` + 空态文案
+          （按当前范围取 `log_empty_copy()`，与 `_refill_task_log` 同口径）；
+        - 数据库：`db.clear_logs()`（仅 log_index；tasks / passwords 一律不动）；
+        - 文件：`Hub.clear_log_files()`（仅 logs/*.log；目录、crash.log 等不动）；
+        - 缓存：`_log_cache_dirty` / `_log_counts_dirty` 清为 False 并把签名对齐当前
+          滤镜——下一次切回日志页不会用旧行重画；`_meta_cache_dirty` 置脏后立即重算，
+          统计 / 「需要处理」/ 徽标按清空后的库刷新；
+        - 回执：`hub.log("日志已清除")` 恰好一行（两处视图都经既有管线看到）。
+        """
+        if getattr(self, "_logs_clearing", False):   # 防重入（确认框回调/连点）
+            return
+        self._logs_clearing = True
+        try:
+            lp = getattr(self, "log_page", None)
+            # 1) 运行日志页：复用本页唯一清空路径，绝不复制其逻辑
+            if lp is not None:
+                try:
+                    lp._on_clear()
+                except Exception:
+                    pass
+                try:
+                    lp.set_level_counts([])          # 级别分段计数立即归零
+                except Exception:
+                    pass
+            # 2) 「该任务日志」：折叠先复位（event filter 已装在 viewport 上，不可重建）
+            try:
+                self.log_box_folds.reset()
+            except Exception:
+                pass
+            try:
+                self.log_box.clear()
+            except Exception:
+                pass
+            try:
+                self.task_page.set_log_empty(True, self.task_page.log_empty_copy())
+            except Exception:
+                pass
+            # 3) 数据库：仅删 log_index 全表
+            try:
+                db.clear_logs()
+            except Exception:
+                pass
+            # 4) 落盘日志文件：仅删 logs/*.log（在 hub 写锁内，幂等）
+            try:
+                clearer = getattr(self.hub, "clear_log_files", None)
+                if callable(clearer):
+                    clearer()
+            except Exception:
+                pass
+            # 5) 缓存标记收尾：视图 == 清空后的库快照；下次访问按真实数据重算
+            try:
+                self._log_cache_dirty = False
+                self._log_counts_dirty = False
+                self._meta_cache_dirty = True
+                if lp is not None:
+                    self._log_cache_sig = (lp.levels(), frozenset(lp.sources() or ()),
+                                           lp.keyword(), self._log_limit())
+            except Exception:
+                pass
+            # 6) 恰好一行用户可见回执（走 Hub 正常管线：落盘 + 入队 + 写 log_index）
+            try:
+                log = getattr(self.hub, "log", None)
+                if callable(log):
+                    log("日志已清除")
+            except Exception:
+                pass
+            # 7) 立即重算统计 / 「需要处理」/ 徽标（今日日志数已随清空归零）
+            try:
+                self._refresh_meta(force=True)
+            except Exception:
+                pass
+        finally:
+            self._logs_clearing = False
 
     def _select_task(self, task_id, name=None):
         """选中任务（None = 清空）：更新徽标 + 重装该任务日志。"""
@@ -2166,11 +2408,23 @@ class MainWindow(QMainWindow):
         return False
 
     def _on_log_action(self, url):
-        """日志里的应用内动作链接：app://settings/<domain> -> 跳转设置页对应领域。
+        """日志里的应用内动作链接。
 
-        动作链接只跳转：不复制、不降级（它永远可再点，与 http 链接「点一次即复制并
-        灰掉」的语义不同）。"""
+        - `app://settings/<domain>` -> 跳转设置页对应领域；
+        - `app://sevenzip/manage`   -> 直接开「7-Zip 管理」引导（解压报错现场的
+          一键安装入口，与设置页「7-Zip 管理…」共用同一个公开入口）。
+
+        动作链接只跳转/只开窗：不复制、不降级（它永远可再点，与 http 链接「点一次
+        即复制并灰掉」的语义不同）。"""
         target = str(url or "")[len(_APP_LINK_PREFIX):]
+        if target.startswith("sevenzip"):
+            # 报错现场一键安装：复用设置页同一入口，不在这里重复一份构造逻辑
+            try:
+                from .dialogs.sevenzip import open_sevenzip_manage
+                open_sevenzip_manage(self.state, self.hub, self)
+            except Exception:
+                pass
+            return
         if not target.startswith("settings"):
             return
         try:
@@ -2320,13 +2574,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         # 已画出的日志行内联色是渲染时写死的：按新调色板逐块重画（保留已复制
-        # 链接的降级状态），否则切主题后旧行仍是旧色（F3e）。
+        # 链接的降级状态），否则切主题后旧行仍是旧色（F3e）。逐块重画最多 3000 行
+        # ×2 个视图，实测约 100ms/视图；改为 singleShot(0) 延后，让上面的 QSS 重套
+        # 先完成、窗口立即以新主题重绘，再补这一遍文字着色（完成后视觉与原来一致）。
+        def _deferred_rerender_logs():
+            try:
+                _rerender_log_view(self, getattr(self, "log_box", None))
+            except Exception:
+                pass
+            try:
+                _rerender_log_view(self, self.log_page.log_view)
+            except Exception:
+                pass
         try:
-            _rerender_log_view(self, getattr(self, "log_box", None))
-        except Exception:
-            pass
-        try:
-            _rerender_log_view(self, self.log_page.log_view)
+            QTimer.singleShot(0, _deferred_rerender_logs)
         except Exception:
             pass
         try:
@@ -2475,30 +2736,15 @@ class MainWindow(QMainWindow):
         # 页面最小高度变了：窗口最小尺寸需要按新 hint 重算一次
         self._apply_screen_limits()
 
-    def _chrome_hint_label(self):
-        """胶囊条说明文案标签（对象名 stripHint），缓存引用避免每次重找。"""
-        lbl = getattr(self, "_chrome_hint_lbl", None)
-        if lbl is None:
-            try:
-                lbl = self.chip_strip.findChild(QWidget, "stripHint")
-            except Exception:
-                lbl = None
-            self._chrome_hint_lbl = lbl
-        return lbl
-
     def _apply_chrome_compact(self):
         """窗口过窄时收起次要装饰（响应式），保证常显控件一个都不被裁切。
 
-        阈值 _CHROME_COMPACT_W 来自两条常显栏的自然宽度（胶囊条含提示文案
-        ≈794 逻辑像素、底栏含 336px 播报 ≈853）。窄于该量级时收起「提示
-        文案 + 播报 + 使用提示标签」这类装饰；真实控件（添加目录 / 胶囊 /
-        状态 / 进度 / 失败 / 快捷键）永不隐藏。
+        阈值 _CHROME_COMPACT_W 来自两条常显栏的自然宽度（胶囊条、底栏含
+        336px 播报 ≈853）。窄于该量级时收起「底栏播报 + 使用提示标签」这类
+        装饰；真实控件（添加目录 / 胶囊 / 状态 / 进度 / 失败 / 快捷键）永不隐藏。
         """
         try:
             compact = int(self.width()) < _CHROME_COMPACT_W
-            hint = self._chrome_hint_label()
-            if hint is not None:
-                hint.setVisible(not compact)
             sb = getattr(self, "statusbar", None)
             if sb is not None:
                 for name in ("ticker", "tip_icon", "tip_label"):
@@ -4141,25 +4387,106 @@ class MainWindow(QMainWindow):
             pass
 
 
+def _sevenzip_should_mark_done(status, outcome):
+    """首次 7-Zip 引导结束后是否可把 sevenzip_check_done 置 True（纯函数，便于离线测试）。
+
+    产品确认语义：「跳过不再问，失败下次再问」。判定：
+      - 探测状态已 ok：无需引导，任何 outcome 都算完成；
+      - 用户显式点了「跳过」（outcome="skipped"）：完成，下次不再问；
+      - 用户直接关闭对话框、且没有失败安装（outcome="closed"）：完成；
+      - 安装成功（outcome="installed"）：完成；
+      - 有安装尝试且失败（outcome="failed"）：**保持 False**，下次启动再问。
+
+    status 取 check_environment() 的 status（ok/low/none）；outcome 取对话框的
+    .outcome（installed/skipped/closed/failed）。"""
+    if status == "ok":
+        return True
+    return outcome in ("installed", "skipped", "closed")
+
+
+class _SevenZipCheckBridge(QObject):
+    """首次 7-Zip 检测的「工作线程 -> 主线程」桥：信号跨线程是队列投递，可靠。
+
+    为什么必须有它：绝不在工作线程里用 QTimer.singleShot —— 那个线程没有事件
+    循环，定时器永远不触发、回调不执行（同 page_settings 更新任务的旧坑）。
+    首次运行的 7-Zip 引导曾因此在**真实干净机器上根本不弹**：客户机实测日志有
+    「首次启动检测: 7-Zip none」，但对话框从未出现。"""
+
+    checked = pyqtSignal(object)        # payload：check_environment() 结果 dict
+
+    def __init__(self, state, hub, parent):
+        super().__init__()              # 在主线程创建 → 槽也在主线程执行
+        self.state = state
+        self.hub = hub
+        self.parent = parent
+        self.checked.connect(self._on_checked)
+
+    def _on_checked(self, info):
+        """在主线程处理检测结果：ok/探测失败直接标记完成；否则弹安装引导。"""
+        try:
+            if info is None:
+                # 探测本身失败（纯本地读取失败）：这次既不引导也不标记完成，
+                # 下次启动再试一次；因为不弹窗，也不会打扰用户。
+                return
+            if info.get("status") == "ok":
+                # 无需引导；直接标记完成（state.set 持锁，线程安全）
+                try:
+                    self.state.set("sevenzip_check_done", True)
+                except Exception:
+                    pass
+                return
+            self.hub.log(f"首次启动检测: 7-Zip {info.get('status')}"
+                         + (f"（{info['version_str']}）"
+                            if info.get("version_str") else ""))
+            host = self.parent
+            try:
+                # 精简模式下主窗隐藏：模态窗改挂可见的小窗，避免孤立/不可见
+                if getattr(self.parent, "is_compact", lambda: False)():
+                    host = getattr(self.parent, "_compact_window", None) or self.parent
+            except Exception:
+                host = self.parent
+            dlg = SevenZipSetupDialog(self.state, self.hub, info, host,
+                                      mode="first_run")
+            dlg.exec_()
+            if _sevenzip_should_mark_done(info.get("status"),
+                                          getattr(dlg, "outcome", "closed")):
+                self.state.set("sevenzip_check_done", True)
+        except Exception as e:
+            try:
+                self.hub.log(f"7-Zip 引导异常: {e}")
+            except Exception:
+                pass
+
+
 def _first_run_7z_check(state, hub, parent):
     """首次启动的 7-Zip 检查：缺失/过低时弹窗询问安装方式。
 
-    在后台线程检测（7z 未装时纯文件系统判断，装了时一次 7z i），
-    不阻塞启动；结果只在需要处理时才在主线程弹窗。"""
+    在后台线程检测（7z 未装时纯文件系统判断，装了时一次 7z i），不阻塞启动；
+    结果经 `_SevenZipCheckBridge` 的信号投递回主线程后才弹窗（绝不跨线程碰 UI，
+    也不用 QTimer.singleShot —— 那在工作线程里永不触发）。精简（compact）模式下
+    主窗是隐藏的，模态对话框改挂到可见的小窗（_compact_window）。
+    `sevenzip_check_done` 只在「探测 ok / 显式跳过 / 直接关闭 / 安装成功」时
+    写入 True；安装尝试失败时保持 False，下次启动再问（见
+    _sevenzip_should_mark_done）。全程异常安全，绝不阻断启动。"""
+    # 桥必须在主线程创建（本函数由 app.main 的主线程定时器调用），其槽才会在主
+    # 线程执行；引用挂到主窗上，避免本函数返回后桥被回收导致信号连接失效。
+    bridge = _SevenZipCheckBridge(state, hub, parent)
+    try:
+        parent._sevenzip_check_bridge = bridge
+    except Exception:
+        pass
+
     def worker():
+        info = None
         try:
             info = sevenzip_manager.check_environment()
         except Exception as e:
-            hub.log(f"首次 7-Zip 检查失败: {e}")
-            return
-        if info["status"] == "ok":
-            return
-        hub.log(f"首次启动检测: 7-Zip {info['status']}"
-                + (f"（{info['version_str']}）" if info["version_str"] else ""))
-        def show():
-            dlg = SevenZipSetupDialog(state, hub, info, parent)
-            dlg.exec_()
-        QTimer.singleShot(0, show)
+            try:
+                hub.log(f"首次 7-Zip 检查失败: {e}")
+            except Exception:
+                pass
+        bridge.checked.emit(info)       # 跨线程 emit：队列投递到主线程
+
     threading.Thread(target=worker, daemon=True).start()
 
 

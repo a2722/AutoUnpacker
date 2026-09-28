@@ -674,7 +674,7 @@ class CompactWindow(QWidget):
         try:
             files, _selected = QFileDialog.getOpenFileNames(
                 self, "添加文件", "",
-                "压缩包 (*.zip *.rar *.7z *.tar *.gz *.bz2 *.xz *.001);;所有文件 (*.*)")
+                "所有文件 (*.*);;压缩包 (*.zip *.rar *.7z *.tar *.gz *.bz2 *.xz *.001)")
         except Exception:
             files = []
         for name in files or []:

@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """一键把本项目打成 Windows 绿色版（PyInstaller onedir）。
 
-做四件事：
-1. 用程序自己的托盘图标画一份 build_assets\\AutoUnpacker.ico（离屏渲染，不弹窗）；
-2. 从 autounpacker.__version__ 生成 Windows 版本信息资源 build_assets\\version_info.txt；
-3. 调 PyInstaller 跑仓库根的 AutoUnpacker.spec，产出 dist\\AutoUnpacker\\；
-4. --zip 时再打成 dist\\AutoUnpacker-<版本>-win64.zip，方便拷到干净机器上试。
+做这几件事：
+1. 调 tools\\gen_ca_bundle.py 从本机 ROOT/CA 存储导出 build_assets\\cacert.pem
+   （失败只警告：干净机器/证书存储读取受限时也不阻断打包）；
+2. 用程序自己的托盘图标画一份 build_assets\\AutoUnpacker.ico（离屏渲染，不弹窗）；
+3. 从 autounpacker.__version__ 生成 Windows 版本信息资源 build_assets\\version_info.txt；
+4. 调 PyInstaller 跑仓库根的 AutoUnpacker.spec，产出 dist\\AutoUnpacker\\；
+5. 把 dist\\AutoUnpacker-7zip.zip 复制到 dist\\AutoUnpacker\\（exe 旁），
+   让冻结包离线自足（源文件缺失则静默跳过）；
+6. --zip 时再打成 dist\\AutoUnpacker-<版本>-win64.zip，方便拷到干净机器上试。
 
 为什么图标要自己生成：本项目没有任何图片资源，窗口 / 托盘图标是 QPainter 画的
 （ui/widgets/inputs.py 的 make_tray_icon），所以 exe 图标也从同一处取，保证一致。
@@ -32,6 +36,37 @@ def _version() -> str:
     sys.path.insert(0, str(ROOT))
     import autounpacker
     return autounpacker.__version__
+
+
+def _gen_ca_bundle() -> bool:
+    """调 tools\\gen_ca_bundle.py 生成 build_assets\\cacert.pem。失败只警告，不阻断打包。"""
+    script = ROOT / "tools" / "gen_ca_bundle.py"
+    if not script.exists():
+        print("  [warn] 找不到 %s，跳过 CA 证书包" % script)
+        return False
+    try:
+        rc = subprocess.run([sys.executable, str(script)],
+                            cwd=str(ROOT)).returncode
+    except OSError as e:
+        print("  [warn] 生成 CA 证书包失败：%s" % e)
+        return False
+    if rc != 0:
+        print("  [warn] 生成 CA 证书包失败 rc=%d（继续打包）" % rc)
+        return False
+    return True
+
+
+def _copy_bundle_next_to_exe() -> bool:
+    """把 dist\\AutoUnpacker-7zip.zip 复制到 dist\\AutoUnpacker\\（exe 旁），便于离线取用。
+
+    源文件不存在时静默跳过（还没跑过 tools\\make_7zip_bundle.py），绝不让打包失败。"""
+    src = ROOT / "dist" / "AutoUnpacker-7zip.zip"
+    if not src.is_file():
+        return False
+    dst = DIST / src.name
+    shutil.copy2(str(src), str(dst))
+    print("      7-Zip 免安装包已放到 exe 旁：%s" % dst)
+    return True
 
 
 def _gen_icon() -> bool:
@@ -112,9 +147,10 @@ def main(argv: list[str]) -> int:
     want_zip = "--zip" in argv
     v = _version()
     print("=== AutoUnpacker %s 打包（onedir） ===" % v)
-    print("[1/4] 生成 exe 图标      :", "OK" if _gen_icon() else "跳过")
-    print("[2/4] 生成版本信息资源  :", "OK" if _gen_version_info(v) else "跳过")
-    print("[3/4] 调 PyInstaller ...")
+    print("[1/5] 生成 CA 证书包    :", "OK" if _gen_ca_bundle() else "跳过（仅警告）")
+    print("[2/5] 生成 exe 图标      :", "OK" if _gen_icon() else "跳过")
+    print("[3/5] 生成版本信息资源  :", "OK" if _gen_version_info(v) else "跳过")
+    print("[4/5] 调 PyInstaller ...")
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm"]
     if clean:
         cmd.append("--clean")
@@ -130,9 +166,11 @@ def main(argv: list[str]) -> int:
     if not DIST.exists() or not exe.exists():
         print("!! 未产出 %s" % exe)
         return 3
+    # 让 7-Zip 免安装包也躺在 exe 旁（可在 --zip 前生效，随 zip 一起分发）
+    _copy_bundle_next_to_exe()
     files = [p for p in DIST.rglob("*") if p.is_file()]
     total = sum(p.stat().st_size for p in files)
-    print("[4/4] 产物 : %s" % DIST)
+    print("[5/5] 产物 : %s" % DIST)
     print("      文件数 %d，合计 %.1f MB，exe 本体 %.1f MB"
           % (len(files), total / 1048576.0, exe.stat().st_size / 1048576.0))
     if want_zip:

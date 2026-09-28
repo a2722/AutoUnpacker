@@ -11,7 +11,7 @@ UI 线程绝不直接跑子进程。网络下载只发生在用户点击后，�
 import threading
 
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                             QDialog)
+                             QFileDialog, QDialog)
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from ... import sevenzip as sevenzip_manager
@@ -111,13 +111,19 @@ class SevenZipSetupDialog(QDialog):
         self.isolated_btn.clicked.connect(lambda: self._install("isolated"))
         self.global_btn = QPushButton("下载安装全局版")
         self.global_btn.clicked.connect(lambda: self._install("global"))
+        self.local_btn = QPushButton("使用本地 7-Zip 包…")
+        self.local_btn.setToolTip(
+            "选择已下载的 AutoUnpacker-7zip.zip，离线安装隔离版（零网络）。")
+        self.local_btn.clicked.connect(self._install_local)
         self.skip_btn = QPushButton("跳过，仅使用 ZIP")
         self.skip_btn.clicked.connect(self._skip)
         row.addWidget(self.isolated_btn)
         row.addWidget(self.global_btn)
+        row.addWidget(self.local_btn)
         row.addWidget(self.skip_btn)
         lay.addLayout(row)
-        self._action_buttons = [self.isolated_btn, self.global_btn, self.skip_btn]
+        self._action_buttons = [self.isolated_btn, self.global_btn,
+                                self.local_btn, self.skip_btn]
 
         note = QLabel(
             "没有 7-Zip 时只能解压 ZIP 格式（使用内置引擎）；"
@@ -127,7 +133,9 @@ class SevenZipSetupDialog(QDialog):
             "不会出现在命令行（任务管理器/WMI 看不到）。\n"
             "注：隔离版默认下载 7-Zip 官方免安装包（portable）到 %APPDATA%，"
             "不需要管理员权限、也不会弹出 UAC；只有该方式失败时才会回退到官方"
-            "安装器，届时需要一次管理员授权。")
+            "安装器，届时需要一次管理员授权。\n"
+            "离线应急：把 AutoUnpacker-7zip.zip 放到 AutoUnpacker.exe 同目录，"
+            "或点「使用本地 7-Zip 包…」手动选择。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {PALETTE['muted']}; font-size: 12px;")
         lay.addWidget(note)
@@ -156,7 +164,9 @@ class SevenZipSetupDialog(QDialog):
             "密码经 stdin 管道传给 7z，不会出现在命令行（任务管理器/WMI 看不到）。\n"
             "注：隔离版默认下载 7-Zip 官方免安装包（portable）到 %APPDATA%，"
             "不需要管理员权限、也不会弹出 UAC；只有该方式失败时才会回退到官方"
-            "安装器，届时需要一次管理员授权。")
+            "安装器，届时需要一次管理员授权。\n"
+            "离线应急：把 AutoUnpacker-7zip.zip 放到 AutoUnpacker.exe 同目录，"
+            "或点「使用本地 7-Zip 包…」手动选择。")
         self.msg_lbl.setWordWrap(True)
         lay.addWidget(self.msg_lbl)
 
@@ -171,6 +181,10 @@ class SevenZipSetupDialog(QDialog):
         self.isolated_btn.clicked.connect(lambda: self._install("isolated"))
         self.global_btn = QPushButton("安装全局版")
         self.global_btn.clicked.connect(lambda: self._install("global"))
+        self.local_btn = QPushButton("使用本地 7-Zip 包…")
+        self.local_btn.setToolTip(
+            "选择已下载的 AutoUnpacker-7zip.zip，离线安装隔离版（零网络）。")
+        self.local_btn.clicked.connect(self._install_local)
         self.uninstall_btn = QPushButton("卸载隔离版")
         self.uninstall_btn.setToolTip("仅卸载 %APPDATA%\\AutoUnpacker\\7z 下的隔离版。")
         self.uninstall_btn.clicked.connect(self._uninstall)
@@ -180,13 +194,14 @@ class SevenZipSetupDialog(QDialog):
         self.close_btn.clicked.connect(self.reject)
         row.addWidget(self.isolated_btn)
         row.addWidget(self.global_btn)
+        row.addWidget(self.local_btn)
         row.addWidget(self.uninstall_btn)
         row.addWidget(self.recheck_btn)
         row.addWidget(self.close_btn)
         lay.addLayout(row)
         self._action_buttons = [self.isolated_btn, self.global_btn,
-                                self.uninstall_btn, self.recheck_btn,
-                                self.close_btn]
+                                self.local_btn, self.uninstall_btn,
+                                self.recheck_btn, self.close_btn]
         self._update_uninstall_enabled()
 
     # ------------------------------------------------------------------
@@ -214,7 +229,8 @@ class SevenZipSetupDialog(QDialog):
     # ------------------------------------------------------------------
     # 后台操作
     # ------------------------------------------------------------------
-    def _install(self, kind):
+    def _install(self, kind, bundle=None):
+        """kind="isolated" 可带 bundle：本地 AutoUnpacker-7zip.zip 路径（零网络）。"""
         if self._busy:
             return
         self._pending_op = "install"
@@ -227,7 +243,8 @@ class SevenZipSetupDialog(QDialog):
         def worker():
             try:
                 if kind == "isolated":
-                    p = sevenzip_manager.install_isolated(progress=_prog)
+                    p = sevenzip_manager.install_isolated(progress=_prog,
+                                                          bundle=bundle)
                     msg = f"隔离版安装成功：{p}"
                 else:
                     p = sevenzip_manager.install_global(progress=_prog)
@@ -236,12 +253,35 @@ class SevenZipSetupDialog(QDialog):
                 self._sig.done.emit(msg, True)
             except Exception as e:
                 self.hub.log(f"7-Zip {kind} 安装失败: {e}")
+                err_text = str(e).lower()
+                offline = any(k in err_text for k in (
+                    "certificate_verify_failed", "sslcertverificationerror",
+                    "ssl", "urlopen", "certificate", "无法访问", "timed out",
+                    "getaddrinfo", "ssl.c"))
+                if offline:
+                    hint = ("疑似网络不通或系统缺少根证书（无法访问 7-zip.org）。\n"
+                            "离线也能装好 7-Zip：\n"
+                            "① 把 AutoUnpacker-7zip.zip 放到 AutoUnpacker.exe "
+                            "同目录后重试；\n"
+                            "② 点「使用本地 7-Zip 包…」选择已下载的包；\n"
+                            "③ 到 7-zip.org 手动安装后点「重新检测」。")
+                else:
+                    hint = "可到 7-zip.org 手动下载安装后点「重新检测」，或稍后重试。"
                 self._sig.done.emit(
-                    f"安装失败：{e}\n"
-                    f"可到 7-zip.org 手动下载安装后点「重新检测」，或稍后重试。",
-                    False)
+                    f"安装失败：{e}\n{hint}\n[{type(e).__name__}]", False)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _install_local(self):
+        """手动选择本地 AutoUnpacker-7zip.zip，走隔离版同一条后台安装线程。"""
+        if self._busy:
+            return
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "选择 7-Zip 免安装包", "",
+            "7-Zip 免安装包 (*.zip);;所有文件 (*)")
+        if not path:
+            return
+        self._install("isolated", bundle=path)
 
     def _uninstall(self):
         if self._busy:

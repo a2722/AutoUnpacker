@@ -47,8 +47,20 @@ binaries = [
     (str(ROOT / "libiconv.dll"), "."),
 ]
 
-# 本项目没有任何图片/字体/QSS 资源文件：图标与样式全是代码画的，主题 PNG 运行时自建。
+# 运行时数据文件（目标 "." = 打包根，PyInstaller 6 中即 _internal\ = sys._MEIPASS）：
+#  - AutoUnpacker-7zip.zip：7-Zip 免安装包（tools\make_7zip_bundle.py 产出），
+#    干净机器首次运行可直接离线取用，不再必须联网；
+#  - cacert.pem：打包时从本机 ROOT/CA 存储导出的根证书（tools\gen_ca_bundle.py 产出），
+#    系统根证书不全时 netca.open_url() 用它重试 HTTPS，避免 "unable to get local issuer"。
+# 两个文件都可能尚未生成（干净 checkout / 维护者还没产出）：缺失即跳过，绝不让打包失败。
+# 图标与样式全是代码画的，没有其它图片/字体/QSS 资源。
 datas = []
+_bundle_zip = ROOT / "dist" / "AutoUnpacker-7zip.zip"
+if _bundle_zip.exists():
+    datas.append((str(_bundle_zip), "."))
+_ca_pem = ASSETS / "cacert.pem"
+if _ca_pem.exists():
+    datas.append((str(_ca_pem), "."))
 
 # 明确排掉不用的重家伙（Qt 的多媒体/WebEngine/QML 等绝无引用）
 excludes = [

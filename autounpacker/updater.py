@@ -8,7 +8,7 @@
   执行器负责备份旧代码、覆盖新版、以握手自证启动成功，进而提交或自动回滚
 - write_update_handshake() 供新版本启动成功后写下握手，执行器据此判定提交
 关键入口：check_latest_version() / apply_update() / compare_versions()
-依赖：urllib.request、zipfile、GitHub API（a2722/AutoUnpacker，无认证 60 次/小时）
+依赖：urllib.request（统一经 netca.open_url，系统根证书不全时用内置 CA pem 回退）、zipfile、GitHub API（a2722/AutoUnpacker，无认证 60 次/小时）
 注意：绝不主动拉取（仅用户点击按钮触发）；config.json/toolbox.db/logs/backup 等数据文件绝不覆盖
 """
 import hashlib
@@ -19,10 +19,12 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
+import urllib.request   # 保留：既有测试经 updater.urllib.request.urlopen 打桩；netca 走同一模块对象
 import uuid
 import zipfile
 from pathlib import Path
+
+from . import netca
 
 # 与 GitHub 仓库同步：本项目的 owner/repo
 GITHUB_REPO = "a2722/AutoUnpacker"
@@ -94,14 +96,13 @@ def check_latest_version():
       (STATUS_OK, "v1.1.0")      —— 成功
       (STATUS_FAILED, None)      —— 网络/解析失败（国内访问 GitHub 受限等）
     """
-    req = urllib.request.Request(
-        RELEASE_LATEST_API,
-        headers={
-            "User-Agent": "AutoUnpacker/" + _local_version(),
-            "Accept": "application/vnd.github+json",
-        })
+    headers = {
+        "User-Agent": "AutoUnpacker/" + _local_version(),
+        "Accept": "application/vnd.github+json",
+    }
     try:
-        with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT) as resp:
+        with netca.open_url(RELEASE_LATEST_API, timeout=CHECK_TIMEOUT,
+                            headers=headers) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = (data or {}).get("tag_name")
         if not tag:
@@ -213,10 +214,12 @@ def _fetch_release_json(tag, timeout=None):
     """取该 tag 的 Release JSON（无认证）。任何失败/限流/解析错一律返回 None。"""
     try:
         api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}"
-        req = urllib.request.Request(api, headers={
+        headers = {
             "User-Agent": "AutoUnpacker/" + _local_version(),
-            "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=timeout or CHECK_TIMEOUT) as resp:
+            "Accept": "application/vnd.github+json",
+        }
+        with netca.open_url(api, timeout=timeout or CHECK_TIMEOUT,
+                            headers=headers) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         return data if isinstance(data, dict) else None
     except Exception:
@@ -243,9 +246,8 @@ def fetch_expected_sha256(tag, timeout=None):
         url = str(asset.get("browser_download_url") or "")
         if not url:
             return ""
-        req2 = urllib.request.Request(url, headers={
-            "User-Agent": "AutoUnpacker/" + _local_version()})
-        with urllib.request.urlopen(req2, timeout=timeout or CHECK_TIMEOUT) as resp:
+        with netca.open_url(url, timeout=timeout or CHECK_TIMEOUT,
+                            headers={"User-Agent": "AutoUnpacker/" + _local_version()}) as resp:
             text = resp.read().decode("utf-8", "replace")
         return _parse_sha256sums(text, tag)
     except Exception:
@@ -289,12 +291,12 @@ def _download_url(url, zip_path, progress_cb=None):
 
     返回 (ok, err)。`progress_cb` 以 (已下载字节, 总字节) 调用（与既有约定一致）。
     """
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "AutoUnpacker/" + _local_version()})
+    headers = {"User-Agent": "AutoUnpacker/" + _local_version()}
     last_err = ""
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+            with netca.open_url(url, timeout=DOWNLOAD_TIMEOUT,
+                                headers=headers) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 with open(zip_path, "wb") as f:

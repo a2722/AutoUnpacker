@@ -2,10 +2,12 @@
 """7-Zip 管理：版本发现/检测、隔离版与全局版的下载安装、卸载。
 
 职责：- get_version()/check_version_ok() 读取 7z 版本并判断是否达 stdin 传密码门槛（18.00+），结果按路径缓存
-- install_isolated() 优先走免提权路径（就地取用/下载本仓库的免安装 zip，标准库 zipfile 解到隔离目录），失败才回退官方安装器（弹一次 UAC）；install_global() 装到系统，始终需 UAC
+- install_isolated() 优先走免提权路径（离线优先：就地取用隔离目录/程序目录/_internal/_MEIPASS 里随包分发的免安装 zip，
+  或使用调用方显式指定的 bundle=<本地 zip>；标准库 zipfile 解到隔离目录），失败才回退官方安装器（弹一次 UAC）
+- install_global() 装到系统，始终需 UAC
 - uninstall_isolated()/uninstall_system() 卸载（隔离版绝不被系统版卸载误伤）
 关键入口：check_environment() / install_isolated() / install_global() / uninstall_isolated()
-依赖：urllib.request、zipfile（解免安装包）、ctypes（UAC 提权）
+依赖：urllib.request（统一经 netca.open_url，系统根证书不全时用内置 CA pem 回退）、zipfile（解免安装包）、ctypes（UAC 提权）
 注意：隔离版装在 %APPDATA%\\AutoUnpacker\\7z，不污染项目与全局；低于 MIN_VERSION 的 7-Zip 无法经 stdin 传密码，一律需升级
 """
 import ctypes
@@ -16,10 +18,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
+
+from . import netca
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -170,10 +173,11 @@ def latest_release():
 
     返回 (version_tuple, installer_url, extra_url)；失败抛异常。
     installer_url 是官方安装器（requireAdministrator），仅在免提权免安装包路径
-    失败时作为回退，届时会弹出一次 UAC。"""
-    req = urllib.request.Request(SEVEN_ZIP_DL, headers={"User-Agent": _USER_AGENT})
+    失败时作为回退，届时会弹出一次 UAC。
+    HTTPS 统一走 netca.open_url：系统根证书不全时用内置 CA pem 重试，而不是裸奔。"""
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with netca.open_url(SEVEN_ZIP_DL, timeout=15,
+                            headers={"User-Agent": _USER_AGENT}) as resp:
             html = resp.read().decode("utf-8", "replace")
     except Exception as e:
         raise RuntimeError(f"无法访问官网下载页：{e}")
@@ -193,13 +197,16 @@ def latest_release():
 
 
 def _download(url, dest):
-    """下载文件到 dest（先写 .part 再原子替换）。TLS 校验保持开启。"""
+    """下载文件到 dest（先写 .part 再原子替换）。TLS 校验保持开启。
+
+    HTTPS 统一走 netca.open_url（系统根证书不全时用内置 CA pem 重试一次）。"""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + f".{uuid.uuid4().hex[:6]}.part")
-    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+        with netca.open_url(url, timeout=120,
+                            headers={"User-Agent": _USER_AGENT}) as resp, \
+                open(tmp, "wb") as out:
             shutil.copyfileobj(resp, out, 1024 * 256)
         if tmp.stat().st_size < 1_000_000:
             raise RuntimeError("下载文件异常偏小，可能下载到错误内容")
@@ -239,9 +246,35 @@ def _app_dir():
 
 
 def _find_local_bundle():
-    """本地免安装包：优先隔离目录，其次程序目录。不存在返回 None。"""
-    for base in (ISOLATED_DIR, _app_dir()):
-        cand = base / BUNDLE_NAME
+    """离线优先地找本地免安装包；按解析后路径去重，返回第一个存在的文件。
+
+    探测顺序：
+      1) ISOLATED_DIR / BUNDLE_NAME —— 程序自己放的位置（上次下载/维护者投放）；
+      2) _app_dir() / BUNDLE_NAME —— 便携用户把包放在 exe（或源码时的项目根）旁边；
+      3) _app_dir() / "_internal" / BUNDLE_NAME —— PyInstaller 6 的 onedir 产物把
+         datas 里目标为 "." 的文件放进 _internal\\，而 exe 在 _internal 的上一级，
+         所以只探 exe 目录会漏掉随包分发的那一份；
+      4) [仅冻结态] Path(sys._MEIPASS) / BUNDLE_NAME —— 运行时打包根（PyInstaller 6
+         中 _internal 即 sys._MEIPASS），兜住上面 3) 覆盖不到的打包内置副本。
+    都不存在返回 None（调用方随后才可能走网络）。"""
+    candidates = [
+        ISOLATED_DIR / BUNDLE_NAME,
+        _app_dir() / BUNDLE_NAME,
+        _app_dir() / "_internal" / BUNDLE_NAME,
+    ]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(Path(meipass) / BUNDLE_NAME)
+    seen = set()
+    for cand in candidates:
+        try:
+            key = os.path.normcase(str(Path(cand).resolve()))
+        except OSError:
+            key = os.path.normcase(str(cand))
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             if cand.is_file():
                 return cand
@@ -271,17 +304,33 @@ def _extract_bundle(bundle, tmp_dir):
             shutil.copy2(target, dest / name)
 
 
-def install_isolated(progress=None):
+def install_isolated(progress=None, bundle=None):
     """安装隔离版到 %APPDATA%\\AutoUnpacker\\7z\\bin，返回 7z.exe 路径。
 
-    优先走免提权路径：就地取用（隔离目录/程序目录）或下载本仓库的免安装 zip
-    （内含官方 7z.exe + 7z.dll），用标准库 zipfile 解到隔离目录，全程无需管理员
-    授权、不弹 UAC。仅当该路径未产出 7z.exe 时，才回退到官方安装器
-    （requireAdministrator，会弹出一次 UAC）。两种方式都只写入隔离目录，不污染
-    项目目录，也不写入 Program Files。"""
+    参数 bundle：可选的本地免安装 zip（str 或 Path）。显式给出时优先于自动探测，
+    不会因为在预期位置找不到包而联网；不是可读文件则直接抛 RuntimeError，
+    绝不悄悄回落到网络。
+
+    优先走免提权路径：离线优先——就地取用隔离目录/程序目录（含 PyInstaller 的
+    _internal/_MEIPASS）里的免安装 zip，或调用方显式指定的 zip（内含官方 7z.exe +
+    7z.dll 等白名单文件），用标准库 zipfile 解到隔离目录，全程无需管理员授权、
+    不弹 UAC；确实没有本地包时才下载本仓库的免安装 zip。仅当该路径未产出
+    7z.exe 时，才回退到官方安装器（requireAdministrator，会弹出一次 UAC）。
+    两种方式都只写入隔离目录，不污染项目目录，也不写入 Program Files。"""
     def _msg(s):
         if progress:
             progress(s)
+
+    if bundle is not None:
+        chosen = Path(bundle)
+        try:
+            with open(chosen, "rb"):
+                pass  # 只验证「可读」；真正的解析交给 zipfile
+        except OSError as e:
+            raise RuntimeError(
+                f"指定的 7-Zip 免安装包不存在或不可读：{chosen}（{e}）") from e
+    else:
+        chosen = None
 
     ISOLATED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -295,23 +344,23 @@ def install_isolated(progress=None):
             _rel["installer_url"] = iu
         return _rel["version"], _rel["installer_url"]
 
-    # ---- 路径一（首选，零 UAC）：本地/下载的免安装 zip + 标准库 zipfile ----
-    local = _find_local_bundle()
+    # ---- 路径一（首选，零 UAC）：显式指定的/本地探测到的/下载的免安装 zip + 标准库 zipfile ----
+    local = chosen if chosen is not None else _find_local_bundle()
     downloaded = None
     tmp_dir = None
     try:
         if local is not None:
             _msg(f"正在使用本地 7-Zip 免安装包（不需要管理员授权）：{local}")
-            bundle = local
+            bundle_path = local
         else:
             version, _iu = _release()
             _msg(f"正在下载 7-Zip {version[0]}.{version[1]:02d} 免安装包"
                  f"（免管理员权限，HTTPS）…")
             downloaded = ISOLATED_DIR / f"7z-bundle-{uuid.uuid4().hex[:6]}.zip"
-            bundle = _download(BUNDLE_URL, downloaded)
+            bundle_path = _download(BUNDLE_URL, downloaded)
         tmp_dir = Path(tempfile.mkdtemp(prefix="7z-unpack-", dir=str(ISOLATED_DIR)))
         _msg("正在解压到隔离目录（不需要管理员授权）…")
-        _extract_bundle(bundle, tmp_dir)
+        _extract_bundle(bundle_path, tmp_dir)
     except Exception:
         # 取包/下载/解压任一环节失败都视为首选路径不可用，交给安装器回退
         pass

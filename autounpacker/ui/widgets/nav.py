@@ -29,9 +29,12 @@ TRAIL_STATUS_ORDER = ["deleted", "restored", "kept", "failed", "recorded"]
 # 目录状态文案（FINAL-SPEC §7）；running/idle 是原型数据的别名。
 # waiting 只表示「忙碌等待」（下载未完成/分卷未齐等）；目录不存在/不可枚举
 # 是 missing，文案「目录不存在」，不再冒充等待中。
+# configuring 只给「添加目录」刚创建、仍在弹窗里配置的空条目（尚无 path），
+# 由宿主 _dir_entries 解析；path 写回后该状态自然消失。
 DIR_STATE_TEXT = {
     "listening": "监听中", "extracting": "解压中", "waiting": "等待中",
     "missing": "目录不存在", "paused": "已暂停", "error": "错误",
+    "configuring": "正在配置",
 }
 
 

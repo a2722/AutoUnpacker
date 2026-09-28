@@ -10,6 +10,7 @@ from PyQt5.QtCore import (Qt, QTimer, QRect, QRegularExpression, QEvent,
 from PyQt5.QtGui import QKeySequence, QRegularExpressionValidator
 
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 from .common import (SHARE_ASK_TIMEOUT_SEC, SHARE_ASK_EDGE_MARGIN,
                      SHARE_ASK_WINDOW_WIDTH, _call_decision, _CodeLineEdit)
 
@@ -158,6 +159,8 @@ class ShareCodeAskDialog(QDialog):
         self._timer.start()
 
         self.setFixedWidth(SHARE_ASK_WINDOW_WIDTH)
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
         # UX-5：跟随父窗 Move/Resize 的锚定状态（showEvent 安装、hideEvent 卸载，
         # 绝不留悬挂过滤器；滑出动画引用保存在 _slide_anim，随控件一起销毁）。
         self._anchor_parent = None
@@ -401,6 +404,8 @@ class ShareCodeAskDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # QSS 重贴 / 字体度量变化后重兜一次（幂等、只抬不降）。
+        fit_text_heights(self)
         try:
             self._install_parent_filter()
         except Exception:

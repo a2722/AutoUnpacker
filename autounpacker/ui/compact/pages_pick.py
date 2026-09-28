@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLabel
 
 from ..share_files import (MAX_AUTO_INFLIGHT, ROLE_PAYLOAD, ROLE_STATE,
                            format_size)
+from ..textfit import fit_text_heights
 from ..widgets.common import repolish
 from ..widgets.inputs import _ElideLabel
 
@@ -109,6 +110,9 @@ class PickPage(QWidget):
         foot.addWidget(self.btn_download, 0)
         foot.addWidget(self.btn_cancel, 0)
         root.addLayout(foot)
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        # 本页由 CompactWindow 懒建（晚于宿主 showEvent 的整树兜底），必须在自己构造时兜一次。
+        fit_text_heights(self)
 
     # ================= 冻结接口 =================
     def load(self, entries, on_expand, subtitle=""):

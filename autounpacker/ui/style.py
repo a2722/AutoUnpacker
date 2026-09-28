@@ -420,7 +420,7 @@ QWidget#settingsPage QLabel#groupTitle {
 QWidget#settingsPage QLabel#setName {
     /* 左右各 1px 余量：CJK 墨迹盒可顶满 content rect，无余量时左缘/右缘会蹭边。
        纵向余量不靠 padding（sizeHint 会同步增大、content 区仍等于 height()），
-       由 textfit.fit_text_heights 统一 setMinimumHeight(lineSpacing + 2) 兜底。 */
+       由 textfit.fit_text_heights 统一 setMinimumHeight(lineSpacing + 3) 兜底。 */
     font-size: 12.5px; font-weight: 600; color: $window_fg; padding: 0 1px;
 }
 
@@ -450,6 +450,25 @@ QWidget#setRow[off="true"] QLabel#rowNote { color: $chip_off_fg; }
 QLabel#riskBadge {
     font-size: $fs_tag; font-weight: 700; color: $danger_fg; background: $danger_bg;
     border: 1px solid $danger_border; border-radius: $radius_tag; padding: 1px 7px;
+}
+/* 实验性门控行名旁的小标（#expBadge）：中性提示，不用 riskBadge 的红色。
+   只在实验性总开关关闭时可见（显隐由 page_settings._apply_gates 统一控制）；
+   不参与 [off="true"] 的置灰规则（那几条只作用 #setName / #unit / #rowNote），
+   所以关闭态下仍清晰可读。 */
+QLabel#expBadge {
+    font-size: $fs_tag; font-weight: 700; color: $chip_off_fg;
+    background: $cat_hover; border: 1px solid $ctl_border;
+    border-radius: $radius_tag; padding: 1px 7px;
+}
+/* 「监听剪贴板」门控行名旁的小标（#clipBadge）：与 #expBadge 同一套中性 token
+   （不新增颜色 / 圆角；入口显眼但仍是次要信息，不用 riskBadge 的红色）。
+   只在剪贴板总开关关闭时可见（显隐由 page_settings._apply_clip_gate 统一控制）；
+   同样不参与 [off="true"] 的置灰规则（那几条只作用 #setName / #unit / #rowNote），
+   所以关闭态下仍清晰可读。 */
+QLabel#clipBadge {
+    font-size: $fs_tag; font-weight: 700; color: $chip_off_fg;
+    background: $cat_hover; border: 1px solid $ctl_border;
+    border-radius: $radius_tag; padding: 1px 7px;
 }
 
 /* ---- 控件尺寸（对齐设计稿；作用域限定本页，避免影响其它页面） ---- */
@@ -615,8 +634,12 @@ QMenu::item { padding: 6px 18px; border-radius: $radius_ctl; }
 QMenu::item:selected { background: $menu_sel_bg; color: $menu_sel_fg; }
 QMenu::separator { height: 1px; background: $menu_sep; margin: 4px 6px; }
 
+/* QToolTip：圆角必须走 token；QTipLabel 顶层窗的半透明由
+   `_ensure_combo_popup_fix` 的 polish 过滤器统一置位（圆角外真正透明，
+   不再露不透明原生窗的底色/黑角）。圆角值与其它小气泡一致走 $radius_ctl。 */
 QToolTip {
-    background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border; padding: 4px;
+    background: $tip_bg; color: $tip_fg; border: 1px solid $tip_border;
+    border-radius: $radius_ctl; padding: 4px;
 }
 
 /* 点击日志链接后的「已复制 / 复制失败」小气泡（§7：底 window_fg / 字 window_bg，
@@ -685,7 +708,7 @@ QProgressBar#chipProg::chunk { background: $prog_chunk; border-radius: 2px; }
    高度按 fontMetrics().height()（11）算、绘制却按 lineSpacing()（13）排线，
    于是上下各被裁 1px；左缘也无余量。给左右各 1px padding（纵向 padding 无效：
    sizeHint 会同步增大、内容区仍等于 height()），纵向余量由 textfit.fit_text_heights
-   （单行/多行统一，show / 主题切换后调用）按 fontMetrics().lineSpacing()+2 兜底。 */
+   （单行/多行统一，show / 主题切换后调用）按 fontMetrics().lineSpacing()+3 兜底。 */
 QLabel#stripHint { color: $chip_off_fg; font-size: 11px; padding: 0 1px; }
 
 /* ---- 顶部标签页（激活态用 2px 下划线，禁止用背景块） ---- */
@@ -767,7 +790,7 @@ QPushButton#rowAct:hover { background: $btn_hover; border-radius: $radius_ctl; }
 /* ---- 底栏纵向播报（一次一句，禁止截断/横滚） ---- */
 QLabel#tipRow { color: $ticker_fg; font-size: 11px; }
 
-/* ---- 通用 ghost 按钮（行内小按钮 / 清除筛选 / 网盘下载目录） ---- */
+/* ---- 通用 ghost 按钮（行内小按钮 / 清除筛选） ---- */
 QPushButton#ghost { background: transparent; border: 1px solid transparent; color: $window_fg; }
 QPushButton#ghost:hover { background: $btn_hover; }
 QPushButton#ghostSm {
@@ -1141,44 +1164,59 @@ def _apply_dark_palette(app):
     app.setPalette(p)
 
 
-# 组合框弹出列表修复器的安装状态（保持引用，避免被 GC；只装一次）
+# 控件 polish 修复器的安装状态（保持引用，避免被 GC；只装一次）
 _COMBO_FIX = {"installed": False, "filter": None}
 
 
 def _ensure_combo_popup_fix(app):
-    """修复：QComboBox 弹出列表行高塌成「一行字高」（三项挤不下、文字被裁）。
+    """应用级 polish 修复器（装一次，覆盖运行期新建的控件）：
 
+    1) QComboBox 弹出列表行高塌成「一行字高」（三项挤不下、文字被裁）。
     根因——两套主题都把 `SH_ComboBox_Popup` 归一到 0（见
     `_combo_dropdown_style`），QComboBox 便使用默认委托 `QComboBoxDelegate`
     （继承自 `QItemDelegate`），而它**不认 QSS 的
     `QComboBox QAbstractItemView::item` 行高规则**，于是行高退回字高
     （约 13px）。浅色（windowsvista）一直如此；深色改用下拉式后亦然。
-
     做法——把弹出视图的委托统一换成 QStyledItemDelegate，让 QSS 行高
-    规则生效。用应用级事件过滤器在控件 polish / show 时惰性处理，可覆盖
-    运行期才创建（如设置对话框）的组合框；重复安装自动跳过。
+    规则生效。
+
+    2) QTipLabel（QToolTip 的顶层窗）统一置 `WA_TranslucentBackground`。
+    QToolTip 规则的圆角只把 QSS 画的背景/边框变圆角，而 QTipLabel 本身是
+    **不透明**原生窗：圆角外的像素保持未绘制 → 真机上露出窗口底色（黑角）。
+    polish 早于原生窗创建，在这里置半透明，圆角外才是真正透明（整只
+    tooltip 呈现为一个干净圆角盒，见 `QToolTip` 规则）。
+
+    两者都由事件过滤器在控件 polish / show 时惰性处理；重复安装自动跳过。
     """
     if _COMBO_FIX["installed"]:
         return
     try:
-        from PyQt5.QtCore import QObject, QEvent
-        from PyQt5.QtWidgets import QComboBox, QStyledItemDelegate
+        from PyQt5.QtCore import QEvent, QObject, Qt
+        from PyQt5.QtWidgets import QComboBox, QLabel, QStyledItemDelegate
     except Exception:
         return
 
-    class _ComboPopupDelegateFixer(QObject):
+    class _PolishFixer(QObject):
         def eventFilter(self, obj, ev):
-            if ev.type() in (QEvent.Polish, QEvent.Show) and isinstance(obj, QComboBox):
-                try:
-                    view = obj.view()
-                    if view is not None and not isinstance(
-                            view.itemDelegate(), QStyledItemDelegate):
-                        view.setItemDelegate(QStyledItemDelegate(view))
-                except Exception:
-                    pass
+            if ev.type() in (QEvent.Polish, QEvent.Show):
+                if isinstance(obj, QComboBox):
+                    try:
+                        view = obj.view()
+                        if view is not None and not isinstance(
+                                view.itemDelegate(), QStyledItemDelegate):
+                            view.setItemDelegate(QStyledItemDelegate(view))
+                    except Exception:
+                        pass
+                elif (isinstance(obj, QLabel)
+                      and obj.windowType() == Qt.ToolTip
+                      and not obj.testAttribute(Qt.WA_TranslucentBackground)):
+                    try:
+                        obj.setAttribute(Qt.WA_TranslucentBackground, True)
+                    except Exception:
+                        pass
             return False
 
-    fixer = _ComboPopupDelegateFixer(app)
+    fixer = _PolishFixer(app)
     app.installEventFilter(fixer)
     _COMBO_FIX["installed"] = True
     _COMBO_FIX["filter"] = fixer

@@ -11,6 +11,7 @@ from ... import trail as deletion_trail
 from ...config import DELETE_POLICY_DEFAULT
 from ...utils import watch_path_conflict
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 from ..widgets import (Glyph, LayoutButton, ModeSelector, DIR_STATE_TEXT,
                        dir_state_key, _Switch)
 from .common import TRASH_HINT_NORMAL, TRASH_HINT_NO_BIN
@@ -82,6 +83,8 @@ class WatchDirDialog(QDialog):
         self._refresh_state_badge()
         self._render_current()
         self._refresh_delete_policy()
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
 
     # ---- 读取入口 ----
     def _load_entry(self):
@@ -308,7 +311,10 @@ class WatchDirDialog(QDialog):
             color = PALETTE["success"]
             if self._state_key == "error":
                 color = PALETTE["danger"]
-            elif self._state_key in ("paused", "waiting", "missing"):
+            elif self._state_key in ("paused", "waiting", "missing",
+                                     "configuring"):
+                # configuring：中性灰；默认分支的 success 绿是 extracting 的色，
+                # 不能拿来渲染「正在配置」。
                 color = PALETTE["muted"]
             elif self._state_key == "listening":
                 color = PALETTE["accent_text"]
@@ -572,6 +578,8 @@ class WatchDirDialog(QDialog):
     def showEvent(self, event):
         self._ensure_scrim()
         super().showEvent(event)
+        # QSS 重贴 / 字体度量变化后重兜一次（幂等、只抬不降）。
+        fit_text_heights(self)
         self._center_on_parent()
         # 弹窗打开时若已开启「删除源文件」且卷无回收站、策略未定，询问一次。
         try:

@@ -16,6 +16,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 from ... import sevenzip as sevenzip_manager
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 
 
 def _status_text(info):
@@ -87,6 +88,8 @@ class SevenZipSetupDialog(QDialog):
             self._build_manage(lay)
         else:
             self._build_first_run(lay)
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
 
     # ------------------------------------------------------------------
     # first_run：既有三按钮引导
@@ -209,6 +212,8 @@ class SevenZipSetupDialog(QDialog):
     # ------------------------------------------------------------------
     def showEvent(self, event):
         super().showEvent(event)
+        # QSS 重贴 / 字体度量变化后重兜一次（幂等、只抬不降）。
+        fit_text_heights(self)
         if self.mode == "manage" and not self._recheck_started:
             self._recheck_started = True
             self._recheck()

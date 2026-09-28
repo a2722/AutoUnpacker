@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QDialog,
                              QVBoxLayout)
 
 from .style import PALETTE
+from .textfit import fit_text_heights
 
 # 挂在 QTreeWidgetItem 上的自定义角色：payload=条目字典，state=加载状态。
 ROLE_PAYLOAD = Qt.UserRole            # {"fs_id","path","name","size","kind"}
@@ -225,6 +226,8 @@ class ShareFilesDialog(QDialog):
         for btn in (self.btn_all, self.btn_invert, self.btn_files_only):
             btn.setEnabled(bool(entries))
         self._update_totals()
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
 
     # ── 条目构建 ────────────────────────────────────────────────────────────
     def _make_placeholder(self, parent, text, color=None):
@@ -665,6 +668,11 @@ class ShareFilesDialog(QDialog):
         except Exception:
             pass
         self._set_busy(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # QSS 重贴 / 字体度量变化后重兜一次（幂等、只抬不降）。
+        fit_text_heights(self)
 
     def done(self, r):
         self._shutdown()

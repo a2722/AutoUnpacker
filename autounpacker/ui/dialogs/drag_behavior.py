@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QCheckBox, QDialog, QFrame, QPushButton)
 from PyQt5.QtCore import Qt, pyqtSignal
 
+from ..textfit import fit_text_heights
 from ..widgets import Glyph
 from .common import TRASH_HINT_NORMAL
 
@@ -50,6 +51,8 @@ class DragBehaviorDialog(QDialog):
         self._build_body(body_lay, v)
         root.addWidget(body)
         root.addWidget(self._build_foot())
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
 
     # ---- 公开 API ----
     def values(self):
@@ -229,6 +232,8 @@ class DragBehaviorDialog(QDialog):
     def showEvent(self, event):
         self._ensure_scrim()
         super().showEvent(event)
+        # QSS 重贴 / 字体度量变化后重兜一次（幂等、只抬不降）。
+        fit_text_heights(self)
         self._center_on_parent()
 
     def hideEvent(self, event):

@@ -67,11 +67,114 @@ def send_to_recycle_bin(paths):
     return (not failed), failed
 
 
-# ---- 卷回收站可用性探测（只读；绝不弹窗 / 绝不删除 / 绝不抛异常） ----
+# ---- 卷回收站可用性 / 计数探测（只读；绝不弹窗 / 绝不删除 / 绝不抛异常） ----
 DRIVE_REMOVABLE = 2   # 可移动盘（U 盘 / 移动硬盘）
 DRIVE_FIXED = 3       # 固定盘
 DRIVE_REMOTE = 4      # 网络盘
 DRIVE_RAMDISK = 6     # 内存盘
+
+# _probe_volume 的盘型判定结果
+_DRIVE_NO_BIN = 0      # 明确没有本机回收站：UNC / 无盘符 / 可移动 / 网络 / 内存盘
+_DRIVE_QUERYABLE = 1   # 固定盘：可向 Shell 实测该卷回收站
+_DRIVE_UNKNOWN = 2     # 非 Windows / 其它盘型 / 探测异常：不确定
+
+# 卷回收站计数缓存 TTL（秒）：页面一次渲染里同一卷最多查一次 Shell，绝不逐行查。
+RECYCLE_STATS_TTL = 45.0
+# 卷根(normcase) -> (到期 monotonic 时刻, _query_recycle_bin 结果)
+_recycle_stats_cache = {}
+
+
+class SHQUERYRBINFO(ctypes.Structure):
+    """SHQueryRecycleBinW 的输出结构（本模块唯一声明 / 使用此结构的地方）。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("i64Size", ctypes.c_longlong),
+        ("i64NumItems", ctypes.c_longlong),
+    ]
+
+
+def reset_recycle_bin_stats_cache():
+    """清空卷回收站计数缓存（测试钩子）：下次查询重新走 Shell。"""
+    _recycle_stats_cache.clear()
+
+
+def _probe_volume(path):
+    """path 所在卷根与盘型：返回 (root, kind)。
+
+    kind ∈ (_DRIVE_NO_BIN, _DRIVE_QUERYABLE, _DRIVE_UNKNOWN)：
+    - UNC / 无盘符 / 可移动 / 网络 / 内存盘 → _DRIVE_NO_BIN（明确没有回收站）；
+    - 固定盘 → _DRIVE_QUERYABLE（可实测）；
+    - 非 Windows / 其它盘型 / 任何异常 → _DRIVE_UNKNOWN（不确定）。
+    只读探测：绝不弹窗、绝不删除、绝不抛异常。
+    """
+    try:
+        if os.name != "nt":
+            return None, _DRIVE_UNKNOWN
+        p = str(path or "")
+        if p.startswith("\\\\") or p.startswith("//"):
+            return None, _DRIVE_NO_BIN
+        drive = os.path.splitdrive(os.path.abspath(p))[0]
+        if not drive:
+            return None, _DRIVE_NO_BIN
+        root = drive + "\\"
+        dtype = int(ctypes.windll.kernel32.GetDriveTypeW(root))
+        if dtype in (DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_RAMDISK):
+            return root, _DRIVE_NO_BIN
+        if dtype != DRIVE_FIXED:
+            return root, _DRIVE_UNKNOWN
+        return root, _DRIVE_QUERYABLE
+    except Exception:
+        return None, _DRIVE_UNKNOWN
+
+
+def _query_recycle_bin(root):
+    """向 Shell 实测卷根回收站：返回 (ok, num_items, size_bytes)。
+
+    ok=True 调用成功（计数有效）/ False 明确失败 / None 过程出错（不确定）。
+    本模块唯一的 SHQueryRecycleBinW 调用点；只读、绝不弹窗、绝不抛异常。
+    """
+    try:
+        info = SHQUERYRBINFO()
+        info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+        ret = ctypes.windll.shell32.SHQueryRecycleBinW(root, ctypes.byref(info))
+    except Exception:
+        return None, 0, 0
+    if ret == 0:
+        return True, int(info.i64NumItems), int(info.i64Size)
+    return False, 0, 0
+
+
+def _cached_recycle_query(root):
+    """按卷根缓存的 _query_recycle_bin（TTL=RECYCLE_STATS_TTL）。
+
+    一次页面渲染里同一卷最多触发一次 Shell 查询；缓存同时覆盖「明确失败 / 出错」，
+    失败也不会在 TTL 内反复重查。测试可用 reset_recycle_bin_stats_cache() 清空。
+    """
+    key = os.path.normcase(str(root))
+    now = time.monotonic()
+    hit = _recycle_stats_cache.get(key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    result = _query_recycle_bin(root)
+    _recycle_stats_cache[key] = (now + RECYCLE_STATS_TTL, result)
+    return result
+
+
+def recycle_bin_stats(path):
+    """path 所在固定卷的回收站当前计数 (num_items, size_bytes)；不可判定时 None。
+
+    None = 非 Windows / UNC / 非固定盘 / 查询失败或异常 —— 调用方据此**绝不**对
+    当前位置做任何断言。结果按卷根缓存 RECYCLE_STATS_TTL 秒：一次页面渲染里同一卷
+    最多一次 Shell 查询（绝不逐行查询）。只读、绝不弹窗、绝不抛异常。
+    """
+    root, kind = _probe_volume(path)
+    if root is None or kind != _DRIVE_QUERYABLE:
+        return None
+    ok, num_items, size_bytes = _cached_recycle_query(root)
+    if not ok:
+        return None
+    return (num_items, size_bytes)
 
 
 def volume_has_recycle_bin(path):
@@ -81,39 +184,21 @@ def volume_has_recycle_bin(path):
     - UNC 路径（\\\\server\\share…）没有「本机回收站」概念 → False；
     - 可移动盘 / 网络盘 / 内存盘 → False（这类卷默认不带回收站）；
     - 固定盘 → 用 SHQueryRecycleBinW 实测该卷根的回收站是否可用：
-      调用成功(0) → True，明确失败 → False；
+      调用成功(0) → True，明确失败 → False，过程出错 → None（不确定）；
     - 其它盘型 / 非 Windows / 探测过程任何异常 → None（不确定，调用方保守处理）。
 
-    只做只读探测：绝不弹窗、绝不删除、绝不抛异常。"""
-    if os.name != "nt":
+    只做只读探测：绝不弹窗、绝不删除、绝不抛异常。查询复用 recycle_bin_stats
+    的同一缓存：同一卷在 TTL 内只实测一次。
+    """
+    root, kind = _probe_volume(path)
+    if kind == _DRIVE_NO_BIN:
+        return False
+    if root is None or kind != _DRIVE_QUERYABLE:
         return None
-    try:
-        p = str(path or "")
-        if p.startswith("\\\\") or p.startswith("//"):
-            return False
-        drive = os.path.splitdrive(os.path.abspath(p))[0]
-        if not drive:
-            return False
-        root = drive + "\\"
-        dtype = int(ctypes.windll.kernel32.GetDriveTypeW(root))
-        if dtype in (DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_RAMDISK):
-            return False
-        if dtype != DRIVE_FIXED:
-            return None
-
-        class SHQUERYRBINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("i64Size", ctypes.c_longlong),
-                ("i64NumItems", ctypes.c_longlong),
-            ]
-
-        info = SHQUERYRBINFO()
-        info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
-        ret = ctypes.windll.shell32.SHQueryRecycleBinW(root, ctypes.byref(info))
-        return ret == 0
-    except Exception:
-        return None
+    if recycle_bin_stats(path) is not None:
+        return True
+    ok, _num_items, _size_bytes = _cached_recycle_query(root)
+    return False if ok is False else None
 
 
 # ---- 从回收站还原 ----

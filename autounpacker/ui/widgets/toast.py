@@ -6,6 +6,8 @@ ToastBubble 与 show_toast 都只操作这一个列表对象。"""
 
 from PyQt5.QtWidgets import QLabel, QApplication, QGraphicsOpacityEffect, QWidget
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
+
+from ..textfit import fit_text_heights
 # ---------------------------------------------------------------------------
 # 点击反馈小气泡（日志链接「已复制 / 复制失败」）：无边框、绝不抢焦点、自动消失
 # ---------------------------------------------------------------------------
@@ -29,9 +31,16 @@ class ToastBubble(QLabel):
         super().__init__(parent)
         self.setObjectName("toastBubble")
         self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint)
+        # 顶层无边框窗默认自带不透明窗口底色：QSS 只把 #toastBubble 的背景画成
+        # 圆角，圆角外的四个方角仍是窗口底色（真机上就是黑角）。必须在首次 show
+        # 之前置半透明，圆角外才真正透明（桌面透出）。
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setText(str(text))
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（顶层 ToolTip 也是最终绘制面；只抬不降）。
+        # 必须在 adjustSize() 之前：最小高度参与 sizeHint 约束。
+        fit_text_heights(self)
         self._closed = False
         self._fade_anim = None
         self.adjustSize()

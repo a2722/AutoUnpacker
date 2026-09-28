@@ -5,6 +5,8 @@ from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QPushButton,
                              QVBoxLayout)
 
+from ..textfit import fit_text_heights
+
 
 # ---------------------------------------------------------------------------
 # 新增 / 编辑口令小对话框
@@ -82,6 +84,12 @@ class _PasswordEditDialog(QDialog):
         if focus_note:
             self.note_edit.setFocus()
             self.note_edit.setCursorPosition(len(self.note_edit.text()))
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fit_text_heights(self)
 
     def _toggle_batch(self):
         """单条 / 批量输入切换（同一表单；备注字段两种模式共用）。"""

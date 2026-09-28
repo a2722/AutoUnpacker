@@ -26,7 +26,13 @@ def main():
             win32clipboard.SetClipboardData(
                 win32clipboard.CF_UNICODETEXT, text)
         finally:
-            win32clipboard.CloseClipboard()
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                # 1418 同族良性竞态：关的时候剪贴板已被系统/其它进程关闭。数据已经
+                # 写入成功，不能把它判成失败——否则上层会认为本次静默复制没成功，
+                # 不推进 last_text，刚写的链接可能被自己当成用户输入再处理一次。
+                pass
         return 0
     except Exception:
         return 1

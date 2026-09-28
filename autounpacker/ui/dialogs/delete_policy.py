@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
 from PyQt5.QtCore import Qt
 
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 
 
 class DeletePolicyAskDialog(QDialog):
@@ -61,6 +62,12 @@ class DeletePolicyAskDialog(QDialog):
         btns.addWidget(keep_btn)
         btns.addWidget(perm_btn)
         lay.addLayout(btns)
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fit_text_heights(self)
 
     def _choose_quarantine(self):
         self._choice = "quarantine"

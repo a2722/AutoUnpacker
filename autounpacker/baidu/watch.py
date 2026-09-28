@@ -74,7 +74,8 @@ def _hint_if_download_dir_unwatched(cfg, db, log):
         if not covered:
             _HINTED_UNWATCHED.add(key)
             log(f"下载目录 {root} 未加入监听：仅监控、不解压")
-            log("  如需自动解压，请在主界面点「网盘下载目录」，或启用对应的监听路径")
+            log("  如需自动解压，请用主界面的「添加目录」把它加为监听路径"
+                "（已有同目录条目则直接启用）")
     except Exception:
         pass
 

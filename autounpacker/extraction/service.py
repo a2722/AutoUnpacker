@@ -720,7 +720,9 @@ class ExtractService:
           1. bomb_guard_enabled=False → 一律 (None, None)：连 7z 路径都不查、
              清单都不列（沿用既有开关语义，见 test_p14 E）。
           2. 任何「未知」（7z 缺失 / 列不出 / 解析不出）都放行——密码或头部
-             加密的归档本来就列不出清单，绝不能因为探测不到就拦住正常解压。"""
+             加密的归档本来就列不出清单，绝不能因为探测不到就拦住正常解压。
+        阈值语义：任一 bomb_* 阈值 <= 0 = 关闭该条规则（0 为哨兵值；None/缺键
+        仍回退默认，见 _opt_number）；bomb_hard_min_gb=0 = 无最小体积门槛。"""
         if not self.options.get("bomb_guard_enabled", True):
             return None, None
         r = self._list_archive_raw(archive)
@@ -743,18 +745,22 @@ class ExtractService:
         soft_entries = self._opt_number("bomb_soft_entries", 50000.0)
         gib = 1024 ** 3
         declared_gb = declared / gib
-        if declared > hard_size_gb * gib:
+        # 阈值 <= 0 = 关闭该条规则（与 _check_size 的 ratio_limit <= 0、
+        # watcher 的 limit_gb <= 0 同口径）；0 是哨兵值——_opt_number 把
+        # None/缺键映射回默认，故 None 无法表达「不限制」。bomb_hard_min_gb=0
+        # 时比例规则的体积门槛自然失效（declared_gb >= 0 恒真）= 无最小体积门槛。
+        if hard_size_gb > 0 and declared > hard_size_gb * gib:
             return (f"声明解压后大小 {declared_gb:.1f} GB 超过硬上限 "
                     f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压"), gap_reason
         ratio = declared / archive_size if archive_size > 0 else 0.0
-        if ratio >= hard_ratio and declared_gb >= hard_min_gb:
+        if hard_ratio > 0 and ratio >= hard_ratio and declared_gb >= hard_min_gb:
             return (f"声明膨胀比 {ratio:.0f}:1（解压后 {declared_gb:.2f} GB / "
                     f"压缩包 {archive_size / 1048576:.1f} MB）达到硬阈值 "
                     f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压"), gap_reason
-        if ratio > soft_ratio:
+        if soft_ratio > 0 and ratio > soft_ratio:
             self.emit(f"[第{depth}层] [安全提示] 声明膨胀比 {ratio:.0f}:1 超过提示阈值 "
                       f"{soft_ratio:g}:1，继续解压，请留意磁盘空间")
-        if entries > soft_entries:
+        if soft_entries > 0 and entries > soft_entries:
             self.emit(f"[第{depth}层] [安全提示] 归档条目数 {entries} 超过提示阈值 "
                       f"{soft_entries:g}，继续解压，请留意耗时与磁盘空间")
         return None, gap_reason

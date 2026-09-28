@@ -19,7 +19,7 @@ import time
 import types
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QSystemTrayIcon, QMenu, QShortcut, QMessageBox, QStackedWidget, QDialog, QScrollArea, QFrame, QLabel)  # noqa: F401
-from PyQt5.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QEvent, QObject, QByteArray, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QTextCursor, QTextCharFormat, QColor, QCursor
 
 from .. import extract as smart_extract    # noqa: F401
@@ -324,10 +324,14 @@ class MainWindow(QMainWindow):
         # 精简模式（定稿·方案 E）：独立小窗 CompactWindow 与本窗**互斥显示**；
         # 主窗自身尺寸/布局不变（规格 §11.8）。懒建：首次切换时才构造。
         self._compact_window = None
-        # M3 工作台布局（标签页 + 胶囊条 + 248px 右栏）：默认宽高按设计稿 1440×880。
-        # DPI/分辨率自适应：初始尺寸按屏幕可用区（逻辑像素）收敛，见 fit_window_size。
+        # 主窗几何记忆（2026-09-28）：saveGeometry/restoreGeometry 自带越界钳制；
+        # `_geo_ready` 在恢复完成、防抖定时器建好后置真，恢复/构造期间不写盘。
+        self._geo_ready = False
+        # M3 工作台布局（标签页 + 胶囊条 + 248px 右栏）：默认宽高 1280×800
+        # （2026-09-28 由旧设计稿 1440×880 收小一档：用户反馈默认过大）。
+        # 已存几何优先；无/坏值才回落默认。DPI/分辨率自适应见 fit_window_size。
         _aw, _ah = self._available_geometry()
-        self.resize(*fit_window_size(1440, 880, _aw, _ah))
+        self._restore_geometry(_aw, _ah)
         self.setWindowIcon(make_tray_icon())
         self.setAcceptDrops(True)   # 支持拖入文件临时解压
         self._build_ui()
@@ -353,6 +357,13 @@ class MainWindow(QMainWindow):
         # 最小尺寸必须在 show 之前收敛：布局最小尺寸被长内容顶大时，
         # 超过屏幕的最小尺寸会让窗口在显示时被撑到屏外（见 fit_min_size）。
         self._apply_screen_limits()
+        # 主窗几何防抖（2026-09-28）：拖动/缩放期间单次 500ms 合并写盘（绝不逐帧
+        # 写 config）；建好后才置 `_geo_ready`，构造期的内部 resize 一概不写。
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.setInterval(500)
+        self._geo_timer.timeout.connect(self._save_geometry)
+        self._geo_ready = True
         self._setup_tray()
         if self.show_event is not None:
             self._show_check = QTimer(self)
@@ -624,12 +635,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._sync_hotkey_display()
-        try:
-            if not bool(self.state.snapshot().get("show_status_tips", True)):
-                self.statusbar.ticker.pause()
-                self.statusbar.ticker.hide()
-        except Exception:
-            pass
+        # 底栏滚动提示组（ticker + 「使用提示」 + bolt 图标）与响应式、设置保存
+        # 共用同一应用路径；构造期先按配置与当前宽度落位。
+        self._apply_status_tips()
 
     # ---------- 拖放临时解压 ----------
     @staticmethod
@@ -698,6 +706,13 @@ class MainWindow(QMainWindow):
         for p in paths:
             self._handle_drop_file(p)
         if image is not None:
+            if urls:
+                # 用户反馈「元素在浏览器里已加载好，程序为何还联网」：图片数据与
+                # 网址链接同时存在时只用本地图片数据，明确记一行；宿主桩没有
+                # 日志能力（如既有拖放单测）时跳过，绝不因此影响落地处理。
+                log = getattr(self, "_append_log", None)
+                if callable(log):
+                    log("[拖放] 同时收到图片数据与网址链接：使用本地图片数据，不发起网络请求")
             self._handle_drop_image(image)
         elif urls:
             for u in urls:
@@ -1148,6 +1163,9 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        # 先落盘几何：无论关闭动作是 exit / tray / ask（含取消），最终几何都写
+        # 一次；防抖计时器已停，之后不会再写第二次（拖拽可能还没到 500ms 到点）。
+        self._flush_geometry_save()
         action = self.state.snapshot().get("close_action", "ask")
         if action == "tray":
             event.ignore()
@@ -1201,6 +1219,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._sync_hotkey_display()
+        # 底栏滚动提示开关可能刚被切换：立即生效（ticker + 「使用提示」 + 图标）。
+        # try 包裹与相邻 set_poll_interval/_refresh_share_menu 同口径（宿主替身可能
+        # 未实现该方法；_apply_status_tips 自身已吞内部异常）。
+        try:
+            self._apply_status_tips()
+        except Exception:
+            pass
         # 实验性总开关可能刚被切换：分享菜单项可见性立即跟随
         try:
             self._refresh_share_menu()
@@ -1229,51 +1254,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _add_baidu_download_dir(self):
-        """从百度网盘本地任务库识别下载目录并加入监听（实验性功能）。"""
-        if not self.state.snapshot().get("experimental_enabled", False):
-            QMessageBox.information(
-                self, "百度网盘下载目录",
-                "该功能依赖实验性功能，请先在「设置 → 常规」开启「实验性功能」。")
-            return
-        root = None
-        try:
-            from ..baidu_task import detect_download_root
-            root = detect_download_root(
-                self.state.snapshot().get("baidu_task_db") or None)
-        except Exception as e:
-            self.hub.log(f"识别百度网盘下载目录失败: {e}")
-        if root is None:
-            QMessageBox.information(
-                self, "百度网盘下载目录",
-                "未能从百度网盘任务库识别到下载目录。\n"
-                "（确认网盘客户端有下载历史，或该库路径未被改动）")
-            return
-        try:
-            entries = list(self.state.snapshot().get("watch_paths") or [])
-            # 实验性功能开启时统一走重叠检测：相等 / 祖先 / 子孙都拦截，避免
-            # 同一批下载文件被两条监听路径重复处理（旧代码只挡精确重复）。
-            conflict = watch_path_conflict(entries, str(root))
-            if conflict is not None:
-                QMessageBox.warning(
-                    self, "百度网盘下载目录",
-                    "该目录与已有监听路径重叠，可能重复处理同一批文件：\n"
-                    f"{root}\n↔ {conflict.get('path')}")
-                return
-            # 新目录默认 quarantine：与监听目录弹窗的推荐一致，避免无回收站卷上被永久删除
-            entries.append({"path": str(root), "enabled": True,
-                            "output_dir": "", "delete_source": False,
-                            "delete_policy": "quarantine",
-                            "mode": "baidu"})
-            self.state.set("watch_paths", entries)
-            self.rebuild_cards()
-            self.hub.log(f"已把百度网盘下载目录加入监听: {root}")
-            QMessageBox.information(self, "百度网盘下载目录",
-                                    f"已添加监听路径：\n{root}")
-        except Exception as e:
-            self.hub.log(f"添加百度网盘下载目录失败: {e}")
-            QMessageBox.warning(self, "百度网盘下载目录", f"添加失败：{e}")
-
     def _remove_path(self, idx):
         cfg = self.state.snapshot()
         if 0 <= idx < len(cfg["watch_paths"]):
@@ -1301,6 +1281,10 @@ class MainWindow(QMainWindow):
                 # 关闭监听的目录一律显示「已暂停」：运行时缓存（可能仍是旧的
                 # listening/extracting）不得覆盖 enabled=False 的配置事实。
                 ent["state"] = "paused"
+            elif not str(e.get("path") or "").strip():
+                # 刚「添加目录」的空条目还在弹窗里配置：绝不能冒充「监听中」。
+                # 弹窗保存把 path 写回后本分支自然失效，状态转为 listening/paused。
+                ent["state"] = "configuring"
             elif cached is not None:
                 ent["state"] = cached[0]
                 if cached[1] is not None:
@@ -2720,6 +2704,94 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    # ---------- 主窗几何记忆（saveGeometry/restoreGeometry，2026-09-28） ----------
+    def _restore_geometry(self, aw, ah):
+        """恢复 `main_geometry` 的 saveGeometry base64；坏值/越界回退默认尺寸。
+
+        与精简小窗同款口径：`restoreGeometry` 自带屏幕越界钳制，但各平台并不
+        总可靠——恢复结果零尺寸、或与所有屏幕可用区都不相交时一律视为坏数据，
+        回退 `fit_window_size(1280, 800, aw, ah)`（新默认；旧默认 1440×880 因
+        用户反馈过大而收小）。返回是否采用了已存几何。
+        """
+        ok = False
+        restored = False
+        raw = None
+        try:
+            raw = self.state.get("main_geometry", "")
+        except Exception:
+            raw = None
+        if raw:
+            try:
+                ba = QByteArray.fromBase64(str(raw).encode("ascii"))
+                if not ba.isEmpty():
+                    restored = bool(self.restoreGeometry(ba))
+                    ok = restored
+            except Exception:
+                ok = False
+        if ok:
+            # 兜底守卫：恢复结果必须落在某块屏幕可用区内且尺寸为正（Qt 钳制
+            # 失效的平台/坏数据不能让窗口永远开在屏外或缩成 0）。
+            try:
+                if int(self.width()) < 1 or int(self.height()) < 1:
+                    ok = False
+                else:
+                    g = self.frameGeometry()
+                    app = QApplication.instance()
+                    screens = app.screens() if app is not None else []
+                    if not any(s.availableGeometry().intersects(g) for s in screens):
+                        ok = False
+            except Exception:
+                pass
+        if not ok:
+            try:
+                self.resize(*fit_window_size(1280, 800, aw, ah))
+            except Exception:
+                pass
+            if restored:
+                # 已存几何被守卫拒绝（全屏外/零尺寸）：restoreGeometry 可能已把
+                # 窗口挪到屏外坐标——必须拉回主屏可见落点，否则「回退默认」仍
+                # 开在屏外。未成功恢复过（空/坏值）时不动位置，保持原默认落点。
+                self._move_default_position()
+        return ok
+
+    def _move_default_position(self):
+        """几何回退落点：主屏可用区左上角 + 边距（把屏外窗口拉回可见区）。"""
+        try:
+            app = QApplication.instance()
+            scr = app.primaryScreen() if app is not None else None
+            if scr is None:
+                return
+            g = scr.availableGeometry()
+            self.move(g.x() + _SCREEN_MARGIN, g.y() + _SCREEN_MARGIN)
+        except Exception:
+            pass
+
+    def _queue_geometry_save(self):
+        """把一次几何变化并入 500ms 防抖窗口（构造期 `_geo_ready` 未置真则忽略）。"""
+        if not getattr(self, "_geo_ready", False):
+            return
+        try:
+            self._geo_timer.start()
+        except Exception:
+            pass
+
+    def _save_geometry(self):
+        """持久化主窗几何（base64 字符串；Qt 自带越界钳制）。异常安全。"""
+        try:
+            data = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            if data:
+                self.state.set("main_geometry", data)
+        except Exception:
+            pass
+
+    def _flush_geometry_save(self):
+        """关闭路径：停掉防抖计时器并立即写一次——最终几何恰好写一次（不多写）。"""
+        try:
+            self._geo_timer.stop()
+        except Exception:
+            pass
+        self._save_geometry()
+
     def _sync_page_min_heights(self):
         """把五个页面的最小高度对齐其首选高度（窗口显示后执行一次）。
 
@@ -2740,27 +2812,51 @@ class MainWindow(QMainWindow):
         # 页面最小高度变了：窗口最小尺寸需要按新 hint 重算一次
         self._apply_screen_limits()
 
+    def _apply_status_tips(self):
+        """底栏滚动提示组（ticker + 「使用提示」 + bolt 图标）可见性的唯一真源。
+
+        enabled = 配置 show_status_tips 为真；紧凑窗口（宽度 < _CHROME_COMPACT_W）
+        时即使开启也收起（响应式），即 visible = enabled and not compact。
+        不可见时 pause() 播报定时器避免隐藏空转；恢复可见时 resume()（pause()
+        置的是宿主意图标志，只 setVisible 不会自动恢复）。任何异常吞掉。
+        """
+        try:
+            sb = getattr(self, "statusbar", None)
+            if sb is None:
+                return
+            enabled = bool(self.state.snapshot().get("show_status_tips", True))
+            visible = enabled and int(self.width()) >= _CHROME_COMPACT_W
+            for name in ("ticker", "tip_icon", "tip_label"):
+                obj = getattr(sb, name, None)
+                if obj is not None:
+                    obj.setVisible(visible)
+            ticker = getattr(sb, "ticker", None)
+            if ticker is not None:
+                if visible:
+                    ticker.resume()
+                else:
+                    ticker.pause()
+        except Exception:
+            pass
+
     def _apply_chrome_compact(self):
         """窗口过窄时收起次要装饰（响应式），保证常显控件一个都不被裁切。
 
         阈值 _CHROME_COMPACT_W 来自两条常显栏的自然宽度（胶囊条、底栏含
         336px 播报 ≈853）。窄于该量级时收起「底栏播报 + 使用提示标签」这类
         装饰；真实控件（添加目录 / 胶囊 / 状态 / 进度 / 失败 / 快捷键）永不隐藏。
+        可见性判定统一收敛到 _apply_status_tips()（配置开关 + 紧凑宽度一致）。
         """
-        try:
-            compact = int(self.width()) < _CHROME_COMPACT_W
-            sb = getattr(self, "statusbar", None)
-            if sb is not None:
-                for name in ("ticker", "tip_icon", "tip_label"):
-                    obj = getattr(sb, name, None)
-                    if obj is not None:
-                        obj.setVisible(not compact)
-        except Exception:
-            pass
+        self._apply_status_tips()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_chrome_compact()
+        self._queue_geometry_save()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._queue_geometry_save()
 
     def _install_screen_watch(self):
         """窗口显示后挂上「屏 / 缩放变化」监视；Qt5 无法自动重排时至少留日志。"""
@@ -3262,6 +3358,12 @@ class MainWindow(QMainWindow):
             if not self.state.snapshot().get("experimental_enabled"):
                 self._append_log("实验性功能未开启，「用客户端下载分享」不可用")
                 return
+            # 剪贴板监听总开关关闭：本功能按压时要就地读剪贴板（A 快路径）——
+            # 绝不读取，明确提示后放弃（与上面的实验性开关同一「记一行」发声口径）。
+            if not self.state.snapshot().get("clipboard_enabled", True):
+                self._append_log(
+                    "剪贴板监听已关闭，「用客户端下载分享」需要读取剪贴板，已跳过")
+                return
             # A. 按压时刻的剪贴板：命中分享链接就从该文本就地解析（零等待）。
             #    绝不把文本再交给 QRMonitor 管线（避免重复抓页/记录/双拉起）。
             _fresh = _clipboard_share_target(self)
@@ -3380,6 +3482,12 @@ class MainWindow(QMainWindow):
             # 整条 2.F 属实验性功能：全局热键也可能被按下，这里必须再校验一次。
             if not self.state.snapshot().get("experimental_enabled"):
                 self._append_log("实验性功能未开启，「挑选文件下载分享」不可用")
+                return
+            # 剪贴板监听总开关关闭：本功能按压时要就地读剪贴板（A 快路径）——
+            # 绝不读取，明确提示后放弃（与上面的实验性开关同一「记一行」发声口径）。
+            if not self.state.snapshot().get("clipboard_enabled", True):
+                self._append_log(
+                    "剪贴板监听已关闭，「挑选文件下载分享」需要读取剪贴板，已跳过")
                 return
             # A. 按压时刻的剪贴板：命中分享链接就从该文本就地解析（零等待）。
             _fresh = _clipboard_share_target(self)

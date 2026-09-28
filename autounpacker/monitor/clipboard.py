@@ -327,6 +327,84 @@ class QRMonitor(threading.Thread):
         # 「静默复制」正在写入剪贴板的文本：写入成功前置位，防止自写内容被轮询
         # 线程当成用户输入（详见 _copy_silently）。None=当前无静默写入。
         self._silent_write = None
+        # 启动基线（用户规则：程序启动那一次摸到的剪贴板内容必须忽略，只有启动
+        # **之后**复制的内容才处理）：start() 一次性把现有文本/图片记为已见值，
+        # 零副作用。剪贴板读不到时 _baseline_unread 置位，由 _poll_once 在成功
+        # 吸收一次之前跳过捕获（见 _read_baseline_now）。
+        self._baseline_primed = False
+        self._baseline_unread = False
+        self._baseline_fail_logged = False
+
+    def start(self):
+        """启动轮询线程；启动前先把当前剪贴板内容记为「已见基线」（一次性）。
+
+        用户规则：程序启动那一次摸到的剪贴板内容必须忽略——只有启动**之后**
+        复制的内容才处理。基线读取放在 start() 而不是 run() 里的原因：必须保证
+        读取**先于**轮询线程的第一次捕获完成，否则「start() 返回后立刻复制」会
+        与基线读取赛跑。读取失败绝不阻断启动（见 _read_baseline_now）。"""
+        self._prime_baseline_once()
+        super().start()
+
+    def _prime_baseline_once(self):
+        """一次性启动基线：无论成功失败都只执行一次；失败置 _baseline_unread。
+
+        监听总开关关闭（clipboard_enabled=False）时同样只执行一次但不读剪贴板：
+        置 _baseline_unread。代价：关闭期间复制的内容会在用户重新打开监听后的
+        第一轮被吸收为基线（不处理）——宁可漏掉那一次，也绝不在关闭状态下读取。"""
+        if getattr(self, "_baseline_primed", False):
+            return
+        self._baseline_primed = True
+        if not _state_get(self.state, "clipboard_enabled", True):
+            # 监听关闭：启动这次不读剪贴板（隐私）。置 _baseline_unread，等用户真正
+            # 打开监听后的第一轮把当时剪贴板内容吸收为基线，而不是当成新复制去处理。
+            self._baseline_unread = True
+            return
+        if not self._read_baseline_now():
+            self._baseline_unread = True
+
+    def _read_baseline_now(self):
+        """读一次剪贴板并写入启动基线（last_text / last_url / last_hash），零副作用。
+
+        只读、只记「已见」：不写剪贴板、不入队、不记临时密码、不 append
+        _recent_texts、不记「已捕获」日志。剪贴板没有文本也没有图片时不设任何
+        基线值（启动后第一次真实复制照常处理）。读取失败返回 False 并最多记
+        一行日志；调用方在成功吸收一次之前跳过捕获，读不到也绝不把旧内容当新。"""
+        try:
+            wc, ig = _ensure_clipboard()
+            if wc is None:
+                return True    # 剪贴板依赖不可用：捕获路径本身也会短路
+            try:
+                text = self._read_clipboard_text(wc)
+            except Exception as e:
+                self._log_baseline_failure(e)
+                return False
+            if text:
+                with self._hist_lock:
+                    self.last_text = text
+                    self.last_url = text
+            if ig is not None and wc.IsClipboardFormatAvailable(wc.CF_DIB):
+                try:
+                    image = ig.grabclipboard()
+                    # 仅处理真实 PIL 图片（CF_HDROP 时返回路径列表），与 _process 同判据
+                    if image is not None and hasattr(image, "save"):
+                        self.last_hash = self._image_md5(image)
+                except Exception:
+                    pass   # 图片侧基线失败不阻断文本基线；捕获路径自带去重与错误日志
+            return True
+        except Exception as e:
+            self._log_baseline_failure(e)
+            return False
+
+    def _log_baseline_failure(self, err):
+        """启动基线读取失败的日志：每个实例至多一行，绝不抛异常。"""
+        if getattr(self, "_baseline_fail_logged", False):
+            return
+        self._baseline_fail_logged = True
+        try:
+            self.hub.log("剪贴板初始基线读取失败，启动前的剪贴板内容将不被处理: "
+                         f"{err}")
+        except Exception:
+            pass
 
     def run(self):
         # 工作线程只启动一次：所有阻塞 I/O（网络/子进程/浏览器）都在它里面串行
@@ -369,9 +447,20 @@ class QRMonitor(threading.Thread):
                     break
                 self._enqueue(("clipcopy", curl))
         # 暂停 = 原「停止监听」：剪贴板/二维码监控一并停止
-        if self.state.running and not (self.pauser is not None
-                                       and self.pauser.is_paused()):
+        # 总开关 clipboard_enabled=False 时同样整块短路：本程序完全不读取剪贴板
+        # （隐私）；上面 url_grant_q / clip_echo_q 的排空保持无条件执行——剪贴板
+        # **写入**（如日志链接静默复制）绝不受监听开关影响。
+        if (self.state.running and not (self.pauser is not None
+                                        and self.pauser.is_paused())
+                and _state_get(self.state, "clipboard_enabled", True)):
             try:
+                if getattr(self, "_baseline_unread", False):
+                    if self._read_baseline_now():
+                        self._baseline_unread = False
+                    else:
+                        # 启动基线还没读到（剪贴板被占用）：本轮不进入捕获，
+                        # 宁可延后，也不把启动前就在剪贴板里的内容当新复制。
+                        return
                 new_text = self._capture_text_password()
                 if cfg.get("qr_url_enabled") and QR_AVAILABLE and new_text:
                     self._enqueue(("text", new_text))
@@ -505,27 +594,9 @@ class QRMonitor(threading.Thread):
         if wc is None:
             return None
         try:
-            if not wc.IsClipboardFormatAvailable(wc.CF_UNICODETEXT):
-                return None
-            # OpenClipboard 会因其他进程短暂占用剪贴板报"拒绝访问"(error 5)，
-            # 重试几次通常能成功；全部失败才放弃本轮（下次轮询再试）。
-            opened = False
-            for _ in range(4):
-                try:
-                    wc.OpenClipboard()
-                    opened = True
-                    break
-                except Exception:
-                    time.sleep(0.15)
-            if not opened:
-                raise OSError("OpenClipboard 重试失败（剪贴板被其他进程占用）")
-            try:
-                text = wc.GetClipboardData(wc.CF_UNICODETEXT)
-            finally:
-                wc.CloseClipboard()
+            text = self._read_clipboard_text(wc)
             if not text:
                 return None
-            text = text.strip()
             # last_text / _recent_texts 由轮询线程（此处）与工作线程
             # （_restore_last_text）共享，统一用 _hist_lock 保护；临界区内不做任何
             # 耗时操作，避免卡住另一线程。
@@ -557,6 +628,46 @@ class QRMonitor(threading.Thread):
         except Exception as e:
             self.hub.log(f"临时密码捕获出错: {e}")
             return None
+
+    @staticmethod
+    def _read_clipboard_text(wc):
+        """从 win32clipboard 读剪贴板文本（strip 后）；无文本返回 None，读取失败抛异常。
+
+        启动基线（_read_baseline_now）与捕获路径（_capture_text_password）共用
+        同一份读取步骤：CF_UNICODETEXT 判定 → OpenClipboard 重试（其他进程短暂
+        占用剪贴板时报"拒绝访问"error 5，重试几次通常能成功；全部失败才会放弃
+        本轮，下次轮询再试）→ GetClipboardData → strip。异常语义交给调用方：
+        捕获路径记「临时密码捕获出错」并跳过本轮；基线路径据此进入
+        _baseline_unread 吸收模式。"""
+        if not wc.IsClipboardFormatAvailable(wc.CF_UNICODETEXT):
+            return None
+        opened = False
+        for _ in range(4):
+            try:
+                wc.OpenClipboard()
+                opened = True
+                break
+            except Exception:
+                time.sleep(0.15)
+        if not opened:
+            raise OSError("OpenClipboard 重试失败（剪贴板被其他进程占用）")
+        try:
+            text = wc.GetClipboardData(wc.CF_UNICODETEXT)
+        finally:
+            try:
+                wc.CloseClipboard()
+            except Exception as e:
+                # 1418 ERROR_CLIPBOARD_NOT_OPEN：OpenClipboard 明明成功、关的时候
+                # 剪贴板却已不在（来源程序退出 / 其它进程 EmptyClipboard / 剪贴板
+                # 所有者销毁窗口都会这样），属于 Win32 上的良性竞态。此时数据已经
+                # 读到了，绝不能因此把本轮结果丢掉、更不能记成「临时密码捕获出错」。
+                # 只放过 1418：其它关闭失败可能意味着「真的没关掉」，绝不能吞——
+                # 吞了会让本线程（长期存活）一直占着剪贴板，才是真的霸占。
+                if (getattr(e, "args", None) or (None,))[0] != 1418:
+                    raise
+        if not text:
+            return None
+        return text.strip()
 
     def _set_clipboard(self, text):
         """把文本写入剪贴板（替换当前内容）。失败返回 False。
@@ -645,6 +756,18 @@ class QRMonitor(threading.Thread):
         with self._hist_lock:
             return list(self._recent_texts)
 
+    @staticmethod
+    def _image_md5(image):
+        """按 _process 同款方式（PNG 编码后 md5）算图片指纹；异常向上抛。
+
+        启动基线（_read_baseline_now）与 _process 共用：保证「启动时已存在的
+        图片」与后续轮询看到的同一张图得到同一个哈希，从而被去重跳过。"""
+        import hashlib
+        from io import BytesIO
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        return hashlib.md5(buf.getvalue()).hexdigest()
+
     def _process(self, image):
         """轮询线程侧：剪贴板图片按 md5 去重后入队，解码交给工作线程。
 
@@ -658,11 +781,7 @@ class QRMonitor(threading.Thread):
         避免 image.save 抛 'list' object has no attribute 'save'。"""
         if image is None or not hasattr(image, "save"):
             return
-        import hashlib
-        from io import BytesIO
-        buf = BytesIO()
-        image.save(buf, format="PNG")
-        h = hashlib.md5(buf.getvalue()).hexdigest()
+        h = self._image_md5(image)
         if h == self.last_hash:
             return
         self.last_hash = h
@@ -1220,7 +1339,8 @@ class QRMonitor(threading.Thread):
         try:
             data = self._fetch_url(text)
         except Exception as e:
-            self.hub.log(f"网址访问失败（跳过）: {text[:60]} ... {e}")
+            self.hub.log(f"网址访问失败（跳过）: {text[:60]} ... {e} —— "
+                         "可右键「复制图片」由剪贴板识别，或另存为文件后拖入")
             return
         if not data:
             self.hub.log(f"网址内容过大或为空（跳过）: {text[:60]}")
@@ -1268,7 +1388,7 @@ class QRMonitor(threading.Thread):
         import ssl
         from urllib.request import (Request, HTTPRedirectHandler,
                                     build_opener, HTTPSHandler)
-        from urllib.error import HTTPError
+        from urllib.error import HTTPError, URLError
         from ..trust import same_site
         cfg = self.state.snapshot()
         hub = self.hub
@@ -1312,6 +1432,12 @@ class QRMonitor(threading.Thread):
             ctx = ssl.create_default_context()
         opener = build_opener(_RedirectGuard(),
                               HTTPSHandler(context=ctx))
+        data = None
+        # 连接失败**不重试**（用户 2026-09-28 决定）：同一瞬间的快速重试对「策略型
+        # RST」无效——对面按 TLS 指纹 / ALPN / IP 信誉拦在握手层，实测换栈（Schannel
+        # 与 OpenSSL）换请求头都是同样结果，重试必然同样失败；却会多送一次握手、累积
+        # 成该 IP 的风控记录，最终可能连浏览器都打不开。失败一律直接上抛：由
+        # _maybe_process_url 记一条带「可右键复制图片 / 另存为文件拖入」建议的日志。
         try:
             with opener.open(req, timeout=timeout) as resp:
                 data = resp.read(max_bytes + 1)
@@ -1321,8 +1447,18 @@ class QRMonitor(threading.Thread):
         except HTTPError as e:
             # 3xx 被信任拦截（guard 已记录日志）；其余 HTTP 错误按访问失败跳过
             if not (300 <= e.code < 400):
-                self.hub.log(f"网址访问失败（HTTP {e.code}）: {url[:60]}")
+                self.hub.log(f"网址访问失败（HTTP {e.code}）: {url[:60]} —— "
+                             "可右键「复制图片」由剪贴板识别，或另存为文件后拖入")
             return None
+        except OSError as e:
+            # URLError 也是 OSError 子类：连接重置/超时/域名解析失败都走这里
+            root = (e.reason if isinstance(e, URLError) and e.reason is not None
+                    else e)
+            if isinstance(root, ssl.SSLError):
+                self.hub.log("HTTPS 证书校验失败（如确需访问可在设置中允许"
+                             f"不验证证书）: {root}")
+                return None
+            raise
         if len(data) > max_bytes:
             return None
         return data

@@ -37,7 +37,7 @@ _MODE_TEXT = {"surface": "表层", "baidu": "百度清单（含子目录）"}
 
 
 def _fit_cjk(w):
-    """把文本控件的最小高度抬到 lineSpacing() + 2（CJK 顶/底 1px 裁切兜底）。
+    """把文本控件的最小高度抬到 lineSpacing() + 3（CJK 顶/底 1px 裁切兜底）。
 
     实现收敛到 ui.textfit.ensure_min_height（规则唯一真源，单行/多行同一配方；
     本弹窗的字段标签 / 固定高容器内的标题都依赖它）；幂等、异常安全。

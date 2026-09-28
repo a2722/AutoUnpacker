@@ -353,7 +353,8 @@ class PythonZipEngine:
         返回 (中文原因, 声明条目数)：命中硬阈值时原因为字符串，否则为 None。
         阈值与文案与 service._precheck（7z 路径）同口径：绝对上限
         bomb_hard_size_gb（默认 50 GB）、膨胀比 bomb_hard_ratio（默认 200×，
-        需同时达到 bomb_hard_min_gb，默认 1 GB）。
+        需同时达到 bomb_hard_min_gb，默认 1 GB）。任一阈值 <= 0 = 关闭该条规则；
+        bomb_hard_min_gb=0 = 比例规则无最小体积门槛。
 
         铁律：任何异常/未知（非 ZIP、打不开、解析不出）一律放行——加密或损坏的
         归档本就读不出真实清单，绝不能因为探测不到就拦住正常解压。"""
@@ -374,11 +375,13 @@ class PythonZipEngine:
             hard_min_gb = self._opt_number(options, "bomb_hard_min_gb", 1.0)
             gib = 1024 ** 3
             declared_gb = declared / gib
-            if declared > hard_size_gb * gib:
+            # 阈值 <= 0 = 关闭该条规则（与 service._precheck 完全同口径）。
+            # bomb_hard_min_gb=0 = 比例规则无最小体积门槛。
+            if hard_size_gb > 0 and declared > hard_size_gb * gib:
                 return (f"声明解压后大小 {declared_gb:.1f} GB 超过硬上限 "
                         f"{hard_size_gb:g} GB（疑似 zip bomb），已停止解压"), entries
             ratio = declared / archive_size if archive_size > 0 else 0.0
-            if ratio >= hard_ratio and declared_gb >= hard_min_gb:
+            if hard_ratio > 0 and ratio >= hard_ratio and declared_gb >= hard_min_gb:
                 return (f"声明膨胀比 {ratio:.0f}:1（解压后 {declared_gb:.2f} GB / "
                         f"压缩包 {archive_size / 1048576:.1f} MB）达到硬阈值 "
                         f"{hard_ratio:g}:1（疑似 zip bomb），已停止解压"), entries

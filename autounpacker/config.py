@@ -52,36 +52,37 @@ def delete_policy_permanent_fallback(policy):
 
 DEFAULT_CONFIG = {
     "qr_enabled": True,
+    "clipboard_enabled": True,   # 剪贴板监听总开关：关闭后本程序完全不读取剪贴板（拖入文件/图片不受影响）
     "notify_enabled": True,
     "notify_share": True,              # 分享 / 网盘分享类通知（手势/解析/拉起/下载结果统一开关）
     "notify_share_dead": True,         # 「分享链接已失效」专用开关（叠加在 notify_share 之上）
-    "notify_archive": True,
-    "notify_success": True,
+    "notify_archive": False,
+    "notify_success": False,
     "notify_failure": True,
     "notify_error": True,
-    "notify_trayed": True,            # 托盘提示：已最小化到托盘
-    "notify_already_running": True,   # 托盘提示：程序已在运行，已打开主界面
+    "notify_trayed": False,           # 托盘提示：已最小化到托盘
+    "notify_already_running": False,  # 托盘提示：程序已在运行，已打开主界面
     "notify_trust_pending": True,     # 托盘提示：有新的网址等待确认
-    "notify_baidu_done": True,        # 实验性：网盘下载批次完成
+    "notify_baidu_done": False,       # 实验性：网盘下载批次完成
     "notify_baidu_leftover": True,    # 实验性：启动时有未完成的网盘任务
-    "notify_baidu_dup": False,        # 实验性：新任务与历史下载重复（默认关，避免打扰）
-    "qr_clipboard_action": "none",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
+    "notify_baidu_dup": True,         # 实验性：新任务与历史下载重复（默认开）
+    "qr_clipboard_action": "code",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
     "qr_url_redirect": True,
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
     "output_time_now": True,         # 解压成功后把产物顶层时间戳校准为现在（避免旧日期在大目录里沉底）
     "qr_url_enabled": True,          # 复制 http(s) 网址时尝试访问并识别二维码图片
     "url_exclude_temp_password": True,  # 带 :// 的网址不记录为临时密码（xxxx.com 域名形式仍记录）
-    "temp_password_filter": False,      # 临时密码智能过滤（默认关；开启后只挡多行/句读/引号括号/路径/文件名/时间日期/域名/≥8分词/超长>128 等明显不是密码的文本）
-    "temp_password_max": 200,           # 临时密码最多保留条数（超出丢最旧）
+    "temp_password_filter": True,       # 临时密码智能过滤（默认开；只挡多行/句读/引号括号/路径/文件名/时间日期/域名/≥8分词/超长>128 等明显不是密码的文本）
+    "temp_password_max": 50,            # 临时密码最多保留条数（超出丢最旧）
     "temp_password_ttl_hours": 24,      # 临时密码有效期（小时），超时自动清理
     "translation_move_enabled": True,   # 翻译 JSON 自动归位（<10MB 单 json 移入同名大文件夹）
     "log_colors_enabled": True,         # 运行日志按事件类型着色
     "hotkey_enabled": True,             # 全局快捷键唤起主界面
-    "hotkey": "Ctrl+Alt+W",             # 快捷键组合（空/无 表示禁用）
-    "hotkey_share": "",                 # 「用客户端下载最近分享」全局快捷键（空=不设置）
-    "hotkey_share_pick": "",            # 「挑选文件下载最近分享」全局快捷键（空=不设置）
+    "hotkey": "Alt+1",                  # 快捷键组合（空/无 表示禁用）
+    "hotkey_share": "Alt+2",            # 「用客户端下载最近分享」全局快捷键（空=不设置）
+    "hotkey_share_pick": "Alt+3",       # 「挑选文件下载最近分享」全局快捷键（空=不设置）
     "url_redirect_rules": [
-        {"from": "drive.uc.cn", "to": "fast.uc.cn"},
+        {"from": "example1.com", "to": "example2.com"},
     ],
     "sevenzip_check_done": False,   # 首次启动的 7-Zip 检测已完成（避免每次启动都检查/弹窗）
     "poll_interval": 2,
@@ -117,27 +118,29 @@ DEFAULT_CONFIG = {
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
-    "share_gesture_wait_sec": 60,   # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
+    "share_gesture_wait_sec": 120,  # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
     # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
     # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
     "pair_split_enabled": True,     # 跨名分卷链配对唯一总闸（验证通过即改名为首卷系列；无 auto 开关）
     # ---------- 解压前安全检查（防 zip bomb）+ 磁盘空间守护（P1-14） ----------
     # 软告警只提示、不拦；硬拒绝则拒绝解压并提示。比例类规则的单位是
     # 「解压后体积 / 归档体积」的膨胀倍数；判定语义由解压链路解释，本处只存阈值。
+    # 任一阈值 <= 0 = 关闭该条规则（0 为哨兵值，None/缺键仍回退各自默认）。
     "bomb_guard_enabled": True,     # 解压前安全检查（防 zip bomb）总开关
-    "bomb_soft_ratio": 100,         # 软告警：解压后体积膨胀倍数上限（只提示，不拦）
-    "bomb_soft_entries": 50000,     # 软告警：归档条目数上限（只提示，不拦）
-    "bomb_hard_ratio": 200,         # 硬拒绝：膨胀倍数上限（需同时达到 bomb_hard_min_gb）
-    "bomb_hard_min_gb": 1.0,        # 硬拒绝：比例规则适用的最小解压后体积（GB）
-    "bomb_hard_size_gb": 50.0,      # 硬拒绝：解压后声明总体积的绝对上限（GB）
+    "bomb_soft_ratio": 100,         # 软告警：解压后体积膨胀倍数上限（只提示，不拦；0=关闭）
+    "bomb_soft_entries": 50000,     # 软告警：归档条目数上限（只提示，不拦；0=关闭）
+    "bomb_hard_ratio": 200,         # 硬拒绝：膨胀倍数上限（需同时达到 bomb_hard_min_gb；0=关闭该规则）
+    "bomb_hard_min_gb": 1.0,        # 硬拒绝：比例规则适用的最小解压后体积（GB；0=无最小体积门槛）
+    "bomb_hard_size_gb": 0.0,       # 硬拒绝：解压后声明总体积的绝对上限（GB；0=不限制）
     "min_free_space_gb": 5.0,       # 目标盘剩余空间低于此值(GB)时暂停一切自动解压；0=关闭
     "ui_theme": "auto",             # 界面主题：auto=跟随系统深浅色 / fluent=浅色 / devtool=深色
     "ui_theme_cached": "",          # 上次实际应用的主题（自动维护：启动时零检测先出首屏用）
-    "show_status_tips": True,       # 底栏滚动提示（使用提示条）；关掉不再轮播。原「幽灵键」转正
+    "show_status_tips": False,      # 底栏滚动提示（使用提示条）；关掉不再轮播。原「幽灵键」转正
     # ---------- 精简界面（E 方案，2026-09-26：独立小窗，与完整界面互斥） ----------
     "ui_compact": False,            # 是否以精简界面启动 / 当前是否精简
     "compact_on_top": False,        # 精简小窗是否置顶（D6：默认关，置顶后始终浮在最前）
     "compact_geometry": "",         # 精简小窗 saveGeometry() 的 base64 串（位置+尺寸记忆；空=默认位置）
+    "main_geometry": "",            # 主窗 saveGeometry() 的 base64 串（位置+尺寸+最大化记忆；空=默认尺寸）
     "settings_wizard_done": False,  # 设置向导已跳过/已完成；True 时设置页不再显示「设置向导」入口
 }
 
@@ -205,7 +208,7 @@ def bomb_options_from_cfg(cfg):
         "bomb_soft_entries": c.get("bomb_soft_entries", 50000),
         "bomb_hard_ratio": c.get("bomb_hard_ratio", 200),
         "bomb_hard_min_gb": c.get("bomb_hard_min_gb", 1.0),
-        "bomb_hard_size_gb": c.get("bomb_hard_size_gb", 50.0),
+        "bomb_hard_size_gb": c.get("bomb_hard_size_gb", 0.0),
         "max_size_ratio": float(soft_ratio) if soft_ratio > 0 else 0.0,
     }
 
@@ -271,19 +274,20 @@ def _sanitize_cfg(cfg):
         except Exception:
             cfg["poll_interval"] = 2
         cfg["qr_enabled"] = bool(cfg.get("qr_enabled", True))
+        cfg["clipboard_enabled"] = bool(cfg.get("clipboard_enabled", True))
         cfg["notify_enabled"] = bool(cfg.get("notify_enabled", True))
         cfg["notify_share"] = bool(cfg.get("notify_share", True))
         cfg["notify_share_dead"] = bool(cfg.get("notify_share_dead", True))
-        cfg["notify_archive"] = bool(cfg.get("notify_archive", True))
-        cfg["notify_success"] = bool(cfg.get("notify_success", True))
+        cfg["notify_archive"] = bool(cfg.get("notify_archive", False))
+        cfg["notify_success"] = bool(cfg.get("notify_success", False))
         cfg["notify_failure"] = bool(cfg.get("notify_failure", True))
         cfg["notify_error"] = bool(cfg.get("notify_error", True))
-        cfg["notify_trayed"] = bool(cfg.get("notify_trayed", True))
-        cfg["notify_already_running"] = bool(cfg.get("notify_already_running", True))
+        cfg["notify_trayed"] = bool(cfg.get("notify_trayed", False))
+        cfg["notify_already_running"] = bool(cfg.get("notify_already_running", False))
         cfg["notify_trust_pending"] = bool(cfg.get("notify_trust_pending", True))
-        cfg["notify_baidu_done"] = bool(cfg.get("notify_baidu_done", True))
+        cfg["notify_baidu_done"] = bool(cfg.get("notify_baidu_done", False))
         cfg["notify_baidu_leftover"] = bool(cfg.get("notify_baidu_leftover", True))
-        cfg["notify_baidu_dup"] = bool(cfg.get("notify_baidu_dup", False))
+        cfg["notify_baidu_dup"] = bool(cfg.get("notify_baidu_dup", True))
         # 拖拽行为（固定胶囊「拖拽行为」）：默认值与历史行为逐一对应——缺键时
         # 拖入文件的行为与旧版完全一致（总开关开 / 识别二维码 / 智能穿透 / 不删源）。
         cfg["drop_enabled"] = bool(cfg.get("drop_enabled", True))
@@ -293,27 +297,30 @@ def _sanitize_cfg(cfg):
         # 幽灵键转正（2026-09-25 设置页 A 方案 D2-b）：main_window 一直在读
         # show_status_tips 控制底栏滚动提示，但此前 DEFAULT_CONFIG / 界面都没有它，
         # 实际恒为「显示」。现补默认值与真控件（「外观与快捷键 · 底栏滚动提示」）。
-        cfg["show_status_tips"] = bool(cfg.get("show_status_tips", True))
+        cfg["show_status_tips"] = bool(cfg.get("show_status_tips", False))
         # 精简界面（E 方案，2026-09-26）：开关 / 置顶（D6 默认关）/ 位置尺寸记忆。
         # compact_geometry 是 saveGeometry() 的 base64 串：坏值回退空串，并限长
         # 4096 防脏数据（正常串约几百字节）。
         cfg["ui_compact"] = bool(cfg.get("ui_compact", False))
         cfg["compact_on_top"] = bool(cfg.get("compact_on_top", False))
         cfg["compact_geometry"] = str(cfg.get("compact_geometry") or "")[:4096]
+        # 主窗几何记忆（2026-09-28）：与 compact_geometry 完全同口径——saveGeometry()
+        # 的 base64 串；坏值（None/列表/超长）回退空串并限长 4096 防脏数据。
+        cfg["main_geometry"] = str(cfg.get("main_geometry") or "")[:4096]
         # 设置向导「跳过后不再显示」的持久化状态（2026-09-25 D1-a）。
         cfg["settings_wizard_done"] = bool(cfg.get("settings_wizard_done", False))
-        action = str(cfg.get("qr_clipboard_action", "none"))
-        cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "none"
+        action = str(cfg.get("qr_clipboard_action", "code"))
+        cfg["qr_clipboard_action"] = action if action in ("code", "url", "none") else "code"
         cfg["qr_url_redirect"] = bool(cfg.get("qr_url_redirect", True))
         cfg["promote_merge"] = bool(cfg.get("promote_merge", True))
         cfg["output_time_now"] = bool(cfg.get("output_time_now", True))
         cfg["qr_url_enabled"] = bool(cfg.get("qr_url_enabled", True))
         cfg["url_exclude_temp_password"] = bool(cfg.get("url_exclude_temp_password", True))
-        cfg["temp_password_filter"] = bool(cfg.get("temp_password_filter", False))
+        cfg["temp_password_filter"] = bool(cfg.get("temp_password_filter", True))
         try:
-            cfg["temp_password_max"] = max(1, min(100000, int(cfg.get("temp_password_max", 200))))
+            cfg["temp_password_max"] = max(1, min(100000, int(cfg.get("temp_password_max", 50))))
         except Exception:
-            cfg["temp_password_max"] = 200
+            cfg["temp_password_max"] = 50
         try:
             cfg["temp_password_ttl_hours"] = max(
                 1, min(24 * 365, int(cfg.get("temp_password_ttl_hours", 24))))
@@ -327,13 +334,13 @@ def _sanitize_cfg(cfg):
         cfg["translation_move_enabled"] = bool(cfg.get("translation_move_enabled", True))
         cfg["log_colors_enabled"] = bool(cfg.get("log_colors_enabled", True))
         cfg["hotkey_enabled"] = bool(cfg.get("hotkey_enabled", True))
-        cfg["hotkey"] = str(cfg.get("hotkey", "Ctrl+Alt+W")).strip()
-        cfg["hotkey_share"] = str(cfg.get("hotkey_share", "")).strip()
+        cfg["hotkey"] = str(cfg.get("hotkey", "Alt+1")).strip()
+        cfg["hotkey_share"] = str(cfg.get("hotkey_share", "Alt+2")).strip()
         # 旧键 hotkey_share_code（已退场的手势）已废弃：丢弃旧键，避免残留。
         # 值的迁移在 load_config() 合并默认值**之前**完成（此处 cfg 已含默认的
         # hotkey_share_pick，无法再区分用户是否显式设置过新键）。
         cfg.pop("hotkey_share_code", None)
-        cfg["hotkey_share_pick"] = str(cfg.get("hotkey_share_pick", "")).strip()
+        cfg["hotkey_share_pick"] = str(cfg.get("hotkey_share_pick", "Alt+3")).strip()
         rules = []
         for r in cfg.get("url_redirect_rules") or []:
             if isinstance(r, dict) and r.get("from") and r.get("to"):
@@ -384,9 +391,9 @@ def _sanitize_cfg(cfg):
         cfg.pop("pair_split_auto", None)
         try:
             cfg["share_gesture_wait_sec"] = max(
-                5, min(600, int(cfg.get("share_gesture_wait_sec", 60))))
+                5, min(600, int(cfg.get("share_gesture_wait_sec", 120))))
         except Exception:
-            cfg["share_gesture_wait_sec"] = 60
+            cfg["share_gesture_wait_sec"] = 120
         # 解压前安全检查（防 zip bomb）/ 磁盘空间守护（P1-14）：缺失或畸形一律回退
         # 默认（绝不抛）；比例与条目数钳到 >= 0，GB 阈值钳到 >= 0.0（0 = 关闭对应规则）。
         cfg["bomb_guard_enabled"] = bool(cfg.get("bomb_guard_enabled", True))
@@ -410,9 +417,9 @@ def _sanitize_cfg(cfg):
             cfg["bomb_hard_min_gb"] = 1.0
         try:
             cfg["bomb_hard_size_gb"] = max(
-                0.0, float(cfg.get("bomb_hard_size_gb", 50.0)))
+                0.0, float(cfg.get("bomb_hard_size_gb", 0.0)))
         except Exception:
-            cfg["bomb_hard_size_gb"] = 50.0
+            cfg["bomb_hard_size_gb"] = 0.0
         try:
             cfg["min_free_space_gb"] = max(
                 0.0, float(cfg.get("min_free_space_gb", 5.0)))

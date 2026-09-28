@@ -94,6 +94,11 @@ _HINT_NAMES = ("stripHint", "bubbleHint", "bubbleDesc", "bubbleRiskBody")
 
 # 实验性门控提示（气泡补充说明；实验性总开关关闭时这些行整行置灰 + 控件禁用）
 _EXP_NOTE = "该功能需开启「实验性」后方可使用。"
+# 实验性门控行名旁的常驻小标文案（比悬停气泡更早可见；显隐由 _apply_gates 控制）
+_EXP_BADGE_TEXT = "该功能需要开启实验性"
+# 「监听剪贴板」门控行名旁的常驻小标文案（关闭剪贴板读取时这些行整行置灰；
+# 显隐由 _apply_clip_gate 控制，独立于实验性 / 通知两套门控）
+_CLIP_BADGE_TEXT = "需开启剪贴板监听"
 
 # 风险行左侧 danger 竖条宽度（与 style.py `QWidget#setRow[risk="true"]` 的
 # `border-left: 3px` 一致；QSS border 不改变布局 contentsRect，行内容左侧必须
@@ -229,11 +234,12 @@ class _SettingRow:
     SettingsPage._controls；本对象负责搜索索引与气泡内容。"""
 
     __slots__ = ("label", "desc", "syn", "key", "widget", "domain", "group",
-                 "risk", "default_key", "default_value", "unit", "host", "note")
+                 "risk", "default_key", "default_value", "unit", "host", "note",
+                 "bubble")
 
     def __init__(self, label, desc, key, widget, domain, group,
                  syn=(), risk=False, default_key=None, default_value=None,
-                 unit=None):
+                 unit=None, bubble=True):
         self.label = label
         self.desc = desc
         self.key = key
@@ -247,6 +253,9 @@ class _SettingRow:
         self.unit = unit
         self.host = None   # 承载本行的 #setRow（实验性门控整行置灰用）
         self.note = None   # 气泡补充说明（实验性门控提示；不参与搜索）
+        # False = 本行不出气泡：_make_name / _dir_label 不登记到 _name_labels，
+        # 悬停计时器、点击固定与 _show_bubble_for 因成员判断失败而整体关闭。
+        self.bubble = bool(bubble)
 
     def search_blob(self):
         """搜索用的小写文本（名称 + 描述 + 同义词 + 键名）。"""
@@ -270,6 +279,29 @@ def _apply_card_shadow(widget, kind="card"):
     eff.setColor(QColor(0, 0, 0, int(spec["alpha"])))
     widget.setGraphicsEffect(eff)
     return eff
+
+
+class _CardFrame(QFrame):
+    """设置页卡片框（#groupCard / #dirCard，均挂 QGraphicsDropShadowEffect）。
+
+    QSS 圆角只裁背景，**圆角外的四个方角保持透明**；卡片挂
+    QGraphicsDropShadowEffect（§6.2）后，下移（dy>0）的阴影会从这两个底角
+    透出——浅色下一小块深灰、深色下一小块黑（顶角因阴影下移不可见）。
+    这里在 QSS 背景**之下**再垫一层页面底色（window_bg token，与
+    #settingsPage / #paneHost 同色）：DestinationOver 只落在透明像素上，
+    卡面与边框不受影响，圆角外露出的就是页面底色而非阴影。
+    """
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            painter.setCompositionMode(QPainter.CompositionMode_DestinationOver)
+            painter.fillRect(self.rect(),
+                             QColor(ui_style.tokens()["window_bg"]))
+            painter.end()
+        except Exception:
+            pass
+        super().paintEvent(event)
 
 
 class _RailDelegate(QStyledItemDelegate):
@@ -488,6 +520,10 @@ class _InfoBubble(QFrame):
         # 不抢键盘焦点（WA_ShowWithoutActivating + NoFocus），点击照常落到名称标签，
         # 页面空白处点击（SettingsPage.mousePressEvent）与 Esc 仍可收起。
         super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
+        # 顶层无边框窗默认自带不透明窗口底色：QSS 只把 #settingsBubble 的背景
+        # 画成圆角，圆角外的四个方角仍是窗口底色（真机上就是黑角）。必须在
+        # 首次 show 之前置半透明，圆角外才真正透明（桌面透出），阴影照常绘制。
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
@@ -576,6 +612,20 @@ class _SevenZipOp(QObject):
     done = pyqtSignal(str, bool)   # (消息, 是否成功)
 
 
+# 7-Zip 动作行的气泡短描述（按动作行名称索引；内容与 sevenzip.py 的能力说明同源：
+# 隔离版零 UAC（失败才回退官方安装器）/ 全局版装 Program Files 需一次 UAC /
+# 卸载只删隔离副本且仅在副本存在时可用 / 状态行只读）。_sevenzip_name 用它在
+# _name_labels 里登记动作行名称 -> 这些行可悬停 / 点击出气泡；动作行仍**不进
+# _rows**（没有配置键，与旧版「7-Zip 管理」入口同一规矩，不污染搜索索引）。
+_SEVENZIP_ACTION_DESC = {
+    "当前状态": "显示当前实际使用的 7-Zip（隔离版优先，否则系统版）与版本号；只读。",
+    "安装隔离版": ("免管理员解压到 %APPDATA%\\AutoUnpacker\\7z，不写系统目录；"
+                   "失败才回退到会弹一次 UAC 的官方安装器。"),
+    "安装全局版": "装到系统 Program Files，供全机使用；会弹一次 UAC。",
+    "卸载隔离版": "只删隔离副本，不影响系统已装的 7-Zip；仅隔离版存在时可用。",
+}
+
+
 def _sevenzip_status_text(info):
     """状态文案：复用引导对话框的 _status_text（唯一真源，避免两处措辞漂移）。
 
@@ -626,6 +676,14 @@ class SettingsPage(QWidget):
         self._section_cards = {}   # 领域 id -> 承载该领域行的 QWidget
         self._rows = []            # _SettingRow 列表（搜索索引 + 气泡内容）
         self._exp_gate = []        # [(host, 控件簇)] 实验性行：整行置灰 + 只禁用控件簇
+        self._exp_badges = []      # [(host, #expBadge)] 实验性行名旁小标（显隐随总开关）
+        self._qr_gate = []         # [(host, 控件簇)] 二维码重定向关闭时置灰的规则行
+        # 「监听剪贴板」总开关门控（独立注册表，绝不并入 _exp_gate / _exp_badges /
+        # _exp_subs——那三张表被离线验收锁定为 10 / 10 / 4）。
+        # 条目 = (host, 控件簇, 额外父条件 None|callable)：
+        #   整行置灰只随总开关；控件可用性 = 总开关关 ? False : 额外父条件。
+        self._clip_gate = []       # [(host, 控件簇, 父条件)] 剪贴板监听关闭时置灰的行
+        self._clip_badges = []     # [(host, #clipBadge)] 剪贴板门控行名旁小标（显隐随总开关）
         # 门控目标列表：懒建后「实验性 / 通知」领域可能尚未物化，先给空元组兜底，
         # 使 _apply_gates() 在任意物化顺序下都不会因缺少列表而抛异常。
         self._notify_subs = ()
@@ -976,7 +1034,7 @@ class SettingsPage(QWidget):
         head.addStretch(1)
         box.addLayout(head)
 
-        card = QFrame(block)
+        card = _CardFrame(block)
         card.setObjectName("groupCard")
         cbox = QVBoxLayout(card)
         # 卡内左右内边距为 0：行（#setRow）必须**整卡宽**，hover 高亮带才能严格
@@ -1061,6 +1119,32 @@ class SettingsPage(QWidget):
                         repolish_tree(row)
                 except Exception:
                     pass
+            # 卡底留白（统一规则）：卡内布局的下边距 = METRICS["card_pad"][2]
+            # (12px，与行内 row_pad_y 同一节奏) **减去**末子项自带的底部内边距：
+            #   - 末子项是 #setRow：行自身已让出 12px（risk 行后还有 6px addSpacing）
+            #     → 卡底下边距补 0，绝不出现「12+12」双份空隙；
+            #   - 末子项是说明标签 / 单选组宿主等：自带内边距为 0 → 卡底补足 12px，
+            #     卡片不再贴住最后一行文字（原「网址信任 / 网盘与分享 / 关闭行为」
+            #     等组的卡底空隙为 0~2px）。
+            try:
+                lay = gc.layout()
+                if lay is not None and lay.count():
+                    base = int(METRICS["card_pad"][2])
+                    inset, last_child = 0, None
+                    for i in range(lay.count() - 1, -1, -1):
+                        item = lay.itemAt(i)
+                        w = item.widget()
+                        if w is not None:
+                            last_child = w
+                            break
+                        si = item.spacerItem()
+                        if si is not None:
+                            inset += si.sizeHint().height()
+                    if last_child is not None and last_child.layout() is not None:
+                        inset += last_child.layout().contentsMargins().bottom()
+                    lay.setContentsMargins(0, 0, 0, max(0, base - inset))
+            except Exception:
+                pass
             # 非行内容：补回与改动前一致的 16px 水平内边距（顶/底边距原样保留）
             for w in kids:
                 if w.objectName() == "setRow":
@@ -1100,14 +1184,14 @@ class SettingsPage(QWidget):
         return lbl
 
     def _fit_hint(self, lbl):
-        """把单个标签/气泡框的最小高度抬到 lineSpacing() + 2（CJK 兜底）。
+        """把单个标签/气泡框的最小高度抬到 lineSpacing() + 3（CJK 兜底）。
 
         实现收敛到 ui.textfit.ensure_min_height（规则唯一真源）；本方法保留为
         页内兼容入口（eventFilter / 气泡等既有调用点不变）。"""
         ensure_min_height(lbl)
 
     def _fit_all_hints(self):
-        """页面内所有会绘制文本的标签都抬到 fontMetrics().lineSpacing() + 2。
+        """页面内所有会绘制文本的标签都抬到 fontMetrics().lineSpacing() + 3。
 
         单行标签不再豁免：共享的字体级兜底由 ui.textfit.fit_text_heights
         统一实现（探针实测单行 #setName rect 12px < CJK 墨迹 13~14px，顶缘
@@ -1193,17 +1277,48 @@ class SettingsPage(QWidget):
         lbl.setWordWrap(False)
         lbl.setCursor(Qt.PointingHandCursor)
         lbl.installEventFilter(self)
-        self._name_labels[id(lbl)] = (lbl, row_meta)
+        # 唯一的气泡登记点之一：row_meta.bubble=False 的行**不登记**。
+        # eventFilter / _arm_bubble / _show_bubble_for 全都以 _name_labels 成员
+        # 判断为准，所以不登记就同时关掉了悬停计时器、点击固定与显示。
+        if getattr(row_meta, "bubble", True):
+            self._name_labels[id(lbl)] = (lbl, row_meta)
         return lbl
 
-    def _row(self, lay, row_meta, make_control, risk=False, key=None):
+    def _exp_badge(self, parent, host):
+        """实验性门控行名旁的常驻小标（#expBadge）：不用悬停也知道为什么灰。
+
+        只建控件 + 登记；显隐由 _apply_gates() 按**实验性总开关**统一决定
+        （与 host 的 off 属性同源；通知总开关不参与）。"""
+        badge = QLabel(_EXP_BADGE_TEXT, parent)
+        badge.setObjectName("expBadge")
+        badge.setAlignment(Qt.AlignCenter)
+        self._exp_badges.append((host, badge))
+        return badge
+
+    def _clip_badge(self, parent, host):
+        """「监听剪贴板」门控行名旁的常驻小标（#clipBadge）：文案见 _CLIP_BADGE_TEXT。
+
+        只建控件 + 登记；显隐由 _apply_clip_gate() 按**剪贴板总开关**统一决定
+        （与 host 的 off 属性同源；实验性 / 通知总开关不参与）。独立于 #expBadge
+        的注册表，避免把两套门控的可见性绑在同一张表上。"""
+        badge = QLabel(_CLIP_BADGE_TEXT, parent)
+        badge.setObjectName("clipBadge")
+        badge.setAlignment(Qt.AlignCenter)
+        self._clip_badges.append((host, badge))
+        return badge
+
+    def _row(self, lay, row_meta, make_control, risk=False, key=None,
+             clip_gated=False):
         """通用行：左侧只有名称（+风险徽章），右侧控件，整行较高。
 
         make_control(host) -> 控件；返回该控件。风险行上下各留 6px（左侧 danger
         竖条 / 徽章不与相邻行贴住，§评审 #8）。
 
         行宿主占满卡宽（卡的左右内边距已为 0），行自己让出 16px 水平内边距：
-        hover 高亮带严格到卡边，文字/控件仍与改动前逐像素对齐。"""
+        hover 高亮带严格到卡边，文字/控件仍与改动前逐像素对齐。
+
+        row_meta.note == _EXP_NOTE 时，名称右侧再挂 #expBadge（实验性门控可见提示）。
+        clip_gated=True 时再挂 #clipBadge（「监听剪贴板」门控可见提示）。"""
         host = QWidget(lay.parentWidget())
         host.setObjectName("setRow")
         host.setAttribute(Qt.WA_StyledBackground, True)   # QSS 背景/边框需要
@@ -1222,6 +1337,12 @@ class SettingsPage(QWidget):
         l.setSpacing(6)
         name = self._make_name(left, row_meta.label, row_meta)
         l.addWidget(name, 0, Qt.AlignVCenter)
+        if row_meta.note == _EXP_NOTE:
+            # 紧贴名称右侧（风险徽章之前、stretch 之前）
+            l.addWidget(self._exp_badge(left, host), 0, Qt.AlignVCenter)
+        if clip_gated:
+            # 同上：紧贴名称右侧（实验性小标之后、风险徽章之前）
+            l.addWidget(self._clip_badge(left, host), 0, Qt.AlignVCenter)
         if risk:
             badge = QLabel("风险", left)
             badge.setObjectName("riskBadge")
@@ -1256,11 +1377,20 @@ class SettingsPage(QWidget):
         return None
 
     def _check(self, lay, label, key, desc, syn=(), risk=False,
-               extra_keys=None, commit=None, default=True, experimental=False):
-        """一行复选框（默认极简）。experimental=True 时纳入实验性门控。"""
+               extra_keys=None, commit=None, default=True, experimental=False,
+               clip_gated=False, clip_parent=None, bubble=True):
+        """一行复选框（默认极简）。experimental=True 时纳入实验性门控。
+
+        clip_gated=True 时纳入「监听剪贴板」门控（整行置灰 + 名称旁 #clipBadge）；
+        clip_parent 是可调用时，控件可用性再与「剪贴板监听开 AND 父条件」取 AND
+        （temp_password_filter 用它绑定自己的父项 url_exclude_temp_password）。
+        bubble=False 时本行不出气泡（描述只是名称的复述时使用，见 bubble 政策）。"""
         meta = _SettingRow(label, desc, key, None, self._domain_id,
                            "一般", syn=syn, risk=risk, default_key=key,
-                           default_value=default)
+                           default_value=default, bubble=bubble)
+        if experimental:
+            # 先落 note：_row 依 row_meta.note 挂 #expBadge
+            meta.note = _EXP_NOTE
 
         def mk(host):
             cb = _Switch(host)
@@ -1271,11 +1401,13 @@ class SettingsPage(QWidget):
                 self._reg(k, cb)
             return cb
 
-        cb = self._row(lay, meta, mk, risk=risk, key=key)
+        cb = self._row(lay, meta, mk, risk=risk, key=key,
+                       clip_gated=clip_gated)
         meta.widget = cb
         if experimental:
             self._exp_gate.append((meta.host, cb))
-            meta.note = _EXP_NOTE
+        if clip_gated:
+            self._clip_gate.append((meta.host, (cb,), clip_parent))
         return cb
 
     def _spin(self, minimum, maximum):
@@ -1293,13 +1425,19 @@ class SettingsPage(QWidget):
         return spin
 
     def _spin_row(self, lay, label, key, desc, minimum, maximum, syn=(),
-                  unit=None, risk=False, default=0, dbl=False, experimental=False):
+                  unit=None, risk=False, default=0, dbl=False, experimental=False,
+                  empty_ok=False, bubble=True):
         """一行「名称 + 数值框 [+ 单位]」。返回内部 spinbox（dbl=True 时是浮点框）。
 
-        experimental=True 时纳入实验性门控（禁用整个控件簇，名称标签保持可用）。"""
+        experimental=True 时纳入实验性门控（禁用整个控件簇，名称标签保持可用）。
+        empty_ok=True 时最小值归 0 且 0 显示为空白（specialValueText）——
+        「空白 = 该项不启用」；输入 / 步进仍照常提交数值（0）落盘。
+        bubble=False 时本行不出气泡（描述只是名称的复述时使用）。"""
         meta = _SettingRow(label, desc, key, None, self._domain_id, "一般",
                            syn=syn, risk=risk, default_key=key,
-                           default_value=default, unit=unit)
+                           default_value=default, unit=unit, bubble=bubble)
+        if experimental:
+            meta.note = _EXP_NOTE      # 先落 note：_row 依它挂 #expBadge
         holder = {}
 
         def mk(host):
@@ -1307,7 +1445,12 @@ class SettingsPage(QWidget):
             b = QHBoxLayout(box)
             b.setContentsMargins(0, 0, 0, 0)
             b.setSpacing(6)
-            spin = self._dspin(minimum, maximum) if dbl else self._spin(minimum, maximum)
+            lo = 0 if empty_ok else minimum
+            spin = self._dspin(lo, maximum) if dbl else self._spin(lo, maximum)
+            if empty_ok:
+                # Qt 把「空字符串的 specialValueText」当作未设置（值 0 仍显示
+                # "0"/"0.0"），故用一个空格：最小值 0 显示为空白 = 该项不启用。
+                spin.setSpecialValueText(" ")
             if dbl:
                 spin.valueChanged.connect(lambda v, k=key: self._commit(k, float(v)))
             else:
@@ -1326,7 +1469,6 @@ class SettingsPage(QWidget):
         meta.widget = spin
         if experimental:
             self._exp_gate.append((meta.host, box))
-            meta.note = _EXP_NOTE
         return spin
 
     def _text_row(self, lay, label, key, desc, parse, syn=(), rows=4,
@@ -1356,13 +1498,14 @@ class SettingsPage(QWidget):
         return edit
 
     def _radio_row(self, lay, label, key, desc, options, value_of, syn=(),
-                   risk=False, default="", on_change=None):
+                   risk=False, default="", on_change=None, bubble=True):
         """一行「名称 + 竖排单选组」。value_of() 返回当前选中值。
 
-        on_change 给定则任一单选被选中时触发（用于改即存）。"""
+        on_change 给定则任一单选被选中时触发（用于改即存）。
+        bubble=False 时本行不出气泡（描述只是名称的复述时使用）。"""
         meta = _SettingRow(label, desc, key, None, self._domain_id, "一般",
                            syn=syn, risk=risk, default_key=key,
-                           default_value=default)
+                           default_value=default, bubble=bubble)
 
         def mk(host):
             box = QWidget(host)
@@ -1433,32 +1576,36 @@ class SettingsPage(QWidget):
             syn=("zip bomb", "炸弹", "安全检查", "预检", "膨胀"))
         self.bomb_entries_spin = self._spin_row(
             g, "文件数量预警", "bomb_soft_entries",
-            "压缩包里文件数超过这个值只提醒、不拦截；0 = 关闭。",
+            "压缩包里文件数超过这个值只提醒、不拦截；留空 / 0 = 关闭。",
             0, 1000000, syn=("条目数", "文件数", "数量", "告警", "预警"),
-            default=50000)
+            default=50000, empty_ok=True)
         self.bomb_soft_ratio_spin = self._spin_row(
             g, "体积膨胀预警倍数", "bomb_soft_ratio",
-            "解压后体积超过压缩包的这个倍数时，只提醒、不拦截。",
-            1, 100000, syn=("软告警", "膨胀", "倍数", "比例", "预警"), default=100)
+            "解压后体积超过压缩包的这个倍数时，只提醒、不拦截；留空 / 0 = 关闭。",
+            0, 100000, syn=("软告警", "膨胀", "倍数", "比例", "预警"), default=100,
+            empty_ok=True)
         self.bomb_hard_ratio_spin = self._spin_row(
             g, "体积膨胀拦截倍数", "bomb_hard_ratio",
-            "解压后体积超过压缩包的这个倍数、且达到下面的最小体积时，直接拒绝解压。",
-            1, 100000, syn=("硬拒绝", "膨胀", "倍数", "拦截", "拒绝"), default=200)
+            "解压后体积超过压缩包的这个倍数、且达到下面的最小体积时，直接拒绝解压；"
+            "留空 / 0 = 关闭。",
+            0, 100000, syn=("硬拒绝", "膨胀", "倍数", "拦截", "拒绝"), default=200,
+            empty_ok=True)
         self.bomb_min_gb_spin = self._spin_row(
             g, "膨胀拦截的最小体积", "bomb_hard_min_gb",
-            "只有解压后体积达到这个大小，上面的倍数规则才生效——避免误伤小文件。",
+            "只有解压后体积达到这个大小，上面的倍数规则才生效——避免误伤小文件；"
+            "留空 / 0 = 不设最小体积。",
             0, 100000, syn=("最小体积", "门槛", "比例规则", "误伤"),
-            unit="GB", default=1.0, dbl=True)
+            unit="GB", default=1.0, dbl=True, empty_ok=True)
         self.bomb_size_gb_spin = self._spin_row(
             g, "解压后体积上限", "bomb_hard_size_gb",
-            "解压后声明的总体积超过这个值就直接拒绝。",
+            "解压后声明的总体积超过这个值就直接拒绝；留空 / 0 = 关闭。",
             0, 1000000, syn=("绝对上限", "总体积", "硬上限", "体积上限"),
-            unit="GB", default=50.0, dbl=True)
+            unit="GB", default=0.0, dbl=True, empty_ok=True)
         self.free_space_spin = self._spin_row(
             g, "磁盘剩余空间下限", "min_free_space_gb",
-            "目标盘剩余空间低于这个值就暂停自动解压，空间够了自动继续；0 = 关闭。",
+            "目标盘剩余空间低于这个值就暂停自动解压，空间够了自动继续；留空 / 0 = 关闭。",
             0, 100000, syn=("磁盘", "空间", "剩余", "暂停", "爆盘", "守护"),
-            unit="GB", default=5.0, dbl=True)
+            unit="GB", default=5.0, dbl=True, empty_ok=True)
 
     def _build_notify(self, box):
         g = self._group(box, "总开关")
@@ -1467,25 +1614,28 @@ class SettingsPage(QWidget):
             "关掉后不再弹任何提示（日志仍照记），下面各项一并变灰。",
             syn=("通知", "总开关", "静音", "关闭提示"))
         g = self._group(box, "解压事件")
+        # 气泡政策：以下事件行的描述只是名称的复述（「解压完成」->「解压成功时提示」），
+        # 按约定 bubble=False 整行不出气泡（不登记 => 无悬停 / 无点击 / 无计时器）。
         self.notify_archive_cb = self._check(
             g, "发现压缩包", "notify_archive", "扫描到新的压缩包时提示。",
-            syn=("发现", "压缩包", "扫描到"))
+            syn=("发现", "压缩包", "扫描到"), default=False, bubble=False)
         self.notify_success_cb = self._check(
             g, "解压完成", "notify_success", "解压成功时提示。",
-            syn=("成功", "完成", "解压完"))
+            syn=("成功", "完成", "解压完"), default=False, bubble=False)
         self.notify_failure_cb = self._check(
             g, "解压失败", "notify_failure", "解压失败时提示。",
-            syn=("失败", "错误", "没解出来"))
+            syn=("失败", "错误", "没解出来"), bubble=False)
         self.notify_error_cb = self._check(
             g, "解压出错", "notify_error", "解压过程报错时提示。",
-            syn=("出错", "异常", "报错"))
+            syn=("出错", "异常", "报错"), bubble=False)
         g = self._group(box, "托盘与启动")
         self.notify_trayed_cb = self._check(
             g, "已最小化到托盘", "notify_trayed", "程序收进托盘时提示一次。",
-            syn=("托盘", "最小化", "收起"))
+            syn=("托盘", "最小化", "收起"), default=False, bubble=False)
         self.notify_running_cb = self._check(
             g, "程序已在运行时提示", "notify_already_running",
-            "重复启动时提示，并打开已有窗口。", syn=("已运行", "重复启动", "单实例"))
+            "重复启动时提示，并打开已有窗口。", syn=("已运行", "重复启动", "单实例"),
+            default=False)
         self.notify_trust_cb = self._check(
             g, "有新的网址等待确认", "notify_trust_pending",
             "遇到没见过的网站、需要你决定信任与否时提示。",
@@ -1502,15 +1652,16 @@ class SettingsPage(QWidget):
         self.notify_baidu_done_cb = self._check(
             g, "网盘下载批次完成", "notify_baidu_done",
             "实验性功能开启时：一个下载批次全部完成时提示。",
-            syn=("网盘", "批次", "下载完成", "百度"), experimental=True)
+            syn=("网盘", "批次", "下载完成", "百度"), experimental=True,
+            default=False)
         self.notify_baidu_leftover_cb = self._check(
             g, "启动时有没下完的网盘任务", "notify_baidu_leftover",
             "实验性功能开启时：启动发现还有未完成任务时提示。",
             syn=("网盘", "未完成", "残留", "启动"), experimental=True)
         self.notify_baidu_dup_cb = self._check(
             g, "新任务与历史重复", "notify_baidu_dup",
-            "实验性功能开启时：新任务和以前下载过的一样时提示（默认关，避免打扰）。",
-            syn=("重复", "去重", "历史下载", "网盘"), default=False,
+            "实验性功能开启时：新任务和以前下载过的一样时提示。",
+            syn=("重复", "去重", "历史下载", "网盘"), default=True,
             experimental=True)
 
         self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
@@ -1523,27 +1674,41 @@ class SettingsPage(QWidget):
         self.notify_cb.toggled.connect(lambda _s: self._sync_notify_enabled())
 
     def _build_clipboard(self, box):
+        g = self._group(box, "剪贴板监听")
+        # 隐私总开关：关闭后本页凡「需要读剪贴板才有输入」的行全部置灰（见
+        # _apply_clip_gate）。开关自身绝不能被门控，也不标 experimental。
+        self.clipboard_cb = self._check(
+            g, "监听剪贴板", "clipboard_enabled",
+            "关闭后本程序完全不读取剪贴板：不再捕获临时密码、不再识别剪贴板里的"
+            "二维码或复制的网址；拖入文件 / 图片仍照常处理。",
+            syn=("监听", "剪贴板", "隐私", "关闭", "不读取"))
+
         g = self._group(box, "二维码识别")
         self.qr_cb = self._check(
             g, "识别剪贴板图片里的二维码", "qr_enabled",
             "复制到剪贴板的截图里有二维码就自动识别；手动拖进来的图片不受这个开关限制。",
-            syn=("二维码", "扫码", "剪贴板", "截图", "识别"))
+            syn=("二维码", "扫码", "剪贴板", "截图", "识别"), clip_gated=True)
         self.clip_host = self._radio_row(
             g, "打开二维码网页后，剪贴板怎么办", "qr_clipboard_action",
             "不处理 / 恢复刚复制的提取码 / 把二维码原文写回剪贴板。",
             (("none", "不处理"), ("code", "恢复刚复制的提取码"),
              ("url", "把二维码原文写回剪贴板")),
             self._clip_value, syn=("剪贴板联动", "提取码", "恢复", "写回"),
-            on_change=self._commit_clip)
+            default="code", on_change=self._commit_clip,
+            # 气泡政策：描述就是下方三个选项的逐字罗列，纯复述 -> 整行不出气泡。
+            bubble=False)
         g = self._group(box, "密码识别")
         self.auto_add_cb = self._check(
             g, "识别到新密码就自动存进密码本", "auto_add_clipboard_password",
             "剪贴板里识别出口令时自动收进长期密码本（与「密码本」页里的开关是同一项）。",
-            syn=("密码本", "自动收录", "长期密码", "口令"), default=False)
+            syn=("密码本", "自动收录", "长期密码", "口令"), default=False,
+            clip_gated=True)
         ph, pl = self._manual_row(g)
         pl.addWidget(self._make_name(
-            ph, "密码本条目", _SettingRow("密码本条目", "", "passwords", None,
-                                          "clipboard", "密码识别")))
+            ph, "密码本条目",
+            _SettingRow("密码本条目",
+                        "长期密码本在「密码本」页管理，这里只显示条数。",
+                        "passwords", None, "clipboard", "密码识别")))
         self.passwords_label = QLabel("", ph)
         self.passwords_label.setObjectName("stripHint")
         pl.addWidget(self.passwords_label)
@@ -1558,28 +1723,40 @@ class SettingsPage(QWidget):
         self.url_exclude_cb = self._check(
             g, "网址不当密码记录", "url_exclude_temp_password",
             "带 :// 的完整网址不记成临时密码；xxxx.com 这种没带协议的仍会记录。关掉就连网址也照收。",
-            syn=("网址排除", "临时密码", "过滤", "协议"))
+            syn=("网址排除", "临时密码", "过滤", "协议"), clip_gated=True)
         self.temp_filter_cb = self._check(
             g, "更严格的密码过滤", "temp_password_filter",
             "在上一项基础上，再挡掉多行文本、文件路径、文件名、句子、超长串等明显不是口令的内容。",
-            syn=("智能过滤", "严格", "误报", "口令"), default=False)
+            syn=("智能过滤", "严格", "误报", "口令"), default=True,
+            clip_gated=True,
+            # 父项条件：父项（网址不当密码记录）未勾选时本项也不可用。与
+            # url_exclude_cb 的 toggled 走同一出口 _apply_clip_gate 统一重算，
+            # 保证「总开关关 → 两者全灰 → 再打开」时按自己的父项状态恢复，
+            # 绝不无条件启用（原来的直接 setEnabled(bool(s)) 会绕过总开关）。
+            clip_parent=lambda: bool(self.url_exclude_cb.isChecked()))
         self.url_exclude_cb.toggled.connect(
-            lambda s: self.temp_filter_cb.setEnabled(bool(s)))
+            lambda _s: self._apply_clip_gate())
         self.ttl_spin = self._spin_row(
             g, "临时密码有效期", "temp_password_ttl_hours",
             "超过这个小时数自动清理。", 1, 24 * 365,
-            syn=("有效期", "过期", "清理", "小时"), unit="小时", default=24)
+            syn=("有效期", "过期", "清理", "小时"), unit="小时", default=24,
+            bubble=False)
         self.temp_max_spin = self._spin_row(
             g, "临时密码保留上限", "temp_password_max",
             "超过这个条数就丢掉最旧的。", 1, 100000,
-            syn=("上限", "条数", "丢最旧"), unit="条", default=200)
+            syn=("上限", "条数", "丢最旧"), unit="条", default=50)
+        # 「监听剪贴板」总开关：构建时先按当前状态贴一次门控（回填 / 切换后由
+        # 同一个 _apply_clip_gate 收敛）；跨领域的行（links 的 qr_url_enabled）
+        # 由 _ensure_domain → _apply_gates 收口，与 _qr_gate 同一套机制。
+        self.clipboard_cb.toggled.connect(lambda _s: self._apply_clip_gate())
+        self._apply_clip_gate()
 
     def _build_links(self, box):
         g = self._group(box, "打开二维码链接")
         self.qr_url_cb = self._check(
             g, "复制网址时自动识别二维码", "qr_url_enabled",
             "复制 http(s) 网址时自动访问一次；如果返回的是二维码图片，就解码后按设置打开。",
-            syn=("复制网址", "识别二维码", "http", "自动访问"))
+            syn=("复制网址", "识别二维码", "http", "自动访问"), clip_gated=True)
         self.qr_redirect_cb = self._check(
             g, "二维码链接域名重定向", "qr_url_redirect",
             "打开前按下面的重定向规则改写域名，例如 drive.uc.cn → fast.uc.cn。",
@@ -1588,7 +1765,12 @@ class SettingsPage(QWidget):
             g, "域名重定向规则", "url_redirect_rules",
             "每行一条「源域名 -> 目标域名」；只换主机名，路径和参数原样保留。",
             _parse_redirect_rules, syn=("重定向规则", "域名替换", "映射"),
-            rows=3, placeholder="每行一条：源域名 -> 目标域名")
+            rows=3, placeholder="每行一条，如 example1.com -> example2.com")
+        # 重定向总开关关闭时，规则行整行置灰（构建 + 每次切换都应用；与实验性
+        # 门控同一套 off 机制，见 _apply_qr_gate）。
+        self._qr_gate.append((self.rules_edit.parentWidget(), (self.rules_edit,)))
+        self.qr_redirect_cb.toggled.connect(lambda _s: self._apply_qr_gate())
+        self._apply_qr_gate()
 
         g = self._group(box, "网址信任")
         self.trust_builtin_cb = self._check(
@@ -1604,10 +1786,13 @@ class SettingsPage(QWidget):
         self._trust_radios = {}
         self.trust_editors = {}
         self._build_trust_purpose(
-            g, "open", "打开二维码链接时，遇到新网站",
-            "无操作 / 弹窗询问 / 自动信任 / 自动拒绝。")
+            g, "open", "把二维码里的链接打开时，遇到新网站",
+            "二维码解出来的网址要打开浏览器时；这一步遇到没见过的网站时怎么办。"
+            "两种用途互不影响。")
         self._build_trust_purpose(
-            g, "fetch", "下载识别时，遇到新网站", "同上；两种用途互不影响。")
+            g, "fetch", "复制网址去识别二维码时，遇到新网站",
+            "复制网址后会自动访问一次，用来判断它是不是二维码图片；"
+            "这一步遇到没见过的网站时怎么办。两种用途互不影响。")
         # 既有说明（两条）随信任分区保留：一条讲内置敏感地址 + 两套名单关系，
         # 一条讲分享链路例外（实验性开启后不受两套名单限制，必须与旧行为逐字一致）。
         self.trust_note = self._hint(
@@ -1628,7 +1813,7 @@ class SettingsPage(QWidget):
             g, "分享等待时长", "share_gesture_wait_sec",
             "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
             5, 600, syn=("分享", "手势", "等待", "超时", "解析中"),
-            unit="秒", default=60, experimental=True)
+            unit="秒", default=120, experimental=True)
         self.baidu_auto_invoke_cb = self._check(
             g, "检测到分享链接时自动拉起客户端下载", "baidu_auto_invoke",
             "复制到百度网盘分享链接时，自动交给网盘客户端下载（整包）。会自动触发下载，请确认来源可信。",
@@ -1639,11 +1824,13 @@ class SettingsPage(QWidget):
         # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
         # 界面报「保存失败」。故按落地纪律「冲突项先搁置」不渲染该项（见交回清单）。
         bah, bal = self._manual_row(g)
-        db_meta = _SettingRow("网盘任务库路径", "", "baidu_task_db", None, "links",
-                              "网盘与分享")
+        db_meta = _SettingRow("网盘任务库路径",
+                              "BaiduYunGuanjia.db 的位置；留空自动探测。",
+                              "baidu_task_db", None, "links", "网盘与分享")
         db_meta.host = bah
         db_meta.note = _EXP_NOTE
         bal.addWidget(self._make_name(bah, "网盘任务库路径", db_meta))
+        bal.addWidget(self._exp_badge(bah, bah), 0, Qt.AlignVCenter)
         self.baidu_db_edit = QLineEdit(bah)
         self.baidu_db_edit.setPlaceholderText("留空 = 自动探测网盘客户端任务库")
         self.baidu_db_edit.setToolTip("BaiduYunGuanjia.db 路径；留空自动探测。")
@@ -1676,9 +1863,15 @@ class SettingsPage(QWidget):
                           self.share_nologin_hint)
 
     def _build_trust_purpose(self, lay, purpose, title, tip):
-        """某用途的信任分区：新域名默认行为单选 + 白/黑名单编辑框。"""
-        self._sub_label(lay, title)
-        self._build_trust_radios(lay, purpose, tip)
+        """某用途的信任分区：新域名默认行为单选 + 白/黑名单编辑框。
+
+        tip（本用途「遇到新网站怎么办」的悬停说明）逐字挂在标题子标签上：
+        行内不放说明文字，悬停该行标题才显示；四个选项各自的 tooltip 不变
+        （见 _build_trust_radios）。"""
+        lbl = self._sub_label(lay, title)
+        if tip:
+            lbl.setToolTip(str(tip))
+        self._build_trust_radios(lay, purpose)
         hosts = {}
         for key, label, hint in (
                 ("whitelist", "自动%s · 白名单" % ("打开" if purpose == "open" else "识别"),
@@ -1693,8 +1886,11 @@ class SettingsPage(QWidget):
             hosts[key] = edit
         self.trust_editors[purpose] = hosts
 
-    def _build_trust_radios(self, lay, purpose, tip):
-        """信任用途的单选组（独立于通用 _radio_row，需按用途登记）。"""
+    def _build_trust_radios(self, lay, purpose):
+        """信任用途的单选组（独立于通用 _radio_row，需按用途登记）。
+
+        说明文字由 _build_trust_purpose 挂在该用途标题子标签的 tooltip 上，
+        本方法只建四个带各自 tooltip 的选项。"""
         host = QWidget(lay.parentWidget())
         b = QVBoxLayout(host)
         # 选项列表与上方标题（#sectionTitle）之间留垂直间距（评审 #7）
@@ -1728,7 +1924,9 @@ class SettingsPage(QWidget):
         self._reg("ui_theme", self.theme_combo)
         th, tl = self._manual_row(g)
         tl.addWidget(self._make_name(
-            th, "主题", _SettingRow("主题", "", "ui_theme", None, "ui", "外观")))
+            th, "主题",
+            _SettingRow("主题", "跟随系统 / 浅色 / 深色；切换后立即生效。",
+                        "ui_theme", None, "ui", "外观")))
         tl.addWidget(self.theme_combo)
         tl.addStretch(1)
         self._rows.append(_SettingRow(
@@ -1740,11 +1938,11 @@ class SettingsPage(QWidget):
         self.logcolor_cb = self._check(
             g, "日志按类型着色", "log_colors_enabled",
             "运行日志按成功 / 失败 / 等待等类型着色。",
-            syn=("日志", "着色", "颜色", "高亮"))
+            syn=("日志", "着色", "颜色", "高亮"), bubble=False)
         self.show_tips_cb = self._check(
             g, "底栏滚动提示", "show_status_tips",
             "底栏每次滚动显示一句使用提示（如「拖入压缩包即可直接解压」）；关掉就不再轮播。",
-            syn=("状态栏", "底栏", "提示", "滚动", "使用提示", "轮播"))
+            syn=("状态栏", "底栏", "提示", "滚动", "使用提示", "轮播"), default=False)
         # 只读行：上次实际应用的主题（自动维护；覆盖契约要求有归属控件）
         self.theme_cached_label = QLabel("", self)
         self.theme_cached_label.setObjectName("stripHint")
@@ -1754,8 +1952,9 @@ class SettingsPage(QWidget):
         ch, chl = self._manual_row(g)
         chl.addWidget(self._make_name(
             ch, "上次实际应用的主题",
-            _SettingRow("上次实际应用的主题", "", "ui_theme_cached", None, "ui",
-                        "外观")))
+            _SettingRow("上次实际应用的主题",
+                        "程序自动维护：启动时先用它出首屏，显示后再按「主题」偏好纠正。",
+                        "ui_theme_cached", None, "ui", "外观")))
         chl.addWidget(self.theme_cached_label)
         chl.addStretch(1)
         self._rows.append(_SettingRow(
@@ -1779,8 +1978,9 @@ class SettingsPage(QWidget):
         ch, chl = self._manual_row(g)
         chl.addWidget(self._make_name(
             ch, "精简窗位置记忆",
-            _SettingRow("精简窗位置记忆", "", "compact_geometry", None, "ui",
-                        "精简界面")))
+            _SettingRow("精简窗位置记忆",
+                        "程序自动记住小窗的位置和尺寸；点右侧按钮清空，下次改用默认位置。",
+                        "compact_geometry", None, "ui", "精简界面")))
         chl.addStretch(1)
         self.compact_reset_btn = QPushButton("重置精简窗位置", ch)
         self.compact_reset_btn.setObjectName("ghostSm")
@@ -1795,6 +1995,32 @@ class SettingsPage(QWidget):
             "程序自动记住小窗的位置和尺寸；点右侧按钮清空，下次改用默认位置。",
             "compact_geometry", self.compact_reset_btn, "ui", "精简界面",
             syn=("位置", "尺寸", "记忆", "小窗", "重置")))
+
+        g = self._group(box, "主界面")
+        # main_geometry 是主窗位置/尺寸/最大化记忆串（2026-09-28），与 compact_geometry
+        # 完全同款：不单独发明编辑控件——登记一个重置按钮完成覆盖契约，并作为显式
+        # 回退入口（清空后下次启动回到默认 1280×800，仍按屏幕可用区收敛）。
+        ch, chl = self._manual_row(g)
+        chl.addWidget(self._make_name(
+            ch, "主窗位置记忆",
+            _SettingRow("主窗位置记忆",
+                        "程序自动记住主窗的位置、尺寸和最大化状态；点右侧按钮清空，"
+                        "下次启动改用默认大小。",
+                        "main_geometry", None, "ui", "主界面")))
+        chl.addStretch(1)
+        self.main_reset_btn = QPushButton("重置主窗位置", ch)
+        self.main_reset_btn.setObjectName("ghostSm")
+        self.main_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.main_reset_btn.setToolTip("清空记住的主窗位置与尺寸，下次启动回到默认大小。")
+        self.main_reset_btn.clicked.connect(
+            lambda: self._commit("main_geometry", ""))
+        chl.addWidget(self.main_reset_btn)
+        self._reg("main_geometry", self.main_reset_btn)
+        self._rows.append(_SettingRow(
+            "主窗位置记忆",
+            "程序自动记住主窗的位置、尺寸和最大化状态；点右侧按钮清空，下次启动改用默认大小。",
+            "main_geometry", self.main_reset_btn, "ui", "主界面",
+            syn=("位置", "尺寸", "记忆", "主窗", "主界面", "最大化", "重置")))
 
         g = self._group(box, "全局快捷键")
         self.hotkey_enable_cb = self._check(
@@ -1818,6 +2044,8 @@ class SettingsPage(QWidget):
     def _hotkey_row(self, lay, label, key, desc, syn=(), experimental=False):
         meta = _SettingRow(label, desc, key, None, "ui", "全局快捷键", syn=syn,
                            default_key=key)
+        if experimental:
+            meta.note = _EXP_NOTE      # 先落 note：_row 依它挂 #expBadge
 
         def mk(host):
             box = QWidget(host)
@@ -1852,7 +2080,6 @@ class SettingsPage(QWidget):
         if experimental:
             # 禁用目标取整个 box（HotkeyEdit + 清除按钮）；meta.widget 随后只留 HotkeyEdit
             self._exp_gate.append((meta.host, box))
-            meta.note = _EXP_NOTE
         return edit
 
     def _build_close_radios(self, lay):
@@ -1946,8 +2173,10 @@ class SettingsPage(QWidget):
         sh, sl = self._manual_row(g)
         sl.addWidget(self._make_name(
             sh, "下次启动重新检测 7-Zip",
-            _SettingRow("下次启动重新检测 7-Zip", "", "sevenzip_check_done",
-                        None, "system", "7-Zip")))
+            _SettingRow("下次启动重新检测 7-Zip",
+                        "勾上就表示「已检测过」；取消勾选 = 下次启动重新检测，"
+                        "缺失或版本过低时会弹安装引导。",
+                        "sevenzip_check_done", None, "system", "7-Zip")))
         sl.addStretch(1)
         sl.addWidget(self.sevenzip_cb)
         self._rows.append(_SettingRow(
@@ -1967,11 +2196,14 @@ class SettingsPage(QWidget):
     def _sevenzip_name(self, parent, text):
         """7-Zip 动作行的名称标签（objectName=setName，与其它行同名样式）。
 
-        不进 _name_labels（无气泡、无搜索项）：这些行没有配置键，与旧版
-        「7-Zip 管理」入口同一规矩——不污染搜索索引。"""
-        lbl = QLabel(str(text), parent)
-        lbl.setObjectName("setName")
-        return lbl
+        描述见 _SEVENZIP_ACTION_DESC；经 _make_name 登记到 _name_labels ->
+        可悬停 / 点击出气泡。仍**不进 _rows**：这些行没有配置键，与旧版
+        「7-Zip 管理」入口同一规矩——不污染搜索索引（test_sevenzip_guide.py
+        D3 断言动作行不在 _rows）。"""
+        return self._make_name(
+            parent, text,
+            _SettingRow(str(text), _SEVENZIP_ACTION_DESC.get(str(text), ""),
+                        "", None, "system", "7-Zip"))
 
     def _sevenzip_action_row(self, lay, name, note, btn_text, tip, on_click):
         """7-Zip 动作行：名称 + 短备注 + 右侧按钮；返回按钮（不登记配置键）。"""
@@ -2234,7 +2466,7 @@ class SettingsPage(QWidget):
         except Exception:
             entries = []
         for idx, entry in enumerate(entries):
-            card = QFrame(box.parentWidget())
+            card = _CardFrame(box.parentWidget())
             card.setObjectName("dirCard")
             cv = QVBoxLayout(card)
             cv.setContentsMargins(16, 14, 16, 14)   # dircard padding 14/16
@@ -2309,16 +2541,20 @@ class SettingsPage(QWidget):
         entries[idx][field] = value
         self._commit("watch_paths", entries)
 
-    def _dir_label(self, card, text, key=None):
+    def _dir_label(self, card, text, key=None, desc="", bubble=True):
         lbl = QLabel(text, card)
         lbl.setObjectName("setName")
         lbl.setCursor(Qt.PointingHandCursor)
         lbl.installEventFilter(self)
-        meta = _SettingRow(text, "", key or "watch_paths", None, "dirs", "目录")
-        self._name_labels[id(lbl)] = (lbl, meta)
+        meta = _SettingRow(text, desc, key or "watch_paths", None, "dirs", "目录",
+                           bubble=bubble)
+        # 与 _make_name 同一约定：bubble=False 的目录字段不登记 -> 无气泡。
+        if meta.bubble:
+            self._name_labels[id(lbl)] = (lbl, meta)
         return lbl, meta
 
-    def _dir_cell(self, card, label, key, badge_key=None, risk=False):
+    def _dir_cell(self, card, label, key, badge_key=None, risk=False,
+                  desc="", bubble=True):
         """目录卡字段格：标签行（可带风险徽章）+ 控件区（调用方追加）；返回 (cell, v)。"""
         cell = QFrame(card)
         cell.setObjectName("dirFieldRisk" if risk else "dirField")
@@ -2332,7 +2568,7 @@ class SettingsPage(QWidget):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(6)
-        lbl, meta = self._dir_label(cell, label, key)
+        lbl, meta = self._dir_label(cell, label, key, desc=desc, bubble=bubble)
         meta.risk = bool(risk)
         self._rows.append(meta)
         top.addWidget(lbl)
@@ -2347,7 +2583,8 @@ class SettingsPage(QWidget):
         return cell, v
 
     def _dir_field_path(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "监听路径", "dir.path")
+        # 气泡政策：监听路径名称已自解释且无副作用 -> 不出气泡。
+        cell, v = self._dir_cell(card, "监听路径", "dir.path", bubble=False)
         h = QHBoxLayout()
         h.setSpacing(6)
         edit = QLineEdit(cell)
@@ -2365,7 +2602,8 @@ class SettingsPage(QWidget):
         return cell
 
     def _dir_field_output(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "解压到", "dir.output_dir")
+        # 气泡政策：解压路径名称已自解释且无副作用 -> 不出气泡。
+        cell, v = self._dir_cell(card, "解压到", "dir.output_dir", bubble=False)
         h = QHBoxLayout()
         h.setSpacing(6)
         edit = QLineEdit(cell)
@@ -2383,7 +2621,8 @@ class SettingsPage(QWidget):
         return cell
 
     def _dir_field_enabled(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "启用这个目录", "dir.enabled")
+        # 气泡政策：启用开关名称已自解释且无副作用 -> 不出气泡。
+        cell, v = self._dir_cell(card, "启用这个目录", "dir.enabled", bubble=False)
         cb = _Switch(cell)
         cb.setChecked(bool(entry.get("enabled", True)))
         cb.toggled.connect(lambda c, i=idx: self._dir_set(i, "enabled", bool(c)))
@@ -2392,7 +2631,11 @@ class SettingsPage(QWidget):
         return cell
 
     def _dir_field_mode(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "监听模式", "dir.mode")
+        cell, v = self._dir_cell(
+            card, "监听模式", "dir.mode",
+            # 气泡政策：两个选项名的含义需要一句解释（含实验性依赖）-> 保留气泡。
+            desc="只扫表层 = 只处理本层；按网盘清单 = 处理下载到子目录里的包"
+                 "（需开启实验性功能）。")
         cur = str(entry.get("mode") or "surface")
         grp = QButtonGroup(cell)
         host = QWidget(cell)
@@ -2411,8 +2654,12 @@ class SettingsPage(QWidget):
         return cell
 
     def _dir_field_delete(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "本目录解压后删除源文件", "dir.delete_source",
-                                 badge_key="dir.delete_source.%d" % idx, risk=True)
+        cell, v = self._dir_cell(
+            card, "本目录解压后删除源文件", "dir.delete_source",
+            # 气泡政策：删源是危险副作用，补一句范围与分卷行为 -> 保留气泡。
+            desc="解压成功后删掉本目录的源压缩包（分卷一起删）；"
+                 "回收站不可用时按右侧策略处理。",
+            badge_key="dir.delete_source.%d" % idx, risk=True)
         cb = _Switch(cell)
         cb.setChecked(bool(entry.get("delete_source", False)))
         cb.toggled.connect(lambda c, i=idx: self._dir_set(i, "delete_source", bool(c)))
@@ -2421,8 +2668,12 @@ class SettingsPage(QWidget):
         return cell
 
     def _dir_field_policy(self, card, idx, entry):
-        cell, v = self._dir_cell(card, "回收站不可用时", "dir.delete_policy",
-                                 badge_key="dir.delete_policy.%d" % idx, risk=True)
+        cell, v = self._dir_cell(
+            card, "回收站不可用时", "dir.delete_policy",
+            # 气泡政策：名称是半句话，需说明它是「删源兜底」及其作用范围 -> 保留气泡。
+            desc="删除源文件时回收站不可用的兜底方式（选项见下方）；"
+                 "只影响这一张目录卡。",
+            badge_key="dir.delete_policy.%d" % idx, risk=True)
         cur = str(entry.get("delete_policy") or "auto")
         host = QWidget(cell)
         b = QVBoxLayout(host)
@@ -3019,11 +3270,12 @@ class SettingsPage(QWidget):
             # 删除与安全（「删除源文件」总控已退场；逐目录删源在「监听目录」里改）
             self.bomb_guard_cb.setChecked(b("bomb_guard_enabled", True))
             self.bomb_entries_spin.setValue(max(0, min(1000000, i("bomb_soft_entries", 50000))))
-            self.bomb_soft_ratio_spin.setValue(max(1, min(100000, i("bomb_soft_ratio", 100))))
-            self.bomb_hard_ratio_spin.setValue(max(1, min(100000, i("bomb_hard_ratio", 200))))
-            self.bomb_min_gb_spin.setValue(max(0, min(100000, i("bomb_hard_min_gb", 1))))
-            self.bomb_size_gb_spin.setValue(max(0, min(1000000, i("bomb_hard_size_gb", 50))))
-            self.free_space_spin.setValue(max(0, min(100000, i("min_free_space_gb", 5))))
+            self.bomb_soft_ratio_spin.setValue(max(0, min(100000, i("bomb_soft_ratio", 100))))
+            self.bomb_hard_ratio_spin.setValue(max(0, min(100000, i("bomb_hard_ratio", 200))))
+            # GB 三个框都是 QDoubleSpinBox：必须用 fl()（i() 会把小数截成整数）
+            self.bomb_min_gb_spin.setValue(max(0.0, min(100000.0, fl("bomb_hard_min_gb", 1.0))))
+            self.bomb_size_gb_spin.setValue(max(0.0, min(1000000.0, fl("bomb_hard_size_gb", 0.0))))
+            self.free_space_spin.setValue(max(0.0, min(100000.0, fl("min_free_space_gb", 5.0))))
 
         if did == "notify":
             # 通知与提醒
@@ -3044,6 +3296,7 @@ class SettingsPage(QWidget):
 
         if did == "clipboard":
             # 剪贴板与二维码
+            self.clipboard_cb.setChecked(b("clipboard_enabled", True))
             self.qr_cb.setChecked(b("qr_enabled", True))
             cur_clip = s("qr_clipboard_action", "none") or "none"
             for rb in self.clip_host.findChildren(QRadioButton):
@@ -3052,7 +3305,9 @@ class SettingsPage(QWidget):
             self.auto_add_cb.setChecked(b("auto_add_clipboard_password", False))
             self.url_exclude_cb.setChecked(b("url_exclude_temp_password", True))
             self.temp_filter_cb.setChecked(b("temp_password_filter", False))
-            self.temp_filter_cb.setEnabled(self.url_exclude_cb.isChecked())
+            # 有效可用性 = 剪贴板监听开 AND 父项勾选（不是只看父项）；
+            # 走门控统一出口，避免「总开关关 + 父项勾选」时误启用。
+            self._apply_clip_gate()
             self.ttl_spin.setValue(max(1, min(24 * 365, i("temp_password_ttl_hours", 24))))
             self.temp_max_spin.setValue(max(1, min(100000, i("temp_password_max", 200))))
             self._refresh_passwords_label()
@@ -3539,6 +3794,9 @@ class SettingsPage(QWidget):
                 ntf = True
         for w in self._exp_subs:
             w.setEnabled(exp)
+        for _host, badge in self._exp_badges:
+            # 常驻小标只随实验性总开关显隐（通知总开关不参与）
+            badge.setVisible(not exp)
         for w in self._notify_subs + tuple(self._notify_labels):
             w.setEnabled(ntf)
         notify_ids = {id(w) for w in self._notify_subs}
@@ -3551,6 +3809,68 @@ class SettingsPage(QWidget):
                 if w is None:
                     continue
                 w.setEnabled(exp and ntf if id(w) in notify_ids else exp)
+        # 「监听剪贴板」门控在这里一并收口：懒建领域（clipboard / links 的物化
+        # 顺序不定）与既有重贴路径（通知 / 实验性切换、_ensure_domain、
+        # _load_from_cfg）都会经过 _apply_gates，门控状态因此始终一致。
+        self._apply_clip_gate()
+
+    def _apply_qr_gate(self):
+        """「二维码链接域名重定向」关闭 → 「域名重定向规则」行整行置灰 + 编辑框禁用。
+
+        与 _apply_gates 同一套 off 动态属性 + repolish_tree 机制；开关切换即生效
+        （构建时也调用一次，懒建领域同样覆盖）。"""
+        on = True
+        try:
+            on = bool(self.qr_redirect_cb.isChecked())
+        except Exception:
+            pass
+        for host, cluster in self._qr_gate:
+            if host is not None:
+                host.setProperty("off", not on)
+                repolish_tree(host)
+            for w in cluster:
+                if w is not None:
+                    w.setEnabled(on)
+
+    def _apply_clip_gate(self):
+        """「监听剪贴板」关闭 → 依赖剪贴板读取的 5 行整行置灰 + 控件簇禁用。
+
+        独立注册表 _clip_gate / _clip_badges（绝不并入 _exp_gate / _exp_badges /
+        _exp_subs——那三张表被离线验收锁定为 10 / 10 / 4）。被门控的 5 行：
+        识别剪贴板图片里的二维码（clipboard）、复制网址时自动识别二维码（links，
+        跨领域）、识别到新密码就自动存进密码本、网址不当密码记录、更严格的密码
+        过滤。拖入的文件 / 图片与临时密码的清理 / 上限不受影响，故不在表内。
+
+        可用性规则：整行 [off] 属性与 #clipBadge 显隐只随总开关；控件可用性 =
+        总开关开 AND 条目自带父条件（目前只有 temp_password_filter：
+        url_exclude_temp_password 勾选）。父项关 / 总开关关都禁用，两者都恢复
+        才重新可用——绝不无条件 setEnabled(True)。懒建 / 未物化时读配置回退，
+        保证任意物化顺序下状态正确；与 _apply_qr_gate 同一套 off + repolish 机制。"""
+        if hasattr(self, "clipboard_cb"):
+            on = bool(self.clipboard_cb.isChecked())
+        else:
+            try:
+                on = bool(self._snapshot().get("clipboard_enabled", True))
+            except Exception:
+                on = True
+        for host, cluster, parent_ok in self._clip_gate:
+            eff = on
+            if eff and callable(parent_ok):
+                try:
+                    eff = bool(parent_ok())
+                except Exception:
+                    eff = False
+            if host is not None:
+                # 整行置灰只看总开关（父项关掉仍保留正常行名，仅控件禁用，
+                # 与改动前「子项随父项直接 setEnabled」的视觉语义一致）。
+                host.setProperty("off", not on)
+                repolish_tree(host)
+            widgets = cluster if isinstance(cluster, (tuple, list)) else (cluster,)
+            for w in widgets:
+                if w is not None:
+                    w.setEnabled(eff)
+        for _host, badge in self._clip_badges:
+            badge.setVisible(not on)
 
     def _sync_notify_enabled(self):
         self._apply_gates()

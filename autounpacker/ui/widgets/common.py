@@ -210,7 +210,9 @@ def _lamp_color(state):
         return _tk("nbar_warn", PALETTE["muted"])
     if key == "error":
         return PALETTE["danger"]
-    if key == "paused":
+    if key in ("paused", "configuring"):
+        # configuring 是「尚未配置完成」的过渡态：用中性灰，绝不显成
+        # listening 的 accent（也不新增颜色 / token）。
         return PALETTE["muted"]
     return PALETTE["accent"]
 

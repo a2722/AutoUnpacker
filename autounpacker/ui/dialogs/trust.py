@@ -6,6 +6,7 @@ from PyQt5.QtCore import Qt
 
 from ...trust import trust_entry_categories
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 
 
 class CloseActionDialog(QDialog):
@@ -60,6 +61,12 @@ class CloseActionDialog(QDialog):
         lay.addLayout(btns)
 
         self._result = None   # "exit" / "tray" / None=取消
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fit_text_heights(self)
 
     def _choose_exit(self):
         self._result = "exit"
@@ -161,6 +168,12 @@ class TrustAskDialog(QDialog):
         row2.addWidget(deny_btn)
         row2.addWidget(block_btn)
         lay.addLayout(row2)
+        # CJK 墨迹盒顶/底 1~2px 裁切兜底（字体级规则、幂等、只抬不降；空标签不触碰）。
+        fit_text_heights(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fit_text_heights(self)
 
     def _choose(self, decision):
         self._decision = decision

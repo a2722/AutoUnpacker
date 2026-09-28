@@ -7,13 +7,17 @@ QWidget，或逼每个调用方写惰性导入。本模块只依赖 PyQt5、不 
 因此不参与循环（见 test_import_graph_acyclic.py），任何 UI 模块都可模块级 import。
 
 规则（字体级，非 per-string 墨迹盒）：
-    need = ceil(fontMetrics().lineSpacing()) + 2
+    need = ceil(fontMetrics().lineSpacing()) + 3
     minimumHeight = max(minimumHeight, need)
 
-为什么是 lineSpacing() + 2：
+为什么是 lineSpacing() + 3：
   - QLabel 单行按 ascent+descent（== fontMetrics().height()）居中，但 CJK（SimSun
     等）的墨迹盒可比 height() 高 1~2px（探针实测：rect 12px vs ink 13~14px，
     顶缘越界 -1px）；多行还会按 lineSpacing() 排线（行间 leading）。
+  - +2 曾被实测为「恰好贴边」：探针判据里 FLUSH = 不越界但 top/bot_off == 0，
+    即墨迹盒边正好压住矩形边、零余量。字体/DPI/字体回退/文案任一变化 1px 就
+    会从 FLUSH 掉成 SHORTFALL（真裁切）。故抬到 +3，给所有文本行留 1px 余量，
+    让探针判定从 FLUSH 收敛为 OK（金丝雀消失）。
   - 字体级常量对「文本运行期会变」的标签同样成立；per-string tightBoundingRect
     只对当前字符串成立，setText 后立即失效，不能当兜底依据。
   - 单行标签**不再豁免**：历史实现以「单行不裁」为由跳过，实测该假设为假。
@@ -25,12 +29,12 @@ from PyQt5.QtWidgets import QLabel
 
 
 def ensure_min_height(widget):
-    """把单个控件（QLabel / 气泡框等任意 QWidget）最小高度抬到 lineSpacing()+2。
+    """把单个控件（QLabel / 气泡框等任意 QWidget）最小高度抬到 lineSpacing()+3。
 
     返回是否实际抬高（幂等：已达标返回 False）；任何异常静默返回 False。
     """
     try:
-        need = int(widget.fontMetrics().lineSpacing()) + 2
+        need = int(widget.fontMetrics().lineSpacing()) + 3
         if widget.minimumHeight() < need:
             widget.setMinimumHeight(need)
             return True
@@ -40,7 +44,7 @@ def ensure_min_height(widget):
 
 
 def fit_text_heights(root):
-    """把 root 下所有「会绘制文本」的 QLabel 抬到 lineSpacing()+2。
+    """把 root 下所有「会绘制文本」的 QLabel 抬到 lineSpacing()+3。
 
     返回被抬高的标签数（0 = 无 / 全已达标 / root 为空或异常）。
     root 自身若是 QLabel 也会被处理；空文本（含全空白）标签绝不触碰。

@@ -12,9 +12,13 @@
       - 隔离区记录（quarantine_map 非空）：原因列如实显示「已移入隔离区（可还原）」，
         经 trail.quarantine_restore 还原、trail.quarantine_purge 彻底删除；
         页头常显隔离区用量「隔离区：N 个文件 · X」
+      - 「已删除」且 deleted_paths 非空的记录：去向文案实时化（按卷回收站计数）——
+        全部删除路径所在卷的计数可查且为 0 →「已删除 · 已清空」；计数 > 0 或
+        不可判定 →「已删除 · 回收站」（纯历史陈述，绝不做当前位置的承诺）
       - 空态：无记录与「筛选无结果」两种文案
 关键入口：TrailPage / _RestoreWorker / record_time() / day_key() / record_reason() /
-          record_matches() / export_rows() / quarantine_files() / has_quarantine()
+          deleted_destination_text() / record_matches() / export_rows() /
+          quarantine_files() / has_quarantine()
 依赖：PyQt5、pages（复用 _EmptyOverlay/_ghost_button/_icon_button 家族控件）、
       widgets（SegControl/Glyph/状态文案与配色/_fmt_size）、style（PALETTE）、trail
 注意：- 页面只经 trail 模块读写记录；清空 = trail.save_records([])，绝不直接删文件
@@ -37,6 +41,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                              QVBoxLayout, QWidget)
 
 from .. import trail as deletion_trail
+from ..deletion.recycle import recycle_bin_stats
 from .pages import _EmptyOverlay, _ghost_button, _icon_button
 from .style import PALETTE
 from .widgets import (Glyph, SegControl, TRAIL_STATUS_COLORS,
@@ -57,6 +62,10 @@ _STATUS_SHORT = {
 
 # 日期分段：今天/昨天/更早（回溯窗口期 = 本次开机，跨零点时会出现「昨天」）
 DAY_FILTERS = (("today", "今天"), ("yesterday", "昨天"), ("earlier", "更早"))
+
+# 「已删除」记录的删除去向文案（仅用于 deleted_paths 非空的记录，实时计算）：
+DELETED_IN_BIN_TEXT = "已删除 · 回收站"        # 计数>0 或不可判定：纯历史陈述
+DELETED_BIN_EMPTIED_TEXT = "已删除 · 已清空"   # 全部所在卷计数可查且为 0：可证已清空
 
 
 # ---------------------------------------------------------------------------
@@ -199,17 +208,48 @@ def quarantine_purge_counts(result, n_files):
     return max(0, int(n_files) - fail_n), fail_n
 
 
+def deleted_destination_text(rec):
+    """「已删除」记录的删除去向文案：只有全部所在卷计数可查且为 0 才断言「已清空」。
+
+    对 deleted_paths 里的每个路径取所在卷回收站计数（recycle_bin_stats 内按卷缓存，
+    一次渲染同一卷最多一次 Shell 查询）：任一卷计数 > 0、查询返回 None（不可判定）
+    或任何异常 → 一律回退「已删除 · 回收站」（不做当前位置承诺）。绝不抛异常。
+    """
+    paths = [str(p) for p in (rec.get("deleted_paths") or []) if str(p or "").strip()]
+    emptied = bool(paths)
+    for p in paths:
+        try:
+            stats = recycle_bin_stats(p)
+        except Exception:
+            stats = None
+        if stats is None:
+            emptied = False
+            continue
+        try:
+            if int(stats[0]) != 0:
+                emptied = False
+        except Exception:
+            emptied = False
+    return DELETED_BIN_EMPTIED_TEXT if emptied else DELETED_IN_BIN_TEXT
+
+
 def record_reason(rec):
     """原因列文案：状态词 + 备注；备注已自带状态词时不再重复；含永久删除文件时追加不可还原提示。
 
     隔离区记录（quarantine_map 非空）绝不显示「已删除（回收站）」：文件并未进入
     回收站，也没有被永久删除，如实显示「已移入隔离区（可还原）」并保留备注里的
     隔离区目录（页内展示允许携带路径，回执文案绝不允许）。
+    「已删除」且 deleted_paths 非空的记录：去向文案实时化 —— 所在卷回收站计数可查且
+    为 0 时显示「已删除 · 已清空」，计数 > 0 或不可判定时显示「已删除 · 回收站」。
     """
     status = str(rec.get("status") or "")
     quarantined = has_quarantine(rec)
-    text = ("已移入隔离区（可还原）" if quarantined
-            else TRAIL_STATUS_TEXT.get(status, status or "—"))
+    if quarantined:
+        text = "已移入隔离区（可还原）"
+    elif status == "deleted" and rec.get("deleted_paths"):
+        text = deleted_destination_text(rec)
+    else:
+        text = TRAIL_STATUS_TEXT.get(status, status or "—")
     note = str(rec.get("note") or "").strip()
     if note and note.startswith(text):
         text = note          # mark_failed/mark_kept 的备注本就以状态词开头，合并列不再重复

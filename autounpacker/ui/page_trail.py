@@ -28,8 +28,8 @@ import csv
 import os
 import time
 
-from PyQt5.QtCore import (QAbstractTableModel, QModelIndex, QObject, Qt,
-                          QThread, QTimer, pyqtSignal)
+from PyQt5.QtCore import (QAbstractTableModel, QItemSelectionModel, QModelIndex,
+                          QObject, Qt, QThread, QTimer, pyqtSignal)
 from PyQt5.QtGui import QBrush, QColor, QFont
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -465,10 +465,21 @@ class _TrailTable(QTableView):
         return w
 
     def _clear_actions(self):
+        """卸载全部行内操作控件（可在不重置模型的情况下安全调用）。
+
+        必须经视图 API setIndexWidget(index, None) 卸载：QAbstractItemView 内部用
+        原始指针登记索引控件（persistent 集），只 setParent(None) + deleteLater 会在
+        视图里留下悬空引用，之后重建索引控件即崩溃——而页不可见时的「释放 / 重建」
+        正是不重置模型的路径。卸载后丢弃引用，控件由 Qt 在下一轮事件循环删除。"""
         for w in self._action_widgets:
             try:
-                w.setParent(None)
-                w.deleteLater()
+                w.hide()          # 立即不可见（与旧 setParent(None) 的可见行为一致）
+            except Exception:
+                pass
+        model = self._model
+        for row in range(model.rowCount()):
+            try:
+                self.setIndexWidget(model.index(row, _TrailModel.COL_ACT), None)
             except Exception:
                 pass
         self._action_widgets = []
@@ -582,6 +593,11 @@ class TrailPage(QWidget):
         self._restore_thread = None
         self._restore_worker = None
         self._restore_progress = None
+        # 页不可见时释放行内操作控件（主题切换的全量重抛光只碰可见页的行控件）；
+        # 再次显示时按当前记录重建，并还原隐藏前的滚动 / 选中位置。仅动控件，模型不动。
+        self._actions_released = False
+        self._saved_scroll = 0
+        self._saved_selection = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 10)
@@ -731,6 +747,72 @@ class TrailPage(QWidget):
         """主题切换后重绘表格（状态色在 data() 里现取调色板，重绘即生效）。"""
         try:
             self.table.viewport().update()
+        except Exception:
+            pass
+
+    # ---- 显隐生命周期：不可见时释放行内操作控件（主题切换重抛光只碰可见页） ----
+    def showEvent(self, event):
+        """切回本页时按当前记录重建行控件，并还原隐藏前的滚动 / 选中位置。"""
+        super().showEvent(event)
+        try:
+            self._restore_row_actions()
+        except Exception:
+            pass
+
+    def hideEvent(self, event):
+        """离开本页时释放行内操作控件（页面不可见就不参与主题全量重抛光）。"""
+        try:
+            self._release_row_actions()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def _release_row_actions(self):
+        """释放行内操作控件（仅控件，记录模型保持不动），并记住滚动与选中位置。
+
+        只在页不可见时调用；从未显示过的页面收不到 hideEvent，行控件仍按今日语义
+        在 set_records 时即时构建。释放失败绝不影响导航（调用点已包 try/except）。"""
+        if self._actions_released:
+            return
+        self._actions_released = True
+        try:
+            self._saved_scroll = int(self.table.verticalScrollBar().value())
+        except Exception:
+            self._saved_scroll = 0
+        try:
+            self._saved_selection = list(self.table.selected_rows())
+        except Exception:
+            self._saved_selection = []
+        self.table._clear_actions()
+
+    def _restore_row_actions(self):
+        """按当前记录重建行控件，并还原隐藏前的滚动与选中位置。
+
+        幂等：已释放才重建，避免重复创建（隐藏期间若发生过重载，行控件已存在则跳过）。"""
+        if not self._actions_released:
+            return
+        self._actions_released = False
+        if not getattr(self.table, "_action_widgets", None):
+            self.table._build_actions()
+        try:
+            self.table.verticalScrollBar().setValue(int(self._saved_scroll))
+        except Exception:
+            pass
+        self._restore_selection(self._saved_selection)
+
+    def _restore_selection(self, rows):
+        """按行号恢复多选（选择模型在释放 / 重建期间未被重置，这里幂等补一次）。"""
+        if not rows:
+            return
+        try:
+            sm = self.table.selectionModel()
+            if sm is None:
+                return
+            for row in rows:
+                idx = self.table.trail_model().index(int(row), 0)
+                if idx.isValid():
+                    sm.select(idx, QItemSelectionModel.Select
+                              | QItemSelectionModel.Rows)
         except Exception:
             pass
 

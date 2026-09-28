@@ -411,10 +411,21 @@ class _PwTable(QTableView):
         return btn
 
     def _clear_actions(self):
+        """卸载全部行内操作控件（可在不重置模型的情况下安全调用）。
+
+        必须经视图 API setIndexWidget(index, None) 卸载：QAbstractItemView 内部用
+        原始指针登记索引控件（persistent 集），只 setParent(None) + deleteLater 会在
+        视图里留下悬空引用，之后重建索引控件即崩溃——而页不可见时的「释放 / 重建」
+        正是不重置模型的路径。卸载后丢弃引用，控件由 Qt 在下一轮事件循环删除。"""
         for w in self._action_widgets:
             try:
-                w.setParent(None)
-                w.deleteLater()
+                w.hide()          # 立即不可见（与旧 setParent(None) 的可见行为一致）
+            except Exception:
+                pass
+        model = self._model
+        for row in range(model.rowCount()):
+            try:
+                self.setIndexWidget(model.index(row, _PwModel.COL_ACT), None)
             except Exception:
                 pass
         self._action_widgets = []

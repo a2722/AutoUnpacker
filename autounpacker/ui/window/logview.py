@@ -9,7 +9,7 @@ import html
 import re
 import time
 
-from PyQt5.QtCore import QEvent, QObject, QTimer, Qt
+from PyQt5.QtCore import QEvent, QObject, QPoint, QTimer, Qt
 from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor, QCursor
 from PyQt5.QtWidgets import QLabel, QToolTip
 
@@ -551,10 +551,6 @@ class FoldController(QObject):
         self._pin_cache = (None, None)   # (firstVisibleBlock 号, 解析出的折叠项)
         self._pin_count = None           # 上次解析时的块数（变小 = 发生过裁剪）
         self._head_blocks = {}           # 折叠 id -> 头 block 句柄（定点编辑用，绝不整页扫描）
-        # 已展开折叠项的整数计数：不变量 = 恰等于 folds 里 expanded 为真的条数。所有写入
-        # fold["expanded"] 的路径（toggle 翻转、prune_folds 剔除、reset 清空）都必须同步；
-        # pin_fold / _refresh_pin_after_toggle 靠它 O(1) 短路，绝不每次遍历 folds。
-        self._expanded_count = 0
         self._prune_tick = 0             # 距上次全量 prune_folds 的追加次数（安全网节流）
         self._tip_key = None
         try:
@@ -576,7 +572,6 @@ class FoldController(QObject):
         self.folds = {}
         self.view_items = []
         self._head_blocks = {}
-        self._expanded_count = 0         # folds 已清空：展开计数同步归零
         self._prune_tick = 0
         self.invalidate_pin()
         self.update_pin()
@@ -723,17 +718,15 @@ class FoldController(QObject):
             return False
 
     def _discard_fold(self, fid):
-        """从 id 映射里剔除一个折叠项（增量裁剪用）：清头句柄并同步展开计数。"""
-        fold = self.folds.pop(fid, None)
-        if fold is not None and bool(fold.get("expanded")):
-            self._expanded_count = max(0, self._expanded_count - 1)
+        """从 id 映射里剔除一个折叠项（增量裁剪用）：只清头句柄。"""
+        self.folds.pop(fid, None)
         self._head_blocks.pop(fid, None)
 
     def prune_folds(self):
         """丢弃已不在视图模型里的折叠项（id 映射绝不无界增长）。
 
         正常路径已由 append_item 增量剔除被裁掉的折叠 id；这里退为罕跑的安全网，
-        万一有漏网的才整表重建——重建时同步扣掉被丢弃的展开计数，守住不变量。"""
+        万一有漏网的才整表重建。"""
         live = set()
         for kind, payload in self.view_items:
             if kind == "fold":
@@ -742,18 +735,9 @@ class FoldController(QObject):
                 except Exception:
                     pass
         if len(self.folds) > len(live) + 64:
-            kept = {}
-            dropped_expanded = 0
-            for k, v in self.folds.items():
-                if k in live:
-                    kept[k] = v
-                elif bool(v.get("expanded")):
-                    dropped_expanded += 1
-            self.folds = kept
+            self.folds = {k: v for k, v in self.folds.items() if k in live}
             self._head_blocks = {k: v for k, v in self._head_blocks.items()
                                  if k in self.folds}
-            if dropped_expanded:
-                self._expanded_count = max(0, self._expanded_count - dropped_expanded)
 
     def render_item(self, item):
         kind, payload = item
@@ -1012,14 +996,7 @@ class FoldController(QObject):
             return False
         if self.force_open():
             return False      # 搜索/级别过滤中：保持展开，绝不藏住命中行
-        fid = self._fold_id(fold)
-        tracked = fid is not None and self.folds.get(fid) is fold
         fold["expanded"] = not bool(fold.get("expanded"))
-        if tracked:
-            # 同步展开计数（不变量见 __init__）：置位 +1、复位 -1。
-            self._expanded_count += 1 if fold["expanded"] else -1
-            if self._expanded_count < 0:
-                self._expanded_count = 0
         if not self._toggle_fold_in_place(fold):
             self.rerender_view()
         else:
@@ -1106,8 +1083,8 @@ class FoldController(QObject):
         try:
             if not self.view.isVisible() or self.view.blockCount() <= 0:
                 return None
-            if self._expanded_count <= 0:
-                return None      # 没有任何展开块：置顶条不可能出现（O(1) 计数短路）
+            if not any(bool(f.get("expanded")) for f in self.folds.values()):
+                return None      # 没有任何展开块：置顶条不可能出现（真值判定，绝不靠计数）
             first = self.view.firstVisibleBlock()
             if not first.isValid():
                 return None
@@ -1213,7 +1190,11 @@ class FoldController(QObject):
         return None
 
     def _refresh_pin_after_toggle(self, fold):
-        """定点编辑后的置顶条刷新：只用已记录的折叠头判定，绝不逐块回溯文档。"""
+        """定点编辑后的置顶条刷新：先用已记录的折叠头判定；句柄被丢弃时回退逐块回溯。
+
+        展开触发 3000 行上限裁剪会故意丢弃头句柄（见 _toggle_fold_in_place），此时
+        _pin_fold_from_heads 找不到头，需退回 _resolve_pin_fold 按 fold:// 锚点回溯；
+        该回退每次点击只跑一次，代价可接受。"""
         try:
             self.ensure_pin()   # 惰性控件与旧路径一致地就位（隐藏，不影响可见结果）
         except Exception:
@@ -1228,11 +1209,14 @@ class FoldController(QObject):
         resolved = None
         try:
             if self.view.isVisible() and count > 0:
-                if self._expanded_count > 0:
+                if any(bool(f.get("expanded")) for f in self.folds.values()):
                     first = self.view.firstVisibleBlock()
                     if first.isValid():
                         num = first.blockNumber()
                         resolved = self._pin_fold_from_heads(num)
+                        if resolved is None:
+                            # 头句柄可能已被裁剪丢弃：按锚点逐块回溯补一次（真值兜底）
+                            resolved = self._resolve_pin_fold(first)
                         self._pin_cache = (num, resolved)
         except Exception:
             resolved = None
@@ -1619,28 +1603,67 @@ def _restore_degraded_in_view(rec):
     return False
 
 
-def _rerender_log_view(win, box):
-    """主题切换后按当前调色板重画已画出的行（保留已复制链接的降级状态）。
+# 主题重绘策略：整页逐块重渲染是 O(总行数)，3000 行 ×2 视图实测约 250ms；而切换
+# 主题时用户真正看到的只有可视区几十行。故行数超过下面阈值时只重画「可视区 + 上下
+# margin」，其余行在滚动进入可视区时按块上盖的「主题代次」惰性补画（见 _recolor_
+# visible_if_needed）。小视图直接整页重画（本就便宜），也覆盖离屏/未布局等拿不到
+# 可靠可视几何的场景——保证任何档位下都不会留下可见的旧色。
+_RERENDER_FULL_MAX_BLOCKS = 400
+_RERENDER_MARGIN = 24          # 可视区上下各多画这么多行，快速滚动时少补几次
 
-    逐块按正文重渲染：行文本与块数都不变（不用 clear 重建），滚动位置与选区
-    自然保留；纯文本模式（log_colors_enabled=False）本就没有内联色，直接跳过。"""
-    if box is None:
-        return
+# 块上「已按哪一代主题色重画」的戳（QTextBlock.setUserState）：块号会随 3000 行
+# 裁剪整体位移，但 userState 跟着块走，滚动补画据此判断某块是否需要重画。本文件
+# 其余逻辑不使用 userState（grep 可证），故此处独占该字段。
+_LOG_THEME_STATE_ATTR = "_log_theme_gen"
+
+
+def _visible_block_range(box):
+    """当前可视区覆盖的块号区间 (first, last)（含上下 margin）；拿不到可靠几何时 None。
+
+    滚动条单位就是块号、且隐藏页仍保留上次几何，故用 firstVisibleBlock +
+    cursorForPosition(viewport 底) 定位，绝不做像素/块号混算。视口高度太小
+    （未布局 / 离屏）时返回 None，调用方退回整页重画。"""
     try:
-        if not bool(win.state.snapshot().get("log_colors_enabled", True)):
-            return
-    except Exception:
-        pass
-    try:
+        vp = box.viewport()
+        h = int(vp.height())
+        if h <= 4:
+            return None
         doc = box.document()
-        cursor = QTextCursor(doc)
-        cursor.beginEditBlock()
-        for i in range(doc.blockCount()):
+        n = doc.blockCount()
+        if n <= 0:
+            return None
+        first = box.firstVisibleBlock()
+        if not first.isValid():
+            return None
+        lo = int(first.blockNumber())
+        bottom = box.cursorForPosition(QPoint(0, h - 1)).block()
+        hi = int(bottom.blockNumber()) if bottom.isValid() else lo
+        if hi < lo:
+            lo, hi = hi, lo
+        return max(0, lo - _RERENDER_MARGIN), min(n - 1, hi + _RERENDER_MARGIN)
+    except Exception:
+        return None
+
+
+def _recolor_block_range(win, box, lo, hi, gen=None):
+    """按当前调色板重画 [lo, hi] 块（保留已复制链接的降级状态与折叠锚点）。
+
+    与整页重画逐块同一套管线（_render_log_html + _degraded_spans_for +
+    _anchor_fold_affordance）：行文本与块数都不变，滚动位置与选区自然保留。
+    gen 非 None 时把「主题代次」盖到处理过的块上，供滚动补画判定是否已是最新。
+    空行没有内联色可重画，但也盖章，避免滚动时被反复当作「待补画」。"""
+    doc = box.document()
+    cursor = QTextCursor(doc)
+    cursor.beginEditBlock()
+    try:
+        for i in range(int(lo), int(hi) + 1):
             block = doc.findBlockByNumber(i)
             if not block.isValid():
                 continue
             text = block.text()
             if not text:
+                if gen is not None:
+                    block.setUserState(int(gen))
                 continue
             href = _fold_href_of_block(block)   # 折叠头行：重绘后锚点必须还在
             cur = QTextCursor(block)
@@ -1650,9 +1673,140 @@ def _rerender_log_view(win, box):
             cur.insertHtml(_render_log_html(
                 text, win._log_color_for(text),
                 _degraded_spans_for(win, box, text)))
-            if href:
-                _anchor_fold_affordance(doc.findBlockByNumber(i), text, href)
-        cursor.endEditBlock()
+            nb = doc.findBlockByNumber(i)
+            if href and nb.isValid():
+                _anchor_fold_affordance(nb, text, href)
+            if gen is not None and nb.isValid():
+                nb.setUserState(int(gen))
+    except Exception:
+        pass
+    finally:
+        try:
+            cursor.endEditBlock()
+        except Exception:
+            pass
+
+
+def _bump_theme_gen(box):
+    """本视图的主题代次 +1：每次主题重绘调用一次，作为「已按哪代色重画」的基准。"""
+    try:
+        gen = int(getattr(box, _LOG_THEME_STATE_ATTR, 0)) + 1
+        setattr(box, _LOG_THEME_STATE_ATTR, gen)
+        return gen
+    except Exception:
+        return 0
+
+
+class _LogRecolorFilter(QObject):
+    """视图显隐 / 尺寸变化时补画落后代次的块（隐藏页放大显示、缩放窗口同理）。
+
+    只订阅 Show / Resize 并一律返回 False（不改变既有事件语义）：滚动已由滚动条
+    valueChanged 覆盖，其余事件与本机制无关。挂在宿主视图与它的 viewport 上，
+    以视图 parent 关系回查是哪个 box。"""
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() in (QEvent.Show, QEvent.Resize):
+                box = obj if hasattr(obj, "verticalScrollBar") else obj.parent()
+                if box is not None and hasattr(box, "verticalScrollBar"):
+                    _recolor_visible_if_needed(box)
+        except Exception:
+            pass
+        return False
+
+
+def _ensure_recolor_hook(win, box):
+    """惰性补画钩子：滚动条滚动 + 视图显隐/缩放时，把落后代次的可视行当场补画。
+
+    只在首次走「可视区优先」路径时挂一次（不可重复连接）。滚动条 valueChanged
+    在重绘之前发出、Show/Resize 在几何就绪后发出，补画都是同步的，故新进入可视区
+    的行与随后那次重绘同帧显示新色，绝不闪现旧色。"""
+    if getattr(box, "_log_recolor_hooked", False):
+        return
+    try:
+        box._log_recolor_owner = win
+        box.verticalScrollBar().valueChanged.connect(
+            lambda *_a, _b=box: _recolor_visible_if_needed(_b))
+        flt = _LogRecolorFilter(box)          # parent=box：与视图同生命周期
+        box.installEventFilter(flt)
+        try:
+            box.viewport().installEventFilter(flt)
+        except Exception:
+            pass
+        box._log_recolor_filter = flt
+        box._log_recolor_hooked = True
+    except Exception:
+        pass
+
+
+def _recolor_visible_if_needed(box):
+    """可视区补画：只有「主题代次」落后的块才重画（都已是新代则只做 O(可视) 扫描）。"""
+    if getattr(box, "_log_recoloring", False):
+        return
+    win = getattr(box, "_log_recolor_owner", None)
+    if win is None:
+        return
+    try:
+        get = getattr(win.state, "get", None)
+        colored = (bool(get("log_colors_enabled", True)) if callable(get)
+                   else bool(win.state.snapshot().get("log_colors_enabled", True)))
+    except Exception:
+        colored = True
+    if not colored:
+        return                     # 纯文本模式：绝不把颜色刷回来
+    rng = _visible_block_range(box)
+    if rng is None:
+        return
+    lo, hi = rng
+    gen = getattr(box, _LOG_THEME_STATE_ATTR, 0)
+    try:
+        doc = box.document()
+        stale = False
+        for i in range(lo, hi + 1):
+            b = doc.findBlockByNumber(i)
+            if b.isValid() and int(b.userState()) != int(gen):
+                stale = True
+                break
+        if not stale:
+            return
+        box._log_recoloring = True   # 防重入：重画可能再触发 valueChanged / Resize
+        try:
+            _recolor_block_range(win, box, lo, hi, gen)
+        finally:
+            box._log_recoloring = False
+    except Exception:
+        pass
+
+
+def _rerender_log_view(win, box):
+    """主题切换后按当前调色板重画已画出的行（保留已复制链接的降级状态）。
+
+    小视图（≤ _RERENDER_FULL_MAX_BLOCKS 行）直接整页逐块重渲染；大视图只重画
+    可视区 + margin，其余行挂滚动钩子在滚入可视区时补画——任何时刻屏幕上可见的
+    行都已是新主题色。逐块按正文重渲染：行文本与块数都不变（不用 clear 重建），
+    滚动位置与选区自然保留；纯文本模式（log_colors_enabled=False）直接跳过。"""
+    if box is None:
+        return
+    try:
+        if not bool(win.state.snapshot().get("log_colors_enabled", True)):
+            return
+    except Exception:
+        pass
+    try:
+        gen = _bump_theme_gen(box)
+        doc = box.document()
+        total = doc.blockCount()
+        if total <= 0:
+            return
+        if total <= _RERENDER_FULL_MAX_BLOCKS:
+            _recolor_block_range(win, box, 0, total - 1, gen)
+            return
+        rng = _visible_block_range(box)
+        if rng is None:
+            _recolor_block_range(win, box, 0, total - 1, gen)
+            return
+        _recolor_block_range(win, box, rng[0], rng[1], gen)
+        _ensure_recolor_hook(win, box)
     except Exception:
         pass
 

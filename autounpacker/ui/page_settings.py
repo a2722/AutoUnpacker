@@ -596,6 +596,11 @@ class SettingsPage(QWidget):
         self._section_cards = {}   # 领域 id -> 承载该领域行的 QWidget
         self._rows = []            # _SettingRow 列表（搜索索引 + 气泡内容）
         self._exp_gate = []        # [(host, 控件簇)] 实验性行：整行置灰 + 只禁用控件簇
+        # 门控目标列表：懒建后「实验性 / 通知」领域可能尚未物化，先给空元组兜底，
+        # 使 _apply_gates() 在任意物化顺序下都不会因缺少列表而抛异常。
+        self._notify_subs = ()
+        self._notify_labels = ()
+        self._exp_subs = ()
         self._hotkey_reason_labels = {}  # 热键配置键 -> 行内失败原因 QLabel
         self._hotkey_states = {}   # 热键配置键 -> (state, msg)（测试 / 重贴用）
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
@@ -735,16 +740,22 @@ class SettingsPage(QWidget):
         except Exception:
             pass
 
-        # 逐领域构建（每个领域 = 一个容器 QWidget，装页头 + 卡片 + 分组 + 行）
+        # 领域目录元数据（_sections）立即就位：左栏、搜索分组、恢复默认范围都读它；
+        # 但领域的**控件卡延迟到首次显示**才构建（_ensure_domain），避免构造时把
+        # 9 个领域 ~500 个控件全建出来（那是主题切换 app.setStyleSheet 重抛光
+        # 的主要成本来源）。初始只物化当前领域（默认「解压与整理」）。
         for did in _DOMAIN_ORDER:
             if did is None:
                 self._sections.append(None)   # 左栏分隔线占位（无对应领域容器）
                 continue
-            self._build_domain(did)
+            self._sections.append(did)
+
+        # 内容顶对齐：stretch 常驻末尾（卡片以 insertWidget(count-1) 插在它之前）
+        self._lay.addStretch(1)
+        self._ensure_domain(self._current_domain)
 
         # 默认选中第一个领域
         self._refresh_catalog(select=0)
-        self._lay.addStretch(1)   # 内容顶对齐（卡片不被拉伸填满视口）
 
         # 底部动作条（固定在滚动区之外）：唯一「恢复默认」+ 即时保存提示。
         foot = QFrame(self)
@@ -787,6 +798,8 @@ class SettingsPage(QWidget):
 
         #settingsDomain 保留为透明容器；真正的卡片是 QFrame#card（含阴影），
         监听目录领域用无卡片的 #dirsHost（每张目录卡自己就是卡片）。"""
+        if did in self._section_cards:
+            return self._section_cards[did]   # 已物化：幂等，重复调用不重建
         name, _icon, desc = _DOMAIN_META[did]
         card = QWidget(self)
         card.setObjectName("settingsDomain")
@@ -838,9 +851,13 @@ class SettingsPage(QWidget):
             except Exception:
                 pass
 
-        self._lay.addWidget(card)
+        # 插在末尾「内容顶对齐」stretch 之前（懒建时逐个插入，顺序不影响视觉：
+        # 同一时刻只显示一个领域卡，隐藏卡不占布局）；stretch 尚未加入时直接追加。
+        try:
+            self._lay.insertWidget(max(0, self._lay.count() - 1), card)
+        except Exception:
+            self._lay.addWidget(card)
         self._section_cards[did] = card
-        self._sections.append(did)
         self._domain_box = rbox            # 后续 _group/_row 追加到这里
         self._domain_id = did
         self._group_open = False
@@ -865,6 +882,51 @@ class SettingsPage(QWidget):
             self._build_dirs(rbox)
         box.addWidget(rows_card)
         self._finalize_row_borders(rows_card)
+
+    def _ensure_domain(self, did):
+        """物化某领域的控件卡（首次需要时调用；幂等）。
+
+        只负责「建控件 + 回填该领域 + 重贴内联色 + 门控」；可见性切换交给
+        _show_domain()。未物化领域不会在这里被误显示（刚建的卡按当前领域设可见性）。"""
+        if did in self._section_cards:
+            return self._section_cards[did]
+        # 物化即回填：必须在 _loading=True 下进行，抑制「改即存」监听——否则
+        # setChecked/setValue 的 toggled/valueChanged 会误写配置（旧版整页回填都在
+        # _load_from_cfg 的 _loading=True 下发生，语义必须一致）。
+        prev_loading = self._loading
+        self._loading = True
+        try:
+            self._build_domain(did)
+            self._load_domain(did)
+        finally:
+            self._loading = prev_loading
+        # 刚建的卡默认可见：保持「同一时刻仅当前领域可见」不变量
+        try:
+            self._section_cards[did].setVisible(did == self._current_domain)
+        except Exception:
+            pass
+        # 新控件上的内联色（风险徽章 / warn 说明 / 卡片阴影）随当前主题重贴
+        try:
+            self.refresh_theme()
+        except Exception:
+            pass
+        # 新领域里的门控目标（实验性 / 通知）立即按当前开关状态应用
+        try:
+            self._apply_gates()
+        except Exception:
+            pass
+        return self._section_cards.get(did)
+
+    def ensure_all_domains(self):
+        """物化全部领域（测试与确需完整控件树的代码路径用；幂等）。
+
+        用户正常使用只会物化被显示过的领域；本入口保证一次拿到 9 个领域的完整
+        控件树（覆盖 / 搜索 / 恢复默认等跨领域契约仍与旧版逐字一致）。物化后
+        只保留当前领域可见，并让说明行折行高度兜底覆盖到新领域。"""
+        for did in _DOMAIN_ORDER:
+            if did is not None:
+                self._ensure_domain(did)
+        self._show_domain(self._current_domain)
 
     def _finalize_row_borders(self, rows_card):
         """每个分组内最后一条 #setRow 打上 [last="true"]（QSS 没有 :last-child，§10）。
@@ -1898,6 +1960,8 @@ class SettingsPage(QWidget):
         `_text_timers` 里，若只 setParent(None) 丢引用，QFrame 会被 C++ 析构、
         其子控件随之被删，但登记表仍持有野指针 → 之后任何遍历 `_controls` 的
         代码都会 RuntimeError。这里先把旧卡下的控件从登记表里摘掉。"""
+        if not hasattr(self, "dirs_box"):
+            return                       # 「监听目录」领域尚未物化：无可重建
         box = self.dirs_box
         old_cards = list(getattr(self, "_dir_card_widgets", []))
         # 清空旧的目录卡（先注销登记，再销毁）
@@ -2244,7 +2308,8 @@ class SettingsPage(QWidget):
         self._show_domain(did)
 
     def _show_domain(self, did):
-        """只显示该领域容器，其余隐藏；滚动回顶部。"""
+        """只显示该领域容器，其余隐藏；滚动回顶部。首次显示即物化该领域。"""
+        self._ensure_domain(did)          # 懒建：首次显示才构建（幂等）
         for d, card in self._section_cards.items():
             card.setVisible(d == did)
         try:
@@ -2291,7 +2356,11 @@ class SettingsPage(QWidget):
             self._show_search_results(self._query)
 
     def _show_search_results(self, q):
-        """把右侧换成搜索结果：#hitCard 卡片 + 可点击命中项 + 空状态（§8 #5）。"""
+        """把右侧换成搜索结果：#hitCard 卡片 + 可点击命中项 + 空状态（§8 #5）。
+
+        搜索是跨全部领域的契约：先物化全部领域，保证 _rows 搜索索引覆盖每个
+        领域（含用户从未打开过的），命中跳转时目标行控件也一定存在。"""
+        self.ensure_all_domains()
         self._search_shown = str(q or "")   # 防抖尾随去重：当前结果卡对应的词
         if getattr(self, "_result_card", None) is not None:
             self._result_card.setParent(None)
@@ -2609,31 +2678,91 @@ class SettingsPage(QWidget):
             return {}
 
     def _load_from_cfg(self):
-        """把 state.snapshot() 的当前配置回填到所有控件（回填期间不触发即时保存）。"""
+        """把 state.snapshot() 的当前配置回填到**已物化**的控件。
+
+        本页改为按领域懒建：这里只回填已经建好的领域；未物化的领域会在
+        _ensure_domain() 里首次构建后立刻用同一个 _load_domain() 回填，所以从
+        用户视角看到的行为与「构造时全建」逐字一致，不会漏回填任何键。
+
+        与控件解耦的标量（主题偏好 / 热键基线）**始终**从配置读取：否则用户从
+        未打开过「外观与快捷键」时，恢复默认的「主题 / 热键是否变化」判定会因为
+        读不到控件而漏报（漏了就不会重贴主题 / 重注册热键）。"""
         self._loading = True
         try:
             self._cancel_text_timers()
             cfg = self._snapshot()
+            for did in list(self._section_cards.keys()):
+                self._load_domain(did, cfg)
+            # 与控件解耦的标量基线（未物化「外观与快捷键」也保持一致）
+            self._theme_pref = self._cfg_theme_pref(cfg)
+            self._hotkeys_at_load = self._cfg_hotkey_tuple(cfg)
+            # 偏离默认小圆点 + 向导入口可见性 + 恢复默认可见性（搜索态）
+            self._refresh_dirty_dots()
+            self._refresh_wizard_visibility()
+            self.reset_btn.setVisible(not self._query)
+            self._clear_notice()
+            # 已物化领域统一重贴一次门控（懒建顺序不定，这里收口）
+            self._apply_gates()
+        finally:
+            self._loading = False
+        # 回填完成后按当前领域渲染一次（初始只显示一个领域）
+        if self._query:
+            self._show_search_results(self._query)
+        else:
+            self._show_domain(self._current_domain)
 
-            def b(key, default=False):
-                return bool(cfg.get(key, default))
+    @staticmethod
+    def _cfg_str(cfg, key, default=""):
+        v = cfg.get(key, default)
+        return str(v if v is not None else default)
 
-            def s(key, default=""):
-                v = cfg.get(key, default)
-                return str(v if v is not None else default)
+    @staticmethod
+    def _cfg_int(cfg, key, default=0):
+        try:
+            return int(cfg.get(key, default))
+        except Exception:
+            return default
 
-            def i(key, default=0):
-                try:
-                    return int(cfg.get(key, default))
-                except Exception:
-                    return default
+    @staticmethod
+    def _cfg_float(cfg, key, default=0.0):
+        try:
+            return float(cfg.get(key, default))
+        except Exception:
+            return default
 
-            def fl(key, default=0.0):
-                try:
-                    return float(cfg.get(key, default))
-                except Exception:
-                    return default
+    def _cfg_theme_pref(self, cfg):
+        pref = self._cfg_str(cfg, "ui_theme", "auto").lower()
+        return pref if pref in ("auto", "fluent", "devtool") else "auto"
 
+    def _cfg_hotkey_tuple(self, cfg):
+        return (self._cfg_str(cfg, "hotkey").strip(),
+                self._cfg_str(cfg, "hotkey_share").strip(),
+                self._cfg_str(cfg, "hotkey_share_pick").strip(),
+                bool(cfg.get("hotkey_enabled", True)))
+
+    def _load_domain(self, did, cfg=None):
+        """把配置回填到某一个**已物化**领域的控件（改懒建后按领域拆分）。
+
+        未物化的领域不会进入这里：_ensure_domain() 把控件建好后会立即调用本
+        方法，因此「回填」与「控件是否存在」始终同步，绝不会静默跳过任何键。"""
+        if did not in self._section_cards:
+            return
+        if cfg is None:
+            cfg = self._snapshot()
+
+        def b(key, default=False):
+            return bool(cfg.get(key, default))
+
+        def s(key, default=""):
+            return self._cfg_str(cfg, key, default)
+
+        def i(key, default=0):
+            return self._cfg_int(cfg, key, default)
+
+        def fl(key, default=0.0):
+            return self._cfg_float(cfg, key, default)
+
+        if did == "unzip":
             # 解压与整理
             self.output_time_cb.setChecked(b("output_time_now", True))
             self.promote_merge_cb.setChecked(b("promote_merge", True))
@@ -2644,6 +2773,7 @@ class SettingsPage(QWidget):
                 suffixes = DEFAULT_CONFIG.get("incomplete_download_suffixes")
             self.dl_suffix_edit.setPlainText(_format_suffix_lines(suffixes))
 
+        if did == "safety":
             # 删除与安全（「删除源文件」总控已退场；逐目录删源在「监听目录」里改）
             self.bomb_guard_cb.setChecked(b("bomb_guard_enabled", True))
             self.bomb_entries_spin.setValue(max(0, min(1000000, i("bomb_soft_entries", 50000))))
@@ -2653,6 +2783,7 @@ class SettingsPage(QWidget):
             self.bomb_size_gb_spin.setValue(max(0, min(1000000, i("bomb_hard_size_gb", 50))))
             self.free_space_spin.setValue(max(0, min(100000, i("min_free_space_gb", 5))))
 
+        if did == "notify":
             # 通知与提醒
             self.notify_cb.setChecked(b("notify_enabled", True))
             self.notify_archive_cb.setChecked(b("notify_archive", True))
@@ -2669,6 +2800,7 @@ class SettingsPage(QWidget):
             self.notify_baidu_dup_cb.setChecked(b("notify_baidu_dup", False))
             self._sync_notify_enabled()
 
+        if did == "clipboard":
             # 剪贴板与二维码
             self.qr_cb.setChecked(b("qr_enabled", True))
             cur_clip = s("qr_clipboard_action", "none") or "none"
@@ -2683,6 +2815,7 @@ class SettingsPage(QWidget):
             self.temp_max_spin.setValue(max(1, min(100000, i("temp_password_max", 200))))
             self._refresh_passwords_label()
 
+        if did == "links":
             # 链接与网盘
             self.qr_url_cb.setChecked(b("qr_url_enabled", True))
             self.qr_redirect_cb.setChecked(b("qr_url_redirect", True))
@@ -2694,6 +2827,7 @@ class SettingsPage(QWidget):
             self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
             self.baidu_db_edit.setText(s("baidu_task_db"))
 
+        if did == "ui":
             # 外观与快捷键
             pref = s("ui_theme", "auto").lower()
             index = 0
@@ -2722,31 +2856,21 @@ class SettingsPage(QWidget):
                 cur_close = "ask"
             self._close_rbs[cur_close].setChecked(True)
 
+        if did == "system":
             # 系统与维护
             self.interval_spin.setValue(max(1, min(30, i("poll_interval", 2))))
             # 语义反转：已检测过(True) => 界面不勾选；否则勾选（下次重检）
             self.sevenzip_cb.setChecked(not b("sevenzip_check_done", False))
             self.task_limit_spin.setValue(max(1, min(100000, i("task_history_limit", 500))))
 
+        if did == "lab":
             # 实验性
             self.experimental_cb.setChecked(b("experimental_enabled", False))
             self._sync_experimental()
 
+        if did == "dirs":
             # 监听目录
             self.rebuild_dirs()
-
-            # 偏离默认小圆点 + 向导入口可见性 + 恢复默认可见性（搜索态）
-            self._refresh_dirty_dots()
-            self._refresh_wizard_visibility()
-            self.reset_btn.setVisible(not self._query)
-            self._clear_notice()
-        finally:
-            self._loading = False
-        # 回填完成后按当前领域渲染一次（初始只显示一个领域）
-        if self._query:
-            self._show_search_results(self._query)
-        else:
-            self._show_domain(self._current_domain)
 
     def _set_radio_in_host(self, host, labels, value):
         for rb in host.findChildren(QRadioButton):
@@ -3155,8 +3279,22 @@ class SettingsPage(QWidget):
         实验性行：整行打 [off] 动态属性置灰（名称标签保持可用，悬停气泡可达），
         只禁用控件簇；同时受通知总开关约束的行（notify_share / notify_share_dead /
         notify_baidu_*）必须两个总开关都开才可用。"""
-        exp = bool(self.experimental_cb.isChecked())
-        ntf = bool(self.notify_cb.isChecked())
+        # 懒建：两个总开关所在领域可能尚未物化 → 缺控件时退化为读配置，保证对
+        # 已建子项的门控状态仍正确（不会把已建的实验性 / 通知子项误启用或误禁用）。
+        if hasattr(self, "experimental_cb"):
+            exp = bool(self.experimental_cb.isChecked())
+        else:
+            try:
+                exp = bool(self._snapshot().get("experimental_enabled", False))
+            except Exception:
+                exp = False
+        if hasattr(self, "notify_cb"):
+            ntf = bool(self.notify_cb.isChecked())
+        else:
+            try:
+                ntf = bool(self._snapshot().get("notify_enabled", True))
+            except Exception:
+                ntf = True
         for w in self._exp_subs:
             w.setEnabled(exp)
         for w in self._notify_subs + tuple(self._notify_labels):
@@ -3538,14 +3676,20 @@ class SettingsPage(QWidget):
         self._load_from_cfg()
 
     def covered_keys(self):
-        """已登记控件的配置键全集（含 url_trust.* / watch_paths.* 点号路径）。"""
+        """已登记控件的配置键全集（含 url_trust.* / watch_paths.* 点号路径）。
+
+        覆盖契约是跨全部领域的：懒建下先物化全部领域，保证从未打开过的领域
+        的配置键也在集合里（与「构造时全建」的行为逐字一致）。"""
+        self.ensure_all_domains()
         return set(self._controls.keys())
 
     def covered_top_keys(self):
-        """顶层配置键（不含点号路径）。"""
+        """顶层配置键（不含点号路径）。懒建下先物化全部领域（见 covered_keys）。"""
+        self.ensure_all_domains()
         return {k for k in self._controls.keys() if "." not in k}
 
     def control_for(self, key):
+        self.ensure_all_domains()
         return list(self._controls.get(str(key)) or [])
 
     def section_titles(self):

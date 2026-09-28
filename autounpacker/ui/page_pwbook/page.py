@@ -50,6 +50,11 @@ class PasswordBookPage(QWidget):
         self._sort_col = _PwModel.COL_HITS
         self._sort_order = Qt.DescendingOrder
         self._live_signature = None
+        # 页不可见时释放行内操作控件（主题切换的全量重抛光只碰可见页的行控件）；
+        # 再次显示时按当前行重建，并还原隐藏前的滚动 / 选中位置。仅动控件，数据模型不动。
+        self._actions_released = False
+        self._saved_scroll = 0
+        self._saved_selection = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 10)
@@ -297,18 +302,63 @@ class PasswordBookPage(QWidget):
         """切回本页时立即校验一次数据（停留期间 QTimer 每 2s 校验）。"""
         super().showEvent(event)
         try:
+            self._restore_row_actions()
+        except Exception:
+            pass
+        try:
             self._live_timer.start()
             self._live_tick()
         except Exception:
             pass
 
     def hideEvent(self, event):
-        """离开本页时停表（页面不可见就不轮询；回到本页由 showEvent 立即补一次）。"""
+        """离开本页时停表并释放行内操作控件（页面不可见就不轮询、不参与全量重抛光）。"""
         try:
             self._live_timer.stop()
         except Exception:
             pass
+        try:
+            self._release_row_actions()
+        except Exception:
+            pass
         super().hideEvent(event)
+
+    def _release_row_actions(self):
+        """释放行内操作控件（仅控件，模型 / 数据保持不动），并记住滚动与选中位置。
+
+        只在页不可见时调用；从未显示过的页面收不到 hideEvent，行控件仍按今日语义
+        在 set_rows 时即时构建。释放失败绝不影响导航（调用点已包 try/except）。"""
+        if self._actions_released:
+            return
+        self._actions_released = True
+        try:
+            self._saved_scroll = int(self.table.verticalScrollBar().value())
+        except Exception:
+            self._saved_scroll = 0
+        try:
+            self._saved_selection = list(self.table.selected_passwords())
+        except Exception:
+            self._saved_selection = []
+        self.table._clear_actions()
+
+    def _restore_row_actions(self):
+        """按当前行重建行内操作控件，并还原隐藏前的滚动与选中位置。
+
+        幂等：已释放才重建，避免重复创建（隐藏期间若发生过重载，行控件已存在则跳过）。"""
+        if not self._actions_released:
+            return
+        self._actions_released = False
+        if not getattr(self.table, "_action_widgets", None):
+            self.table._build_actions()
+        try:
+            self.table.verticalScrollBar().setValue(int(self._saved_scroll))
+        except Exception:
+            pass
+        if self._saved_selection:
+            try:
+                self.table.select_passwords(self._saved_selection)
+            except Exception:
+                pass
 
     def _sorted_rows(self, rows):
         """按当前列头排序状态对可见行做「仅显示层」重排（绝不改写库内顺序）。

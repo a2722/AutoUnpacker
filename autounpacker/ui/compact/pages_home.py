@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""HOME 页：拖放落区（52px 虚线，拖动进入时高亮）+ 紧凑任务列表 + 底部两按钮。
+"""HOME 页：拖放落区（44px 虚线，拖动进入时高亮）+ 紧凑任务列表 + 底部两按钮。
 
-按钮（40px 区）：`＋ 添加文件` / `新增口令`——只发信号，具体动作（QFileDialog、
+按钮（36px 区）：`＋ 添加文件` / `新增口令`——只发信号，具体动作（QFileDialog、
 进 PW 页）由 `CompactWindow` 统一处理，本页不直接碰宿主私有入口，便于测试与复用。
+本轮整体压缩：落区 52→44、按钮区 40→36（按钮自身高度不变，仍 ≥ 字体 lineSpacing+2）、
+根边距 10→8、间距 8→6；任何画文字的控件都不低于其字体所需高度。
 
 **刻意不放「提取码」入口**：提取码页只应在**真的需要填码**时出现（复制的 pan.baidu
 缺码、二维码指向的 pan.baidu 缺码、分享链接带的码不对……这些都由分享流程自己路由到
@@ -30,15 +32,15 @@ class HomePage(QWidget):
         self.setObjectName("compactHomePage")
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
-        # ---- 落区（52px 虚线；dragMove 时整块高亮，见 CompactWindow.dragMoveEvent）----
+        # ---- 落区（44px 虚线；dragMove 时整块高亮，见 CompactWindow.dragMoveEvent）----
         self.drop_zone = QFrame(self)
         self.drop_zone.setObjectName("compactDropZone")
         self.drop_zone.setAttribute(Qt.WA_StyledBackground, True)
         self.drop_zone.setProperty("drag", "false")
-        self.drop_zone.setFixedHeight(52)
+        self.drop_zone.setFixedHeight(44)
         self.drop_zone.setToolTip("把压缩包拖到这里，或点下方「＋ 添加文件」")
         zone_lay = QHBoxLayout(self.drop_zone)
         zone_lay.setContentsMargins(8, 0, 8, 0)
@@ -58,16 +60,16 @@ class HomePage(QWidget):
         self.head.hide()
         root.addWidget(self.head)
 
-        # ---- 紧凑任务列表（最多 6 行后滚动；双击行 = 打开输出目录）----
+        # ---- 紧凑任务列表（最多 2 行后滚动；双击行 = 打开输出目录）----
         self.task_list = CompactTaskList(host, self)
         self.task_list.taskActivated.connect(self.taskActivated)
         root.addWidget(self.task_list, 1)
 
-        # ---- 底部两按钮（40px 区）----
+        # ---- 底部两按钮（36px 区；按钮自身高度不变，见 setMinimumHeight(30)）----
         foot = QWidget(self)
-        foot.setFixedHeight(40)
+        foot.setFixedHeight(36)
         foot_lay = QHBoxLayout(foot)
-        foot_lay.setContentsMargins(0, 4, 0, 4)
+        foot_lay.setContentsMargins(0, 2, 0, 2)
         foot_lay.setSpacing(6)
         self.add_btn = QPushButton("＋ 添加文件", foot)
         self.add_btn.setObjectName("primary")

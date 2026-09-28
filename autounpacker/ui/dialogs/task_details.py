@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QFrame, QGridLayout,
 
 from ... import db
 from ..pages import task_log_line
+from ..textfit import ensure_min_height, fit_text_heights
 from ..widgets import (Glyph, _STATE_TEXT, _clear_layout, _fmt_cost, _fmt_pwd,
                        _fmt_size, _row_file, _row_out, _task_state_key)
 
@@ -38,16 +39,10 @@ _MODE_TEXT = {"surface": "表层", "baidu": "百度清单（含子目录）"}
 def _fit_cjk(w):
     """把文本控件的最小高度抬到 lineSpacing() + 2（CJK 顶/底 1px 裁切兜底）。
 
-    与 page_settings._fit_hint 同一配方：QLabel 折行高度按 fontMetrics().height()
-    算、绘制按 lineSpacing() 排，默认上下各裁约 1px。幂等（只抬不降、与当前文本
-    无关）、异常安全（字体度量未就绪时静默跳过）。
+    实现收敛到 ui.textfit.ensure_min_height（规则唯一真源，单行/多行同一配方；
+    本弹窗的字段标签 / 固定高容器内的标题都依赖它）；幂等、异常安全。
     """
-    try:
-        need = int(w.fontMetrics().lineSpacing()) + 2
-        if w.minimumHeight() < need:
-            w.setMinimumHeight(need)
-    except Exception:
-        pass
+    ensure_min_height(w)
 
 
 def _fmt_ts(value):
@@ -398,6 +393,9 @@ class TaskDetailsDialog(QDialog):
     # ---- 几何：居中于父级（父级是 Scrim，其几何 == 主窗 frameGeometry） ----
     def showEvent(self, event):
         super().showEvent(event)
+        # 共享文本高度兜底：本弹窗在固定高容器（#err_box 88 / #log_box 132 的
+        # 标题列）之外仍可能有单行标签；show 后整树兜底一次（幂等），再居中。
+        fit_text_heights(self)
         self._center_on_parent()
 
     def _center_on_parent(self):

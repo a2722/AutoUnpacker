@@ -3,7 +3,7 @@
 
 数据与完整界面**同源**：直接读 `db.count_tasks()` / `db.list_tasks()`
 （绝不新建数据库、绝不写入）。排序：进行中 → 排队(含待密码) → 失败 → 最近完成；
-最多显示 6 行，超出在列表内滚动。双击行发 `taskActivated(task_id)`，
+最多显示 2 行，超出在列表内滚动。双击行发 `taskActivated(task_id)`，
 具体的「打开输出目录」动作由 `CompactWindow` 交给宿主既有入口执行。
 
 进度说明：任务表本身没有逐任务进度列；进行中的行进度取自宿主已有的
@@ -18,7 +18,7 @@ from ..widgets.common import _task_state_key, _task_rows_signature
 from ..widgets.inputs import Glyph, _ElideLabel
 
 ROW_H = 32          # 单行高（含 1px 分隔线）
-MAX_VISIBLE = 6     # 列表最多显示 6 行，超出滚动（规格 §5.1）
+MAX_VISIBLE = 2     # 列表最多显示 2 行，超出滚动（本轮压缩：4 → 2，正好矮 2×ROW_H）
 MAX_ROWS = 50       # 单次最多渲染行数（防极端数据量拖慢小窗）
 
 # 排序分组：进行中 → 排队(含待密码) → 失败 → 最近完成（规格 §5.1）
@@ -164,7 +164,7 @@ class _TaskRow(QWidget):
 
 
 class CompactTaskList(QWidget):
-    """紧凑任务列表：空态一行灰字；最多 6 行后滚动；整表随数据指纹重建。"""
+    """紧凑任务列表：空态一行灰字；最多 2 行后滚动；整表随数据指纹重建。"""
 
     taskActivated = pyqtSignal(int)
 
@@ -255,7 +255,7 @@ class CompactTaskList(QWidget):
         self._vbox.addStretch(1)
 
     def _sync_visibility(self, count):
-        """空态切换 + 列表高度（≤6 行按行数收缩，超出固定 6 行高度滚动）。"""
+        """空态切换 + 列表高度（≤2 行按行数收缩，超出固定 2 行高度滚动）。"""
         try:
             if count <= 0:
                 self.scroll.hide()

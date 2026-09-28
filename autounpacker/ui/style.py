@@ -146,10 +146,10 @@ METRICS = {
     "nav_item_h": 36,         # 左栏项高（QSS 里另有同名规则）
     "search_w": 320,          # 搜索框宽
     "search_h": 34,           # 搜索框高
-    "row_pad_y": 10,          # 行上下留白
+    "row_pad_y": 12,          # 行上下留白（分组卡片内行 12px，§4）
     "card_pad": (6, 16, 12),  # 卡片 padding (top, x, bottom)
     "pane_pad": (16, 18, 24),  # 滚动主区 padding (top, x, bottom)
-    "gblock_gap": 14,         # 分组间距（上）
+    "gblock_gap": 16,         # 组 ↔ 组间距（上；首组给小值，见 _group）
     "topbar_h": 58,           # 顶部工具条高（约）
     "actionbar_pad": (12, 18),  # 底部操作条 padding (y, x)
 }
@@ -242,12 +242,17 @@ QFrame#card, #statcard {
 QLabel#appTitle { font-size: 18px; font-weight: bold; color: $title_fg; }
 QLabel#sectionTitle { font-size: 13px; font-weight: 600; color: $section_fg; }
 
-QLineEdit, QSpinBox, QComboBox {
+/* 注意（不许再犯）：QSpinBox 与 QDoubleSpinBox 必须**成对**出现在每一条
+   「输入框盒模型」规则里（本条 / :focus / :disabled / 设置页尺寸规则）。
+   历史缺陷：本条只列 QSpinBox，浮点框从未拿到 background / border / radius /
+   padding，于是本体走原生框绘制、尺寸又由 QSS 叠加 → 与整数框形状不同、
+   底缘被裁（解压安全的三只 GB 框）。新增输入类控件时，两款 spin 一起列。 */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background: $ctl_bg; border: 1px solid $ctl_border; border-radius: $radius_ctl;
     padding: 5px 8px; min-height: 22px; color: $ctl_fg;
     selection-background-color: $sel_bg; selection-color: $sel_fg;
 }
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on {
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QComboBox:on {
     border: 1px solid $ctl_focus;
 }
 QComboBox::drop-down { border: none; width: 22px; }
@@ -395,26 +400,47 @@ QWidget#settingsPage QLabel#stripHint[role="pageDesc"] {
     font-size: $fs_body; color: $section_fg;
 }
 
-/* ---- 卡片 / 分组 ---- */
+/* ---- 卡片 / 分组（方案三 · 三1 基线：每组一张独立白卡，卡内零分隔线） ---- */
 QFrame#card {
     background: $card_bg; border: 1px solid $card_border;
     border-radius: $radius_card;
 }
-QFrame#group { background: transparent; border: none; border-top: 1px solid $group_border; }
-QFrame#group[first="true"] { border-top: none; }
-QLabel#groupTitle { font-size: $fs_section; font-weight: 800; color: $group_title; }
-QFrame#groupSep {
-    background: $group_border; border: none;
-    min-height: 1px; max-height: 1px;
+/* 分组排布容器（#groupsHost）：只排布，不画边框 / 底色（卡片在每组里） */
+QWidget#groupsHost { background: transparent; border: none; }
+/* 每组一张独立白卡；组名在卡外上方（见 page_settings._group） */
+QFrame#groupCard {
+    background: $card_bg; border: 1px solid $card_border;
+    border-radius: $radius_card;
 }
 
-/* ---- 行（底部分隔线 / hover / 风险底色；末行无底边） ---- */
-QWidget#setRow { border-bottom: 1px solid $group_border; background: transparent; }
-QWidget#setRow[last="true"] { border-bottom: none; }
-QWidget#setRow:hover { background: $accent_soft; }
-QWidget#setRow[risk="true"] { background: $danger_bg; border-radius: $radius_card; }
+/* ---- 标题层级（方案A）：组名 14/700；行名 12.5/600（作用域收在本页） ---- */
+QWidget#settingsPage QLabel#groupTitle {
+    font-size: 14px; font-weight: 700; color: $window_fg;
+}
+QWidget#settingsPage QLabel#setName {
+    /* 左右各 1px 余量：CJK 墨迹盒可顶满 content rect，无余量时左缘/右缘会蹭边。
+       纵向余量不靠 padding（sizeHint 会同步增大、content 区仍等于 height()），
+       由 textfit.fit_text_heights 统一 setMinimumHeight(lineSpacing + 2) 兜底。 */
+    font-size: 12.5px; font-weight: 600; color: $window_fg; padding: 0 1px;
+}
+
+/* ---- 行（无分隔线；hover = 整行圆角高亮带；风险行 = 左侧 3px danger 竖条） ---- */
+QWidget#setRow { background: transparent; }
+QWidget#setRow:hover { background: $accent_soft; border-radius: $radius_card; }
+/* hover 高亮带严格到卡边：卡内左右内边距为 0、16px 由每行自己让出（见
+   page_settings._row / _manual_row），行宿主因此占满整卡宽。圆角按行在卡内的
+   位置区分：首/末行跟随卡片圆角，中间行严格直角（左/右到卡边）。rowPos 由
+   page_settings._finalize_group_cards 标注——不能用 `pos`：QWidget 自带几何
+   属性 pos（QPoint），动态属性会被 Qt 拒绝、选择器永远匹配不到。 */
+QWidget#setRow[rowPos="first"]:hover { border-radius: $radius_card; }
+QWidget#setRow[rowPos="mid"]:hover { border-radius: 0; }
+QWidget#setRow[rowPos="last"]:hover { border-radius: $radius_card; }
+/* 风险行：整行 danger 底 → 左侧 3px danger 竖条（§7 选定变体）。竖条圆角固定用
+   $radius_tag（2px），不让 hover 的 $radius_card 把 3px 竖条弯成弧线 */
+QWidget#setRow[risk="true"] {
+    border-left: 3px solid $danger_fg; border-radius: $radius_tag;
+}
 QWidget#setRow[flash="true"] { background: $accent_soft; }
-QLabel#setName { font-size: $fs_row; font-weight: 700; color: $window_fg; }
 QLabel#rowNote { font-size: $fs_hint; color: $chip_off_fg; }
 QLabel#unit    { font-size: $fs_section; color: $chip_off_fg; }
 /* 实验性总开关关闭：整行置灰（名称 / 单位 / 行内备注），控件簇由 setEnabled 禁用 */
@@ -658,8 +684,8 @@ QProgressBar#chipProg::chunk { background: $prog_chunk; border-radius: 2px; }
 /* 说明文字（#stripHint）：字号 11px 的 CJK 墨迹几乎顶满 em 框，QLabel 折行
    高度按 fontMetrics().height()（11）算、绘制却按 lineSpacing()（13）排线，
    于是上下各被裁 1px；左缘也无余量。给左右各 1px padding（纵向 padding 无效：
-   sizeHint 会同步增大、内容区仍等于 height()），纵向余量由页面在 polish 后
-   setMinimumHeight(lineSpacing + 2) 兜底（见 page_settings._fit_hint）。 */
+   sizeHint 会同步增大、内容区仍等于 height()），纵向余量由 textfit.fit_text_heights
+   （单行/多行统一，show / 主题切换后调用）按 fontMetrics().lineSpacing()+2 兜底。 */
 QLabel#stripHint { color: $chip_off_fg; font-size: 11px; padding: 0 1px; }
 
 /* ---- 顶部标签页（激活态用 2px 下划线，禁止用背景块） ---- */

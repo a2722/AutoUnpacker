@@ -51,8 +51,10 @@ class CodePage(QWidget):
         self._remain_sec = self._timeout_sec
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 12)
-        root.setSpacing(8)
+        # 版面压缩（本轮）：上下边距 10/12→6/6、行距 8→3——CODE 页原本是整窗最小高
+        # （269px）的来源，瘦身后小窗才降得下来；控件自身高度（含文字的）一个没动。
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(3)
 
         # 顶部：‹ 返回（= 忽略并回 HOME）+ 标题 + 右侧倒计时
         head = QHBoxLayout()

@@ -21,7 +21,8 @@
   「打开目录设置」就在该卡的虚线页脚里（按卡片绑定 idx，不再共用按钮）；
 - #stripHint 描述行：11px CJK 墨迹几乎顶满 em 框，QLabel 折行高度按
   fontMetrics().height() 算、绘制按 lineSpacing() 排，默认上下各裁 1px；
-  由 QSS padding + polish 后的 _fit_hint() 兜底（见 style.py 注释）；
+  由 QSS padding + show / 主题切换后的 textfit.fit_text_heights() 兜底
+  （单行/多行同一字体级规则，见 ui/textfit.py）；
 - 主题：走既有 ui_style.resolve_theme + apply_theme + ui_theme_cached + 回调
   路径，绝不手写 QSS、绝不新增主题 token（风险徽章 / 呼吸灯 / 气泡都在
   refresh_theme() 里重贴）。
@@ -43,9 +44,10 @@
       「键 -> 控件 -> 即时保存」的覆盖契约在一个文件里可直接审计。
 """
 import json
+import threading
 
-from PyQt5.QtCore import (QEvent, QPoint, QPropertyAnimation, QRect, QRectF,
-                          QSize, QTimer, Qt, pyqtSignal)
+from PyQt5.QtCore import (QEvent, QObject, QPoint, QPropertyAnimation, QRect,
+                          QRectF, QSize, QTimer, Qt, pyqtSignal)
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
@@ -58,8 +60,10 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
 
 from ..config import DEFAULT_CONFIG, _sanitize_cfg
 from ..config import load_config
+from .. import sevenzip as sz
 from . import style as ui_style
 from .style import METRICS, PALETTE
+from .textfit import ensure_min_height, fit_text_heights
 from .widgets import Glyph, HotkeyEdit, _Switch, repolish_tree
 
 # 主题偏好与显示名（设置页主题下拉的唯一真源）
@@ -90,6 +94,11 @@ _HINT_NAMES = ("stripHint", "bubbleHint", "bubbleDesc", "bubbleRiskBody")
 
 # 实验性门控提示（气泡补充说明；实验性总开关关闭时这些行整行置灰 + 控件禁用）
 _EXP_NOTE = "该功能需开启「实验性」后方可使用。"
+
+# 风险行左侧 danger 竖条宽度（与 style.py `QWidget#setRow[risk="true"]` 的
+# `border-left: 3px` 一致；QSS border 不改变布局 contentsRect，行内容左侧必须
+# 让出同宽内边距，否则竖条会压住行名，见 _row / _manual_row）
+_RISK_BAR_W = 3
 
 # 补充信息气泡：悬停延迟（对齐现有设置页的 Qt 原生 tooltip 唤醒延迟 = 700ms）
 _BUBBLE_DELAY_MS = 700
@@ -557,6 +566,27 @@ class _InfoBubble(QFrame):
         self.raise_()
 
 
+class _SevenZipOp(QObject):
+    """7-Zip 后台操作信号（worker 线程 → GUI 主线程）。
+
+    与 ui/dialogs/sevenzip.py 的 _SevenZipOp 同一模式（跨线程发信号是队列投递，
+    可靠）；设置页内联组自己持有一份，不 import 对话框的私有类。"""
+
+    progress = pyqtSignal(str)
+    done = pyqtSignal(str, bool)   # (消息, 是否成功)
+
+
+def _sevenzip_status_text(info):
+    """状态文案：复用引导对话框的 _status_text（唯一真源，避免两处措辞漂移）。
+
+    dialogs 按项目惯例延迟 import（模块级 import 会连带整个 dialogs 包）。"""
+    try:
+        from .dialogs.sevenzip import _status_text
+        return _status_text(info)
+    except Exception:
+        return "未安装" if not info else "检测中…"
+
+
 class SettingsPage(QWidget):
     """设置页：9 领域左栏导航 + 改即存 / 恢复默认；覆盖 DEFAULT_CONFIG 全部键。
 
@@ -623,7 +653,7 @@ class SettingsPage(QWidget):
         self._result_card = None   # 搜索结果容器（搜索态用）
         self._domain_box = None
         self._domain_id = "unzip"
-        self._group_open = False   # 当前领域是否已经开过分组（[first=true] 用）
+        self._group_open = False   # 当前领域是否已经开过分组（首组上边距给小值用）
         self._shadow_widgets = []  # 挂了 QGraphicsDropShadowEffect 的卡片（主题切换重建）
         self._search_icon_act = None
         self._flash_timer = None
@@ -794,10 +824,11 @@ class SettingsPage(QWidget):
         return wrap
 
     def _build_domain(self, did):
-        """建一个领域容器：页头（大标题 + 描述 + 命中数）+ 卡片（分组 + 行）。
+        """建一个领域容器：页头（大标题 + 描述 + 命中数）+ 分组卡片。
 
-        #settingsDomain 保留为透明容器；真正的卡片是 QFrame#card（含阴影），
-        监听目录领域用无卡片的 #dirsHost（每张目录卡自己就是卡片）。"""
+        #settingsDomain 保留为透明容器；常规领域的行宿主是透明 #groupsHost，
+        真正的卡片是每组一张 QFrame#groupCard（含阴影）；监听目录领域用透明的
+        #dirsHost（每张目录卡自己就是卡片）。"""
         if did in self._section_cards:
             return self._section_cards[did]   # 已物化：幂等，重复调用不重建
         name, _icon, desc = _DOMAIN_META[did]
@@ -830,26 +861,15 @@ class SettingsPage(QWidget):
         self._hit_labels[did] = hit
         box.addWidget(head)
 
-        # 行卡片：常规领域是 #card（阴影）；监听目录领域是透明 #dirsHost
+        # 行宿主：常规领域是透明 #groupsHost（真正的卡片是每组一张 #groupCard，
+        # 阴影挂在各组的卡上）；监听目录领域是透明 #dirsHost（每张目录卡自己就是卡片）
         is_dirs = (did == "dirs")
-        rows_card = QWidget(card) if is_dirs else QFrame(card)
-        rows_card.setObjectName("dirsHost" if is_dirs else "card")
+        rows_card = QWidget(card)
+        rows_card.setObjectName("dirsHost" if is_dirs else "groupsHost")
         rbox = QVBoxLayout(rows_card)
-        if is_dirs:
-            rbox.setContentsMargins(0, 0, 0, 0)
-            rbox.setSpacing(12)
-        else:
-            # card_pad=(6,16,12)：上下内边距走布局（QSS padding 对普通 QWidget 常被忽略）
-            rbox.setContentsMargins(16, 6, 16, 12)
-            rbox.setSpacing(0)
-
-        # 卡片阴影：只给领域卡片挂（§6.2；一个 widget 一个 effect）
-        if not is_dirs:
-            try:
-                _apply_card_shadow(rows_card, "card")
-                self._shadow_widgets.append(rows_card)
-            except Exception:
-                pass
+        rbox.setContentsMargins(0, 0, 0, 0)
+        # 目录卡之间已有 12px 间距；常规领域的组间距由各组块自身（gblock_gap）提供
+        rbox.setSpacing(12 if is_dirs else 0)
 
         # 插在末尾「内容顶对齐」stretch 之前（懒建时逐个插入，顺序不影响视觉：
         # 同一时刻只显示一个领域卡，隐藏卡不占布局）；stretch 尚未加入时直接追加。
@@ -881,7 +901,8 @@ class SettingsPage(QWidget):
         elif did == "dirs":
             self._build_dirs(rbox)
         box.addWidget(rows_card)
-        self._finalize_row_borders(rows_card)
+        # 领域构建收口：行位置标注（hover 圆角）+ 卡内非行内容的 16px 内边距
+        self._finalize_group_cards(did)
 
     def _ensure_domain(self, did):
         """物化某领域的控件卡（首次需要时调用；幂等）。
@@ -928,68 +949,68 @@ class SettingsPage(QWidget):
                 self._ensure_domain(did)
         self._show_domain(self._current_domain)
 
-    def _finalize_row_borders(self, rows_card):
-        """每个分组内最后一条 #setRow 打上 [last="true"]（QSS 没有 :last-child，§10）。
-
-        构建期（widget 首次 polish 之前）设置动态属性即可；QSS 在 show/polish 时
-        读取。分组本身用 [first="true"] 去掉首组上边框。"""
-        try:
-            groups = [w for w in rows_card.findChildren(QFrame)
-                      if w.objectName() == "group"]
-            for grp in groups:
-                rows = grp.findChildren(QWidget, "setRow", Qt.FindDirectChildrenOnly)
-                for n, w in enumerate(rows):
-                    try:
-                        w.setProperty("last", n == len(rows) - 1)
-                    except Exception:
-                        pass
-            repolish_tree(rows_card)
-        except Exception:
-            pass
-
     # ---- 分组标题 / 行骨架 ----
     def _group(self, lay, title):
-        """分组块（QFrame#group）：标题 + 右侧 1px 填充线，之后的行直接追加进来。
+        """分组块（QWidget#groupBlock）：组名在卡外上方 + 一张独立白卡（#groupCard）。
 
-        首组上边框由 `[first="true"]` 去掉（QSS 没有 :first-child，§10.3）；组间
-        间距 14 走上外边距（QSS padding/margin 对普通容器不可靠，§10.1）。"""
+        组名相对卡内容左缩进 16px（标题行布局的左边距）；组名与卡间距 6px；组间距
+        16 走上外边距（QSS padding/margin 对普通容器不可靠，§10.1），首组给小值。
+        卡内左右各 16 也走布局 margins；卡片阴影每组建一张（不给每行挂）。返回
+        #groupCard 的内部 QVBoxLayout——调用方 `g = self._group(box, "…")` 后
+        直接追加行的契约不变。"""
         host = lay.parentWidget()
-        frame = QFrame(host)
-        frame.setObjectName("group")
+        block = QWidget(host)
+        block.setObjectName("groupBlock")
         first = not bool(self._group_open)
-        frame.setProperty("first", first)
         self._group_open = True
         gap = int(METRICS["gblock_gap"])
-        box = QVBoxLayout(frame)
+        box = QVBoxLayout(block)
         box.setContentsMargins(0, 6 if first else gap, 0, 0)
-        box.setSpacing(0)
+        box.setSpacing(6)                      # 组名 ↔ 本组卡
         head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(9)
-        lbl = QLabel(str(title), frame)
+        head.setContentsMargins(16, 0, 0, 0)   # 组名左缩进 = 卡内内容左缘
+        head.setSpacing(0)
+        lbl = QLabel(str(title), block)
         lbl.setObjectName("groupTitle")
         head.addWidget(lbl)
-        sep = QFrame(frame)
-        sep.setObjectName("groupSep")
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFixedHeight(1)
-        sep.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        head.addWidget(sep, 1)
+        head.addStretch(1)
         box.addLayout(head)
-        lay.addWidget(frame)
-        return box
+
+        card = QFrame(block)
+        card.setObjectName("groupCard")
+        cbox = QVBoxLayout(card)
+        # 卡内左右内边距为 0：行（#setRow）必须**整卡宽**，hover 高亮带才能严格
+        # 到卡边（左右无白条）。原来的 16px 内边距改由每行自己让出（_row /
+        # _manual_row），行内文字/控件仍缩进 16px；卡内非行内容（说明标签 /
+        # 单选组宿主等）由 _finalize_group_cards 统一补回同样的 16px。
+        cbox.setContentsMargins(0, 0, 0, 0)
+        cbox.setSpacing(0)
+        box.addWidget(card)
+        try:
+            _apply_card_shadow(card, "card")
+            self._shadow_widgets.append(card)
+        except Exception:
+            pass
+        lay.addWidget(block)
+        return cbox
 
     def _manual_row(self, lay, risk=False):
-        """手工行（不走 _row 的复合控件）：仍是 #setRow，享受分隔线 / hover。
+        """手工行（不走 _row 的复合控件）：仍是 #setRow，享受整行 hover。
 
-        返回 (host, QHBoxLayout)；调用方把控件加进这个布局。"""
+        返回 (host, QHBoxLayout)；调用方把控件加进这个布局。
+
+        行宿主占满卡宽（卡的左右内边距已为 0），行**自己**让出 16px 水平内边距：
+        hover 高亮带因此从卡左缘画到卡右缘，而文字/控件仍与改动前逐像素对齐。"""
         host = QWidget(lay.parentWidget())
         host.setObjectName("setRow")
         host.setAttribute(Qt.WA_StyledBackground, True)   # QSS 背景/边框需要
         host.setAttribute(Qt.WA_Hover, True)              # QSS :hover 需要（§10.2）
         host.setProperty("risk", bool(risk))
         h = QHBoxLayout(host)
-        h.setContentsMargins(0, int(METRICS["row_pad_y"]), 0,
+        # 风险行左侧 3px danger 竖条由 QSS 画在行的左缘（= 卡左缘）；行内容让出
+        # 竖条宽度 + 16px，右缘同样 16px —— 与非风险行的文字左缘逐像素对齐。
+        h.setContentsMargins((_RISK_BAR_W + 16) if risk else 16,
+                             int(METRICS["row_pad_y"]), 16,
                              int(METRICS["row_pad_y"]))
         h.setSpacing(10)
         if risk:
@@ -1004,6 +1025,56 @@ class SettingsPage(QWidget):
             except Exception:
                 pass
         return host, h
+
+    def _finalize_group_cards(self, did):
+        """领域构建收口（每个领域构建完调用一次）：
+
+        1) 给每张 #groupCard 里的 #setRow 标 `rowPos` = first / mid / last —— hover
+           高亮带的圆角只在首/末行跟随卡圆角，中间行严格直角（见 style.py）。
+           **用 rowPos 而不是 pos**：QWidget 自带几何属性 `pos`（QPoint），
+           setProperty("pos", "first") 会被 Qt 拒绝（类型不可转换），QSS 选择器
+           永远匹配不到。
+        2) 卡内**非行**内容（说明标签 / 单选组宿主等）补回 16px 水平内边距 ——
+           卡的左右内边距已改为 0（见 _group），不补的话这些内容会贴到卡边。
+
+        只做动态属性 + 布局内边距，不新增任何包裹控件：#setRow 的父链契约
+        （标签的 parentWidget() 仍是 #setRow）保持不变。"""
+        card = self._section_cards.get(did)
+        if card is None:
+            return
+        try:
+            cards = card.findChildren(QFrame, "groupCard")
+        except Exception:
+            return
+        for gc in cards:
+            try:
+                kids = [w for w in gc.children() if isinstance(w, QWidget)]
+            except Exception:
+                continue
+            rows = [w for w in kids if w.objectName() == "setRow"]
+            for idx, row in enumerate(rows):
+                pos = ("first" if idx == 0
+                       else ("last" if idx == len(rows) - 1 else "mid"))
+                try:
+                    if row.property("rowPos") != pos:
+                        row.setProperty("rowPos", pos)
+                        repolish_tree(row)
+                except Exception:
+                    pass
+            # 非行内容：补回与改动前一致的 16px 水平内边距（顶/底边距原样保留）
+            for w in kids:
+                if w.objectName() == "setRow":
+                    continue
+                try:
+                    lay = w.layout()
+                    if lay is not None:
+                        m = lay.contentsMargins()
+                        lay.setContentsMargins(16, m.top(), 16, m.bottom())
+                    else:
+                        m = w.contentsMargins()
+                        w.setContentsMargins(16, m.top(), 16, m.bottom())
+                except Exception:
+                    pass
 
     def _reg(self, key, widget):
         """登记某配置键对应的控件（同一键可多个控件）。"""
@@ -1029,34 +1100,20 @@ class SettingsPage(QWidget):
         return lbl
 
     def _fit_hint(self, lbl):
-        """把说明标签的最小高度抬到 lineSpacing() + 2（CJK 兜底）。"""
-        try:
-            need = int(lbl.fontMetrics().lineSpacing()) + 2
-            if lbl.minimumHeight() < need:
-                lbl.setMinimumHeight(need)
-        except Exception:
-            pass
+        """把单个标签/气泡框的最小高度抬到 lineSpacing() + 2（CJK 兜底）。
+
+        实现收敛到 ui.textfit.ensure_min_height（规则唯一真源）；本方法保留为
+        页内兼容入口（eventFilter / 气泡等既有调用点不变）。"""
+        ensure_min_height(lbl)
 
     def _fit_all_hints(self):
-        """页面内所有「会绘制多行」的文本标签都抬到 lineSpacing() + 2。
+        """页面内所有会绘制文本的标签都抬到 fontMetrics().lineSpacing() + 2。
 
-        四个白名单名（_HINT_NAMES）无条件兜底，行为与旧版逐字一致；其余标签按
-        是否可能绘制多行区分：wordWrap 或文本含换行的标签，行间会排 leading
-        （按 lineSpacing() 绘制），默认上下各裁约 1px，必须兜底；单行标签按
-        ascent+descent（== fontMetrics().height()）绘制、不排 leading，本就
-        不裁切，且抬高其最小高度会破坏 test_settings_switch_and_bubble 的 W2
-        单行锁（setName 的 height() <= lineSpacing()），故不适用。全程异常安全。
-        """
-        for lbl in self.findChildren(QLabel):
-            try:
-                if lbl.objectName() in _HINT_NAMES:
-                    self._fit_hint(lbl)
-                    continue
-                text = str(lbl.text() or "")
-                if text.strip() and (lbl.wordWrap() or "\n" in text):
-                    self._fit_hint(lbl)
-            except Exception:
-                pass
+        单行标签不再豁免：共享的字体级兜底由 ui.textfit.fit_text_heights
+        统一实现（探针实测单行 #setName rect 12px < CJK 墨迹 13~14px，顶缘
+        越界 -1px，「单行不裁切」的旧假设为假）。幂等、异常安全、空文本标签
+        不触碰；只在 show / 切领域 / 主题切换后调用，绝不进逐帧/逐行路径。"""
+        fit_text_heights(self)
 
     def eventFilter(self, obj, event):
         handled = False
@@ -1142,15 +1199,21 @@ class SettingsPage(QWidget):
     def _row(self, lay, row_meta, make_control, risk=False, key=None):
         """通用行：左侧只有名称（+风险徽章），右侧控件，整行较高。
 
-        make_control(host) -> 控件；返回该控件。风险行上下各留 6px（不与上一行
-        的红块/文字贴住，§评审 #8）。"""
+        make_control(host) -> 控件；返回该控件。风险行上下各留 6px（左侧 danger
+        竖条 / 徽章不与相邻行贴住，§评审 #8）。
+
+        行宿主占满卡宽（卡的左右内边距已为 0），行自己让出 16px 水平内边距：
+        hover 高亮带严格到卡边，文字/控件仍与改动前逐像素对齐。"""
         host = QWidget(lay.parentWidget())
         host.setObjectName("setRow")
         host.setAttribute(Qt.WA_StyledBackground, True)   # QSS 背景/边框需要
         host.setAttribute(Qt.WA_Hover, True)              # QSS :hover 需要（§10.2）
         host.setProperty("risk", bool(risk))
         h = QHBoxLayout(host)
-        h.setContentsMargins(0, int(METRICS["row_pad_y"]), 0,
+        # 风险行左侧 3px danger 竖条由 QSS 画在行的左缘（= 卡左缘）；行内容让出
+        # 竖条宽度 + 16px，右缘同样 16px —— 与非风险行的文字左缘逐像素对齐。
+        h.setContentsMargins((_RISK_BAR_W + 16) if risk else 16,
+                             int(METRICS["row_pad_y"]), 16,
                              int(METRICS["row_pad_y"]))
         h.setSpacing(10)
         left = QWidget(host)
@@ -1171,7 +1234,7 @@ class SettingsPage(QWidget):
         ctl = make_control(host)
         h.addWidget(ctl, 0, Qt.AlignVCenter)
         if risk:
-            # 风险块的红色背景与上一行分隔线不贴边（QSS margin 对普通 QWidget 不可靠，
+            # 风险行与相邻行留 6px（QSS margin 对普通 QWidget 不可靠，
             # 用布局 spacing 实现，见 style.py 的 §10.1 说明）
             try:
                 lay.addSpacing(6)
@@ -1817,7 +1880,66 @@ class SettingsPage(QWidget):
             g, "目录扫描间隔", "poll_interval",
             "每隔多少秒扫一次监听目录；改完下一轮即生效。", 1, 30,
             syn=("轮询", "扫描", "间隔", "频率", "性能"), unit="秒", default=2)
-        g = self._group(box, "解压引擎")
+        g = self._group(box, "历史")
+        self.task_limit_spin = self._spin_row(
+            g, "任务历史保留条数", "task_history_limit",
+            "只清理已结束的任务，进行中的永不删除；磁盘上的旧数据在下次启动时清理。",
+            1, 100000, syn=("历史", "记录", "条数", "上限", "清理"),
+            unit="条", default=500)
+        # 「7-Zip」一等设置组：原「解压引擎」组的开关行 + 原「7-Zip 管理…」弹窗
+        # 的全部动作，现内联成一组，位置在「历史」与「版本与更新」之间。
+        self._build_sevenzip_group(box)
+        self._build_update_group(box)
+
+    def _build_sevenzip_group(self, box):
+        """7-Zip 组（内联）：状态 + 安装隔离版 / 安装全局版 / 卸载隔离版 + 开关行。
+
+        原「解压引擎」组解散：sevenzip_check_done 开关行原样搬入本组（键义不变，
+        「勾选 = 下次启动重新检测」的语义反转保持），原「7-Zip 管理…」弹窗入口
+        改为内联动作行。本组**不登记任何配置键**（覆盖契约要求 covered_top_keys()
+        恰为 DEFAULT_CONFIG 顶层键），引擎操作全部在后台线程（_SevenZipOp 桥回
+        主线程），UI 线程绝不直接跑安装器；忙碌时所有动作按钮统一禁用。"""
+        # 工作线程 -> 主线程的桥：本组只建一次（_build_domain 幂等），只连一次
+        self._sz_sig = _SevenZipOp(self)
+        self._sz_sig.progress.connect(self._on_sevenzip_progress)
+        self._sz_sig.done.connect(self._on_sevenzip_done)
+        self._sz_busy = False
+        self._sz_pending = None
+        self._sz_info = None
+
+        g = self._group(box, "7-Zip")
+
+        # 状态行：当前引擎状态（只读展示）+ 重新检测
+        self.sevenzip_status_lbl = QLabel("检测中…", self)
+        self.sevenzip_status_lbl.setObjectName("roval")
+        self.sevenzip_recheck_btn = QPushButton("重新检测", self)
+        self.sevenzip_recheck_btn.setObjectName("ghost")
+        self.sevenzip_recheck_btn.setCursor(Qt.PointingHandCursor)
+        self.sevenzip_recheck_btn.setToolTip(
+            "重新探测本机 7-Zip：隔离版优先，其次系统版。")
+        self.sevenzip_recheck_btn.clicked.connect(
+            lambda _c=False: self._sevenzip_start("recheck"))
+        sh, sl = self._manual_row(g)
+        sl.addWidget(self._sevenzip_name(sh, "当前状态"))
+        sl.addStretch(1)
+        sl.addWidget(self.sevenzip_status_lbl)
+        sl.addWidget(self.sevenzip_recheck_btn)
+
+        # 安装隔离版（免管理员）/ 安装全局版（一次 UAC）/ 卸载隔离版
+        self.sevenzip_install_iso_btn = self._sevenzip_action_row(
+            g, "安装隔离版", "免管理员 · 不弹 UAC", "安装",
+            "下载官方免安装包，解到 %APPDATA%\\AutoUnpacker\\7z（不污染系统）。",
+            lambda: self._sevenzip_start("install_isolated"))
+        self.sevenzip_install_global_btn = self._sevenzip_action_row(
+            g, "安装全局版", "需要一次 UAC", "安装",
+            "装到系统（会弹一次管理员授权），供全机所有程序使用。",
+            lambda: self._sevenzip_start("install_global"))
+        self.sevenzip_uninstall_btn = self._sevenzip_action_row(
+            g, "卸载隔离版", "仅删隔离副本", "卸载",
+            "只删 %APPDATA% 下的隔离版，不影响系统安装的 7-Zip。",
+            lambda: self._sevenzip_start("uninstall_isolated"))
+
+        # 下次启动重新检测 7-Zip（原「解压引擎」组的开关行原样搬入；键义不变）
         # sevenzip_check_done 的界面语义与键值相反：勾选 = 下次启动重新检测 = 写 False
         self.sevenzip_cb = _Switch(self)   # 名称由左侧标签承担，选框不带文字
         self._reg("sevenzip_check_done", self.sevenzip_cb)
@@ -1825,42 +1947,179 @@ class SettingsPage(QWidget):
         sl.addWidget(self._make_name(
             sh, "下次启动重新检测 7-Zip",
             _SettingRow("下次启动重新检测 7-Zip", "", "sevenzip_check_done",
-                        None, "system", "解压引擎")))
+                        None, "system", "7-Zip")))
         sl.addStretch(1)
         sl.addWidget(self.sevenzip_cb)
         self._rows.append(_SettingRow(
             "下次启动重新检测 7-Zip",
             "勾上就表示「已检测过」；取消勾选 = 下次启动重新检测，缺失或版本过低时会弹安装引导。",
-            "sevenzip_check_done", self.sevenzip_cb, "system", "解压引擎",
+            "sevenzip_check_done", self.sevenzip_cb, "system", "7-Zip",
             syn=("7-Zip", "7z", "检测", "重新检测", "引擎", "安装"),
             default_key="sevenzip_check_done"))
         # 语义反转：勾选 -> False（重检）；不勾 -> True（已检测）
         self.sevenzip_cb.toggled.connect(
             lambda checked: self._commit("sevenzip_check_done", not bool(checked)))
-        # 「7-Zip 管理…」入口：查看状态 / 安装隔离版·全局版 / 卸载隔离版 / 重新检测。
-        # 只放普通控件与按钮，**不登记任何配置键、不新增 _SettingRow** —— 覆盖契约
-        # 要求 covered_top_keys() 恰为 DEFAULT_CONFIG 顶层键（不多不少），做法同
-        # _build_update_group。按钮的最终状态展示由弹窗自己后台检测。
-        mh, ml = self._manual_row(g)
-        manage_name = QLabel("7-Zip 管理", mh)
-        manage_name.setToolTip("查看当前 7-Zip 状态，或安装/卸载隔离版、全局版。")
-        self.sevenzip_manage_btn = QPushButton("7-Zip 管理…", mh)
-        self.sevenzip_manage_btn.setObjectName("ghost")
-        self.sevenzip_manage_btn.setCursor(Qt.PointingHandCursor)
-        self.sevenzip_manage_btn.setToolTip(
-            "打开 7-Zip 管理：查看版本状态、安装隔离版/全局版、"
-            "卸载隔离版、重新检测。不登记任何配置项。")
-        self.sevenzip_manage_btn.clicked.connect(self._open_sevenzip_manage)
-        ml.addWidget(manage_name)
-        ml.addStretch(1)
-        ml.addWidget(self.sevenzip_manage_btn)
-        g = self._group(box, "历史")
-        self.task_limit_spin = self._spin_row(
-            g, "任务历史保留条数", "task_history_limit",
-            "只清理已结束的任务，进行中的永不删除；磁盘上的旧数据在下次启动时清理。",
-            1, 100000, syn=("历史", "记录", "条数", "上限", "清理"),
-            unit="条", default=500)
-        self._build_update_group(box)
+
+        # 首屏状态：先给不跑子进程的占位，真状态由后台检测填充（UI 线程不跑 7z）
+        self._update_sevenzip_uninstall_enabled()
+        self._sevenzip_start("recheck")
+
+    def _sevenzip_name(self, parent, text):
+        """7-Zip 动作行的名称标签（objectName=setName，与其它行同名样式）。
+
+        不进 _name_labels（无气泡、无搜索项）：这些行没有配置键，与旧版
+        「7-Zip 管理」入口同一规矩——不污染搜索索引。"""
+        lbl = QLabel(str(text), parent)
+        lbl.setObjectName("setName")
+        return lbl
+
+    def _sevenzip_action_row(self, lay, name, note, btn_text, tip, on_click):
+        """7-Zip 动作行：名称 + 短备注 + 右侧按钮；返回按钮（不登记配置键）。"""
+        host, h = self._manual_row(lay)
+        h.addWidget(self._sevenzip_name(host, name))
+        note_lbl = QLabel(str(note), host)
+        note_lbl.setObjectName("rowNote")
+        h.addWidget(note_lbl)
+        h.addStretch(1)
+        btn = QPushButton(str(btn_text), host)
+        btn.setObjectName("ghost")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(str(tip))
+        btn.clicked.connect(lambda _c=False: on_click())
+        h.addWidget(btn)
+        return btn
+
+    # ---- 7-Zip 后台操作（worker 线程 -> 主线程；UI 线程绝不直接跑安装器） ----
+    def _sevenzip_buttons(self):
+        return [b for b in (getattr(self, "sevenzip_recheck_btn", None),
+                            getattr(self, "sevenzip_install_iso_btn", None),
+                            getattr(self, "sevenzip_install_global_btn", None),
+                            getattr(self, "sevenzip_uninstall_btn", None))
+                if b is not None]
+
+    def _set_sevenzip_busy(self, busy):
+        """忙碌时统一禁用本组所有动作按钮（完成后按文件系统状态恢复卸载按钮）。"""
+        self._sz_busy = bool(busy)
+        for b in self._sevenzip_buttons():
+            try:
+                b.setEnabled(not self._sz_busy)
+            except Exception:
+                pass
+        if not self._sz_busy:
+            self._update_sevenzip_uninstall_enabled()
+
+    def _update_sevenzip_uninstall_enabled(self):
+        """「卸载隔离版」仅在隔离版副本存在时可用（文件系统判定，不跑子进程）。"""
+        btn = getattr(self, "sevenzip_uninstall_btn", None)
+        if btn is None:
+            return
+        try:
+            exists = bool(sz.ISOLATED_BIN.exists())
+        except Exception:
+            exists = False
+        try:
+            btn.setEnabled((not self._sz_busy) and exists)
+        except Exception:
+            pass
+
+    def _sevenzip_set_status(self, text):
+        lbl = getattr(self, "sevenzip_status_lbl", None)
+        if lbl is not None:
+            try:
+                lbl.setText(str(text))
+            except Exception:
+                pass
+
+    def _sevenzip_start(self, kind):
+        """启动一次 7-Zip 后台操作。
+
+        kind: recheck / install_isolated / install_global / uninstall_isolated。
+        安装器只在这里被 worker 线程调用；完成信号由 _on_sevenzip_done 处理。"""
+        if getattr(self, "_sz_busy", False):
+            return
+        self._sz_pending = kind
+        self._set_sevenzip_busy(True)
+        self._sevenzip_set_status("检测中…" if kind == "recheck" else "处理中…")
+        if kind == "recheck":
+            # 重新检测必须先作废版本缓存，否则拿到的还是旧版本号
+            try:
+                sz.invalidate_cache()
+            except Exception:
+                pass
+        sig = self._sz_sig
+
+        def _prog(s):
+            try:
+                sig.progress.emit(str(s))
+            except Exception:
+                pass
+
+        def worker():
+            ok = False
+            msg = ""
+            info = None
+            try:
+                if kind == "install_isolated":
+                    p = sz.install_isolated(progress=_prog)
+                    msg = "隔离版安装完成：%s" % p
+                    ok = True
+                elif kind == "install_global":
+                    p = sz.install_global(progress=_prog)
+                    msg = "全局版安装完成：%s" % p
+                    ok = True
+                elif kind == "uninstall_isolated":
+                    res = sz.uninstall_isolated(progress=_prog)
+                    if isinstance(res, (tuple, list)):
+                        ok = bool(res[0])
+                        msg = str(res[1]) if len(res) > 1 else str(res[0])
+                    else:
+                        ok = bool(res)
+                        msg = str(res)
+                else:
+                    info = sz.check_environment()
+                    msg = _sevenzip_status_text(info)
+                    ok = True
+            except Exception as e:
+                msg = "操作失败：%s" % e
+            try:
+                if info is not None:
+                    self._sz_info = info
+                sig.done.emit(msg, ok)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_sevenzip_progress(self, s):
+        self._sevenzip_set_status(s)
+
+    def _on_sevenzip_done(self, msg, ok):
+        op = self._sz_pending
+        self._sz_pending = None
+        try:
+            if self.hub:
+                self.hub.log("7-Zip %s: %s" % (op, msg))
+        except Exception:
+            pass
+        if op == "recheck":
+            # 检测结束（无论成败）：状态行显示结果，不再二次重检（防死循环）
+            if ok:
+                self._sevenzip_apply_info(self._sz_info)
+            else:
+                self._sevenzip_set_status(msg)
+            self._set_sevenzip_busy(False)
+            return
+        # 任何动作完成后：作废版本缓存 + 重新检测真实状态（刷新状态行 / 卸载可用性）
+        try:
+            sz.invalidate_cache()
+        except Exception:
+            pass
+        self._set_sevenzip_busy(False)
+        self._sevenzip_start("recheck")
+
+    def _sevenzip_apply_info(self, info):
+        self._sevenzip_set_status(_sevenzip_status_text(info))
+        self._update_sevenzip_uninstall_enabled()
 
     def _build_update_group(self, box):
         """版本与更新：当前版本 + 手动「检查更新」（本页唯一联网点）+ 更新动作，**同一排**。
@@ -1918,23 +2177,6 @@ class SettingsPage(QWidget):
             "", self.check_update_btn, "system", "版本与更新",
             syn=("版本", "版本号", "当前版本", "更新", "检查更新", "升级",
                  "新版", "下载")))
-
-    def _open_sevenzip_manage(self):
-        """「7-Zip 管理…」按钮：打开管理对话框（查看/安装/卸载/重新检测）。
-
-        与日志里的「安装 7-Zip」动作链接共用同一个公开入口
-        `dialogs.sevenzip.open_sevenzip_manage()`；只在本机操作、不登记配置键，
-        真正的检测与安装都在对话框的后台线程里完成，这里只负责模态打开。"""
-        try:
-            from .dialogs.sevenzip import open_sevenzip_manage
-        except Exception as e:
-            try:
-                if self.hub:
-                    self.hub.log(f"打开 7-Zip 管理失败: {e}")
-            except Exception:
-                pass
-            return
-        open_sevenzip_manage(self.state, self.hub, self)
 
     def _build_lab(self, box):
         g = self._group(box, "总开关")
@@ -3633,11 +3875,11 @@ class SettingsPage(QWidget):
             self.cat_list.viewport().update()   # 左栏竖条颜色（委托 paint 现取 token）
         except Exception:
             pass
-        # 主题切换**不**重跑 _fit_all_hints()：它按 fontMetrics().lineSpacing() 抬
-        # 最小高度，而两套主题的 fs_* 字号 token 逐值相同、apply_theme 也不改字体，
-        # 故字体几何恒定、兜底高度无需重算；_HINT_NAMES 四个白名单标签在 QSS 重套
-        # 时由 eventFilter 的 Polish/StyleChange 分支自动重贴，showEvent 与
-        # _show_domain 也仍会整体兜底。省掉一次全页 findChildren(QLabel) 文本测量。
+        # 主题切换后**重跑**共享文本兜底：apply_theme → setStyleSheet 会对整棵树
+        # 重套 QSS / 重新 polish，字体几何虽两套主题同值，但本方法契约要求
+        # 「样式表重贴后立即重贴兜底高度」；fit_text_heights 幂等、只抬不降，
+        # 只在 show / 主题切换调用，不进逐帧路径（成本 = 一次 findChildren(QLabel)）。
+        self._fit_all_hints()
 
     def _badge_qss(self):
         """风险徽章内联样式：取 QSS token 真值（与新 QSS 规则同色值）。

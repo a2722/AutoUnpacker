@@ -41,6 +41,7 @@ from .widgets import (WatchCard,  # noqa: F401  （M3 起主界面不再创建�
                       show_toast, Glyph)
 from . import style as ui_style
 from .style import PALETTE
+from .textfit import fit_text_heights
 from . import pages as ui_pages
 from .pages import TaskPage, LogPage, StatusBar
 from .page_pwbook import PasswordBookPage
@@ -2543,6 +2544,9 @@ class MainWindow(QMainWindow):
 
     def on_theme_changed(self, theme):
         """主题已切换：刷新胶囊/筛选 chips + 重算动态属性 + 重设标题栏 + 记一条日志。"""
+        # 样式表整树重贴后，重跑共享文本高度兜底（幂等；单行/多行同一规则）。
+        # 放在最前：后续 rebuild_cards / 各页 refresh_theme 里的尺寸测量都吃新高度。
+        fit_text_heights(self)
         try:
             self.rebuild_cards()
         except Exception:
@@ -2878,6 +2882,10 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # 共享文本高度兜底（单行/多行同一字体级规则）：在 QSS polish 后、页面
+        # 最小高度重算（_sync_page_min_heights）**之前**抬好，保证页面的
+        # min == sizeHint 契约仍成立（sizeHint 已含新最小高度）。
+        fit_text_heights(self)
         if not getattr(self, "_titlebar_done", False):
             self._titlebar_done = True
             QTimer.singleShot(0, self._apply_titlebar)

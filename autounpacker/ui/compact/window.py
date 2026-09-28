@@ -2,8 +2,11 @@
 """CompactWindow：精简模式（方案 E）的独立顶层小窗——所有事都在这个窗内办完。
 
 窗口（规格 §3）：`QWidget` + `Qt.Window | FramelessWindowHint`，**保留任务栏按钮**
-（绝不用 `Qt.Tool`）；默认 360×360、最小 320×300、最大 460×600；32px 自绘标题栏
-（左=图标+`AutoUnpacker`；中=状态 `● 运行中` / `队列 N`；右=`‹` `›` `⤢` `—` `✕`）。
+（绝不用 `Qt.Tool`）；默认 360×256、最小 320×240、最大 460×600；32px 自绘标题栏
+（左=图标+`AutoUnpacker`；右=`‹` `›` 图钉(窗口置顶) `⤢` `—` `✕`）。
+标题栏不再有状态文本（`● 运行中` / `队列 N` 已移除）：队列计数由 HOME 页小标题负责，
+暂停态不再上标题栏；图钉按钮与右键菜单「窗口置顶」共用 `set_on_top` 同一状态
+（可见时走 Win32 `SetWindowPos` 翻转 topmost，不重建原生窗、不闪烁）。
 
 导航（规格 §4.2）：QStackedWidget 三页 + 浏览器式历史；`‹`/`›` 与 `Alt+←`/`Alt+→`；
 `Esc` 按页处理（CODE=忽略回 HOME、PW=取消回 HOME、HOME=与主界面一致：走 close_action）。
@@ -31,15 +34,17 @@ from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
 from ... import db
 from .. import style as ui_style
 from ..style import PALETTE
+from ..textfit import fit_text_heights
 from ..widgets import make_tray_icon
-from ..widgets.inputs import Glyph, _ElideLabel
+from ..widgets.common import repolish
+from ..widgets.inputs import Glyph
 from .nav import NavHistory
 from .pages_code import CodePage
 from .pages_home import HomePage
 from .pages_pw import PwPage
 
-_WIN_W, _WIN_H = 360, 360          # 默认尺寸（规格 §3）
-_MIN_W, _MIN_H = 320, 300          # 最小尺寸
+_WIN_W, _WIN_H = 360, 256          # 默认尺寸：高 320→256（列表 4→2 行 + 版面再压缩，正好矮 2×ROW_H）
+_MIN_W, _MIN_H = 320, 240          # 最小尺寸（高 300→240：不再顶住压缩后的默认高）
 _MAX_W, _MAX_H = 460, 600          # 最大尺寸
 _EDGE = 5                          # 无边框窗的边缘缩放热区（px）
 _TITLE_H = 32                      # 自绘标题栏高
@@ -50,7 +55,7 @@ _TASKS_IDLE_TTL_HOOKED = 10.0      # 已接宿主事件：仅作安全网（事�
 
 
 class _TitleBar(QWidget):
-    """32px 自绘标题栏：按住拖动整窗；右键弹「窗口置顶」勾选（规格 §3）。"""
+    """32px 自绘标题栏：按住拖动整窗；「顶」按钮与右键菜单「窗口置顶」同一状态（规格 §3）。"""
 
     def __init__(self, window):
         super().__init__(window)
@@ -118,6 +123,9 @@ class CompactWindow(QWidget):
             self.setWindowIcon(make_tray_icon())
         except Exception:
             pass
+        # 先按规格下限设最小尺寸；版面建好后 `_apply_min_height()` 再按各页实际
+        # 需要抬高（显式最小会盖掉布局最小：不抬的话用户能把窗缩到比 CODE 页
+        # 需要还矮 -> 底部按钮被窗沿裁掉）。
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.setMaximumSize(_MAX_W, _MAX_H)
         self.resize(_WIN_W, _WIN_H)
@@ -136,6 +144,7 @@ class CompactWindow(QWidget):
         for page in (self.home_page, self.code_page, self.pw_page):
             self.stack.addWidget(page)
         root.addWidget(self.stack, 1)
+        self._apply_min_height()           # 版面最小高已可算：最小高抬到够用为止
 
         # 页内轻提示（窗内 QLabel，绝不弹顶层气泡窗）
         self._toast_label = QLabel("", self)
@@ -171,7 +180,6 @@ class CompactWindow(QWidget):
         #      刷新；1s tick 只在数据过期时兜底重查，空闲时不再每秒盲查整表 ----
         self._tasks_refresh_at = 0.0
         self._tasks_hooked = False
-        self._counts_cache = None      # 最近一次 db.count_tasks()（状态标签直接复用）
         try:
             host_timer = getattr(host, "_tasks_refresh_timer", None)
             if host_timer is not None:
@@ -197,6 +205,7 @@ class CompactWindow(QWidget):
             self._on_top = False
         if self._on_top:
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self._sync_on_top_button()     # 「顶」按钮初值 = 已存的 compact_on_top
 
         self._apply_compact_style()
         self._switch_page("HOME")
@@ -214,7 +223,14 @@ class CompactWindow(QWidget):
         self.refresh_tasks()
 
     def set_on_top(self, flag):
-        """置顶开关 + 持久化 `compact_on_top`；可见时改 flags 后需重新 show。"""
+        """置顶开关 + 持久化 `compact_on_top`；按钮 / 右键菜单共用这一条路径。
+
+        可见时**不再** `setWindowFlag` + `show()`：Qt 改窗口标志会销毁并重建原生窗，
+        那正是切换置顶时闪一下的来源。Windows 下直接翻转活窗口的 topmost 位
+        （`SetWindowPos` + `SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE`）：窗口不重建、
+        不抢焦点、不闪。Win32 不可用（非 Windows / 句柄无效 / 调用失败）时回落到
+        原路径，行为只退化为「会闪一下」，绝不让开关本身失效。
+        """
         flag = bool(flag)
         self._on_top = flag
         visible = False
@@ -222,17 +238,83 @@ class CompactWindow(QWidget):
             visible = bool(self.isVisible())
         except Exception:
             visible = False
-        try:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, flag)
-        except Exception:
-            pass
+        live = False
         if visible:
             try:
-                self.show()
+                live = self._apply_topmost_live(flag)
+            except Exception:
+                live = False
+        if not live:
+            try:
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, flag)
             except Exception:
                 pass
+            # ⚠️ 可见性必须在改标志**之前**取好：setWindowFlag 会先隐藏原生窗，
+            # 改完再查 isVisible() 已是 False，那样就再也不会 show 回来。
+            if visible:
+                try:
+                    self.show()
+                except Exception:
+                    pass
         try:
             self._host.state.set("compact_on_top", flag)
+        except Exception:
+            pass
+        self._sync_on_top_button()
+
+    def _apply_topmost_live(self, flag):
+        """Windows：翻转**活窗口**的 WS_EX_TOPMOST，返回是否已生效。
+
+        返回 True = Win32 路径已改到位（调用方不得再 setWindowFlag）；
+        False = 路径不可用，由调用方回落旧路径。绝不抛异常。
+        """
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+        except Exception:
+            return False
+        if not hwnd:
+            return False
+        try:
+            swp_no_size, swp_no_move, swp_no_activate = 0x0001, 0x0002, 0x0010
+            hwnd_topmost = ctypes.c_void_p(-1)       # HWND_TOPMOST
+            hwnd_notopmost = ctypes.c_void_p(-2)     # HWND_NOTOPMOST
+            # 64 位下必须显式声明签名，否则 hwnd / 特殊常量会被按 32 位 c_int 截断。
+            user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_uint]
+            user32.SetWindowPos.restype = ctypes.c_int
+            res = user32.SetWindowPos(
+                ctypes.c_void_p(hwnd),
+                hwnd_topmost if flag else hwnd_notopmost,
+                0, 0, 0, 0,
+                swp_no_size | swp_no_move | swp_no_activate)
+            return bool(res)
+        except Exception:
+            return False
+
+    def _sync_on_top_button(self):
+        """把 `self._on_top` 回写到标题栏图钉按钮（勾选态 + 动态属性 on + 图标角色）。
+
+        按钮与右键菜单共用本方法所属的 `set_on_top` 路径：无论从哪条入口改状态，
+        都会在这里统一回写，两条入口永远一致。`blockSignals` 防止 `setChecked`
+        再触发一次 `toggled` 造成递归。
+        """
+        btn = getattr(self, "pin_btn", None)
+        if btn is None:
+            return
+        try:
+            blocked = bool(btn.blockSignals(True))
+            btn.setChecked(bool(self._on_top))
+            btn.blockSignals(blocked)
+            btn.setProperty("on", "true" if self._on_top else "false")
+            repolish(btn)
+            glyph = getattr(self, "_pin_glyph", None)
+            if glyph is not None:
+                # 图标也随开关换角色（muted ⇄ accent）：不新增颜色，只换 role。
+                glyph.set_role("accent" if self._on_top else "muted")
         except Exception:
             pass
 
@@ -426,7 +508,7 @@ class CompactWindow(QWidget):
 
         1s tick 只是兜底：宿主有 `_tasks_refresh_timer`（MainWindow 合并任务事件的
         防抖定时器）时，其到点即接事件强制刷新；没有钩子时按 TTL 节流，空闲时不再
-        每秒盲查整表。列表刷新顺带返回计数，状态区直接复用（同一轮不重复查库）。
+        每秒盲查整表。列表刷新顺带返回计数（HOME 页小标题用），标题栏状态文本已移除。
         """
         self._tasks_refresh_at = 0.0
         counts = None
@@ -797,7 +879,7 @@ class CompactWindow(QWidget):
 
     # ================= 内部：状态区 / 轮询 =================
     def _on_tick(self):
-        """1s tick：暂停态每拍跟手；任务数据只在过期时兜底重查（事件即时刷新）。"""
+        """1s tick：任务数据只在过期时兜底重查（事件即时刷新）；未过期只同步导航按钮。"""
         if self._tasks_cache_stale():
             self.refresh_tasks()
         else:
@@ -821,39 +903,14 @@ class CompactWindow(QWidget):
             pass
 
     def _refresh_status(self, counts=None):
-        """标题栏状态：`● 运行中` / `● 已暂停`（队列 N 有余量时追加）。
+        """标题栏状态文本已移除（`● 运行中` / `队列 N` 不再上屏）。
 
-        counts：调用方刚查到的 `db.count_tasks()`；不传则复用上次结果（仅首次
-        无缓存时才自查）。无参调用只重渲染标签（暂停态每 tick 跟手），不碰数据库。
+        方法名与签名保留：宿主 / 测试仍可调用。历史上它把暂停态与队列数写进
+        `status_label` 并顺带同步 `‹`/`›` 可用态；标签删除后已无消费者，
+        所以无参调用**不再自查数据库**（空闲 tick 不再为一行不存在的文字
+        每秒重查整表），只保留仍在生效的导航按钮同步。
         """
-        if counts is not None:
-            self._counts_cache = counts
-        elif self._counts_cache is None:
-            try:
-                self._counts_cache = db.count_tasks() or {}
-            except Exception:
-                self._counts_cache = {}
-        counts = self._counts_cache or {}
-        queue_n = 0
-        try:
-            queue_n = int(counts.get("queue", 0) or 0)
-        except Exception:
-            queue_n = 0
-        paused = False
-        pauser = getattr(self._host, "pauser", None)
-        try:
-            paused = bool(pauser is not None and pauser.is_paused())
-        except Exception:
-            paused = False
-        text = "● 已暂停" if paused else "● 运行中"
-        if queue_n > 0:
-            text += " · 队列 %d" % queue_n
-        try:
-            color = PALETTE["muted"] if paused else PALETTE["success"]
-            self.status_label.set_full_text(text)   # 可省略标签：全文进 tooltip
-            self.status_label.setStyleSheet("color: %s; font-size: 11px;" % color)
-        except Exception:
-            pass
+        _ = counts                          # 保留参数：不动调用方签名（已无消费者）
         self._sync_nav_buttons()
 
     # ================= 内部：窗口生命周期 =================
@@ -864,6 +921,9 @@ class CompactWindow(QWidget):
             self._refresh_timer.start()
         except Exception:
             pass
+        # 共享文本高度兜底：紧凑落区提示（#compactDropHint，44px 定高落区里居中）
+        # 实测顶/底 0 余量；单行/多行同一字体级规则，show 后立即抬好。
+        fit_text_heights(self)
         self.refresh_tasks()
 
     def hideEvent(self, event):
@@ -898,6 +958,10 @@ class CompactWindow(QWidget):
             if et in (QEvent.StyleChange, QEvent.PaletteChange) or \
                     (theme_ev is not None and et == theme_ev):
                 self._apply_compact_style()
+                # 主题可能换字体 → 版面最小高会变，重新抬一次最小高（幂等、只抬）
+                self._apply_min_height()
+                # 局部 QSS 重贴后立即重跑共享文本高度兜底（幂等、只抬不降）
+                fit_text_heights(self)
         except Exception:
             pass
 
@@ -919,7 +983,11 @@ class CompactWindow(QWidget):
             pass
 
     def _restore_geometry(self):
-        """恢复 saveGeometry 的 base64；失败 / 越界 -> 主屏右下角离边 24px。"""
+        """恢复 saveGeometry 的 base64；失败 / 越界 -> 主屏右下角离边 24px。
+
+        恢复成功后还要 `_clamp_restored_height()`：旧版本存下的「高」几何
+        （那时列表有 4 行、默认高 320）不能把窗口顶回原来的高度。
+        """
         ok = False
         raw = None
         try:
@@ -941,6 +1009,57 @@ class CompactWindow(QWidget):
             self._move_default()
         else:
             self._clamp_to_screen()
+            self._clamp_restored_height()
+
+    def _apply_min_height(self):
+        """最小高 = max(规格下限 `_MIN_H`, 版面最小高)。
+
+        显式最小尺寸会盖掉布局算出来的最小尺寸：只按 `_MIN_H` 设死的话，用户可以
+        把窗缩得比某一页需要的还矮（最矮的那页是 CODE 页），底部按钮会被窗沿裁掉。
+        这里显式取 max，保证「能缩到多矮」永远由页面自己决定。幂等。
+        """
+        try:
+            floor_h = int(max(int(_MIN_H), int(self.minimumSizeHint().height())))
+        except Exception:
+            return
+        try:
+            if int(self.minimumHeight()) != floor_h:
+                self.setMinimumSize(_MIN_W, floor_h)
+        except Exception:
+            pass
+
+    def _natural_height_for_content(self):
+        """当前内容自然高度：标题栏 + HOME 版面 sizeHint，且不低于窗口最小高。
+
+        用 HOME（队列页）而不是 QStackedWidget 的 sizeHint：栈的 sizeHint 是
+        三页里最高的一页（CODE 页的富余留白），拿它做钳制等于不钳。窗口最小高
+        本身已保证其它页切换过去时够用。
+        """
+        try:
+            content = _TITLE_H + int(self.home_page.layout().sizeHint().height())
+        except Exception:
+            content = _WIN_H
+        try:
+            floor = int(self.minimumSizeHint().height())
+        except Exception:
+            floor = _MIN_H
+        try:
+            return max(floor, min(int(content), _MAX_H))
+        except Exception:
+            return _WIN_H
+
+    def _clamp_restored_height(self):
+        """只压不抬：`min(已存高, 内容自然高)`。
+
+        用户存的合理小尺寸原样保留（绝不放大）；旧的「高」几何被压回当前内容
+        需要的高度，最后仍受窗口自身最小高兜底。位置不动。
+        """
+        try:
+            natural = self._natural_height_for_content()
+            if int(self.height()) > natural:
+                self.resize(int(self.width()), int(natural))
+        except Exception:
+            pass
 
     def _save_geometry(self):
         """持久化窗口几何（base64 字符串；Qt 自带越界钳制）。"""
@@ -1046,18 +1165,28 @@ class CompactWindow(QWidget):
         title.setObjectName("compactTitle")
         title.setMinimumWidth(0)          # 320px 最小宽时标题栏不顶宽（布局压力）
         lay.addWidget(title, 0, Qt.AlignVCenter)
-
-        # 状态用可省略标签：窄窗下优先收缩它，绝不把整窗最小宽度顶大
-        self.status_label = _ElideLabel("● 运行中", bar)
-        self.status_label.setObjectName("compactStatus")
-        self.status_label.setMaximumWidth(130)
-        lay.addWidget(self.status_label, 0, Qt.AlignVCenter)
         lay.addStretch(1)
 
         self.back_btn = self._title_button(bar, "‹", "后退（Alt+←）", "compactNav")
         self.back_btn.clicked.connect(lambda *_: self.back())
         self.fwd_btn = self._title_button(bar, "›", "前进（Alt+→）", "compactNav")
         self.fwd_btn.clicked.connect(lambda *_: self.forward())
+        # 「顶」= 窗口置顶：与右键菜单「窗口置顶」共用 set_on_top（同一标志、同一
+        # 持久化 compact_on_top），绝不另造第二套置顶机制。按下态由动态属性 on +
+        # `_compact_qss()` 的 `[on="true"]` 规则着色（不新增颜色 token）。
+        # 图标同 `⤢`：QPainter 自绘的 `Glyph("pin")`，**不用字符「顶」**——字符与
+        # 相邻按钮的字体度量/基线不一致，语义也不对（按钮是「置顶」不是「顶」）。
+        # 开/关除按钮底色外还有图标角色差（muted ⇄ accent），见 `_sync_on_top_button`。
+        self.pin_btn = self._title_button(bar, "", "窗口置顶", "compactCtl")
+        self.pin_btn.setCheckable(True)
+        self.pin_btn.setChecked(bool(self._on_top))
+        self.pin_btn.setProperty("on", "true" if self._on_top else "false")
+        _pin_lay = QHBoxLayout(self.pin_btn)
+        _pin_lay.setContentsMargins(0, 0, 0, 0)
+        self._pin_glyph = Glyph("pin", self.pin_btn, 13,
+                                role="accent" if self._on_top else "muted")
+        _pin_lay.addWidget(self._pin_glyph)
+        self.pin_btn.toggled.connect(self.set_on_top)
         # 图标用 QPainter 自绘的 `Glyph`，**不用字符 "⤢"(U+2922)**：该码位不在默认
         # UI 字体（Segoe UI）里，Qt 会回退到符号字体，其 ascent/descent 与相邻的 —/✕
         # 不同 → 视觉上不与它俩同一条水平线（用户实测）。自绘图标与字体度量无关，
@@ -1071,7 +1200,7 @@ class CompactWindow(QWidget):
         self.min_btn.clicked.connect(lambda *_: self.showMinimized())
         self.close_btn = self._title_button(bar, "✕", "关闭", "compactClose")
         self.close_btn.clicked.connect(lambda *_: self._on_close_clicked())
-        for btn in (self.back_btn, self.fwd_btn, self.full_btn,
+        for btn in (self.back_btn, self.fwd_btn, self.pin_btn, self.full_btn,
                     self.min_btn, self.close_btn):
             lay.addWidget(btn, 0, Qt.AlignVCenter)
         return bar
@@ -1124,13 +1253,15 @@ class CompactWindow(QWidget):
             " border-bottom: 1px solid %s; }" % (c("card_bg"), c("card_border")),
             "QLabel#compactTitle { color: %s; font-size: 13px;"
             " font-weight: 700; }" % c("title_fg"),
-            "QLabel#compactStatus { color: %s; font-size: 11px; }" % c("section_fg"),
             "QPushButton#compactNav, QPushButton#compactCtl,"
             " QPushButton#compactClose { background: transparent; border: none;"
             " border-radius: %s; color: %s; padding: 0; font-size: 13px; }"
             % (c("radius_ctl"), c("section_fg")),
             "QPushButton#compactNav:hover, QPushButton#compactCtl:hover"
             " { background: %s; color: %s; }" % (c("btn_hover"), c("btn_fg")),
+            # 「顶」按下态：放在 :hover 之后，勾选时悬停也保持按下配色
+            "QPushButton#compactCtl[on=\"true\"] { background: %s; color: %s; }"
+            % (c("accent_soft"), c("accent_text")),
             "QPushButton#compactNav:disabled { color: %s; }" % c("btn_dis_fg"),
             "QPushButton#compactClose:hover { background: %s; color: %s; }"
             % (c("danger_bg"), c("danger_fg")),

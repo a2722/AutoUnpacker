@@ -28,6 +28,7 @@ from .db import (_select, _as_text, select_task_db, detect_download_root)
 from .manifest import (observe_tasks, report_events, leftover_tasks,
                        summarize, format_summary, format_summary_brief,
                        _TRACK)
+from .share import _effective_client_proc_names
 
 # 轮询状态（模块级，供 diagnose() 展示；只读、无副作用）
 _STATE = {
@@ -84,6 +85,9 @@ def _baidu_running():
     """百度网盘客户端进程是否在运行（只读进程快照，无子进程、无第三方依赖）。
 
     用 ctypes 调 kernel32 的 Toolhelp32 快照直接拿进程名，比 tasklist 子进程轻得多。
+    进程名列表与分享链路共用同一份「生效列表」
+    （`share._effective_client_proc_names`，用户可用配置键 baidu_client_proc_names
+    覆盖，默认与内置三进程名逐字一致）；大小写不敏感、按映像名（basename）精确匹配。
     任何异常都返回 True（保守放行）——不能因为「检测失败」就停掉读取。
     """
     try:
@@ -107,6 +111,8 @@ def _baidu_running():
                 ("szExeFile", ctypes.c_char * 260),
             ]
 
+        want = {n.lower() for n in _effective_client_proc_names()}
+
         k32 = ctypes.windll.kernel32
         k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
         k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -126,7 +132,7 @@ def _baidu_running():
                 return True
             while True:
                 name = pe.szExeFile.decode("mbcs", "replace").lower()
-                if name == "baidunetdisk.exe":
+                if name in want:
                     return True
                 if not k32.Process32Next(snap, ctypes.byref(pe)):
                     return False

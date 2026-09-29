@@ -495,6 +495,11 @@ class MainWindow(QMainWindow):
         self._log_cache_dirty = True
         self._log_counts_dirty = True     # 级别分段计数需重算（视图由实时追加保持最新）
         self._meta_cache_dirty = True
+        # 最近一次「整页快照」已画出的 log_index 行 id 集：两个日志视图各一份。
+        # 启动期后台线程先写日志（探测/监听），窗口稍后才 drain 队列；没有这份
+        # 记录时同一批启动行会被"快照 + 实时追加"各画一遍（真机=两组重复的日志）。
+        self._log_rendered_ids = set()
+        self._task_rendered_ids = set()
         # 任务表缓存：任务写入路径经 _emit_tasks_changed / 生命周期定时器刷新并清脏；
         # 切回任务页只在脏时重建（没有任务变化就不重查重画）。
         self._tasks_dirty = True
@@ -1084,6 +1089,11 @@ class MainWindow(QMainWindow):
         self._return_full_action = menu.addAction("返回完整界面")
         self._return_full_action.triggered.connect(
             lambda *_: self._toggle_compact(False))
+        # 完整界面专用：一键切到精简小窗（仅完整模式下可见，见 _refresh_share_menu；
+        # 与顶部「⤡ 精简界面」按钮同一入口 _toggle_compact(True)）。
+        self._to_compact_action = menu.addAction("使用精简界面")
+        self._to_compact_action.triggered.connect(
+            lambda *_: self._toggle_compact(True))
         # 2.F「用客户端下载最近分享」：整条链路属实验性功能，未开启时整项隐藏。
         self._open_share_action = menu.addAction("用客户端打开最近分享")
         self._open_share_action.triggered.connect(self._open_recent_share)
@@ -1530,6 +1540,13 @@ class MainWindow(QMainWindow):
             lp.reload(rows)
         except Exception:
             pass
+        # 记下本次整页快照已画的 log_index 行 id：_drain 把启动期积压的同类
+        # 队列项交回来追加时据此跳过（否则同一行上屏两遍）。
+        try:
+            self._log_rendered_ids = {int(r.get("id") or 0) for r in rows
+                                      if isinstance(r, dict)}
+        except Exception:
+            self._log_rendered_ids = set()
         self._log_cache_sig = sig
         self._log_cache_dirty = False
         self._log_counts_dirty = False
@@ -1573,6 +1590,13 @@ class MainWindow(QMainWindow):
             self.log_box_folds.finish()
         except Exception:
             pass
+        # 记下本次任务视图快照已画的行 id（与日志页同一理由：drain 的积压项
+        # 不许把快照里已有的行再追加一遍）。
+        try:
+            self._task_rendered_ids = {int(r.get("id") or 0) for r in rows
+                                       if isinstance(r, dict)}
+        except Exception:
+            self._task_rendered_ids = set()
         try:
             tp.set_log_empty(not rows, tp.log_empty_copy())
         except Exception:
@@ -2290,21 +2314,36 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         view_msg = msg if shown is None else shown
-        if _accepts_in_task_view(self, record):
-            ctl = getattr(self, "log_box_folds", None)
+        # 行 id（Hub 队列带的 log_index 行 id）：该行若已由「整页快照」画进对应
+        # 视图，这里就不再追加一次。启动期后台线程（探测/监听）先写日志、窗口稍后
+        # 才 drain 队列 —— 否则同一批启动行会在两个视图里各上屏两遍（真机现象：
+        # 日志页出现「两组重复的日志」；落盘文件只有一遍，重复纯在视图）。
+        _rid = 0
+        if isinstance(record, dict):
             try:
-                if ctl is not None:
-                    ctl.feed(view_msg)       # 该任务日志同样折叠（与日志页共用一套）
-                else:
-                    box = getattr(self, "log_box", None)
-                    if box is not None:
-                        _append_log_html(self, box, view_msg)
+                _rid = int(record.get("id") or 0)
             except Exception:
-                pass
+                _rid = 0
+        if _accepts_in_task_view(self, record):
+            if _rid and _rid in getattr(self, "_task_rendered_ids", ()):
+                pass                         # 任务视图快照里已有这一行
+            else:
+                ctl = getattr(self, "log_box_folds", None)
+                try:
+                    if ctl is not None:
+                        ctl.feed(view_msg)   # 该任务日志同样折叠（与日志页共用一套）
+                    else:
+                        box = getattr(self, "log_box", None)
+                        if box is not None:
+                            _append_log_html(self, box, view_msg)
+                except Exception:
+                    pass
         lp = getattr(self, "log_page", None)
         if lp is not None:
             try:
-                if lp.accepts_record(record, msg):
+                if _rid and _rid in getattr(self, "_log_rendered_ids", ()):
+                    pass                     # 日志页快照里已有这一行
+                elif lp.accepts_record(record, msg):
                     lp.append_line(view_msg)
             except Exception:
                 pass
@@ -3049,7 +3088,8 @@ class MainWindow(QMainWindow):
                               + _n_text)
                     self._append_log(_n_msg, {"text": _n_text, "level": "info",
                                               "source_dir": None, "task_id": None,
-                                              "link": None, "ts": _n_ts})
+                                              "link": None, "ts": _n_ts,
+                                              "id": item.get("id")})
                 except Exception:
                     pass
             elif item["type"] == "dir_state":
@@ -3184,6 +3224,9 @@ class MainWindow(QMainWindow):
             # 「返回完整界面」只在精简模式下有意义（完整模式下点了等于原地不动）
             if hasattr(self, "_return_full_action"):
                 self._return_full_action.setVisible(self.is_compact())
+            # 「使用精简界面」只在完整模式下有意义（精简模式下点它同样原地不动）
+            if hasattr(self, "_to_compact_action"):
+                self._to_compact_action.setVisible(not self.is_compact())
         except Exception:
             pass
 

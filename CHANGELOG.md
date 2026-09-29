@@ -5,6 +5,45 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.7] - 2026-09-29
+
+> **本轮重点**：把百度网盘客户端集成从「一处硬编码 + 零版本概念」变成**可配置 + 可探测**——客户端**进程名可由用户在设置页配置**（默认与历史硬编码逐字一致），并新增**客户端版本探测**（只记录 / 展示，**绝不阻断**）；新增**开机自启**（静默启动，不弹主界面）与托盘「使用精简界面」一键入口。修复方面：**设置项气泡只剩文字没有背景**、以及**启动期日志重复上屏**（真机「两组重复的日志」）。百度相关结论由一次抓包复盘驱动，见下方「调查记录」。
+
+### 新增
+- **开机自启（静默启动，不弹主界面）**：设置 →「系统与维护」新增「开机自启」一项。勾选即在**当前用户**的启动项 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写入 `AutoUnpacker` 值（无需管理员 / 免 UAC），取消即删除。命令行 `<启动命令> --autostart`：冻结运行用 `"<exe>"`，源码运行用 `"<pythonw.exe>" "<main.py>"`（优先 pythonw，避免留控制台黑窗）。`--autostart` 复用既有语义——**隐藏到托盘启动、不调用 `start_interface()`**（不弹主界面），发现已有实例时不唤醒、静默退出。真源是**注册表**：`autostart_enabled` 仅作期望状态缓存，启动时 `sync_from_registry()` 以注册表实际状态双向校正，勾选/取消后按读回的实际状态回填控件（写失败不撒谎、把勾选弹回去并提示）。新增模块 `autounpacker/autostart.py`（纯 stdlib `winreg`，非 win32 安全 no-op，依赖可注入故可离线测）。
+- **托盘菜单「使用精简界面」**：完整界面下右键托盘图标，新增一项一键切到精简小窗（与右上角「⤡ 精简界面」同一入口 `_toggle_compact(True)`）；仅在**完整模式**下可见，精简模式下改由既有「返回完整界面」承担，两者互斥不重复出现。
+
+### 变更
+- **客户端进程名可配置**：新增 `baidu_client_proc_names`（逗号分隔字符串，默认 `BaiduNetdisk.exe,YunDetectService.exe,BaiduNetdiskHost.exe`）；设置 → 链接与网盘 新增同名文本行（实验性组，随总开关置灰）。解析口径：半角 / 全角逗号分隔、逐项去空白、大小写不敏感去重、单项截 64 字符、最多 32 项；**留空 / 全是分隔符 / 键缺失一律回落到内置三进程名**（绝不返回空表）。`share._client_running()`（`tasklist` 子串匹配）与 `watch._baidu_running()`（Toolhelp32 按映像名精确匹配）**共用同一个解析器**，避免两处口径漂移——百度若改名 `BaiduNetdisk.exe`，用户改配置即可，不必等发版。
+- **客户端版本探测（只报不拦）**：`baidu/db.py` 新增 `_registry_client_exe()`（从协议关联命令解析 exe 路径，`_registry_install_dir()` 改为复用）、`parse_version()` / `version_below()`、`client_version()`——优先读 exe 的文件版本资源（纯 stdlib `ctypes`：离线、失败返回 `None`、成功后缓存），回落卸载项注册表的 `DisplayVersion`。唤起时 info 记一行；**已知**版本低于软阈值 `MIN_WAKE_VERSION = (4, 8, 0)`（取自百度网页端 `GUANJIA_VERSION_COMPARE`）时**只多一条 warning**，**不阻断、不延迟、不重试**。成功文案仅在探测到版本时追加「（客户端 X.Y.Z.W）」，探测不到则**逐字保持旧文案**。
+
+### 调查记录（百度网页下载策略 / 调端，供日后回查）
+原始抓包在 `backup\20260928  charles-------\`（含 Charles `.chlz`，未改动）。
+
+1. **「点下载不拉起客户端、反而走浏览器 / IDM」不是故障，是网页有意的 `browser-direct` 策略**。老分享页控件 `function-widget-1/pkg/download-all_28d4802.js`（`config.js` 模块）的策略函数：
+   `if(!experimentEnabled || !valid) return "legacy"; if(isdir) return "folder-dialog"; if(total >= 3GiB) return "over-3g-dialog"; var n = (50MiB > total); return (1===count && n) ? "browser-direct" : isSvip ? "browser-direct" : …`
+   实测代入：单文件 + `size=1918389818`（1.79 GiB ⇒ `n=false`）+ **`is_svip=1`**（页面 locals / `user_tag`）⇒ 只剩 `isSvip` 分支 ⇒ **`browser-direct`**。调用栈实证：`newPolicyPromise.then` → `startNewPolicy(H)` → `"browser-direct"` → `E()` → `downloadDirect.start` → `ajaxGetDlinkShare`；`/api/sharedownload` 请求体为 **`encrypt=0`**（明文 `list`），dlink 带 **`bid=websviplargefile`**、`vip=2`、`resvsflag=1-0-0-1-1-1`。该分支是 `return void E();`，**结构上永不触达客户端**——所以整份抓包里 `baiduyunguanjia://`、`/api/invoker/*`、本地端口探测**零出现**。
+2. **网站上两个「看起来一样」的按钮其实是两种动作，老客户端只认其中一种**：
+   - 「**打开客户端**」（首页头部，`jumpDir:false`、`route:"allFile"`、`btn=top_invoke_btn`）→ 埋点 `invoke_method:"schema"` ⇒ **成功**；
+   - 「**打开电脑端**」（我的文件 / 操作区，`jumpDir:true`、`btn=operate_invoke_btn`、desc「web页面的文件打开电脑端」）→ `invoke_method:""`（两种方式都没成功）⇒ 随后按 `jumpToDownloadOnFail` **去下载 `BaiduNetdisk_8.8.8.101.exe` 安装包**。
+   两者共用同一调端器 `invokeApp(…, {invokers:["schema","local-service"]})`，且**本地服务端口 `10000…10005` 在两次里全部被拒**——**探测结果完全相同、结果却一成一败**，故差异只在「动作 / 参数」（`jumpDir` 是否带目标）而不在环境 ⇒ **schema 通道本身可用，缺的是老客户端对该动作的支持**。
+3. **调端通道与阈值（新版分享页实测）**：`GET /api/invoker/get`（取 `browserId`，缓存进 localStorage）→ `GET /api/invoker/online?browserId=`（`online`：`1`=带版本、`2`=版本未知）→ `POST /api/sharedownload`（客户端通道带 **`encrypt=1` + `extra.sekey`**；已知版本时再带 **`ct=pcygj&cv=<版本>`**）→ `POST /api/invoker/send`（`{"method":"DownloadShareItems",…}`）→ **`status=0` 即服务器长连接成功**；`status=1/2/3` 回退本地 HTTPS（`https://localhost.pan.baidu.com:10000..10005/guanjia?method=getversion` → `/downloadpc`）→ 再退 **`baiduyunguanjia://evoked-download/?browserId=&seq=`**（schema）→ `/api/invoker/check` 轮询收尾。阈值：网页 `GUANJIA_VERSION_COMPARE="4.8.0"`（**只决定用哪种调端方法，不拦截**）、本地连接器 `minVersion="5.3.4.5"`、网页黑名单区间 `[7.37.0.0, 7.37.1.0)`。
+4. **已排除的三条**：① **客户端版本过低** —— 同机同版本换干净浏览器即成功，且实测旧客户端为 **`7.44.0.5`**，远高于 `4.8.0`；② **去广告插件** —— 单变量对照的两份抓包均 **0 个 `ERR_BLOCKED_BY_CLIENT`**，而失败那份的全部拦截都落在埋点上（关键请求全 200）；更早那份的 84 个拦截**推测**是 **IDM 集成扩展**取消浏览器下载所致；③ **本地服务** —— 见第 2 条，两边探测结果相同。
+5. **对本程序的意义**：本程序走 `/api/invoker/*` + `baiduyunguanjia://evoked-download/?browserId=&seq=`，**恰好是网页自己失败时的最后兜底**（同机实测可用）。但**该协议的「动作名」敏感**：`baiduyunguanjia://<动作>`（`evoked-download` / `evoked-common` / `open-wangpan` …）决定老客户端认不认——**不要随意改动动作名**；将来扩展先按此口径抓包验证。
+
+### 修复
+- **设置项「补充信息气泡」只剩文字、没有背景（真机）**。根因：`WA_TranslucentBackground`（先前为修「圆角黑角」而加）会**隐含 `WA_NoSystemBackground`**，Qt 因此**跳过整个 `paintBackground()`** —— 而顶层窗的 QSS `background`/`border` 恰好只在那里绘制，于是 `#settingsBubble` 的卡面与边框整个不再绘制，真机上只剩文字。修复：`_InfoBubble` 改为在 `paintEvent` **自绘**圆角卡面（颜色/圆角全取自既有主题 token，不新增颜色）；自绘属于控件自身绘制，在半透明 backing store 与阴影 effect 源 pixmap 里都会被渲染，圆角路径**之外**的像素保持 `alpha=0`，**圆角外仍真正透明（不回到黑角）**。同时移除已失效的 QSS 背景规则（避免双写）、并给固定态打 `pinned` 动态属性使 `ctl_focus` 边框真正生效（此前该属性从未被设置，是既有小缺陷）。回归用例 `test_bubble_corners.py` 的 P 组口径随「自绘」更新为更贴近真机诉求的断言（四角未被卡面填满 + 中心确为卡面）。
+- **启动期日志重复上屏（真机现象：启动后出现「两组完全相同的启动日志」）**。根因：`Hub.log()` 一次调用做三件事 —— 落盘、写 `log_index`、入 GUI 队列；而 GUI 有**两条**上屏路径：① 装载 / 整页重载按 `log_index` 渲染快照（`clear` + 重建）；② `_drain()`（构造期 200ms 定时器）把队列项交给 `_append_log()` **实时追加**。启动期后台线程（实验性探测 / 监听器）**先**写日志，窗口随后才装载 —— 路径①把这几行画上屏，200ms 后路径②又把队列里同一批积压项追加一遍 ⇒ 同几行上屏两次。**落盘文件与 `log_index` 只有一遍**（源头没重复，重复纯在视图）；「该任务日志」视图（「全部」模式）同一 bug。
+  - 修复：`hub.log()` / `emit_record()` / `notify()` **先落库拿到行 id、再入队**，队列项带该 id；`_reload_log_page()` / `_refill_task_log()` 记下本次快照已画的行 id 集；`_append_log()` 对两个视图**按行 id 精确跳过**「快照里已有」的队列项。装载**之后**写入的行（含与旧行**完全同文本**的新行）照常上屏 —— 按 id 去重，绝不做文本启发式吞并。
+  - 回归用例 `test_log_startup_dedup.py`（25 项断言）：改前 **12 项失败**且逐条复现真机「各 2 次」，改后全绿。
+
+### 测试
+- 新增离线用例 `test_baidu_resilience.py`（261 行）：进程名解析 / 回落 / 上限与截断、`parse_version`、`version_below`、`client_version()` 对不存在路径返回 `None` 且不抛、探测失败不污染成功缓存。
+- 新增离线用例 `test_log_startup_dedup.py`（25 项断言，见「修复」）：启动行在日志页 / 「该任务日志」视图各恰好 1 行，落盘与 `log_index` 各 1 行，且新行（含同文本新行）照常上屏。
+- 新增离线用例 `test_autostart_and_tray.py`（28 项断言，注入假 `winreg`，绝不写真实注册表）：`entry_command` 冻结/源码两形态、`enable`/`disable`/`is_enabled` 幂等与读回、`apply()` 写失败不撒谎、`sync_from_registry` 双向校正、config 键契约与覆盖、托盘「使用精简界面」在完整/精简两模式下的可见性与触发、气泡自绘卡面（中心=card_bg、四角未填满、边框随 `pinned` 取 `card_border`/`ctl_focus`）、QSS 已无 `#settingsBubble` 背景规则。
+- 串行全量 **155 项 / FAILCOUNT=3**（`test_dead_share_flow` / `test_need_code_gate` / `test_polish_three`，环境依赖的既有失败，与本次无关）。
+- 默认行为零漂移已核对：`_effective_client_proc_names({})` 与历史硬编码三进程名**逐字一致**；版本探测走软告警，异常与未知版本都不改变原文案。
+
 ## [2.2.6] - 2026-09-28
 
 > **本轮重点**：隐私总开关——新增「监听剪贴板」，关闭后本程序**完全不读取剪贴板**（轮询 / 启动基线 / Alt+2·Alt+3 的 Qt 级读三处全部短路，**写**剪贴板不受影响）；同时把一批默认值按实际使用收敛（通知类多数默认关、快捷键改 Alt+1/2/3、解压后体积上限默认改成「不限制」），并修掉底栏提示关不掉、补充信息气泡四角黑角、拖拽行为弹窗文字被裁等一批看得见的毛病。

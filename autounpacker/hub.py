@@ -279,14 +279,18 @@ class Hub:
         lv = level or guess_level(msg)
         now = int(time.time())
         self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+        # 先落 log_index 拿到行 id，再入队：队列项带上该 id，GUI 侧据此判断
+        # 「这一行是否已由整页重载画进视图」，避免启动期积压项被再次追加
+        # （否则启动日志会上屏两遍，见 MainWindow._append_log）。
+        rid = 0
+        try:
+            rid = int(db.add_log_index(now, lv, msg, source_dir, task_id, link) or 0)
+        except Exception:
+            rid = 0
         try:
             self.q.put({"type": "log", "msg": f"[{time.strftime('%H:%M:%S')}] {msg}",
-                        "text": msg, "ts": now, "level": lv,
+                        "text": msg, "ts": now, "level": lv, "id": rid,
                         "source_dir": source_dir, "task_id": task_id, "link": link})
-        except Exception:
-            pass
-        try:
-            db.add_log_index(now, lv, msg, source_dir, task_id, link)
         except Exception:
             pass
 
@@ -297,17 +301,21 @@ class Hub:
                 f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {rec.text}")
         except Exception:
             pass
+        # 与 log() 同口径：先落库拿行 id，再入队（id 供 GUI 侧去重追加用）。
+        rid = 0
+        try:
+            rid = int(db.add_log_index(rec.ts, rec.level, rec.text,
+                                       rec.source_dir, rec.task_id,
+                                       rec.link) or 0)
+        except Exception:
+            rid = 0
         try:
             self.q.put({"type": "log",
                         "msg": f"[{time.strftime('%H:%M:%S')}] {rec.text}",
                         "text": rec.text, "ts": rec.ts, "level": rec.level,
+                        "id": rid,
                         "source_dir": rec.source_dir, "task_id": rec.task_id,
                         "link": rec.link})
-        except Exception:
-            pass
-        try:
-            db.add_log_index(rec.ts, rec.level, rec.text, rec.source_dir,
-                             rec.task_id, rec.link)
         except Exception:
             pass
 
@@ -317,10 +325,11 @@ class Hub:
         self._write_file(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}")
         # 通知文本也进 log_index（级别固定 info），让新版日志页能过滤到
         now = int(time.time())
+        rid = 0
         try:
-            db.add_log_index(now, "info", line)
+            rid = int(db.add_log_index(now, "info", line) or 0)
         except Exception:
-            pass
+            rid = 0
         if self.state is not None:
             cfg = self.state.snapshot()
             if not cfg.get("notify_enabled", True):
@@ -334,7 +343,8 @@ class Hub:
                 if k and not cfg.get(k, True):
                     return
         try:
-            self.q.put({"type": "notify", "title": title, "msg": msg, "ts": now})
+            self.q.put({"type": "notify", "title": title, "msg": msg, "ts": now,
+                        "id": rid})
         except Exception:
             pass
 

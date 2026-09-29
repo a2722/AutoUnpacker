@@ -561,12 +561,14 @@ QLabel#chipState {
 /* 胶囊内说明文字（说明性文案，不是状态角标；故无描边、无内边距、无圆角） */
 QLabel#chipText { font-size: $fs_tag; color: $chip_off_fg; }
 
-/* ---- 补充信息气泡（只留用户可见两段：标题 + 描述；风险项追加风险块） ---- */
-QFrame#settingsBubble {
-    background: $card_bg; border: 1px solid $card_border;
-    border-radius: $radius_card;
-}
-QFrame#settingsBubble[pinned="true"] { border-color: $ctl_focus; }
+/* ---- 补充信息气泡（只留用户可见两段：标题 + 描述；风险项追加风险块） ----
+   注意：#settingsBubble 是**半透明顶层窗**（WA_TranslucentBackground 隐含
+   WA_NoSystemBackground），Qt 会因此**跳过 paintBackground()** —— 顶层窗 QSS
+   的 background/border 恰好只在那里绘制，写了也不生效（真机缺陷：只剩文字、
+   没有卡面）。卡面与边框改由 `_InfoBubble.paintEvent` **自绘**（见
+   page_settings.py），圆角外的像素保持 alpha=0（真机不露黑角）。
+   下方 #bubbleTitle/#bubbleDesc/#bubbleRisk 是**子控件**，不受该开关影响，
+   仍照常走 QSS。 */
 QLabel#bubbleTitle { font-size: $fs_title; font-weight: 800; color: $window_fg; }
 QLabel#bubbleDesc  { font-size: $fs_body; color: $section_fg; }
 QFrame#bubbleRisk {

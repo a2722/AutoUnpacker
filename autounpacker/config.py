@@ -118,6 +118,10 @@ DEFAULT_CONFIG = {
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
+    # 实验性：客户端进程映像名（半角/全角逗号分隔；留空 = 使用内置默认 3 个）。
+    # 百度更换客户端进程名后无需改代码，两个「客户端是否在运行」检测点共用
+    # （解析与回退见 baidu/share.py 的 _effective_client_proc_names）。
+    "baidu_client_proc_names": "BaiduNetdisk.exe,YunDetectService.exe,BaiduNetdiskHost.exe",
     "share_gesture_wait_sec": 120,  # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
     # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
     # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
@@ -142,7 +146,14 @@ DEFAULT_CONFIG = {
     "compact_geometry": "",         # 精简小窗 saveGeometry() 的 base64 串（位置+尺寸记忆；空=默认位置）
     "main_geometry": "",            # 主窗 saveGeometry() 的 base64 串（位置+尺寸+最大化记忆；空=默认尺寸）
     "settings_wizard_done": False,  # 设置向导已跳过/已完成；True 时设置页不再显示「设置向导」入口
+    # 开机自启（静默：登录后隐藏到托盘启动，不弹主界面）。真源是 HKCU\...\Run
+    # 注册表项；本键只是「期望状态」的缓存 + 首屏勾选回填（见 autostart.py）。
+    "autostart_enabled": False,
 }
+
+# ---------- 开机自启注册表位置（纯 stdlib winreg；供 autostart.py 与设置页共用） ----------
+AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE_NAME = "AutoUnpacker"
 
 
 # ---------- 配置取值访问器（全包唯一强制转换口径，与 _sanitize_cfg 容错一致） ----------
@@ -384,6 +395,13 @@ def _sanitize_cfg(cfg):
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
+        # 客户端进程名（逗号分隔字符串）：缺键/非字符串回退内置默认字符串；
+        # **空串合法**（= 用内置默认，拆分与回退在 baidu/share.py），只去首尾
+        # 空白、不在此拆分/规整，保证「改即存」的回读校验逐字一致。
+        _cpn = cfg.get("baidu_client_proc_names")
+        if not isinstance(_cpn, str):
+            _cpn = str(DEFAULT_CONFIG["baidu_client_proc_names"])
+        cfg["baidu_client_proc_names"] = _cpn.strip()
         # baidu_pick_before_download 已退场：丢弃陈旧键（与 pair_split_auto 同口径）。
         cfg.pop("baidu_pick_before_download", None)
         cfg["pair_split_enabled"] = bool(cfg.get("pair_split_enabled", True))
@@ -429,6 +447,7 @@ def _sanitize_cfg(cfg):
         cfg["ui_theme"] = _ut if _ut in ("auto", "fluent", "devtool") else "auto"
         _utc = str(cfg.get("ui_theme_cached", "") or "").strip().lower()
         cfg["ui_theme_cached"] = _utc if _utc in ("fluent", "devtool") else ""
+        cfg["autostart_enabled"] = bool(cfg.get("autostart_enabled", False))
     except Exception:
         pass
     return cfg

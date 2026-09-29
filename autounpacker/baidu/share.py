@@ -40,6 +40,7 @@
 """
 import http.cookiejar
 import json
+import logging
 import os
 import re
 import ssl
@@ -48,7 +49,12 @@ import time
 import urllib.parse
 import urllib.request
 
+from .db import MIN_WAKE_VERSION, client_version, parse_version, version_below
 from .manifest import detect_dead_share_page
+
+# 本模块的进程内日志（版本探测软告警 / 诊断走标准 logging；未配置 handler 时
+# 由 lastResort 兜底，绝不抛异常、绝不影响链路）。
+_log = logging.getLogger(__name__)
 
 
 # 公共查询串：chunlei Web 端固定参数，末尾的 `=` 不能省。
@@ -120,8 +126,54 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # BaiduNetdisk.exe 是主客户端进程（登录态的宿主）；YunDetectService.exe /
 # BaiduNetdiskHost.exe 是随主进程拉起的辅助进程。命中其中任意一个即视为
 # 「客户端已在运行」——对「是否可安全投递」而言，辅助进程在也说明主链路已起。
-_CLIENT_PROC_NAMES = ("BaiduNetdisk.exe", "YunDetectService.exe",
-                      "BaiduNetdiskHost.exe")
+# 这是**内置默认**：用户可用配置键 baidu_client_proc_names 覆盖（百度更换客户端
+# 进程名时无需改代码，走 _effective_client_proc_names 解析生效列表）。
+_DEFAULT_CLIENT_PROC_NAMES = ("BaiduNetdisk.exe", "YunDetectService.exe",
+                              "BaiduNetdiskHost.exe")
+# 兼容旧引用：默认列表的别名（真正生效的列表一律走 _effective_client_proc_names）。
+_CLIENT_PROC_NAMES = _DEFAULT_CLIENT_PROC_NAMES
+
+# 生效进程名列表的解析上限：单项 64 字符、最多 32 项（防脏配置撑爆匹配表）。
+_CLIENT_PROC_NAME_MAX_LEN = 64
+_CLIENT_PROC_NAME_MAX_ITEMS = 32
+
+
+def _effective_client_proc_names(cfg=None):
+    """返回生效的客户端进程映像名列表（**永不为空**，默认与内置三进程名逐字一致）。
+
+    配置项 `baidu_client_proc_names`（字符串）的解析口径：
+    - 半角 `,` 与全角 `，` 都当分隔符；逐项 strip、丢弃空项；
+    - 大小写不敏感去重（保留首次出现的写法）；
+    - 单项截 64 字符、最多 32 项；
+    - 解析结果为空（键缺失 / 空串 / 纯分隔符 / 非字符串）时回退内置默认
+      `_DEFAULT_CLIENT_PROC_NAMES`——**绝不返回空列表**。
+    cfg 为 None 时按需读取 config.json（`load_config()`），读取失败同样回退
+    内置默认。本函数绝不抛异常。
+    """
+    raw = None
+    try:
+        if cfg is None:
+            from .. import config as app_config
+            cfg = app_config.load_config()
+        raw = (cfg or {}).get("baidu_client_proc_names")
+    except Exception:
+        raw = None
+    if not isinstance(raw, str):
+        raw = ""
+    out = []
+    seen = set()
+    try:
+        for part in raw.replace("，", ",").split(","):
+            name = part.strip()[:_CLIENT_PROC_NAME_MAX_LEN]
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append(name)
+            if len(out) >= _CLIENT_PROC_NAME_MAX_ITEMS:
+                break
+    except Exception:
+        out = []
+    return out if out else list(_DEFAULT_CLIENT_PROC_NAMES)
 
 # 客户端未运行时是否禁止投递唤醒（默认禁止，保护登录态）
 _WAKE_GUARD_ENABLED = True
@@ -263,9 +315,10 @@ def prepare_share(share_url, pwd=""):
       {"surl_full","surl","pwd","sign","ts","randsk","share_uk","shareid",
        "entries":[{"fs_id","path","name","size","isdir"}, …]}
       entries 顺序 = 服务端返回顺序（已按 fs_id 去重，保持现行为）；`isdir=True`
-      的目录项也保留（勾选目录 = 整目录下载）。另有两个下划线内部键：`_op`
-      （共用 OpenerDirector）与 `_share_url`（原始分享链接），供 commit_download
-      原样复用同一 CookieJar 与 Referer，UI 无需关心、也不应改动。
+      的目录项也保留（勾选目录 = 整目录下载）。另有三个下划线内部键：`_op`
+      （共用 OpenerDirector）、`_share_url`（原始分享链接）与 `_client_version`
+      （本次链路开始时软探测的客户端版本，供 commit_download 进成功文案；
+      未知为 None），供 commit_download 原样复用，UI 无需关心、也不应改动。
     - 失败：data 为 str（中文原因）。**绝不抛异常。**
     """
     try:
@@ -407,6 +460,11 @@ def prepare_share(share_url, pwd=""):
         if not (share_uk and shareid):
             return False, "分享页未解析到 share_uk / shareid（链接可能失效或需提取码）"
 
+        # 客户端版本软探测（detect-and-report，不属于链路步骤）：每次准备只探测
+        # 一次，结果随 prep 带到提交段进成功文案（None = 版本未知，文案保持干净）。
+        # 只读、极快、绝不阻断任何后续步骤（见 _probe_client_version）。
+        ver = _probe_client_version()
+
         return True, {
             "surl_full": surl_full,
             "surl": surl,
@@ -420,6 +478,7 @@ def prepare_share(share_url, pwd=""):
             "_op": op,
             "_share_url": share_url,
             "_deadline": deadline,
+            "_client_version": ver,
         }
     except Exception as e:
         return False, str(e)
@@ -501,12 +560,14 @@ def list_share_dir(prep, path):
         return False, str(e)
 
 
-def _client_running():
+def _client_running(cfg=None):
     """百度网盘客户端是否已在运行（只读进程表，无第三方依赖）。
 
-    用 `tasklist` 过滤已知的客户端进程名；任何异常一律返回 False（保守：宁可不唤起）。
-    `_CLIENT_PROC_NAMES` 里的 `BaiduNetdisk.exe` 是主客户端进程，另外两个是随它拉起
-    的辅助进程；本机实测客户端运行时三者都在，命中任意一个即视为「客户端已在运行」。
+    用 `tasklist` 过滤生效的客户端进程名（`_effective_client_proc_names`：默认
+    内置三进程名，用户可用配置键 baidu_client_proc_names 覆盖）；任何异常一律
+    返回 False（保守：宁可不唤起）。
+    `BaiduNetdisk.exe` 是主客户端进程，另外两个是随它拉起的辅助进程；本机实测
+    客户端运行时三者都在，命中任意一个即视为「客户端已在运行」。
     中文 Windows 的 tasklist 输出可能是 GBK，解码按 GBK → cp936 → UTF-8 依次尝试，
     最后兜底 UTF-8/replace，绝不让解码错误逃逸。
     """
@@ -531,32 +592,70 @@ def _client_running():
         except Exception:
             return False
     low = text.lower()
-    for name in _CLIENT_PROC_NAMES:
+    for name in _effective_client_proc_names(cfg):
         if name.lower() in low:
             return True
     return False
 
 
-def client_ready():
+def client_ready(cfg=None):
     """给 UI 用的只读检查：客户端是否可安全投递（现在是「客户端必须在运行」）。
 
     返回 bool，**绝不抛异常**；`_WAKE_GUARD_ENABLED = False`（门已关）时恒为 True。
+    cfg 可显式传入配置快照（缺省时按需读配置），便于测试注入。
     """
     try:
         if not _WAKE_GUARD_ENABLED:
             return True
-        return bool(_client_running())
+        # 默认路径保持 `_client_running()` 的无参调用（既有测试/调用方以 0 参桩替换）；
+        # 只有显式传入 cfg 时才透传。
+        if cfg is None:
+            return bool(_client_running())
+        return bool(_client_running(cfg))
     except Exception:
         return False
 
 
-def _wake_detail(bid, seq):
+def _wake_detail(bid, seq, version=None):
     """唤起客户端后的统一简述（`on_wake` 回调与成功返回值**共用同一措辞**）。
 
     抽成助手是为了让「唤醒即通知」的通知文案与链路最终 `ok` 的文案逐字一致，
-    避免两处各写一遍字符串日后漂移。
+    避免两处各写一遍字符串日后漂移。探测到客户端版本（`client_version()`）时
+    带上「客户端 x.y.z」；版本未知时保持原文案（不带版本，逐字兼容旧行为）。
     """
+    if version:
+        return (f"已唤起客户端下载（客户端 {version}，"
+                f"browserId={bid}, seq={seq}）")
     return f"已唤起客户端下载（browserId={bid}, seq={seq}）"
+
+
+def _probe_client_version():
+    """链路准备阶段的客户端版本软探测：记录日志并返回版本串（探测不到返回 None）。
+
+    只做「探测 + 记录」，**绝不阻断 / 延迟 / 重试**任何一步：
+    - 探测到版本：info 一行；已知版本低于 `MIN_WAKE_VERSION`（百度网页端
+      GUANJIA_VERSION_COMPARE 的软阈值）时再加**一条** warning，仅提示；
+    - 探测不到：debug 一行，成功文案不带版本。
+    任何异常一律吞掉并按「版本未知」处理。
+    """
+    try:
+        ver = client_version()
+    except Exception:
+        ver = None
+    try:
+        if ver:
+            _log.info("百度网盘客户端版本：%s", ver)
+            pv = parse_version(ver)
+            if pv is not None and version_below(pv, MIN_WAKE_VERSION):
+                _log.warning(
+                    "百度网盘客户端版本 %s 低于 %s：新版「唤起下载」可能不被支持"
+                    "（仅提示，不阻断）", ver,
+                    ".".join(str(x) for x in MIN_WAKE_VERSION))
+        else:
+            _log.debug("未能探测到百度网盘客户端版本（继续正常唤起）")
+    except Exception:
+        pass
+    return ver
 
 
 def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
@@ -578,13 +677,16 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
     7. `/api/invoker/online` 上报在线；
     8. `/api/invoker/send` 投递 downloadInfo → seq；
     9. `os.startfile("baiduyunguanjia://evoked-download/?…")` 唤起客户端，随后
-       **立即回调 `on_wake(detail)`**（在复核轮询之前，供上层「唤醒即通知」）；
+       **立即回调 `on_wake(detail)`**（在复核轮询之前，供上层「唤醒即通知」）。
+       成功文案带上 prepare 阶段探测到的客户端版本「客户端 x.y.z」（未知则不带；
+       低于软阈值只在 prepare 阶段记一条 warning，绝不阻断）。
     10. 复核轮询 `/api/invoker/check`：最多 3 次、每次间隔 1.5s（上限 4.5s），
         status==2 提前跳出；errno≠0 才算失败；超时容忍（视为已唤起）。
 
     参数：
     - `on_wake`：可选回调。唤起成功后、复核轮询之前调用一次，收到
-      `_wake_detail(bid, seq)` 字符串；回调自身异常一律吞掉，绝不影响链路。
+      `_wake_detail(bid, seq, 版本或 None)` 字符串；回调自身异常一律吞掉，
+      绝不影响链路。
 
     返回 (ok: bool, detail: str)：成功时 detail 为简述，失败时为原因。**绝不抛异常。**
     """
@@ -720,6 +822,9 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         # 9. 唤起客户端下载。
         if _deadline_hit(deadline):
             return False, _timeout_reason()
+        # 客户端版本：prepare_share 已在链路开始时软探测一次并随 prep 带来
+        # （手工构造的 prep 视为版本未知）——只进成功文案，绝不阻断 / 延迟唤醒。
+        ver = prep.get("_client_version") if isinstance(prep, dict) else None
         wake = (f"baiduyunguanjia://evoked-download/?browserId={bid}&seq={seq}"
                 f"&src_from=wp-download_web_share&src_type=web_sharelink_page")
         os.startfile(wake)
@@ -728,7 +833,7 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         #     「已请求客户端下载」。复核只作为静默兜底，不再阻塞这条告知。
         if on_wake is not None:
             try:
-                on_wake(_wake_detail(bid, seq))
+                on_wake(_wake_detail(bid, seq, ver))
             except Exception:
                 pass
 
@@ -756,7 +861,7 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
                 break
         if err is not None:
             return False, f"{CHECK_FAIL_PREFIX}（errno={err}）"
-        return True, _wake_detail(bid, seq)
+        return True, _wake_detail(bid, seq, ver)
     except Exception as e:
         return False, str(e)
 

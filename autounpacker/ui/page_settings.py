@@ -523,9 +523,17 @@ class _InfoBubble(QFrame):
         # 顶层无边框窗默认自带不透明窗口底色：QSS 只把 #settingsBubble 的背景
         # 画成圆角，圆角外的四个方角仍是窗口底色（真机上就是黑角）。必须在
         # 首次 show 之前置半透明，圆角外才真正透明（桌面透出），阴影照常绘制。
+        #
+        # 重要（真机缺陷根因）：`WA_TranslucentBackground` 会**隐含**
+        # `WA_NoSystemBackground`，而 Qt 正是靠后者这个开关**跳过整个
+        # paintBackground()** —— 顶层窗的 QSS `background`/`border` 恰好只在
+        # 那里绘制。于是置半透明后，卡面与边框不再由 QSS 画出，真机上只剩文字。
+        # 故本类改为在 **paintEvent 里自绘**圆角卡面（见 paintEvent 注释）：
+        # 自绘属于「控件自己的绘制」，在半透明 backing store 与阴影 effect 的
+        # 源 pixmap 里都会被渲染，圆角路径外的像素保持 alpha=0（真机无黑角）。
+        # 不再需要 WA_StyledBackground（QSS 顶层背景规则已随之移除）。
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setObjectName("settingsBubble")
         self._shadow = None
@@ -575,8 +583,45 @@ class _InfoBubble(QFrame):
                         int(anchor_global_pos.y()) - self.height() - 6)
         self.move(QPoint(int(x), int(y)))
 
-    def show_for(self, row, anchor_global_pos):
-        """按行元数据填充内容（标题 / 描述 / 补充说明 / 风险说明）并显示到 anchor 下方。"""
+    def paintEvent(self, event):   # noqa: N802（Qt 命名）
+        """自绘圆角卡面（真机缺陷修复：半透明顶层窗下 QSS 背景不绘制）。
+
+        为什么必须自绘：`WA_TranslucentBackground` 隐含 `WA_NoSystemBackground`，
+        Qt 因此在绘制顶层窗时**跳过 paintBackground()** —— 顶层窗 QSS 的
+        `background`/`border` 只在该处生效，于是卡面/边框整个消失（真机上「只有字、
+        没有底」）。自绘属于控件自身绘制：在半透明 backing store 与
+        QGraphicsDropShadowEffect 的源 pixmap 里都会被渲染，而圆角路径**之外**的
+        像素从不被触碰、保持 alpha=0，故真机上圆角外真正透明（不回到黑角）。
+
+        颜色/圆角全部取自既有主题 token（绝不新增颜色 / 硬编码色）；`pinned`
+        动态属性为真时边框用 `ctl_focus`（与 QSS 旧规则同义）。任何异常吞掉。
+        """
+        try:
+            tk = ui_style.tokens()
+            radius = float(str(tk.get("radius_card", "8px")).rstrip("px") or 8)
+            border = tk["ctl_focus"] if self.property("pinned") else tk["card_border"]
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # 内缩半像素：1px 描边落在像素中心，边缘不发虚、四角不留残边。
+            rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            path = QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
+            painter.fillPath(path, QColor(tk["card_bg"]))
+            pen = QPen(QColor(border))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.drawPath(path)
+            painter.end()
+        except Exception:
+            pass
+        super().paintEvent(event)
+
+    def show_for(self, row, anchor_global_pos, pinned=False):
+        """按行元数据填充内容（标题 / 描述 / 补充说明 / 风险说明）并显示到 anchor 下方。
+
+        `pinned=True`（点击固定态）时给自身打 `pinned` 动态属性：paintEvent 据此
+        把边框画成 `ctl_focus`（与 QSS 旧 `[pinned="true"]` 规则同义）。"""
+        self.setProperty("pinned", bool(pinned))
         self._title.setText(row.label)
         # 补充说明（如实验性门控提示）追加在描述之后；非门控行 note 为 None，正文不变
         self._desc.setText(
@@ -689,6 +734,11 @@ class SettingsPage(QWidget):
         self._notify_subs = ()
         self._notify_labels = ()
         self._exp_subs = ()
+        # 后加的实验性行（离线验收把 _exp_gate / _exp_badges / _exp_subs 锁定为
+        # 10 / 10 / 4，新增行一律走这两张独立登记表——与 _clip_gate 同一约定，
+        # 门控效果与 _exp_gate 完全一致）。
+        self._exp_extra_gate = []    # [(host, 控件簇)] 整行置灰 + 禁用控件簇
+        self._exp_extra_badges = []  # [(host, #expBadge)] 小标显隐随总开关
         self._hotkey_reason_labels = {}  # 热键配置键 -> 行内失败原因 QLabel
         self._hotkey_states = {}   # 热键配置键 -> (state, msg)（测试 / 重贴用）
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
@@ -1295,6 +1345,17 @@ class SettingsPage(QWidget):
         self._exp_badges.append((host, badge))
         return badge
 
+    def _exp_extra_badge(self, parent, host):
+        """后加实验性行名旁的常驻小标（同 #expBadge，走独立登记表）。
+
+        离线验收把 _exp_badges 锁定为 10 条，后加行不得扩它；显隐仍由
+        _apply_gates() 按实验性总开关统一决定（见 __init__ 的登记表说明）。"""
+        badge = QLabel(_EXP_BADGE_TEXT, parent)
+        badge.setObjectName("expBadge")
+        badge.setAlignment(Qt.AlignCenter)
+        self._exp_extra_badges.append((host, badge))
+        return badge
+
     def _clip_badge(self, parent, host):
         """「监听剪贴板」门控行名旁的常驻小标（#clipBadge）：文案见 _CLIP_BADGE_TEXT。
 
@@ -1851,6 +1912,37 @@ class SettingsPage(QWidget):
         self._rows.append(db_row)
         # 手工行的控件簇（编辑框 + 浏览按钮）纳入实验性门控
         self._exp_gate.append((bah, (self.baidu_db_edit, self.baidu_db_browse_btn)))
+        # 网盘客户端进程名（两个「客户端是否在运行」检测点共用）：与上一行同一套
+        # 手工行结构；离线验收把 _exp_gate/_exp_badges/_exp_subs 锁定为 10/10/4，
+        # 故本行走独立登记表 _exp_extra_gate/_exp_extra_badges，门控效果一致。
+        pah, pal = self._manual_row(g)
+        proc_meta = _SettingRow(
+            "网盘客户端进程名",
+            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
+            "baidu_client_proc_names", None, "links", "网盘与分享")
+        proc_meta.host = pah
+        proc_meta.note = _EXP_NOTE
+        pal.addWidget(self._make_name(pah, "网盘客户端进程名", proc_meta))
+        pal.addWidget(self._exp_extra_badge(pah, pah), 0, Qt.AlignVCenter)
+        self.baidu_proc_edit = QLineEdit(pah)
+        self.baidu_proc_edit.setPlaceholderText(
+            "留空 = 使用内置默认（BaiduNetdisk.exe 等 3 个）")
+        self.baidu_proc_edit.setToolTip(
+            "逗号分隔的客户端进程名（半角 / 全角逗号都行）；留空 = 使用内置默认；"
+            "百度更换客户端进程名后在此补充。")
+        pal.addWidget(self.baidu_proc_edit, 1)
+        self._reg("baidu_client_proc_names", self.baidu_proc_edit)
+        self._bind_text(self.baidu_proc_edit, "baidu_client_proc_names",
+                        lambda: str(self.baidu_proc_edit.text()).strip())
+        proc_row = _SettingRow(
+            "网盘客户端进程名",
+            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
+            "baidu_client_proc_names", self.baidu_proc_edit, "links", "网盘与分享",
+            syn=("客户端", "进程名", "进程", "百度", "网盘", "BaiduNetdisk"))
+        proc_row.host = pah
+        proc_row.note = _EXP_NOTE
+        self._rows.append(proc_row)
+        self._exp_extra_gate.append((pah, (self.baidu_proc_edit,)))
         self.share_nologin_hint = self._hint(
             "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
             "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
@@ -2102,6 +2194,17 @@ class SettingsPage(QWidget):
         lay.addWidget(host)
 
     def _build_system(self, box):
+        g = self._group(box, "启动")
+        # 开机自启：静默（登录后隐藏到托盘，不弹主界面）。真源是 HKCU Run 注册表项；
+        # 勾选即写、取消即删，config 的 autostart_enabled 只作期望状态缓存。
+        self.autostart_cb = self._check(
+            g, "开机自启", "autostart_enabled",
+            "登录 Windows 后自动启动，**静默隐藏到托盘、不弹主界面**（右键托盘图标"
+            "或双击小图标可随时唤出）。写入当前用户的启动项（HKCU\\...\\Run），"
+            "无需管理员权限。",
+            syn=("开机", "自启", "启动", "登录", "开机启动", "开机自启动", "自启动"),
+            default=False)
+        self.autostart_cb.toggled.connect(self._on_autostart_toggled)
         g = self._group(box, "监听")
         self.interval_spin = self._spin_row(
             g, "目录扫描间隔", "poll_interval",
@@ -3046,7 +3149,9 @@ class SettingsPage(QWidget):
         self._bubble_pinned = bool(pinned)
         self._bubble_row = row
         self._bubble_anchor = lbl          # 固定态跟随窗口 / 滚动的锚点
-        self._bubble.show_for(row, lbl.mapToGlobal(QPoint(0, lbl.height())))
+        self._bubble.show_for(
+            row, lbl.mapToGlobal(QPoint(0, lbl.height())),
+            pinned=bool(pinned))
         self._fit_hint(self._bubble)
         if self._bubble_pinned:
             self._install_outside_filter()
@@ -3323,6 +3428,7 @@ class SettingsPage(QWidget):
             self.share_wait_spin.setValue(max(5, min(600, i("share_gesture_wait_sec", 60))))
             self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
             self.baidu_db_edit.setText(s("baidu_task_db"))
+            self.baidu_proc_edit.setText(s("baidu_client_proc_names"))
 
         if did == "ui":
             # 外观与快捷键
@@ -3359,6 +3465,8 @@ class SettingsPage(QWidget):
             # 语义反转：已检测过(True) => 界面不勾选；否则勾选（下次重检）
             self.sevenzip_cb.setChecked(not b("sevenzip_check_done", False))
             self.task_limit_spin.setValue(max(1, min(100000, i("task_history_limit", 500))))
+            # 开机自启：以注册表实际状态为准回填（config 缓存可能被手工改注册表搞脏）
+            self.autostart_cb.setChecked(self._autostart_actual())
 
         if did == "lab":
             # 实验性
@@ -3472,6 +3580,51 @@ class SettingsPage(QWidget):
                 self._snapshot().get("incomplete_download_suffixes"))
         except Exception:
             pass
+
+    # ---- 开机自启（真源 = HKCU Run 注册表；勾选即写 / 取消即删） ----
+    def _autostart_actual(self):
+        """注册表里开机自启的**实际**状态（读不到一律 False）。"""
+        try:
+            from .. import autostart
+            return bool(autostart.is_enabled())
+        except Exception:
+            return False
+
+    def _on_autostart_toggled(self, checked):
+        """勾选/取消开机自启：写/删注册表项，并按回读的实际状态校正 config 与控件。
+
+        绝不「谎报」：写失败（无权限等）时回滚勾选到实际状态并提示。
+        `_loading` 期间（批量回填）不触发写入——避免 _load_domain 的 setChecked
+        被当成用户操作而误写注册表。"""
+        if self._loading:
+            return
+        try:
+            from .. import autostart
+        except Exception:
+            return
+        want = bool(checked)
+        try:
+            _ok, actual = autostart.apply(want)
+        except Exception:
+            actual = self._autostart_actual()
+        # config 缓存对齐实际状态（不经过 _commit 的通用提示，避免"已保存"误导）
+        try:
+            self.state.set("autostart_enabled", bool(actual))
+        except Exception:
+            pass
+        # 回读标尺：控件勾选强制等于实际状态（写失败时把勾选弹回去）
+        try:
+            if self.autostart_cb.isChecked() != bool(actual):
+                self.autostart_cb.blockSignals(True)
+                self.autostart_cb.setChecked(bool(actual))
+                self.autostart_cb.blockSignals(False)
+        except Exception:
+            pass
+        if bool(actual) == want:
+            self._notice("已开启开机自启（登录后静默启动，不弹主界面）"
+                         if actual else "已关闭开机自启")
+        else:
+            self._notice("开机自启设置失败（注册表只读或权限不足）", ok=False)
 
     # ---- 版本与更新（唯一联网点：用户手动点击才查） ----
     def _set_update_status(self, text, ok=True):
@@ -3809,6 +3962,18 @@ class SettingsPage(QWidget):
                 if w is None:
                     continue
                 w.setEnabled(exp and ntf if id(w) in notify_ids else exp)
+        # 后加的实验性行（独立登记表，见 __init__）：与 _exp_gate 同一套整行
+        # 置灰语义；这些控件不在通知门控交集里，可用性只随实验性总开关。
+        for _host, badge in self._exp_extra_badges:
+            badge.setVisible(not exp)
+        for host, cluster in self._exp_extra_gate:
+            if host is not None:
+                host.setProperty("off", not exp)
+                repolish_tree(host)
+            widgets = cluster if isinstance(cluster, (tuple, list)) else (cluster,)
+            for w in widgets:
+                if w is not None:
+                    w.setEnabled(exp)
         # 「监听剪贴板」门控在这里一并收口：懒建领域（clipboard / links 的物化
         # 顺序不定）与既有重贴路径（通知 / 实验性切换、_ensure_domain、
         # _load_from_cfg）都会经过 _apply_gates，门控状态因此始终一致。

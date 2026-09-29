@@ -29,8 +29,8 @@ DB_NAME = "BaiduYunGuanjia.db"
 
 
 # ---------- 定位数据库 ----------
-def _registry_install_dir():
-    """从协议关联读取百度网盘安装目录（只读注册表）。"""
+def _registry_client_exe():
+    """从协议关联读取客户端可执行文件完整路径（只读注册表）；失败返回 None。"""
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
@@ -38,26 +38,57 @@ def _registry_install_dir():
             cmd, _ = winreg.QueryValueEx(k, "")
         m = re.match(r'\s*"([^"]+)"', cmd or "")
         if m:
-            return Path(m.group(1)).parent
+            return m.group(1)
     except Exception:
         pass
     return None
 
 
+def _registry_install_dir():
+    """从协议关联读取百度网盘安装目录（只读注册表）。"""
+    exe = _registry_client_exe()
+    if exe:
+        try:
+            return Path(exe).parent
+        except Exception:
+            pass
+    return None
+
+
+def _install_dirs():
+    """列出百度网盘可能的安装目录（协议关联注册表 + 常见安装位置，去重保序）。
+
+    顺序与历史 `_candidate_dbs` 的拼装口径一致：协议关联安装目录优先；其后是
+    ProgramFiles / ProgramFiles(x86) / LOCALAPPDATA / APPDATA 下的
+    Baidu\\BaiduNetdisk。实测（Win11 + 百度网盘 8.8.8.101）：新版客户端会装到
+    %APPDATA%\\baidu\\BaiduNetdisk（Roaming），并不在 Program Files 下；平时靠
+    协议关联的注册表兜住，但注册表缺失时这里必须也能命中。
+    """
+    out = []
+    seen = set()
+
+    def _add(p):
+        try:
+            if not p:
+                return
+            key = str(p).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(Path(p))
+        except Exception:
+            pass
+
+    _add(_registry_install_dir())
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                 os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")):
+        if base:
+            _add(Path(base) / "Baidu" / "BaiduNetdisk")
+    return out
+
+
 def _candidate_dbs():
     """列出所有候选 BaiduYunGuanjia.db（注册表安装目录 + 常见安装位置，去重）。"""
-    roots = []
-    install = _registry_install_dir()
-    if install:
-        roots.append(install / "users")
-    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
-                 os.environ.get("LOCALAPPDATA"),
-                 # 实测（Win11 + 百度网盘 8.8.8.101）：新版客户端会装到
-                 # %APPDATA%\baidu\BaiduNetdisk（Roaming），并不在 Program Files 下。
-                 # 平时靠协议关联的注册表兜住，但注册表缺失时这里必须也能命中。
-                 os.environ.get("APPDATA")):
-        if base:
-            roots.append(Path(base) / "Baidu" / "BaiduNetdisk" / "users")
+    roots = [install / "users" for install in _install_dirs()]
     out = []
     seen = set()
     for root in roots:
@@ -73,6 +104,208 @@ def _candidate_dbs():
         except OSError:
             continue
     return out
+
+
+# ---------- 客户端 exe / 版本探测（只读、离线、绝不抛） ----------
+# 百度网页端 `function-widget-1/pkg/download-all` 里的
+# `GUANJIA_VERSION_COMPARE: "4.8.0"`：低于该版本的客户端可能无法正确处理新版
+# 「唤起下载」深链。**仅用于软告警**（见 baidu/share.py 准备阶段的一条 warning），
+# 绝不据此跳过 / 延迟 / 阻断任何唤起或启动。
+MIN_WAKE_VERSION = (4, 8, 0)
+
+# 版本探测成功后的模块级缓存（探测本身廉价，但唤起链路是热路径；只缓存成功
+# 结果，探测不到时保持 None、允许下次重试）。小写命名：这是可变模块状态，
+# 不是常量。
+_client_version_cache = None
+
+# 自动探测时在安装目录下预期的客户端主程序名（协议关联的注册表值实测可能指向
+# YunDetectService.exe 等辅助进程，安装目录候选统一找主程序 BaiduNetdisk.exe）。
+_CLIENT_EXE_NAME = "BaiduNetdisk.exe"
+
+
+def parse_version(s):
+    """把 '8.8.8.101' / '8.8' 这类点分版本解析成整型元组；解析不出返回 None。
+
+    纯函数、绝不抛异常。口径从严：按 `.` 分段后**每段都必须是纯数字**
+    （逐段 strip），任一段不是数字即整体判失败（不把 '8.8.8.101 beta' 之类
+    的文本误当版本号）。
+    """
+    try:
+        text = str(s or "").strip()
+        if not text:
+            return None
+        nums = []
+        for part in text.split("."):
+            p = part.strip()
+            if not p.isdigit():
+                return None
+            nums.append(int(p))
+        return tuple(nums) if nums else None
+    except Exception:
+        return None
+
+
+def version_below(a, b):
+    """版本元组 a 是否**低于** b（长度不同时短的一方按 0 补齐）。绝不抛异常。
+
+    例：version_below((4, 7, 9), (4, 8, 0)) is True；任一侧不可比较返回 False。
+    """
+    try:
+        n = max(len(a), len(b))
+        pa = tuple(a) + (0,) * (n - len(a))
+        pb = tuple(b) + (0,) * (n - len(b))
+        return bool(pa < pb)
+    except Exception:
+        return False
+
+
+def _registry_display_version():
+    """从卸载项注册表读客户端 DisplayVersion（HKLM/HKCU + WOW6432Node）；失败 None。"""
+    try:
+        import winreg
+        paths = (
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\BaiduNetdisk"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+             r"\BaiduNetdisk"),
+            (winreg.HKEY_CURRENT_USER,
+             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\BaiduNetdisk"),
+        )
+        for hive, sub in paths:
+            try:
+                with winreg.OpenKey(hive, sub) as k:
+                    v, _ = winreg.QueryValueEx(k, "DisplayVersion")
+                s = str(v or "").strip()
+                if s:
+                    return s
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _file_version(path):
+    """读 exe 的**文件版本资源**（如 "8.8.8.101"）；失败返回 None。
+
+    只用标准库 ctypes 调 version.dll 的 GetFileVersionInfoSizeW /
+    GetFileVersionInfoW / VerQueryValueW + VS_FIXEDFILEINFO。注意
+    VerQueryValueW 的 `\\` 子块路径必须传**可写缓冲**
+    （`ctypes.create_unicode_buffer("\\")`），普通 str 会被 ctypes 拒绝。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        p = str(path or "").strip()
+        if not p or not os.path.isfile(p):
+            return None
+        vd = ctypes.WinDLL("version", use_last_error=True)
+        vd.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)]
+        vd.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        vd.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                           wintypes.DWORD, ctypes.c_void_p]
+        vd.GetFileVersionInfoW.restype = wintypes.BOOL
+        vd.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                      ctypes.POINTER(ctypes.c_void_p),
+                                      ctypes.POINTER(wintypes.UINT)]
+        vd.VerQueryValueW.restype = wintypes.BOOL
+
+        size = vd.GetFileVersionInfoSizeW(p, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(int(size))
+        if not vd.GetFileVersionInfoW(p, 0, int(size), buf):
+            return None
+        ptr = ctypes.c_void_p()
+        length = wintypes.UINT()
+        sub = ctypes.create_unicode_buffer("\\")
+        if not vd.VerQueryValueW(ctypes.cast(buf, ctypes.c_void_p), sub,
+                                 ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        if not ptr or length.value < ctypes.sizeof(VS_FIXEDFILEINFO):
+            return None
+        info = ctypes.cast(ptr, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        ms, ls = int(info.dwFileVersionMS), int(info.dwFileVersionLS)
+        return ".".join(str(v) for v in (
+            (ms >> 16) & 0xFFFF, ms & 0xFFFF,
+            (ls >> 16) & 0xFFFF, ls & 0xFFFF))
+    except Exception:
+        return None
+
+
+def _client_exe_candidates():
+    """自动探测时的客户端 exe 候选路径（协议关联优先，其次常见安装目录）。"""
+    out = []
+    seen = set()
+
+    def _add(p):
+        try:
+            if p:
+                key = str(p).lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(str(p))
+        except Exception:
+            pass
+
+    _add(_registry_client_exe())
+    for d in _install_dirs():
+        _add(d / _CLIENT_EXE_NAME)
+    return out
+
+
+def client_version(exe_path=None):
+    """探测百度网盘客户端版本号（如 "8.8.8.101"）；探测不到返回 None。
+
+    只读、离线、极快、**绝不阻塞 / 不重试 / 不开 socket**，任何失败一律返回
+    None（绝不对调用方抛异常）。策略：
+    - `exe_path` 显式给定：只读该 exe 的文件版本资源；
+    - `exe_path` 为 None：自动探测——协议关联 exe → 常见安装目录下的
+      BaiduNetdisk.exe → 卸载项注册表 DisplayVersion（HKLM/HKCU + WOW6432Node）。
+    成功结果缓存到 `_client_version_cache`（唤起链路是热路径）；失败不缓存。
+    """
+    global _client_version_cache
+    if _client_version_cache is not None:
+        return _client_version_cache
+    try:
+        if exe_path is None:
+            for cand in _client_exe_candidates():
+                v = _file_version(cand)
+                if v:
+                    _client_version_cache = v
+                    return v
+            v = _registry_display_version()
+            if v:
+                _client_version_cache = v
+                return v
+            return None
+        v = _file_version(exe_path)
+        if v:
+            _client_version_cache = v
+            return v
+    except Exception:
+        pass
+    return None
 
 
 def select_task_db(explicit=""):

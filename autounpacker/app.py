@@ -224,6 +224,15 @@ def main():
 
     cfg = load_config()
 
+    # 开机自启：以注册表实际状态校正 config 缓存（用户可能在系统里手工增删了 Run
+    # 项）。只在真的不一致时落盘，避免每次启动都白写一次 config。
+    try:
+        from . import autostart as _autostart
+        if _autostart.sync_from_registry(cfg):
+            save_config(cfg)
+    except Exception:
+        pass
+
     # 未完成下载后缀：把配置表应用到 extraction.formats（启动即生效；CLI 不读
     # 配置，仍用内置默认）。设置页改该键时会再同步一次。
     try:

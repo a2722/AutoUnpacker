@@ -85,6 +85,7 @@
   "experimental_enabled": false,
   "baidu_task_db": "",
   "baidu_auto_invoke": false,
+  "baidu_client_proc_names": "BaiduNetdisk.exe,YunDetectService.exe,BaiduNetdiskHost.exe",
   "share_gesture_wait_sec": 120,
   "pair_split_enabled": true,
   "bomb_guard_enabled": true,
@@ -97,5 +98,6 @@
   "ui_theme": "auto",
   "ui_theme_cached": "",
   "show_status_tips": false,
-  "settings_wizard_done": false
+  "settings_wizard_done": false,
+  "autostart_enabled": false
 }

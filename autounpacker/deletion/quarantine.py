@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..utils import same_volume
 from .records import (QUARANTINE_DIRNAME, get_record, load_records,
-                      update_record)
+                      mark_restored_exempt, update_record)
 
 
 # ---- 隔离区（回收站不可用时源文件的可还原落点） ----
@@ -139,6 +139,14 @@ def quarantine_restore(rec_id):
                 shutil.move(str(src), str(dst))
             if dst.exists() and not src.exists():
                 restored.append(e["from"])
+                # 还原成功 ⇒ 给「还原回来的文件」登记豁免（路径+身份）：用户还原的
+                # 意图就是完整保留这份源文件，不该在监听目录里被再次解压、再按
+                # delete_policy 删掉。与 recycle.restore_record 同一口径；
+                # 逐条 try/except：登记失败绝不影响还原本身。
+                try:
+                    mark_restored_exempt(str(dst))
+                except Exception:
+                    pass
             else:
                 failed.append(e["from"])
                 left.append(e)

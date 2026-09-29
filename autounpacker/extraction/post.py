@@ -311,6 +311,18 @@ def remove_empty_dirs(directory):
         pass
 
 
+def _dir_has_files(directory):
+    """目录树里是否还有文件：有返回 True。只读、短路；异常按「有文件」保守处理
+    （保守=宁可把它当有内容的目录继续回收，也绝不原地删掉可能还有内容的目录）。"""
+    try:
+        for p in Path(directory).rglob("*"):
+            if p.is_file():
+                return True
+    except OSError:
+        return True
+    return False
+
+
 def _set_created_time(path, ts):
     """把 Windows「创建时间」设为 ts；非 Windows 无此概念，直接视为成功。
 
@@ -608,6 +620,7 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     pre_recycled, pre_failed = [], []
     qmap = []            # 本函数累计的隔离区地图（pre + 主回收两段）
     occupies_source = False
+    empty_intermediate = False   # 输出目录已空：原地清理而非回收（见下方 targets 构造）
     if not same_place:
         promote_to.mkdir(parents=True, exist_ok=True)
         dest = promote_to / src_dir.name
@@ -682,7 +695,16 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     if same_place:
         targets.extend(str(f) for f in top_files)
     elif output_dir.exists():
-        targets.append(str(output_dir))
+        # 提升后已空掉的输出目录是**程序自建的中间目录**：原地清理（rmdir），
+        # 不送回收站。送进回收站会被记进 deleted_paths（可还原），用户之后在回溯页
+        # 还原源文件时，这个空目录会跟着一起被还原回来，凭空多出一个同名文件夹
+        # （真机 BUG：豁免已生效、却仍冒出一个同名空文件夹）。
+        # 这与 delete_source=False 分支的 remove_empty_dirs(output_dir) 处理一致。
+        # 只有当目录树里**仍有文件残留**（提升没搬干净）时才回收，绝不丢内容。
+        if _dir_has_files(output_dir):
+            targets.append(str(output_dir))
+        else:
+            empty_intermediate = True
 
     if pre_hook:
         pre_hook(targets)
@@ -691,6 +713,8 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
         quarantine_root=quarantine_root, quarantine_out=qmap)
     recycled = pre_recycled + recycled2
     failed = pre_failed + failed2
+    if empty_intermediate:
+        remove_empty_dirs(output_dir)   # 空中间目录原地删除：不进回收站、不记回溯
 
     if hook:
         hook(recycled, failed, qmap or None)

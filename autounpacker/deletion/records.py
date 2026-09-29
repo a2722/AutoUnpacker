@@ -244,6 +244,63 @@ def already_handled(original_path):
     return False
 
 
+def _norm_path_key(path):
+    """路径归一（删除回溯各判定共用）：resolve + os.path.normcase。
+
+    Windows 大小写不敏感，仅 resolve() 不足以保证不同写法命中同一文件——真机案里
+    记录 original_path 用大写盘符（D:\\...）而还原落点用小写盘符（d:\\...），精确
+    字符串比较永不相等，豁免因此落空。任何异常一律返回 ""（调用方按不命中处理）。
+    """
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except Exception:
+        return ""
+
+
+def is_restored_file(original_path):
+    """该磁盘文件是否「曾被本程序处理并删除、现又以相同身份回到原路径」。
+
+    与 is_restored_exempt 不同：不要求本程序登记过豁免——只要回溯记录里存在一条
+    路径（归一同大小写后）相同、状态为 deleted/restored、且身份 (size, mtime 容差
+    2.0s) 与当前磁盘文件一致，就认定它是「删除回溯还原回来的源文件」，监听线程应
+    跳过再次解压。因此即使用户用资源管理器还原（没走本程序 recycle/quarantine 的
+    还原登记路径）也能生效——这正是真机「还原回来的文件又被解压、再被删」的根因。
+
+    身份 (size, mtime) 是必须的：路径相同但大小/时间已变的同名新文件绝不算还原
+    （避免误挡真正要处理的新文件）；记录缺身份信息时该条不算命中。绝不抛异常，
+    任何错误一律返回 False。
+    """
+    try:
+        target = str(Path(original_path).resolve())
+        tgt_key = _norm_path_key(target)
+        if not tgt_key:
+            return False
+        try:
+            st = Path(target).stat()
+            now_ident = [int(st.st_size), float(st.st_mtime)]
+        except Exception:
+            return False
+        with _lock:
+            recs = load_records()
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            rp = r.get("original_path")
+            if not isinstance(rp, str) or _norm_path_key(rp) != tgt_key:
+                continue
+            if r.get("status") not in ("deleted", "restored"):
+                continue
+            fsize, fmtime = r.get("file_size"), r.get("file_mtime")
+            if fsize is None or fmtime is None:
+                continue    # 记录缺身份：绝不当成还原（避免误挡同名新文件）
+            rec_ident = [int(fsize), float(fmtime)]
+            if _ident_matches(rec_ident, now_ident):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def mark_restored_exempt(original_path):
     """登记「从删除回溯还原回来的源文件 ⇒ 豁免再次解压」（路径 + 身份）。
 
@@ -261,15 +318,17 @@ def mark_restored_exempt(original_path):
     except Exception:
         return False
     try:
+        tgt_key = _norm_path_key(target)
         with _lock:
             recs = load_records()
             for r in recs:
-                if r.get("original_path") != target:
+                if _norm_path_key(r.get("original_path")) != tgt_key:
                     continue
                 entries = r.get("restored_exempt")
                 entries = list(entries) if isinstance(entries, list) else []
                 entries = [e for e in entries
-                           if not (isinstance(e, dict) and e.get("path") == target)]
+                           if not (isinstance(e, dict)
+                                   and _norm_path_key(e.get("path")) == tgt_key)]
                 entries.append({"path": target, "ident": ident})
                 r["restored_exempt"] = entries
                 return save_records(recs)
@@ -313,6 +372,7 @@ def is_restored_exempt(original_path):
     hit = False
     dirty = False
     try:
+        tgt_key = _norm_path_key(target)
         with _lock:
             recs = load_records()
             for r in recs:
@@ -321,7 +381,8 @@ def is_restored_exempt(original_path):
                     continue
                 keep = []
                 for e in entries:
-                    if not (isinstance(e, dict) and e.get("path") == target):
+                    if not (isinstance(e, dict)
+                            and _norm_path_key(e.get("path")) == tgt_key):
                         keep.append(e)
                         continue
                     if _ident_matches(e.get("ident"), ident):

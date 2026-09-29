@@ -248,13 +248,18 @@ def _identity_of(path):
 
 
 def _snapshot_dir(folder):
-    """目录内文件清单：{normcase(路径): 身份}，用于识别还原后真正落地的文件。"""
+    """目录内条目清单：{normcase(路径): 身份}，用于识别还原后真正落地的文件。
+
+    目录条目以 None 占位（目录没有 (size, mtime) 身份）：这样「原位置本轮由空变有」
+    的判定能认出「这里原本就有一个同名目录」而不误报成功；下方只认文件的落点扫描
+    则因身份为 None 自然跳过目录。"""
     snap = {}
     try:
         for p in Path(folder).iterdir():
-            ident = _identity_of(p)
-            if ident is not None:
-                snap[os.path.normcase(str(p))] = ident
+            try:
+                snap[os.path.normcase(str(p))] = _identity_of(p)   # 目录 -> None
+            except Exception:
+                continue
     except Exception:
         pass
     return snap
@@ -290,7 +295,11 @@ def _find_landed(original_path, ident, before):
     opath = Path(original_path)
     key = os.path.normcase(str(opath))
     try:
-        if key not in before and _identity_of(str(opath)) is not None:
+        if key not in before and Path(original_path).exists():
+            # 原位置还原前不存在、还原后存在：文件或目录都算本次还原的落点。
+            # 记录里 deleted_paths 可能含「提升后已空的输出目录」这类中间目录，
+            # 目录没有 (size, mtime) 身份，若仍要求 is_file，目录还原成功也归属不上，
+            # 会白轮询满 30 秒再谎报「还原未生效」（真机：还原很慢 + 读条不停）。
             return str(opath)
     except Exception:
         pass
@@ -313,12 +322,36 @@ def _find_landed(original_path, ident, before):
     return ""
 
 
-def _restore_one(original_path, rec=None):
-    """从回收站还原单个文件，返回 (是否成功, 实际落点, 失败原因)。
+def _recycle_items():
+    """打开回收站并返回条目快照 list；打不开返回 None。
+
+    整条记录的所有还原目标共用同一份快照：回收站枚举本身要走 Shell、很慢，逐目标
+    重新枚举会让「还原 N 个文件」的耗时线性膨胀（真机单条记录 2 个目标就要枚举两遍）。
+    """
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        shell = win32com.client.Dispatch("Shell.Application")
+        rb = shell.Namespace(10)          # 回收站
+        if rb is None:
+            return None
+        return list(rb.Items())
+    except Exception:
+        return None
+
+
+def _restore_one(original_path, rec=None, items=None):
+    """从回收站还原单个文件（或目录），返回 (是否成功, 实际落点, 失败原因)。
 
     - 还原前先记录原位置占用状态与目录清单（A）：绝不把「调用过还原」当成功；
     - 原位置被占用时回收站可能落到同名变体：按记录身份 (file_size/file_mtime)
       在原始目录里找真正落点，如实上报实际路径（C）；
+    - items=回收站条目快照（restore_record 一次枚举、多目标共用）；None 时自行枚举，
+      打不开回收站返回「无法打开回收站」；
+    - **名称先筛**：只有名字命中的条目才去读 System.Recycle.DeletedFrom —— Shell 的
+      ExtendedProperty 每次调用都很慢，对回收站每个条目都读一遍正是「还原很慢」主因；
+    - 目录也能还原，落点判定见 _find_landed（原位置本轮由空变有即算成功）；
     - 绝不覆盖已有文件、绝不抛异常。
     """
     original_path = str(Path(original_path))
@@ -328,25 +361,27 @@ def _restore_one(original_path, rec=None):
     before = _snapshot_dir(parent)
     ident = _record_identity(rec)
     try:
-        import pythoncom
-        import win32com.client
-        pythoncom.CoInitialize()
-        shell = win32com.client.Dispatch("Shell.Application")
-        rb = shell.Namespace(10)  # 回收站
-        if rb is None:
-            return False, "", "无法打开回收站"
+        if items is None:
+            items = _recycle_items()
+            if items is None:
+                return False, "", "无法打开回收站"
+        want = os.path.normcase(name)
         found = False
         invoked = False
-        for item in rb.Items():
+        for item in items:
             try:
                 it_name = str(item.Name or "")
+            except Exception:
+                continue
+            if os.path.normcase(it_name) != want:
+                continue        # 名字不对：跳过昂贵的 DeletedFrom 读取
+            try:
                 it_parent = str(item.ExtendedProperty("System.Recycle.DeletedFrom") or "")
             except Exception:
                 continue
             # 回收站的 DeletedFrom 只给原始目录，因此用「文件名 + 原始目录」匹配
             # Windows 路径大小写不敏感，统一 normcase 后比较
-            if (os.path.normcase(it_name) == os.path.normcase(name)
-                    and os.path.normcase(it_parent) == os.path.normcase(parent)):
+            if os.path.normcase(it_parent) == os.path.normcase(parent):
                 found = True
                 if not _invoke_restore(item):
                     continue
@@ -384,8 +419,13 @@ def restore_record(rec_id):
     if not targets:
         return False, "没有可还原的文件"
     restored, failed = [], []   # restored: [(原路径, 实际落点)]；failed: [(原路径, 原因)]
+    # 回收站只枚举一次，本记录所有目标共用（枚举很慢，逐目标重来会线性变慢）。
+    items = _recycle_items()
     for t in targets:
-        ok, dest, reason = _restore_one(t, rec)
+        if items is None:
+            ok, dest, reason = False, "", "无法打开回收站"
+        else:
+            ok, dest, reason = _restore_one(t, rec, items)
         if ok:
             restored.append((t, dest))
         else:

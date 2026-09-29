@@ -102,6 +102,26 @@ def _restored_exempt(fp):
         return False
 
 
+def _restored_same_identity(fp):
+    """该源文件是否与「已处理并删除」的旧记录身份一致（删除回溯还原回来的文件）。
+
+    与 `_restored_exempt` 的区别：不要求本程序登记过豁免——真机上文件可能是用户用
+    资源管理器还原的，本程序从没走过还原登记路径（记录 restored_exempt 缺失）。只
+    要回溯记录里存在一条路径相同、状态 deleted/restored、身份 (size, mtime 容差
+    2.0s) 与磁盘现状一致的记录，就判定为还原回来的源文件并跳过再次解压。
+
+    注意：与 initial_scan 无关——运行中还原走常规轮询也必须生效（真机根因）。
+    防御性：取不到方法/异常一律 False，绝不让监听线程因这条增强分支崩溃。
+    """
+    fn = getattr(deletion_trail, "is_restored_file", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(fp))
+    except Exception:
+        return False
+
+
 def _state_get(state, key, default=None):
     """读单个配置键：优先用 State.get（只取该键，不做整份深拷贝）；仅对只实现
     snapshot() 的轻量 state 替身（测试桩）回退到整份快照。生产环境的 State 始终
@@ -1667,13 +1687,16 @@ class FolderWatcher(threading.Thread):
         elif smart_extract.is_non_first_volume(name):
             self.hub.log(f"非首卷分卷，等待首卷处理整个分卷: {name}")
             return "done"
-        # 还原豁免：该源文件是用户从删除回溯里**还原**回来的（登记了 路径+身份）。
-        # 用户还原的意图就是完整保留这份源文件，所以即使它又出现在监听目录里也跳过
-        # 解压——否则解压成功后又会被 delete_policy 删掉（「还原后立刻又被解压、再被
-        # 删」的根因）。身份变化（重新下载/替换）后自动失效；**与 initial_scan 无关**：
-        # 运行中还原走的是常规轮询，也必须生效。
-        elif _restored_exempt(fp):
-            self.hub.log(f"该源文件是从删除回溯还原的，豁免再次解压，跳过: {name}")
+        # 还原豁免：该源文件是用户从删除回溯里**还原**回来的。两条判定都算：
+        #   1) 本程序还原时登记了「路径+身份」的豁免（is_restored_exempt）；
+        #   2) 磁盘文件与一条 status=deleted/restored 的旧记录身份一致
+        #      （is_restored_file，容差 2.0s）——用户用资源管理器还原、本程序没有
+        #      登记豁免时也生效。身份变化（重新下载/替换）后自动失效；**与
+        #      initial_scan 无关**：运行中还原走的是常规轮询，也必须生效。
+        elif _restored_exempt(fp) or _restored_same_identity(fp):
+            self.hub.log(
+                f"该源文件是已处理并删除、又被还原回来的（身份一致），"
+                f"跳过再次解压: {name}")
             return "done"
         # 监听（重）初始化扫描时，跳过已成功处理过的文件（避免重复解压）
         elif initial_scan and deletion_trail.already_handled(fp):

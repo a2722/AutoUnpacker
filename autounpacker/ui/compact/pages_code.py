@@ -4,7 +4,10 @@
 字段 / 校验 / 文案 / 快捷键与 `ui/dialogs/share_ask.py` 的 `ShareCodeAskDialog`
 逐条一致（顶部 `‹ 返回`、标题、`剩余 Ns`、分享者、链接中部省略 + hover 全链、
 `提取码（4 位）`、仅字母数字 maxLength=4、满 4 位才可提交、提示语满 4 位变绿 /
-非法变红、主按钮 `本次使用（Alt+2）`、次按钮 `忽略`）。
+非法变红、主按钮 `全部下载（Alt+2）`、次按钮 `忽略`）。
+精简模式**只保留一个动作按钮**（「全部下载」）：挑文件走全局 Alt+3 手势
+（`_share_ask_force_pick` 置真 ⇒ 提交后宿主仍强制走挑选路径），因此本页不需要
+第二个按钮——与完整模式浮窗（两个动作按钮）的差异是刻意的。
 
 红线（规格 §0 D4）：**不得出现**「同时存入永久口令本」或任何保存入口；
 提取码 ≠ 压缩包口令，两者不得关联。
@@ -23,7 +26,9 @@ from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QShortcut,
                              QVBoxLayout, QWidget)
 
 from ..dialogs.common import (SHARE_ASK_TIMEOUT_SEC, _CodeLineEdit,
-                              _call_decision)
+                              _call_decision,
+                              ask_deadline as _ask_deadline,
+                              remain_from_deadline as _remain_from_deadline)
 
 
 class CodePage(QWidget):
@@ -48,6 +53,9 @@ class CodePage(QWidget):
             self._timeout_sec = max(1, int(SHARE_ASK_TIMEOUT_SEC))
         except Exception:
             self._timeout_sec = 120
+        # 倒计时真值 = 绝对截止时刻（见 dialogs/common.ask_deadline）：从完整模式
+        # 浮窗交接过来时传入同一 deadline ⇒ **倒计时连续、不重置**。
+        self._deadline = _ask_deadline(self._timeout_sec)
         self._remain_sec = self._timeout_sec
 
         root = QVBoxLayout(self)
@@ -103,7 +111,7 @@ class CodePage(QWidget):
         self.hint_label.setWordWrap(True)
         root.addWidget(self.hint_label)
 
-        self.once_btn = QPushButton("本次使用（Alt+2）", self)
+        self.once_btn = QPushButton("全部下载（Alt+2）", self)
         self.once_btn.setObjectName("primary")
         self.once_btn.setCursor(Qt.PointingHandCursor)
         self.once_btn.clicked.connect(lambda *_: self._on_once_clicked())
@@ -154,19 +162,32 @@ class CodePage(QWidget):
             self.code_edit.setText("")
         self._refresh_state()
 
-    def start(self):
-        """重置并启动 120s 倒计时（复用场景 = 重新计时）。"""
+    def start(self, deadline=None):
+        """启动倒计时；`deadline` 给定时按其剩余秒继续（= 跨模式交接，绝不重置）。
+
+        复用场景（同分享再次进入）不传 deadline ⇒ 重新计满 120s（既有语义不变）。
+        """
         self._loaded = True
         self._done = False
         self._timed_out = False
         self._emitted = False
-        self._remain_sec = self._timeout_sec
+        self._deadline = (deadline if deadline is not None
+                          else _ask_deadline(self._timeout_sec))
+        self._remain_sec = _remain_from_deadline(self._deadline, self._timeout_sec)
         self._update_countdown()
         self._timer.start()
         try:
             self.code_edit.setFocus()
         except Exception:
             pass
+
+    def deadline(self):
+        """绝对截止时刻（epoch 秒）——跨模式交接倒计时用。"""
+        return self._deadline
+
+    def remaining(self):
+        """当前剩余秒（按绝对截止时刻现算）。"""
+        return _remain_from_deadline(self._deadline, self._timeout_sec)
 
     def stop(self):
         """只停倒计时（不改变状态；供窗口隐藏 / 关闭时调用）。"""

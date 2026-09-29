@@ -91,7 +91,8 @@ from .window.share_flow import (  # noqa: F401
     _manual_reinvoke_guard, _share_parent_usable,
     _share_notify_via,
     _take_share_ask_notified, _announce_ask_code_hidden,
-    _share_pan_open_blocked, _show_share_code_window)
+    _share_pan_open_blocked, _show_share_code_window,
+    _pending_ask, _carry_ask_across_mode)
 
 try:
     import win32api
@@ -2643,6 +2644,10 @@ class MainWindow(QMainWindow):
         `ui_compact` 落 config；启动时由 `start_interface()` 按它决定初始界面。
         """
         want = (not self.is_compact()) if on is None else bool(on)
+        # 取码小窗的跨模式交接必须**先快照再切**：`is_compact()` 读的就是 ui_compact，
+        # 一旦落盘就分不清「切换前活动的是哪套表面」了（见 _carry_ask_across_mode）。
+        _was_compact = self.is_compact()
+        _ask_pending = _pending_ask(self)
         try:
             self.state.set("ui_compact", bool(want))
         except Exception:
@@ -2676,6 +2681,13 @@ class MainWindow(QMainWindow):
             # 先让窗口出来再缓缓填，与启动时 defer_initial_load 同一思路；幂等）。
             try:
                 QTimer.singleShot(0, self._do_initial_load)
+            except Exception:
+                pass
+        # 未结束的取码请求交接到新模式的表面（倒计时连续）：切换**绝不丢失**取码小窗。
+        if _ask_pending:
+            try:
+                _carry_ask_across_mode(self, bool(want), ask=_ask_pending,
+                                       from_compact=_was_compact)
             except Exception:
                 pass
         # 托盘菜单里「返回完整界面」只在精简模式有意义：切完立刻同步一次可见性
@@ -4156,7 +4168,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"[分享] 处理缺少提取码的分享出错: {e}")
 
     def _on_share_code_decision(self, kind, code, url, surl, share_uk):
-        """提取码询问回调（Qt 线程）：once=只本次使用；ignore=忽略。"""
+        """提取码询问回调（Qt 线程）：once=全部下载；pick=先挑文件再下载；ignore=忽略。"""
         try:
             self._share_ask_dlg = None
             if kind == "ignore" or not code:
@@ -4164,8 +4176,10 @@ class MainWindow(QMainWindow):
                 return
             # manual=True：本回调只由小窗按钮触发，用户明确点击 = 手动，
             # 绝不吃「实验性自动拉起不携带登录态」托盘提示（与 Alt+2/Alt+3 一致）。
-            # 手势归属：Alt+3 挑选手势即便先经缺码小窗，敲定提取码后仍强制挑文件。
-            _fp = bool(getattr(self, "_share_ask_force_pick", False))
+            # 强制挑文件有两个来源，任一成立即走挑选路径：
+            #   kind == "pick"（完整模式小窗的「挑选文件下载」按钮）；
+            #   _share_ask_force_pick（全局 Alt+3 手势先经缺码小窗，敲定码后仍要挑）。
+            _fp = (kind == "pick") or bool(getattr(self, "_share_ask_force_pick", False))
             self._share_ask_force_pick = False
             _call_start_share_pick(self, url, surl, code, manual=True,
                                    force_pick=_fp)

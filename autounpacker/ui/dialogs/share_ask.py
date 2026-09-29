@@ -12,7 +12,9 @@ from PyQt5.QtGui import QKeySequence, QRegularExpressionValidator
 from ..style import PALETTE
 from ..textfit import fit_text_heights
 from .common import (SHARE_ASK_TIMEOUT_SEC, SHARE_ASK_EDGE_MARGIN,
-                     SHARE_ASK_WINDOW_WIDTH, _call_decision, _CodeLineEdit)
+                     SHARE_ASK_WINDOW_WIDTH, _call_decision, _CodeLineEdit,
+                     ask_deadline as _ask_deadline,
+                     remain_from_deadline as _remain_from_deadline)
 
 
 class ShareCodeAskDialog(QDialog):
@@ -27,8 +29,11 @@ class ShareCodeAskDialog(QDialog):
     自动用框里的码发起任何操作。
 
     三个按钮即回调词表（语义见下），一律经 _finish 恰好回调一次，回调不向外抛异常：
-      「本次使用」   -> on_decision("once", code)
-      「忽略」/关闭  -> on_decision("ignore", "")
+      「全部下载（Alt+2）」     -> on_decision("once", code)   整包提交（不挑文件）
+      「挑选文件下载（Alt+3）」 -> on_decision("pick", code)   先挑文件再下载
+      「忽略」/关闭            -> on_decision("ignore", "")
+    精简模式对应的 CODE 页只保留**一个**动作按钮（「全部下载」），挑文件由全局
+    Alt+3 手势进入（见 compact/pages_code.py）。
 
     只读访问器（供接线侧读取本窗当前状态）：
       current_code() -> 通过校验的 4 位码，否则 ""
@@ -38,7 +43,7 @@ class ShareCodeAskDialog(QDialog):
 
     def __init__(self, parent, surl, url, share_uk,
                  timeout_sec=SHARE_ASK_TIMEOUT_SEC, on_decision=None,
-                 state=None, hub=None):
+                 state=None, hub=None, deadline=None):
         # UX-5：挂到传进来的主窗上（子工具窗，随主窗移动/隐藏）。非 QWidget
         # （既有测试桩）按无父处理；无父时几何退回旧「贴屏幕右缘」行为。
         p = parent if isinstance(parent, QWidget) else None
@@ -55,7 +60,11 @@ class ShareCodeAskDialog(QDialog):
             self._timeout_sec = max(1, int(timeout_sec))
         except Exception:
             self._timeout_sec = SHARE_ASK_TIMEOUT_SEC
-        self._remain_sec = self._timeout_sec
+        # 倒计时真值 = 绝对截止时刻（见 dialogs/common.ask_deadline）：
+        # 从精简模式 CODE 页交接过来时传入同一 deadline ⇒ **倒计时连续、不重置**。
+        self._deadline = (deadline if deadline is not None
+                          else _ask_deadline(self._timeout_sec))
+        self._remain_sec = _remain_from_deadline(self._deadline, self._timeout_sec)
 
         self.setWindowTitle("分享缺提取码")
         # 子工具窗 + 无边框：父窗存在时始终位于主窗之上（但不越过整个桌面）；
@@ -131,10 +140,17 @@ class ShareCodeAskDialog(QDialog):
             f"color: {PALETTE['muted']}; font-size: 12px;")
         lay.addWidget(self.hint_label)
 
-        self.once_btn = QPushButton("本次使用（Alt+2）")
+        self.once_btn = QPushButton("全部下载（Alt+2）")
         self.once_btn.setObjectName("primary")
         self.once_btn.clicked.connect(self._on_once_clicked)
         lay.addWidget(self.once_btn)
+
+        # Alt+3：先挑文件再下载（与托盘/热键「挑选文件下载最近分享」同一语义）。
+        # 完整模式下小窗给两个动作按钮；精简模式的 CODE 页只保留上面那一个。
+        self.pick_btn = QPushButton("挑选文件下载（Alt+3）")
+        self.pick_btn.setCursor(Qt.PointingHandCursor)
+        self.pick_btn.clicked.connect(self._on_pick_clicked)
+        lay.addWidget(self.pick_btn)
 
         foot = QHBoxLayout()
         foot.addStretch(1)
@@ -147,9 +163,11 @@ class ShareCodeAskDialog(QDialog):
         self.code_edit.textChanged.connect(self._refresh_state)
         self._refresh_state()
 
-        # Alt+2：鼠标路径的键盘等价（仅本窗激活时生效，不注册全局热键）
+        # Alt+2 / Alt+3：鼠标路径的键盘等价（仅本窗激活时生效，不注册全局热键）
         QShortcut(QKeySequence("Alt+2"), self).activated.connect(
             self._on_once_clicked)
+        QShortcut(QKeySequence("Alt+3"), self).activated.connect(
+            self._on_pick_clicked)
 
         # 逐秒倒计时：单个 1s 重复 QTimer；到点走 _on_timeout（只关闭、不回调）
         self._timer = QTimer(self)
@@ -185,12 +203,28 @@ class ShareCodeAskDialog(QDialog):
         """本窗对应的 share_uk（可能为空串）。"""
         return self.share_uk
 
+    def deadline(self):
+        """绝对截止时刻（epoch 秒）——跨模式交接倒计时用（见 dialogs/common）。"""
+        return self._deadline
+
+    def remaining(self):
+        """当前剩余秒（按绝对截止时刻现算，交接时不重置倒计时）。"""
+        return _remain_from_deadline(self._deadline, self._timeout_sec)
+
+    def is_active(self):
+        """是否仍是「未结束的取码请求」（迁移判定用，与 CODE 页同名）。"""
+        return not bool(self._done or self._timed_out)
+
     # ---- 状态刷新 / 按钮入口 ----
     def _refresh_state(self):
-        """按框内内容刷新下载按钮可用态与行内提示（码无效即置灰）。"""
+        """按框内内容刷新两个动作按钮的可用态与行内提示（码无效即都置灰）。"""
         raw = self.code_edit.text().strip()
         valid = bool(self.current_code())
         self.once_btn.setEnabled(valid)
+        try:
+            self.pick_btn.setEnabled(valid)      # 两个动作按钮同步启用/置灰
+        except Exception:
+            pass
         if not raw:
             self.hint_label.setText("请输入 4 位提取码（字母或数字）")
             self.hint_label.setStyleSheet(
@@ -217,6 +251,10 @@ class ShareCodeAskDialog(QDialog):
 
     def _on_once_clicked(self):
         self._submit("once")
+
+    def _on_pick_clicked(self):
+        """Alt+3：先挑文件再下载（kind="pick"，宿主据此强制走挑选路径）。"""
+        self._submit("pick")
 
     def _on_ignore_clicked(self):
         if self._done or self._timed_out:

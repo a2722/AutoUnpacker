@@ -120,6 +120,142 @@ def _compact_win(win):
         return None
 
 
+def _ask_surface(win):
+    """当前**活动的**取码表面：精简模式返回 CODE 页，完整模式返回浮窗；否则 None。
+
+    只认「未结束」的请求（`is_active()`）——已提交/已忽略/已超时的不算。
+    """
+    cw = _compact_win(win)
+    if cw is not None:
+        try:
+            page = getattr(cw, "code_page", None)
+            if page is not None and page.is_active():
+                return page
+        except Exception:
+            pass
+        return None
+    dlg = getattr(win, "_share_ask_dlg", None)
+    if dlg is not None and _share_window_alive(dlg):
+        try:
+            if dlg.is_active():
+                return dlg
+        except Exception:
+            pass
+    return None
+
+
+def _pending_ask(win):
+    """未结束的「缺提取码」请求快照（跨模式交接用）；没有则 None。
+
+    返回 dict：surl / url / share_uk / force_pick / deadline。
+    `deadline` 是**绝对截止时刻**，交接后倒计时连续、绝不重置（见 dialogs/common）。
+    """
+    surf = _ask_surface(win)
+    if surf is None:
+        return None
+    out = {"surl": "", "url": "", "share_uk": "", "force_pick": False,
+           "deadline": None}
+    try:
+        t_surl, t_uk = _share_dlg_target(surf)
+        out["surl"], out["share_uk"] = t_surl, t_uk
+    except Exception:
+        pass
+    try:
+        out["url"] = str(getattr(surf, "url", "") or "")
+    except Exception:
+        pass
+    try:
+        out["force_pick"] = bool(getattr(surf, "force_pick", False))
+    except Exception:
+        pass
+    try:
+        fn = getattr(surf, "deadline", None)
+        out["deadline"] = fn() if callable(fn) else None
+    except Exception:
+        out["deadline"] = None
+    # 目标全空 ⇒ 认不出是哪个分享，交接没有意义（宁可不弹，也不弹一个空窗）
+    if not (out["surl"] or out["share_uk"] or out["url"]):
+        return None
+    return out
+
+
+def _end_ask_surface(win, from_compact):
+    """静默结束**来源模式**的取码表面（**绝不回调解**）：交接前先收掉旧表面，避免双份。
+
+    `from_compact` 必须由调用方在**模式切换前**判定并传入：切换后 `is_compact()`
+    已翻新，按它推导会找错表面（这正是「交接空转、小窗照样丢」的原因）。
+    - 精简：`cw.leave_code()`（abandon + 回 HOME）；
+    - 完整：摘掉 `on_decision` 再 close（closeEvent 的 ignore 回调因此不会发生），
+      并清空 `win._share_ask_dlg`。
+    返回是否收掉了某个表面。
+    """
+    if from_compact:
+        cw = getattr(win, "_compact_window", None)
+        if cw is None:
+            return False
+        try:
+            cw.leave_code()
+            return True
+        except Exception:
+            return False
+    dlg = getattr(win, "_share_ask_dlg", None)
+    if dlg is None:
+        return False
+    try:
+        dlg.on_decision = None      # 先摘回调：close 只关窗、不产生 ignore 决策
+    except Exception:
+        pass
+    try:
+        dlg.close()
+    except Exception:
+        pass
+    try:
+        win._share_ask_dlg = None
+    except Exception:
+        pass
+    return True
+
+
+def _carry_ask_across_mode(win, to_compact, ask=None, from_compact=None):
+    """模式切换时**不丢失**取码小窗：把未结束的请求交接到目标模式的表面。
+
+    - 切到精简：浮窗 → CompactWindow 的 CODE 页；
+    - 切回完整：CODE 页 → 浮窗；
+    两边共用同一 `deadline`（倒计时连续）。没有未结束请求时是 no-op。
+
+    `ask` / `from_compact` 由调用方在**切换前**取好传入（切换后模式已翻新，
+    再推导就会指错表面）。两个都不传时按「切换前就是当前模式」退化为自行判定。
+    任何异常都吞掉（切换界面绝不因这条增强分支失败）。返回是否发生了交接。
+    """
+    try:
+        if from_compact is None:
+            from_compact = bool(_compact_win(win) is not None)
+    except Exception:
+        from_compact = False
+    if ask is None:
+        try:
+            ask = _pending_ask(win)
+        except Exception:
+            ask = None
+    if not ask:
+        return False
+    try:
+        _end_ask_surface(win, bool(from_compact))
+    except Exception:
+        pass
+    try:
+        _show_share_code_window(win, ask.get("surl") or "", ask.get("url") or "",
+                                ask.get("share_uk") or "",
+                                deadline=ask.get("deadline"))
+        try:
+            setattr(win, "_share_ask_force_pick", bool(ask.get("force_pick")))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _close_share_ask_dlg(win, surl=None, uk=None, url=None, note=None):
     """成功提取后关闭「属于同一分享」的缺提取码小窗（只关闭、绝不回调）。
 
@@ -583,7 +719,8 @@ def _share_pan_open_blocked(win, url):
     return True
 
 
-def _show_share_code_window(win, surl, url, share_uk, open_browser=False):
+def _show_share_code_window(win, surl, url, share_uk, open_browser=False,
+                           deadline=None):
     """把「缺提取码小窗」收敛到唯一入口（Qt 主线程调用）。
 
     - 已有小窗且属于同一分享 → 复用（不覆盖用户已填内容）；
@@ -606,7 +743,7 @@ def _show_share_code_window(win, surl, url, share_uk, open_browser=False):
             cw.show_home(raise_=True)
             _force_pick = bool(getattr(win, "_share_ask_force_pick", False))
             cw.enter_code(surl, url, share_uk, force_pick=_force_pick,
-                          open_browser=bool(open_browser))
+                          open_browser=bool(open_browser), deadline=deadline)
             if open_browser:
                 # 未知分享者：沿用既有「浏览器打开分享页做探针」行为。
                 # UX-4：实验性开启时 pan.baidu 一律静默，绝不显式打开浏览器。
@@ -684,7 +821,8 @@ def _show_share_code_window(win, surl, url, share_uk, open_browser=False):
         # 传 hub= 让 120s 超时日志（「分享询问超时(120s)，已关闭丢弃」）真正出现。
         new_dlg = ShareCodeAskDialog(parent=win, surl=surl, url=url,
                                      share_uk=share_uk,
-                                     hub=getattr(win, "hub", None))
+                                     hub=getattr(win, "hub", None),
+                                     deadline=deadline)
     except Exception as e:
         _share_log(win, f"[分享] 打开提取码询问失败: {e}")
         return None

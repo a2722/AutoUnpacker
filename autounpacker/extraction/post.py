@@ -27,34 +27,46 @@ from .formats import PART_RE, _part_info, is_volume_file, is_volume_name
 
 def strip_embedded_zip(path, dest_dir):
     """把多段伪装文件内嵌的 ZIP 部分剥离成独立 zip 文件（7-Zip 对超大/越界偏移的
-    内嵌 ZIP64 打不开，剥离后可正常处理，含 AES 加密）。失败返回 None。"""
+    内嵌 ZIP64 打不开，剥离后可正常处理，含 AES 加密）。失败返回 None。
+
+    起点算法（**权威**，别再改回 min(header_offset)）：多段伪装文件 = 前导数据 +
+    内嵌 ZIP。`ZipInfo.header_offset` 是**相对归档起点**的偏移（不含前导），而
+    `min(header_offset)` 常落在前导区里的**伪 local header** 上 ⇒ 从它起切会**少切
+    一截**头部，副本被 7-Zip 判 `Unavailable start of archive`（rc=2）而必然失败，
+    于是白掉进「改用 Python zipfile 重试」的长尾（实测 1.79GB 包 CPU 空转 25 分钟）。
+    正确起点由 EOCD 反推：`起点 = EOCD绝对位置 - (中央目录偏移 + 中央目录大小)`
+    —— 中央目录偏移同样是相对归档起点的，两者相减即得归档在文件中的真实位置。
+    """
     try:
         path = Path(path)
-        with zipfile.ZipFile(path) as zf:
-            entries = [i for i in zf.infolist() if not i.is_dir()]
-            if not entries:
-                return None
-            start = min(i.header_offset for i in entries)
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            if size - start <= 0:
+            if size <= 22:
                 return None
+            # EOCD 固定在归档最后 22 字节起、注释最长 65535 ⇒ 取尾部 65557 字节足够
             f.seek(max(0, size - 65557))
             tail = f.read()
-        eocd = tail.rfind(b"PK\x05\x06")
-        if eocd < 0:
+        eocd_rel = tail.rfind(b"PK\x05\x06")
+        if eocd_rel < 0:
             return None
-        clen = struct.unpack_from("<H", tail, eocd + 20)[0]
-        end = (size - (len(tail) - eocd)) + 22 + clen
-        if end <= start:
+        eocd_abs = size - (len(tail) - eocd_rel)
+        try:
+            cd_size, cd_off = struct.unpack_from("<II", tail, eocd_rel + 12)
+        except struct.error:
+            return None
+        # 权威起点：EOCD 绝对位置 − (中央目录偏移 + 中央目录大小)
+        start = eocd_abs - (int(cd_off) + int(cd_size))
+        if start < 0 or start >= size:
+            return None
+        if size - start <= 0:
             return None
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / f"poly_{path.stem[:20]}_{uuid.uuid4().hex[:6]}.zip"
         with open(path, "rb") as src, open(dest, "wb") as out:
             src.seek(start)
-            remaining = end - start
+            remaining = size - start
             while remaining > 0:
                 chunk = src.read(min(8 * 1024 * 1024, remaining))
                 if not chunk:

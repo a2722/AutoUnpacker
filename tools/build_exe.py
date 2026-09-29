@@ -70,8 +70,19 @@ def _copy_bundle_next_to_exe() -> bool:
 
 
 def _gen_icon() -> bool:
-    """离屏渲染托盘图标 → 多尺寸 ico。失败只警告，不阻断打包。"""
+    """准备 exe 图标：优先用随包交付的 `onion-arrow.ico`（多尺寸、已是成品），
+    取不到时回落「离屏渲染托盘图标 → 放大 → Pillow 合成」。失败只警告，不阻断打包。"""
     try:
+        import shutil
+        ASSETS.mkdir(parents=True, exist_ok=True)
+
+        # ① 首选：包内交付的成品 .ico（16/24/32/48/64/128/256 多帧，不糊）
+        delivered = ROOT / "autounpacker" / "assets" / "onion-arrow.ico"
+        if delivered.exists():
+            shutil.copyfile(str(delivered), str(ASSETS / "AutoUnpacker.ico"))
+            return True
+
+        # ② 回落：离屏渲染旧绘图再合成（保持历史行为，图标缺失也不至于没有图标）
         import os
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         sys.path.insert(0, str(ROOT))
@@ -80,9 +91,7 @@ def _gen_icon() -> bool:
         from autounpacker.ui.widgets.inputs import make_tray_icon
         from PIL import Image
 
-        ASSETS.mkdir(parents=True, exist_ok=True)
         png = ASSETS / "_icon_src.png"
-        # make_tray_icon() 只提供 64x64 的位图；放大会糊，所以按需要平滑放大到 256 再交给 Pillow 合成多尺寸 ico
         from PyQt5.QtCore import Qt
         pm = make_tray_icon().pixmap(256, 256)
         if pm.width() < 256 or pm.height() < 256:

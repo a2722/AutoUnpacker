@@ -32,6 +32,13 @@ ui-proposals/
 # ===== 内部维护笔记（AI/维护者专用，不公开） =====
 .omo/
 
+# ===== 交付物里的「内部交流」材料（只在我们之间流转，绝不入库） =====
+# 图标/素材包常带交付说明、设计稿说明等，属内部交流文档，不是源码。
+# 放进 assets/ 的只允许成品资源（.ico/.png/.svg 等）+ 代码引用。
+autounpacker/assets/*.txt
+autounpacker/assets/*.md
+autounpacker/assets/README*
+
 # ===== Python 缓存 =====
 __pycache__/
 *.pyc
@@ -46,6 +53,9 @@ build/
 dist/
 venv/
 .venv/
+# 发版资产（冻结更新包 / 便携包）由 make_release_asset.py 生成后**只上传 Release**，
+# 绝不入库（历史上仓库从未跟踪任何 .zip）。dist/ 已在上方忽略，这里兜住根目录那份。
+/AutoUnpacker-*.zip
 
 # ===== 第三方二进制 =====
 *.dll

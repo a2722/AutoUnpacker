@@ -28,6 +28,19 @@ CONTENT_STOP_MIN_FILES = 30
 CONTENT_STOP_MIN_SMALL = 10
 CONTENT_STOP_MIN_BUCKETS = 3
 
+# Python zipfile 兜底「明显会慢」的归档体积门槛（MB）：超过时提前告知用户
+# 「纯 Python 解压可能需较长时间」，而不是让日志长时间静默被误判为卡死。
+# 真机案：1.79GB ZipCrypto 包纯 Python 解压约 25 分钟。
+_PYZIP_SLOW_MB = 200.0
+
+
+def _archive_size_mb(path):
+    """归档体积（MB）；取不到返回 0.0（绝不影响解压主流程）。"""
+    try:
+        return Path(path).stat().st_size / 1048576.0
+    except OSError:
+        return 0.0
+
 
 def looks_like_complete_content(paths):
     """启发式：解出的内容里存在大量大小不一的零碎文件时，通常已到达真实内容层，
@@ -301,7 +314,17 @@ class ExtractService:
                               "logs": list(best.get("logs") or [])
                                        + ["[警告] 7-Zip 返回非零退出码，但校验文件数量与大小后确认全部解出"]}
                 else:
-                    self.emit(f"[第{depth}层] 改用 Python zipfile 重试")
+                    # Python zipfile 兜底：纯 Python 逐字节解压，超大归档会非常慢
+                    # （真机案：1.79GB ZipCrypto 包 ~25 分钟、期间无任何输出）。
+                    # 仅在 7-Zip 也拿不下的情况下才用，且超阈值时先如实告知用户
+                    # 「需要多久」，不让人误以为卡死。
+                    size_mb = _archive_size_mb(item["archive"])
+                    self.emit(f"[第{depth}层] 改用 Python zipfile 重试"
+                              + (f"（{size_mb:.0f} MB，纯 Python 解压可能需较长时间）"
+                                 if size_mb >= _PYZIP_SLOW_MB else ""))
+                    if size_mb >= _PYZIP_SLOW_MB:
+                        self.emit(f"[第{depth}层] 提示：7-Zip 未能处理该归档，"
+                                  f"Python 兜底正在解压，请耐心等待（期间无进度输出）")
                     fallback_attempts.append(PythonZipEngine().extract(layer_task, self.options, depth))
                     winner = next((a for a in fallback_attempts if a["success"]), None)
                     if winner is not None:

@@ -278,11 +278,31 @@ def mark_restored_exempt(original_path):
     return False
 
 
+def _ident_matches(stored, now, mtime_tol=2.0):
+    """身份比对：大小必须相等，mtime 允许秒级小偏差（还原会保留时间戳，但
+    回收站往返后常见亚秒级差异，精确浮点相等会把真豁免误判成「已替换」）。
+
+    容差口径与 `deletion/recycle._same_identity` **完全一致**——同一份「文件身份」
+    语义只该有一套，否则两处判定会各说各话（真机 BUG：还原豁免登记后被精确比较
+    判成失效并顺手清掉，于是「还原回来的文件又被解压、再被删」）。
+    """
+    try:
+        if not stored or not now:
+            return False
+        if int(stored[0]) != int(now[0]):
+            return False
+        return abs(float(stored[1]) - float(now[1])) <= float(mtime_tol)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
 def is_restored_exempt(original_path):
     """该源文件是否处于「已还原 ⇒ 豁免」状态**且身份未变**。
 
     身份（size, mtime）对不上 → 说明已被重新下载/替换，豁免立即失效并顺手清掉那条
-    登记（绝不让豁免黏在别的文件上）。任何异常一律按「不豁免」处理。
+    登记（绝不让豁免黏在别的文件上）。mtime 比较走 `_ident_matches` 的**容差**口径
+    （与 recycle._same_identity 同源）——回收站还原回来的文件常有亚秒级时间戳差异，
+    用精确相等会把合法豁免误判成失效。任何异常一律按「不豁免」处理。
     """
     try:
         target = str(Path(original_path).resolve())
@@ -304,7 +324,7 @@ def is_restored_exempt(original_path):
                     if not (isinstance(e, dict) and e.get("path") == target):
                         keep.append(e)
                         continue
-                    if list(e.get("ident") or []) == ident:
+                    if _ident_matches(e.get("ident"), ident):
                         hit = True
                         keep.append(e)
                     else:

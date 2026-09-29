@@ -322,12 +322,16 @@ class CompactWindow(QWidget):
         return bool(self._on_top)
 
     # ================= 冻结接口：CODE 页（分享流程唯一入口） =================
-    def enter_code(self, surl, url, share_uk, force_pick=False, open_browser=False):
+    def enter_code(self, surl, url, share_uk, force_pick=False, open_browser=False,
+                   deadline=None):
         """进入 / 复用 CODE 页。
 
         单例：CODE 页当前就是这个 (surl 或 share_uk) -> 只更新字段 + 重置 120s
         倒计时，返回 False；否则 push CODE 页（记住 force_pick）并启动倒计时，
         返回 True（调用方可据此决定是否做「未知分享者探针」之类的首次动作）。
+
+        `deadline`：绝对截止时刻（跨模式交接用）。给定时**倒计时按其剩余秒续上**，
+        **绝不重置**——从完整模式浮窗切到精简模式时，用户看到的剩余秒是连续的。
         """
         surl = str(surl or "").strip()
         url = str(url or "").strip()
@@ -339,10 +343,10 @@ class CompactWindow(QWidget):
         if same:
             if self.current_page_key() != "CODE":
                 self.push_page("CODE")
-            self.code_page.start()
+            self.code_page.start(deadline)
             return False
         self.push_page("CODE")
-        self.code_page.start()
+        self.code_page.start(deadline)
         if open_browser:
             self._probe_share_url(url)
         return True

@@ -301,6 +301,14 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
+    # 应用图标（任务栏 / Alt-Tab / 各窗口默认图标）：与托盘图标同一来源，
+    # 取不到时静默跳过（图标不是关键路径，绝不影响启动）。
+    try:
+        from .ui.widgets.inputs import make_tray_icon
+        app.setWindowIcon(make_tray_icon())
+    except Exception:
+        pass
+
     # 主题：启动**不做任何系统检测**（零启动开销），先用「上次记住的主题」出首屏；
     # 窗口显示后再检测纠正一次；之后靠 WM_SETTINGCHANGE 跟随系统切换（零轮询）。
     _pref = str(cfg.get("ui_theme", "auto") or "auto").lower()

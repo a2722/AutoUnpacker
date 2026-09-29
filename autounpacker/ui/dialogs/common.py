@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """对话框共享模块级名字：回溯状态词表/回收站文案/取码小窗常量、_call_decision、_CodeLineEdit。"""
 import inspect
+import math
+import time
 
 from PyQt5.QtWidgets import QLineEdit
 
@@ -34,10 +36,38 @@ SHARE_ASK_EDGE_MARGIN = 16
 SHARE_ASK_WINDOW_WIDTH = 300
 
 
+def ask_deadline(remain_sec):
+    """由「剩余秒数」算出**绝对截止时刻**（epoch 秒）。
+
+    取码请求的倒计时在两套表面之间交接（完整模式浮窗 ⇄ 精简模式 CODE 页），
+    必须有一个与界面无关的真值：绝对截止时刻。交接时传它，**倒计时连续、绝不重置**。
+    """
+    try:
+        return time.time() + max(1, int(remain_sec))
+    except Exception:
+        return time.time() + SHARE_ASK_TIMEOUT_SEC
+
+
+def remain_from_deadline(deadline, fallback=SHARE_ASK_TIMEOUT_SEC):
+    """由绝对截止时刻算剩余秒（向上取整，至少 1）；deadline 无效时回退 fallback。
+
+    与 `ask_deadline()` 成对：这是倒计时数学的唯一真源，浮窗与 CODE 页共用，
+    避免两处各写一份「怎么算剩余」而漂移。
+    """
+    try:
+        return max(1, int(math.ceil(float(deadline) - time.time())))
+    except Exception:
+        try:
+            return max(1, int(fallback))
+        except Exception:
+            return SHARE_ASK_TIMEOUT_SEC
+
+
 def _call_decision(cb, kind, code, url, surl, share_uk):
     """按注入 callable 可接受的位置参数个数回调 on_decision，兼容旧/新签名。
 
-    冻结词表：kind ∈ {"mapped", "once", "ignore"}（ignore 时 code 为空串）。
+    冻结词表：kind ∈ {"mapped", "once", "pick", "ignore"}（ignore 时 code 为空串）。
+    "once" = 全部下载；"pick" = 先挑文件再下载（完整模式小窗的第二个动作按钮）。
     - 新接线：cb(kind, code, url, surl, share_uk)
     - 旧接线（仍闭包 url/surl/uk 的 2 参 lambda）：cb(kind, code)
     """

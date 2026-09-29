@@ -158,7 +158,47 @@ class _Switch(QCheckBox):
             painter.end()
 
 
+def app_icon_path():
+    """应用图标资源目录 `autounpacker/assets/` 下的图标路径（不存在返回 None）。
+
+    资源随包分发（源码运行与 PyInstaller 冻结运行都可定位）：
+    - 源码运行：`assets/` 与 `inputs.py` 的相对位置固定（包内），直接用
+      `Path(__file__)` 往上一级拼；
+    - 冻结运行：datas 会把 `assets` 解到 `sys._MEIPASS` 下（见 spec），
+      优先从那里取；两种情况都取不到时返回 None，由调用方回落旧绘图。
+    """
+    try:
+        from pathlib import Path
+        import sys as _sys
+        cands = []
+        meipass = getattr(_sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "assets")
+        # inputs.py 位于 autounpacker/ui/widgets/ ⇒ 包根 = parents[2]
+        cands.append(Path(__file__).resolve().parents[2] / "assets")
+        for base in cands:
+            ico = base / "onion-arrow.ico"
+            if ico.exists():
+                return ico
+    except Exception:
+        pass
+    return None
+
+
 def make_tray_icon():
+    """应用 / 托盘图标：优先用交付的洋葱-箭图标，取不到时回落旧绘图（行为不变）。"""
+    try:
+        ico = app_icon_path()
+        if ico is not None:
+            icon = QIcon(str(ico))
+            if not icon.isNull():
+                return icon
+    except Exception:
+        pass
+    return _make_tray_icon_fallback()
+
+
+def _make_tray_icon_fallback():
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)

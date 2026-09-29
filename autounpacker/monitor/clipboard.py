@@ -166,7 +166,7 @@ def _imagegrab():
 
 
 # ==================== 剪贴板二维码识别 ====================
-# 带这些扩展名的文本基本是文件名（如 MAKO202608.jpg / 画面.png），不是提取码
+# 带这些扩展名的文本基本是文件名（如 示例图片.jpg / 画面.png），不是提取码
 _FILE_EXT_RE = re.compile(
     r"\.(png|jpe?g|gif|bmp|webp|tiff?|svg|mp4|mkv|avi|mov|wmv|flv|"
     r"rar|zip|7z|tar|gz|txt|json|xml|lnk|exe|dll|msi|pdf|db|log|"

@@ -5,6 +5,38 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.8] - 2026-09-29
+
+> **本轮重点**：① 取码小窗补齐动作按钮——完整模式**两个**（「全部下载（Alt+2）」/「挑选文件下载（Alt+3）」）、精简模式**一个**，旧文案「本次使用」改为「全部下载」；② **取码小窗在精简 ⇄ 完整切换时不再丢失**（两套表面交接请求、**倒计时连续**）；③ **还原豁免修好了**——从删除回溯还原回来的源文件不再被重复解压（真机根因是身份比较漏了 mtime 容差）；④ 应用图标换成交付的**洋葱-箭**（精简到 `.ico` + 矢量源两个文件）；⑤ 修一个「以前能解、现在卡」的真机回归——多段伪装 ZIP 的**剥离起点偏移算错**，导致 7-Zip 被喂了坏副本、白掉进纯 Python 兜底（实测 1.79GB 包空转约 25 分钟）。另外把 `.gitignore` 补上「交付物里的内部交流材料」守门（这类文档绝不入库）。
+
+### 新增
+- **应用图标（洋葱-箭）**：交付的多尺寸图标随包放进 `autounpacker/assets/`，**精简到只留成品 `onion-arrow.ico`（内含 16/24/32/48/64/128/256 七帧）+ 矢量源 `onion-arrow.svg`**（原 17 个文件 268.9 KB → 2 个 51.8 KB；散装各尺寸 PNG 与透明底版全删——代码只用 `.ico`，多尺寸由 ico 自带，SVG 留作矢量母版）。`make_tray_icon()` 改为**优先加载真 .ico**、取不到时**回落旧绘图**（行为不变、绝不返回空）；新增 `app_icon_path()` 同时覆盖**源码运行**与 **PyInstaller 冻结运行**（`sys._MEIPASS/assets`）两种定位。接入点：托盘图标 / 主窗 / 精简小窗 / **`QApplication.setWindowIcon()`（此前未设，任务栏与 Alt-Tab 用的是默认图标）**。打包侧：`tools/build_exe.py` 的 exe 图标改为**直接用交付 .ico**（不再"渲染 64×64 再放大"，避免糊），`AutoUnpacker.spec` 的 `datas` 增加 `autounpacker/assets/` 以便冻结态取到图标。
+- **`.gitignore` 增加「交付物里的内部交流材料」守门**：`autounpacker/assets/*.txt`、`assets/*.md`、`assets/README*` 一律不入库。图标/素材包常夹带交付说明、设计稿说明等**内部交流文档**（如原 `ICON-README.txt`），按仓库既有约定（见 `.gitignore` 的「本地排查/笔记文件」「内部维护笔记」两段）绝不公开；`assets/` 只允许成品资源（`.ico/.png/.svg` 等）。已核对：**已跟踪文件里没有任何内部交流材料**（历史上也从未上传过）。
+
+### 修复
+- **取码小窗在「精简 ⇄ 完整」切换时丢失（真机：无提取码链接的填码窗一切界面就没了）**。现象：实验性开启、复制一个**无提取码**的分享链接弹出的填码窗，一切换「精简界面 / 返回完整界面」就整个消失，用户再也没法填码。根因：这条流程有**两套互不相识的表面**——完整模式是贴主窗右缘的 `ShareCodeAskDialog` 浮窗（主窗 hide 时被一起隐藏），精简模式是 `CompactWindow` 的 CODE 页；`_toggle_compact` 只做「隐藏一方、显示另一方」，**没有任何交接**，`ui_compact` 一变另一边完全不知道有未完成的取码请求。
+  - **修复**：给取码请求引入**与界面无关的绝对截止时刻（deadline）**，切换时把未结束的请求**交接**到目标模式的表面：`_pending_ask()` 在切换**前**快照（surl/url/share_uk/force_pick/deadline），`_carry_ask_across_mode()` 先静默收掉来源表面（`leave_code()` / 摘掉 `on_decision` 再 close，**绝不产生决策回调**，避免两份同屏），再在目标表面重建。倒计时数学收敛到 `dialogs/common.ask_deadline()` / `remain_from_deadline()` **唯一真源**，浮窗与 CODE 页共用 ⇒ **切换后倒计时连续、绝不重置为满额**。没有未结束请求时是 no-op（绝不凭空弹窗）。
+  - 回归用例 `test_share_ask_carry.py`（19 项）：两方向交接、字段一致、旧表面静默收掉、**决策回调一次都不触发**、no-op；并用**真实等待**量化倒计时共用（显式「只剩 30 秒」的 deadline → 交接后仍 ~30 且真在走 → 再切回仍是同一个 deadline）。
+- **还原豁免失效（真机：从删除回溯还原的源文件又被解压、再被删）**。现象：用户还原的 `看看缝合操作有多难，你会手抖吗.mp4` 回到监听目录后，监听线程**又完整解压了一遍**（日志 `18:01:57 === 处理 ===` → `18:02:18 === 完成，穿透 1 层，共 8 个文件 ===`），豁免完全没生效；查 `deletion_trail.json` 该记录 `restored_exempt = None`（**登记已被清掉**）。
+  - **根因**：`records.is_restored_exempt` 用 `list(e.get("ident")) == ident` 做**精确浮点相等**比较 mtime；而回收站往返后 mtime 常有**亚秒级偏差** ⇒ 判成「已被替换」⇒ 不豁免、**并把登记顺手清掉**（所以事后看是 `None`，日志里连豁免那行都没有）。仓库自己的口径 `deletion/recycle._same_identity` 明明是「大小相等 + **mtime 容差 2.0s**」——同一份「文件身份」语义在两处各说各话。既有用例 `test_p03_restore_guard` 之所以没抓到：它用 `os.utime` 把 mtime **精确设回**记录值，恰好掩盖了这个缺陷。
+  - **修复**：抽出 `records._ident_matches(stored, now, mtime_tol=2.0)`，与 `recycle._same_identity` **同源同容差**（大小必须相等；mtime 容差 2.0s）；`is_restored_exempt` 改用它。真实替换（偏差远超容差）仍照旧失效并清登记。
+  - 回归用例 `test_restored_exempt_path.py`（16 项）：**改前 F1/F2 必失败**（亚秒偏差 ⇒ 判不豁免且登记被清空），改后全绿；`test_p03_restore_guard.py` 20/20 未破。
+- **多段伪装 ZIP 剥离起点偏移（真机：`D:\test\看看缝合操作有多难，你会手抖吗.mp4`，1.79GB）**。现象：文件 = MP4 前导 + 内嵌 ZIP；7-Zip 打不开原文件 → 程序「剥离伪装头后重试」→ **副本 7-Zip 仍 rc=2 / `Unavailable start of archive`** → 掉进「改用 Python zipfile 重试」（纯 Python 逐字节解压 1.79GB ZipCrypto 流，**约 25 分钟且期间零输出**），看起来像卡死。
+  - **根因**：`strip_embedded_zip` 用 `min(i.header_offset for i in entries)` 当归档起点。但 `header_offset` 是**相对归档起点**的偏移（不含前导数据），多段伪装时它会落在前导区里的**伪 local header** 上 ⇒ 从它起切**少切一截头**（实测少 39 字节），副本头被截断，7-Zip 必然判 `Unavailable start of archive`。
+  - **修复**：起点改用**权威算法**（由 EOCD 反推）：`起点 = EOCD绝对位置 − (中央目录偏移 + 中央目录大小)`；`end` 直接用文件尾（归档尾部即文件尾），不再自行推算注释长度。真机样本实测：剥离产物由 `1907155491` → **`1907155530`** 字节（= 7-Zip 报告的期望值），`7z l` 由 **rc=2 → rc=0**，**7-Zip 直接就能解**，Python 兜底不再触发。
+  - **附带**：顺手核实「错密码假命中」不成立（ZipCrypto 判据正确：真密码命中、错密码与空密码实测全部返回 `None`），故未改动 `_test_password_any`；仅在 Python 兜底入口对 ≥200MB 归档**提前如实告知**「纯 Python 解压可能需较长时间、期间无进度输出」，避免再次被误判为卡死。
+  - 回归用例 `test_polyglot_strip_offset.py`（12 项，含结构复现 + 真机同构的 39 字节偏移）：**改前 3 项必失败**（`EOCD` 反推起点为 `-41`，与真机 7-Zip 报的 `Offset = -39` 同构），改后全绿。
+- **顺带修掉一个新用例的偶发死锁**：`test_autostart_and_tray.py` 先 `ensure_all_domains()` 触发 7-Zip 后台探测线程 lazily import `dialogs.sevenzip`、同时主线程 import `MainWindow`，会在模块锁上撞出 `_DeadlockError(ModuleLock('autounpacker.ui.dialogs.sevenzip'))`（真机表现为偶发失败）。固定为先 import `MainWindow` 再建 `SettingsPage`，消除该竞态。
+
+### 测试
+- 新增离线用例 `test_polyglot_strip_offset.py`（12 项断言：权威起点复现 / 产物逐字节一致 / 头部齐整 / 条目齐全 / 普通 ZIP 不回归 / 非 ZIP 与空档案返回 None）。
+- 新增离线用例 `test_app_icon.py`（18 项断言：资源已精简为「.ico 七帧 + 矢量源」/ 真 .ico 加载覆盖多档 / 内部交流文档不进包 / 旧绘图兜底仍可用 / 冻结态优先 `_MEIPASS` / 打包产物与交付 .ico 逐字节一致）。
+- 新增离线用例 `test_restored_exempt_path.py`（16 项断言：还原登记的路径写法归一、mtime 容差内仍豁免且登记不被清、超容差才失效）。
+- 新增离线用例 `test_share_ask_carry.py`（19 项断言：取码请求跨模式交接两方向 / 字段一致 / 旧表面静默收掉 / 绝不触发决策回调 / 无请求时不凭空弹窗 / 真实计时验证倒计时共用）。
+- 新增离线用例 `test_share_ask_buttons.py`（22 项断言：完整模式两个动作按钮与文案 / 码空都置灰 / 两按钮分别产出 `once` 与 `pick` / 宿主 `pick` 与标记都强制挑选 / **精简模式恰好一个**动作按钮 / 精简模式下 Alt+3 确实进入小窗 PICK 页且完整模式才用独立挑选窗）。
+- 既有文案类断言随「本次使用 → 全部下载」同步更新（`test_w1_ask` / `test_ux_fixes` / `test_compact_window` 仅改按钮文案，断言强度不变）。
+- 串行全量 **160 项 / FAILCOUNT=3**（`test_dead_share_flow` / `test_need_code_gate` / `test_polish_three`，环境依赖的既有失败，与本次无关）。
+
 ## [2.2.7] - 2026-09-29
 
 > **本轮重点**：把百度网盘客户端集成从「一处硬编码 + 零版本概念」变成**可配置 + 可探测**——客户端**进程名可由用户在设置页配置**（默认与历史硬编码逐字一致），并新增**客户端版本探测**（只记录 / 展示，**绝不阻断**）；新增**开机自启**（静默启动，不弹主界面）与托盘「使用精简界面」一键入口。修复方面：**设置项气泡只剩文字没有背景**、以及**启动期日志重复上屏**（真机「两组重复的日志」）。百度相关结论由一次抓包复盘驱动，见下方「调查记录」。
@@ -14,6 +46,7 @@
 - **托盘菜单「使用精简界面」**：完整界面下右键托盘图标，新增一项一键切到精简小窗（与右上角「⤡ 精简界面」同一入口 `_toggle_compact(True)`）；仅在**完整模式**下可见，精简模式下改由既有「返回完整界面」承担，两者互斥不重复出现。
 
 ### 变更
+- **取码小窗的动作按钮（完整模式两个 / 精简模式一个）**：完整模式的「分享缺提取码」浮窗改为**两个动作按钮**——「**全部下载（Alt+2）**」整包提交、「**挑选文件下载（Alt+3）**」先挑文件再下载；**精简模式的 CODE 页刻意保持一个动作按钮**（「全部下载」），挑文件走全局 Alt+3 手势。Alt+2 在该小窗上的旧文案「本次使用」已按新语义改为「**全部下载**」（Alt+3 的功能此前改过，旧名已不达意）。决策词表新增 `kind="pick"`（`{"mapped","once","pick","ignore"}`）：宿主任一命中 `kind == "pick"` **或** `_share_ask_force_pick` 标记即强制走挑选路径，两条来源互不干扰。
 - **客户端进程名可配置**：新增 `baidu_client_proc_names`（逗号分隔字符串，默认 `BaiduNetdisk.exe,YunDetectService.exe,BaiduNetdiskHost.exe`）；设置 → 链接与网盘 新增同名文本行（实验性组，随总开关置灰）。解析口径：半角 / 全角逗号分隔、逐项去空白、大小写不敏感去重、单项截 64 字符、最多 32 项；**留空 / 全是分隔符 / 键缺失一律回落到内置三进程名**（绝不返回空表）。`share._client_running()`（`tasklist` 子串匹配）与 `watch._baidu_running()`（Toolhelp32 按映像名精确匹配）**共用同一个解析器**，避免两处口径漂移——百度若改名 `BaiduNetdisk.exe`，用户改配置即可，不必等发版。
 - **客户端版本探测（只报不拦）**：`baidu/db.py` 新增 `_registry_client_exe()`（从协议关联命令解析 exe 路径，`_registry_install_dir()` 改为复用）、`parse_version()` / `version_below()`、`client_version()`——优先读 exe 的文件版本资源（纯 stdlib `ctypes`：离线、失败返回 `None`、成功后缓存），回落卸载项注册表的 `DisplayVersion`。唤起时 info 记一行；**已知**版本低于软阈值 `MIN_WAKE_VERSION = (4, 8, 0)`（取自百度网页端 `GUANJIA_VERSION_COMPARE`）时**只多一条 warning**，**不阻断、不延迟、不重试**。成功文案仅在探测到版本时追加「（客户端 X.Y.Z.W）」，探测不到则**逐字保持旧文案**。
 

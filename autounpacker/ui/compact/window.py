@@ -1331,7 +1331,8 @@ class CompactWindow(QWidget):
             except Exception:
                 blocked = False
         if blocked:
-            self._log("已开启实验性：pan.baidu 网址改走静默通道，不在浏览器打开")
+            # 静默说明已由 `_share_pan_open_blocked`（经 `_share_log`）记过一行；
+            # 这里绝不再补一行，否则一次动作会重复出现两行（文件 1 + DB 2）。
             return
         try:
             webbrowser.open(url, new=2)

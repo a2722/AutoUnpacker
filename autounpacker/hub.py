@@ -94,34 +94,43 @@ class Hub:
     通知按类型可控：notify_enabled 总开关 + 各类型单独开关（见 NOTIFY_KEYS）。
     """
 
-    # 通知标题 -> 对应配置开关
+    # 通知标题 -> 对应配置开关（2026-09-29 按「类型」归并：成功 / 报错 / 必要提醒）
     NOTIFY_KEYS = {
-        "发现压缩包": "notify_archive",
+        # 成功与完成提示（默认关）
+        "发现压缩包": "notify_success",
         "智能解压完成": "notify_success",
-        "智能解压失败": "notify_failure",
+        "网盘下载完成": "notify_success",
+        "识别二维码图片": "notify_success",
+        "已最小化到托盘": "notify_success",
+        "程序已在运行时提示": "notify_success",
+        # 报错提示（默认开）
+        "智能解压失败": "notify_error",
         "智能解压出错": "notify_error",
-        # 实验性：百度网盘任务库（A/B/C/D）
-        "网盘下载完成": "notify_baidu_done",
-        "网盘任务未完成": "notify_baidu_leftover",
-        "网盘重复下载": "notify_baidu_dup",
-        # 分享 / 网盘分享家族：14 种标题统一由 notify_share 一个分组开关控制
-        "分享手势超时": "notify_share",
-        "分享链接正在解析": "notify_share",
-        "二维码正在解析": "notify_share",
-        "分享缺少提取码": "notify_share",
-        # 「链接已失效」在分组开关之外再挂一个**专用**开关：想留失效提醒、只关
-        # 分享类噪音的人关 notify_share；想彻底静音的人关 notify_share_dead。
-        # 元组 = 两个开关必须同时为真才显示。
-        "分享链接已失效": ("notify_share", "notify_share_dead"),
-        "分享下载已中断": "notify_share",
-        "拉起后校验失败": "notify_share",
-        "分享拉起失败": "notify_share",
-        "分享下载失败": "notify_share",
-        "分享需要选择文件": "notify_share",
-        "用客户端下载分享": "notify_share",
-        "实验性自动拉起": "notify_share",
-        "分享下载": "notify_share",
-        "重复的分享链接": "notify_share",
+        "智能解压部分完成": "notify_error",
+        "分享链接已失效": "notify_error",
+        "分享下载已中断": "notify_error",
+        "拉起后校验失败": "notify_error",
+        "分享拉起失败": "notify_error",
+        "分享下载失败": "notify_error",
+        "网址访问失败": "notify_error",
+        "监听目录不可用": "notify_error",
+        "磁盘空间不足": "notify_error",
+        "分卷等待放弃": "notify_error",
+        # 必要提醒（默认开）
+        "分享手势超时": "notify_reminder",
+        "分享链接正在解析": "notify_reminder",
+        "二维码正在解析": "notify_reminder",
+        "分享缺少提取码": "notify_reminder",
+        "分享需要选择文件": "notify_reminder",
+        "重复的分享链接": "notify_reminder",
+        "用客户端下载分享": "notify_reminder",
+        "实验性自动拉起": "notify_reminder",
+        "分享下载": "notify_reminder",
+        "发现未完成下载": "notify_reminder",
+        "疑似改名分卷": "notify_reminder",
+        "网盘任务未完成": "notify_reminder",
+        "网盘重复下载": "notify_reminder",
+        "有新的网址等待确认": "notify_reminder",
     }
 
     def __init__(self, state=None):
@@ -335,9 +344,8 @@ class Hub:
             if not cfg.get("notify_enabled", True):
                 return
             key = self.NOTIFY_KEYS.get(title)
-            # 值可以是单个键名，也可以是键名元组：全部为真才显示（分组开关 +
-            # 专用开关叠加）。元组形式用于「分享链接已失效」这类既要受分组管、
-            # 又想单独关掉的标题。
+            # 值可以是单个键名，也可以是键名元组：全部为真才显示（多个开关叠加）。
+            # 按类型归并后每条标题只映射单个「类型」键，元组形式保留兼容。
             keys = key if isinstance(key, (tuple, list)) else (key,)
             for k in keys:
                 if k and not cfg.get(k, True):

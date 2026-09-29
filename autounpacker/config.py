@@ -53,19 +53,13 @@ def delete_policy_permanent_fallback(policy):
 DEFAULT_CONFIG = {
     "qr_enabled": True,
     "clipboard_enabled": True,   # 剪贴板监听总开关：关闭后本程序完全不读取剪贴板（拖入文件/图片不受影响）
-    "notify_enabled": True,
-    "notify_share": True,              # 分享 / 网盘分享类通知（手势/解析/拉起/下载结果统一开关）
-    "notify_share_dead": True,         # 「分享链接已失效」专用开关（叠加在 notify_share 之上）
-    "notify_archive": False,
-    "notify_success": False,
-    "notify_failure": True,
-    "notify_error": True,
-    "notify_trayed": False,           # 托盘提示：已最小化到托盘
-    "notify_already_running": False,  # 托盘提示：程序已在运行，已打开主界面
-    "notify_trust_pending": True,     # 托盘提示：有新的网址等待确认
-    "notify_baidu_done": False,       # 实验性：网盘下载批次完成
-    "notify_baidu_leftover": True,    # 实验性：启动时有未完成的网盘任务
-    "notify_baidu_dup": True,         # 实验性：新任务与历史下载重复（默认开）
+    # 通知开关（2026-09-29 按「类型」归并）：15 个子开关合并为 3 个类型开关（+ 总开关）。
+    # 归并只改「哪个键管哪条标题」，不改任何事件是否通知；旧键由 _sanitize_cfg
+    # 以 OR 语义迁移后静默丢弃（任一为真即为真）。
+    "notify_enabled": True,            # 通知总开关（关闭后不再弹任何提示，日志仍照记）
+    "notify_success": False,           # 成功与完成提示（发现压缩包、解压/下载完成、识别二维码等）
+    "notify_error": True,              # 报错提示（解压失败/出错、分享/网盘/网址失败、磁盘不足等）
+    "notify_reminder": True,           # 必要提醒（解析中/超时、缺少提取码、未完成下载、待确认等）
     "qr_clipboard_action": "code",   # none=不处理 code=恢复最近非图片内容 url=写回二维码内容
     "qr_url_redirect": True,
     "promote_merge": True,           # 提升时同名文件夹无文件冲突则合并
@@ -287,18 +281,42 @@ def _sanitize_cfg(cfg):
         cfg["qr_enabled"] = bool(cfg.get("qr_enabled", True))
         cfg["clipboard_enabled"] = bool(cfg.get("clipboard_enabled", True))
         cfg["notify_enabled"] = bool(cfg.get("notify_enabled", True))
-        cfg["notify_share"] = bool(cfg.get("notify_share", True))
-        cfg["notify_share_dead"] = bool(cfg.get("notify_share_dead", True))
-        cfg["notify_archive"] = bool(cfg.get("notify_archive", False))
-        cfg["notify_success"] = bool(cfg.get("notify_success", False))
-        cfg["notify_failure"] = bool(cfg.get("notify_failure", True))
-        cfg["notify_error"] = bool(cfg.get("notify_error", True))
-        cfg["notify_trayed"] = bool(cfg.get("notify_trayed", False))
-        cfg["notify_already_running"] = bool(cfg.get("notify_already_running", False))
-        cfg["notify_trust_pending"] = bool(cfg.get("notify_trust_pending", True))
-        cfg["notify_baidu_done"] = bool(cfg.get("notify_baidu_done", False))
-        cfg["notify_baidu_leftover"] = bool(cfg.get("notify_baidu_leftover", True))
-        cfg["notify_baidu_dup"] = bool(cfg.get("notify_baidu_dup", True))
+        # 通知开关归并（2026-09-29）：按「类型」重组为 成功 / 报错 / 必要提醒 三类。
+        # 归并只改「哪个键管哪条标题」，不改任何事件是否通知。OR 语义：某类只要
+        # 有一个「来源旧键」存在，就按「任一为真即为真」取值；全部来源键都不存在
+        # 时才读该类新键自身（缺键取默认），从而二次净化（旧键已丢）保持已迁移的
+        # 值、天然幂等。注意 notify_success / notify_error 既是旧键名也是新键名：
+        # 先把三类结果都算进局部变量（此刻 cfg 里仍是旧值），再统一写回新键，最后
+        # pop 掉的旧键里**不含**这 3 个新键，故迁移值不会被误删。全程 bool()/in
+        # 不抛异常。
+        _success_sources = ("notify_success", "notify_archive", "notify_baidu_done",
+                            "notify_trayed", "notify_already_running",
+                            "notify_extract_ok")
+        _error_sources = ("notify_error", "notify_failure", "notify_share_dead",
+                          "notify_url_failed", "notify_extract_bad")
+        _reminder_sources = ("notify_share", "notify_baidu_leftover",
+                             "notify_baidu_dup", "notify_trust_pending",
+                             "notify_watch", "notify_split", "notify_tray")
+
+        def _or_bucket(sources, new_key, default):
+            present = [bool(cfg.get(k)) for k in sources if k in cfg]
+            return any(present) if present else bool(cfg.get(new_key, default))
+
+        _v_success = _or_bucket(_success_sources, "notify_success", False)
+        _v_error = _or_bucket(_error_sources, "notify_error", True)
+        _v_reminder = _or_bucket(_reminder_sources, "notify_reminder", True)
+        cfg["notify_success"] = _v_success
+        cfg["notify_error"] = _v_error
+        cfg["notify_reminder"] = _v_reminder
+        # 16 个旧键（不含 3 个新键 notify_success / notify_error / notify_reminder）
+        # 迁移完成后静默丢弃，确保旧键不再出现在任何配置输出里。
+        for _k in ("notify_extract_ok", "notify_extract_bad", "notify_share",
+                   "notify_watch", "notify_url_failed", "notify_tray",
+                   "notify_share_dead", "notify_archive", "notify_failure",
+                   "notify_trayed", "notify_already_running",
+                   "notify_trust_pending", "notify_baidu_done",
+                   "notify_baidu_leftover", "notify_baidu_dup", "notify_split"):
+            cfg.pop(_k, None)
         # 拖拽行为（固定胶囊「拖拽行为」）：默认值与历史行为逐一对应——缺键时
         # 拖入文件的行为与旧版完全一致（总开关开 / 识别二维码 / 智能穿透 / 不删源）。
         cfg["drop_enabled"] = bool(cfg.get("drop_enabled", True))

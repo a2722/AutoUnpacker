@@ -67,7 +67,8 @@ from .window import share_flow as _share_flow_home  # noqa: F401
 from .window.consts import (  # noqa: F401
     SHARE_PREP_STALE_SEC, SHARE_PICK_WAIT_SEC, PENDING_SHARE_TTL_SEC,
     SHARE_INVOKE_BUSY_MAX_SEC, SHARE_GESTURE_DEDUP_SEC, PENDING_SHARE_TEXT,
-    PENDING_SHARE_TAG, IMAGE_EXTS, _QR_DROP_MAX_BYTES, _QR_ARCHIVE_MAGICS,
+    PENDING_SHARE_TAG, SHARE_RECENT_MAX_AGE_SEC, IMAGE_EXTS,
+    _QR_DROP_MAX_BYTES, _QR_ARCHIVE_MAGICS,
     _HUB_LOG_PREFIX, _LOG_VALUE_LABELS, _PAGE_KEYS, _SCREEN_MARGIN,
     _MIN_FLOOR_W, _MIN_FLOOR_H, _CHROME_COMPACT_W, _SHARE_ASK_NOTIFIED)
 from .window.chrome import (  # noqa: F401
@@ -89,7 +90,7 @@ from .window.share_flow import (  # noqa: F401
     _share_uk_for_surl, _mark_gesture_launch, _gesture_launched_recently,
     _share_invoke_busy_stale, _call_start_share_pick,
     _manual_reinvoke_guard, _share_parent_usable,
-    _share_notify_via,
+    _share_notify_via, _notify_fallback_allowed,
     _take_share_ask_notified, _announce_ask_code_hidden,
     _share_pan_open_blocked, _show_share_code_window,
     _pending_ask, _carry_ask_across_mode)
@@ -1166,7 +1167,7 @@ class MainWindow(QMainWindow):
                 self._show_window()
                 snap = self.state.snapshot()
                 if (hasattr(self, "tray") and snap.get("notify_enabled", True)
-                        and snap.get("notify_already_running", True)):
+                        and snap.get("notify_success", True)):
                     self.tray.showMessage(
                         "AutoUnpacker", "程序已在运行，已打开主界面。",
                         QSystemTrayIcon.Information, 2000)
@@ -1215,7 +1216,7 @@ class MainWindow(QMainWindow):
 
     def _notify_trayed(self):
         cfg = self.state.snapshot()
-        if cfg.get("notify_enabled", True) and cfg.get("notify_trayed", True):
+        if cfg.get("notify_enabled", True) and cfg.get("notify_success", True):
             self.tray.showMessage(
                 "AutoUnpacker", "已最小化到托盘，右键托盘图标可退出。",
                 QSystemTrayIcon.Information, 2500)
@@ -3446,6 +3447,14 @@ class MainWindow(QMainWindow):
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
                 return
+            # 时效拦截：最近记录也可能是很久以前分享的文件（跨重启依旧在），超时不再
+            # 沿用，避免剪贴板无分享链接时误拉陈年旧链接（须重新复制分享链接）。
+            if rec and bt.is_share_record_stale(rec, SHARE_RECENT_MAX_AGE_SEC):
+                self._append_log(
+                    f"[分享] 最近记录的分享链接距今超过 "
+                    f"{int(SHARE_RECENT_MAX_AGE_SEC)} 秒，已不再沿用"
+                    "（请重新复制分享链接）")
+                return
             self._append_log(
                 f"[分享] 剪贴板无分享链接，沿用最近记录: {rec.get('url')}")
             # 失效短路：该分享已在本进程被标记失效（抓页/探测/提交任一环节命中）→
@@ -3567,6 +3576,14 @@ class MainWindow(QMainWindow):
                 return
             if not rec:
                 self._append_log("还没有记录到百度分享链接（复制一下分享链接即可）")
+                return
+            # 时效拦截：最近记录也可能是很久以前分享的文件（跨重启依旧在），超时不再
+            # 沿用，避免剪贴板无分享链接时误拉陈年旧链接（须重新复制分享链接）。
+            if rec and bt.is_share_record_stale(rec, SHARE_RECENT_MAX_AGE_SEC):
+                self._append_log(
+                    f"[分享] 最近记录的分享链接距今超过 "
+                    f"{int(SHARE_RECENT_MAX_AGE_SEC)} 秒，已不再沿用"
+                    "（请重新复制分享链接）")
                 return
             self._append_log(
                 f"[分享] 剪贴板无分享链接，沿用最近记录: {rec.get('url')}")
@@ -3978,12 +3995,15 @@ class MainWindow(QMainWindow):
 
     def _share_notify(self, title, msg):
         """托盘气泡（线程安全）：走 `hub.notify`（受通知总开关/分组开关过滤），
-        由 `_drain()` 在 Qt 线程消费；轻量宿主无 notify 时回退直接投队列。"""
+        由 `_drain()` 在 Qt 线程消费；轻量宿主无 notify 时回退直接投队列。
+        回退同样受 `notify_enabled` + `NOTIFY_KEYS` 门控，避免绕过开关刷气泡。"""
         try:
             self.hub.notify(title, msg)
             return
         except Exception:
             pass
+        if not _notify_fallback_allowed(self.hub, title):
+            return
         try:
             self.hub.q.put({"type": "notify", "title": title, "msg": msg})
         except Exception:
@@ -4293,7 +4313,7 @@ class MainWindow(QMainWindow):
             self._queue_pending_trust(req)
             snap = self.state.snapshot()
             if (snap.get("notify_enabled", True) and hasattr(self, "tray")
-                    and snap.get("notify_trust_pending", True)):
+                    and snap.get("notify_reminder", True)):
                 try:
                     self.tray.showMessage(
                         "网址信任确认", "有新的网址等待确认，打开主界面后处理。",

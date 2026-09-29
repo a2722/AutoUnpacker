@@ -724,7 +724,7 @@ class SettingsPage(QWidget):
         self._exp_badges = []      # [(host, #expBadge)] 实验性行名旁小标（显隐随总开关）
         self._qr_gate = []         # [(host, 控件簇)] 二维码重定向关闭时置灰的规则行
         # 「监听剪贴板」总开关门控（独立注册表，绝不并入 _exp_gate / _exp_badges /
-        # _exp_subs——那三张表被离线验收锁定为 10 / 10 / 4）。
+        # _exp_subs——那三张表被离线验收锁定为 5 / 5 / 4）。
         # 条目 = (host, 控件簇, 额外父条件 None|callable)：
         #   整行置灰只随总开关；控件可用性 = 总开关关 ? False : 额外父条件。
         self._clip_gate = []       # [(host, 控件簇, 父条件)] 剪贴板监听关闭时置灰的行
@@ -735,7 +735,7 @@ class SettingsPage(QWidget):
         self._notify_labels = ()
         self._exp_subs = ()
         # 后加的实验性行（离线验收把 _exp_gate / _exp_badges / _exp_subs 锁定为
-        # 10 / 10 / 4，新增行一律走这两张独立登记表——与 _clip_gate 同一约定，
+        # 5 / 5 / 4，新增行一律走这两张独立登记表——与 _clip_gate 同一约定，
         # 门控效果与 _exp_gate 完全一致）。
         self._exp_extra_gate = []    # [(host, 控件簇)] 整行置灰 + 禁用控件簇
         self._exp_extra_badges = []  # [(host, #expBadge)] 小标显隐随总开关
@@ -1348,7 +1348,7 @@ class SettingsPage(QWidget):
     def _exp_extra_badge(self, parent, host):
         """后加实验性行名旁的常驻小标（同 #expBadge，走独立登记表）。
 
-        离线验收把 _exp_badges 锁定为 10 条，后加行不得扩它；显隐仍由
+        离线验收把 _exp_badges 锁定为 5 条，后加行不得扩它；显隐仍由
         _apply_gates() 按实验性总开关统一决定（见 __init__ 的登记表说明）。"""
         badge = QLabel(_EXP_BADGE_TEXT, parent)
         badge.setObjectName("expBadge")
@@ -1674,63 +1674,30 @@ class SettingsPage(QWidget):
             g, "通知总开关", "notify_enabled",
             "关掉后不再弹任何提示（日志仍照记），下面各项一并变灰。",
             syn=("通知", "总开关", "静音", "关闭提示"))
-        g = self._group(box, "解压事件")
-        # 气泡政策：以下事件行的描述只是名称的复述（「解压完成」->「解压成功时提示」），
-        # 按约定 bubble=False 整行不出气泡（不登记 => 无悬停 / 无点击 / 无计时器）。
-        self.notify_archive_cb = self._check(
-            g, "发现压缩包", "notify_archive", "扫描到新的压缩包时提示。",
-            syn=("发现", "压缩包", "扫描到"), default=False, bubble=False)
+        g = self._group(box, "按类型")
+        # 按「类型」归并（2026-09-29）：成功 / 报错 / 必要提醒三条轴，各自覆盖
+        # 跨领域的一批事件；均不属实验性门控（类型轴横跨实验性与非实验性事件）。
         self.notify_success_cb = self._check(
-            g, "解压完成", "notify_success", "解压成功时提示。",
-            syn=("成功", "完成", "解压完"), default=False, bubble=False)
-        self.notify_failure_cb = self._check(
-            g, "解压失败", "notify_failure", "解压失败时提示。",
-            syn=("失败", "错误", "没解出来"), bubble=False)
+            g, "成功与完成提示", "notify_success",
+            "发现压缩包、智能解压完成、网盘下载完成、识别二维码图片、已最小化到托盘、"
+            "程序已在运行时提示等成功与完成类提示。",
+            syn=("成功", "完成", "发现", "压缩包", "下载完成", "二维码", "托盘"),
+            default=False)
         self.notify_error_cb = self._check(
-            g, "解压出错", "notify_error", "解压过程报错时提示。",
-            syn=("出错", "异常", "报错"), bubble=False)
-        g = self._group(box, "托盘与启动")
-        self.notify_trayed_cb = self._check(
-            g, "已最小化到托盘", "notify_trayed", "程序收进托盘时提示一次。",
-            syn=("托盘", "最小化", "收起"), default=False, bubble=False)
-        self.notify_running_cb = self._check(
-            g, "程序已在运行时提示", "notify_already_running",
-            "重复启动时提示，并打开已有窗口。", syn=("已运行", "重复启动", "单实例"),
-            default=False)
-        self.notify_trust_cb = self._check(
-            g, "有新的网址等待确认", "notify_trust_pending",
-            "遇到没见过的网站、需要你决定信任与否时提示。",
-            syn=("网址", "信任", "待确认", "新域名"))
-        g = self._group(box, "分享与网盘")
-        self.notify_share_cb = self._check(
-            g, "分享相关通知", "notify_share",
-            "分享手势、链接解析、拉起客户端、下载结果的统一开关。",
-            syn=("分享", "网盘分享", "解析", "手势"), experimental=True)
-        self.notify_share_dead_cb = self._check(
-            g, "分享链接已失效", "notify_share_dead",
-            "链接被取消 / 过期 / 违规时当场提醒（需与上面开关同时打开）。",
-            syn=("失效", "过期", "取消", "违规", "死链"), experimental=True)
-        self.notify_baidu_done_cb = self._check(
-            g, "网盘下载批次完成", "notify_baidu_done",
-            "实验性功能开启时：一个下载批次全部完成时提示。",
-            syn=("网盘", "批次", "下载完成", "百度"), experimental=True,
-            default=False)
-        self.notify_baidu_leftover_cb = self._check(
-            g, "启动时有没下完的网盘任务", "notify_baidu_leftover",
-            "实验性功能开启时：启动发现还有未完成任务时提示。",
-            syn=("网盘", "未完成", "残留", "启动"), experimental=True)
-        self.notify_baidu_dup_cb = self._check(
-            g, "新任务与历史重复", "notify_baidu_dup",
-            "实验性功能开启时：新任务和以前下载过的一样时提示。",
-            syn=("重复", "去重", "历史下载", "网盘"), default=True,
-            experimental=True)
+            g, "报错提示", "notify_error",
+            "智能解压失败 / 出错 / 部分完成、分享链接已失效、分享或网盘下载失败、"
+            "拉起失败、网址访问失败、监听目录不可用、磁盘空间不足、分卷等待放弃等报错类提示。",
+            syn=("失败", "出错", "错误", "中断", "失效", "磁盘", "空间"))
+        self.notify_reminder_cb = self._check(
+            g, "必要提醒", "notify_reminder",
+            "分享手势超时、链接 / 二维码正在解析、分享缺少提取码、需要选择文件、重复的分享"
+            "链接、用客户端下载分享、实验性自动拉起、发现未完成下载、疑似改名分卷、网盘任务"
+            "未完成 / 重复下载、有新的网址等待确认等必要提醒。",
+            syn=("提醒", "超时", "解析", "提取码", "选择文件", "重复", "未完成",
+                 "分卷", "待确认"))
 
-        self._notify_subs = (self.notify_archive_cb, self.notify_success_cb,
-                             self.notify_failure_cb, self.notify_error_cb,
-                             self.notify_trayed_cb, self.notify_running_cb,
-                             self.notify_trust_cb, self.notify_share_cb,
-                             self.notify_share_dead_cb, self.notify_baidu_done_cb,
-                             self.notify_baidu_leftover_cb, self.notify_baidu_dup_cb)
+        self._notify_subs = (self.notify_success_cb, self.notify_error_cb,
+                             self.notify_reminder_cb)
         self._notify_labels = ()
         self.notify_cb.toggled.connect(lambda _s: self._sync_notify_enabled())
 
@@ -2220,6 +2187,7 @@ class SettingsPage(QWidget):
         # 的全部动作，现内联成一组，位置在「历史」与「版本与更新」之间。
         self._build_sevenzip_group(box)
         self._build_update_group(box)
+        self._build_support_group(box)
 
     def _build_sevenzip_group(self, box):
         """7-Zip 组（内联）：状态 + 安装隔离版 / 安装全局版 / 卸载隔离版 + 开关行。
@@ -2512,6 +2480,41 @@ class SettingsPage(QWidget):
             "", self.check_update_btn, "system", "版本与更新",
             syn=("版本", "版本号", "当前版本", "更新", "检查更新", "升级",
                  "新版", "下载")))
+
+    def _build_support_group(self, box):
+        """支持作者（页尾）：一行说明 + 「打开 GitHub 仓库」按钮。
+
+        放在「版本与更新」之后：都属「关于本程序」的收尾区，页尾是这类入口的惯例
+        位置。本组**不登记任何配置键**（覆盖契约要求 covered_top_keys() 恰为
+        DEFAULT_CONFIG 顶层键，不多不少）；按钮只在默认浏览器打开仓库首页，
+        绝不联网检查更新、绝不改动本机任何文件。"""
+        g = self._group(box, "支持作者")
+        self.star_repo_btn = QPushButton("打开 GitHub 仓库", self)
+        self.star_repo_btn.setObjectName("primary")
+        self.star_repo_btn.setCursor(Qt.PointingHandCursor)
+        self.star_repo_btn.setToolTip("在默认浏览器打开项目仓库，点个 Star 支持作者。")
+        self.star_repo_btn.clicked.connect(self._open_repo_page)
+        # 文案口径：点 Star 的对象是**仓库**（GitHub 的概念），软件本体用「程序」；
+        # 「项目」偏工程管理，二者混用才别扭。
+        self.support_hint = QLabel(
+            "如果这个小工具帮到了你，欢迎到 GitHub 仓库点个 Star 支持一下。", self)
+        self.support_hint.setObjectName("rowNote")
+        rh, rl = self._manual_row(g)
+        rl.addWidget(self._make_name(
+            rh, "支持作者",
+            _SettingRow("支持作者",
+                        "在默认浏览器打开项目仓库，点个 Star 支持作者"
+                        "（本程序完全免费、无广告，Star 是最好的鼓励）。",
+                        "", None, "system", "支持作者")))
+        rl.addWidget(self.support_hint)
+        rl.addStretch(1)
+        rl.addWidget(self.star_repo_btn)
+        self._rows.append(_SettingRow(
+            "支持作者",
+            "如果这个小工具帮到了你，欢迎到 GitHub 仓库点个 Star 支持一下。",
+            "", self.star_repo_btn, "system", "支持作者",
+            syn=("支持", "支持作者", "star", "星标", "收藏", "点赞",
+                 "仓库", "github", "作者", "打赏", "赞助")))
 
     def _build_lab(self, box):
         g = self._group(box, "总开关")
@@ -3383,20 +3386,11 @@ class SettingsPage(QWidget):
             self.free_space_spin.setValue(max(0.0, min(100000.0, fl("min_free_space_gb", 5.0))))
 
         if did == "notify":
-            # 通知与提醒
+            # 通知与提醒（按类型：成功 / 报错 / 必要提醒）
             self.notify_cb.setChecked(b("notify_enabled", True))
-            self.notify_archive_cb.setChecked(b("notify_archive", True))
-            self.notify_success_cb.setChecked(b("notify_success", True))
-            self.notify_failure_cb.setChecked(b("notify_failure", True))
+            self.notify_success_cb.setChecked(b("notify_success", False))
             self.notify_error_cb.setChecked(b("notify_error", True))
-            self.notify_trayed_cb.setChecked(b("notify_trayed", True))
-            self.notify_running_cb.setChecked(b("notify_already_running", True))
-            self.notify_trust_cb.setChecked(b("notify_trust_pending", True))
-            self.notify_share_cb.setChecked(b("notify_share", True))
-            self.notify_share_dead_cb.setChecked(b("notify_share_dead", True))
-            self.notify_baidu_done_cb.setChecked(b("notify_baidu_done", True))
-            self.notify_baidu_leftover_cb.setChecked(b("notify_baidu_leftover", True))
-            self.notify_baidu_dup_cb.setChecked(b("notify_baidu_dup", False))
+            self.notify_reminder_cb.setChecked(b("notify_reminder", True))
             self._sync_notify_enabled()
 
         if did == "clipboard":
@@ -3725,6 +3719,29 @@ class SettingsPage(QWidget):
         except Exception as e:
             self._set_update_status("打开浏览器失败：%s" % e, ok=False)
 
+    def _open_repo_page(self):
+        """在默认浏览器打开项目仓库首页（点 Star 支持作者）。
+
+        只打开浏览器：不联网检查更新、绝不改动本机任何文件。与「前往下载更新」
+        同一 QDesktopServices 入口，不另起 webbrowser 依赖。"""
+        try:
+            from .. import updater
+            url = str(updater.repo_url() or "")
+        except Exception:
+            url = ""
+        if not url:
+            self.notice.emit("无法获取仓库地址")
+            return
+        ok = False
+        try:
+            from PyQt5.QtCore import QUrl
+            from PyQt5.QtGui import QDesktopServices
+            ok = bool(QDesktopServices.openUrl(QUrl(url)))
+        except Exception:
+            ok = False
+        if not ok:
+            self.notice.emit("打开浏览器失败，请手动访问 " + url)
+
     def _on_apply_update(self):
         """一键自更新：后台线程下载/校验/启动执行器；成功后本进程退出交给执行器。"""
         if getattr(self, "_update_busy", False):
@@ -3927,8 +3944,8 @@ class SettingsPage(QWidget):
         """统一门控：实验性总开关 + 通知总开关（两套开关互不干扰，交集行取 AND）。
 
         实验性行：整行打 [off] 动态属性置灰（名称标签保持可用，悬停气泡可达），
-        只禁用控件簇；同时受通知总开关约束的行（notify_share / notify_share_dead /
-        notify_baidu_*）必须两个总开关都开才可用。"""
+        只禁用控件簇。按类型归并后通知子开关不再是实验性行，两个总开关的交集为空
+        （通知主开关只经 _notify_subs 禁用三条类型行）。"""
         # 懒建：两个总开关所在领域可能尚未物化 → 缺控件时退化为读配置，保证对
         # 已建子项的门控状态仍正确（不会把已建的实验性 / 通知子项误启用或误禁用）。
         if hasattr(self, "experimental_cb"):
@@ -4001,7 +4018,7 @@ class SettingsPage(QWidget):
         """「监听剪贴板」关闭 → 依赖剪贴板读取的 5 行整行置灰 + 控件簇禁用。
 
         独立注册表 _clip_gate / _clip_badges（绝不并入 _exp_gate / _exp_badges /
-        _exp_subs——那三张表被离线验收锁定为 10 / 10 / 4）。被门控的 5 行：
+        _exp_subs——那三张表被离线验收锁定为 5 / 5 / 4）。被门控的 5 行：
         识别剪贴板图片里的二维码（clipboard）、复制网址时自动识别二维码（links，
         跨领域）、识别到新密码就自动存进密码本、网址不当密码记录、更严格的密码
         过滤。拖入的文件 / 图片与临时密码的清理 / 上限不受影响，故不在表内。

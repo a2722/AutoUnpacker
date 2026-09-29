@@ -23,6 +23,9 @@ SHARE_INVOKE_BUSY_MAX_SEC = 180
 # 派发）拉起某 surl 后，同 surl 经 share_link 自动分支再次出现时不再重复拉起，
 # 也绝不弹「重复分享」确认（那就是同一次用户意图）。
 SHARE_GESTURE_DEDUP_SEC = 30
+# 手动手势（Alt+2/Alt+3）回退「最近记录」的最长时效（秒）：记录更新时间超过该
+# 秒数即不再沿用，避免剪贴板无分享链接时误拉很久以前分享的文件（须重新复制）。
+SHARE_RECENT_MAX_AGE_SEC = 300
 # 预定任务的 kind → 文案。(登记日志, 托盘通知正文)；托盘标题两路都用「二维码正在解析」。
 # Alt+2（share）文案已验收，逐字不动；Alt+3（share_code）为「打开文件挑选窗」那一路。
 PENDING_SHARE_TEXT = {

@@ -600,6 +600,28 @@ def last_share():
         return None
 
 
+def is_share_record_stale(rec, max_age_sec, now=None):
+    """记录是否已超过「最近记录可用」时效（手动手势沿用前调用）。
+
+    fail-open 契约：无记录 / 无 ts / ts 不可解析 / max_age_sec 不可解析 ⇒ False
+    （无法判断，按原行为不拦截）；真实记录必带 ts（见 remember_share_link）。
+    仅当 rec 是 dict、ts 存在且可解析为 float、且 (now - ts) > max_age_sec 时返回
+    True（严格大于：恰好等于 max_age_sec 不算过期，闭区间）。未来时间戳
+    （now - ts < 0）返回 False。now 缺省取 time.time()。绝不抛异常。
+    """
+    try:
+        if not isinstance(rec, dict):
+            return False
+        if "ts" not in rec or rec.get("ts") is None:
+            return False
+        ts = float(rec.get("ts"))
+        limit = float(max_age_sec)
+        t = time.time() if now is None else float(now)
+        return (t - ts) > limit
+    except Exception:
+        return False
+
+
 def latest_share_ts(exclude_surl=None):
     """_TRACK["shares"] 里最近一条分享记录的 ts（可排除某个 surl）；无记录返回 0.0。
 

@@ -73,6 +73,9 @@ _DECODE_ERROR_LOGGED = False  # __DECODE_ERROR__ 逐图刷屏节流
 _NO_QR_LOGGED = False         # 「解码成功但未识别到二维码内容」提示只记一次
 _clipboard_mod = None   # 探测成功后缓存的 win32clipboard 模块
 _imagegrab_mod = None   # 探测成功后缓存的 PIL.ImageGrab 模块
+# 同一网址抓取失败的托盘提示去重窗口（秒）：force=True 重试会绕过 last_url 去重，
+# 短时间反复复制同一网址也不该把托盘气泡刷屏；窗口内重复失败不再提示，首次必提示。
+_URL_FAIL_NOTIFY_TTL = 120
 
 
 def _ensure_clipboard():
@@ -315,6 +318,9 @@ class QRMonitor(threading.Thread):
         self.last_hash = None
         self.last_text = None
         self.last_url = None  # 最近尝试访问的网址（避免同一网址重复拉取）
+        # 网址抓取失败托盘提示的去重表：normalized url -> 上次提示时间戳。
+        # 仅用于「不要对同一失败网址刷屏」，首次失败一定提示（见 _report_url_failed）。
+        self._url_fail_notify_at = {}
         self.qr_worker_path = paths.WORKERS_DIR / "qr_worker.py"          # 解码子进程脚本
         self.clipboard_worker_path = paths.WORKERS_DIR / "clipboard_worker.py"  # 剪贴板写入子进程脚本
         # 最近捕获的非图片剪贴板内容（如用户复制二维码前复制的提取码）
@@ -1339,8 +1345,7 @@ class QRMonitor(threading.Thread):
         try:
             data = self._fetch_url(text)
         except Exception as e:
-            self.hub.log(f"网址访问失败（跳过）: {text[:60]} ... {e} —— "
-                         "可右键「复制图片」由剪贴板识别，或另存为文件后拖入")
+            self._report_url_failed(text, e)
             return
         if not data:
             self.hub.log(f"网址内容过大或为空（跳过）: {text[:60]}")
@@ -1367,6 +1372,43 @@ class QRMonitor(threading.Thread):
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def _report_url_failed(self, url, err, log_line=None):
+        """网址抓取失败：记一行日志 + 发一条托盘通知（开关见 config.notify_url_failed）。
+
+        连接重置 / TLS 握手被拒这类错误无法在 Python 侧绕过（用户已确认），本方法
+        只负责「让用户知道」：多数时候主界面没打开，托盘气泡是唯一可见的失败提醒。
+        恒常调用 hub.notify()——是否弹气泡由 Hub 按 notify_enabled 总开关 +
+        NOTIFY_KEYS[title]（notify_url_failed）统一过滤，日志始终记录。
+
+        同一网址的失败提示按 _URL_FAIL_NOTIFY_TTL 去重，避免 force=True 重试或短时间
+        反复复制同一网址把气泡刷屏；**首次失败一定提示**。
+
+        log_line：调用点带有专属文案（HTTP 状态码 / 证书校验失败）时传入，按原样
+        记录该行；不传则记录默认的连接失败行。通知与节流行为、通知文案完全不变。"""
+        if log_line is not None:
+            self.hub.log(log_line)
+        else:
+            self.hub.log(f"网址访问失败（跳过）: {url[:60]} ... {err} —— "
+                         "可右键「复制图片」由剪贴板识别，或另存为文件后拖入")
+        try:
+            key = str(url or "").strip()
+            now = time.time()
+            last = self._url_fail_notify_at.get(key)
+            if last is not None and (now - last) < _URL_FAIL_NOTIFY_TTL:
+                return
+            self._url_fail_notify_at[key] = now
+            # 顺手清理过期项，避免字典随历史失败网址无限增长（不动本次这一条）。
+            if len(self._url_fail_notify_at) > 1:
+                for k in [k for k, t in self._url_fail_notify_at.items()
+                          if k != key and (now - t) >= _URL_FAIL_NOTIFY_TTL]:
+                    self._url_fail_notify_at.pop(k, None)
+            # 托盘气泡会截断，只放 host + 一句可操作建议，绝不塞整段异常。
+            host = _host_of(url) or str(url or "")
+            self.hub.notify("网址访问失败",
+                            f"{host} 抓取失败，可右键「复制图片」识别或另存后拖入")
+        except Exception:
+            pass
 
     def _fetch_url(self, url, timeout=8, max_bytes=16 << 20, for_share=False):
         """拉取网址内容（限制大小，超时/超限返回 None）。
@@ -1442,12 +1484,17 @@ class QRMonitor(threading.Thread):
             with opener.open(req, timeout=timeout) as resp:
                 data = resp.read(max_bytes + 1)
         except ssl.SSLError as e:
-            self.hub.log(f"HTTPS 证书校验失败（如确需访问可在设置中允许不验证证书）: {e}")
+            self._report_url_failed(
+                url, e,
+                log_line=("HTTPS 证书校验失败（如确需访问可在设置中允许"
+                          f"不验证证书）: {e}"))
             return None
         except HTTPError as e:
             # 3xx 被信任拦截（guard 已记录日志）；其余 HTTP 错误按访问失败跳过
             if not (300 <= e.code < 400):
-                self.hub.log(f"网址访问失败（HTTP {e.code}）: {url[:60]} —— "
+                self._report_url_failed(
+                    url, e,
+                    log_line=f"网址访问失败（HTTP {e.code}）: {url[:60]} —— "
                              "可右键「复制图片」由剪贴板识别，或另存为文件后拖入")
             return None
         except OSError as e:
@@ -1455,7 +1502,9 @@ class QRMonitor(threading.Thread):
             root = (e.reason if isinstance(e, URLError) and e.reason is not None
                     else e)
             if isinstance(root, ssl.SSLError):
-                self.hub.log("HTTPS 证书校验失败（如确需访问可在设置中允许"
+                self._report_url_failed(
+                    url, root,
+                    log_line="HTTPS 证书校验失败（如确需访问可在设置中允许"
                              f"不验证证书）: {root}")
                 return None
             raise

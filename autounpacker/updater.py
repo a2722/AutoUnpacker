@@ -126,6 +126,14 @@ def releases_url():
     return f"https://github.com/{GITHUB_REPO}/releases/latest"
 
 
+def repo_url():
+    """GitHub 仓库首页地址（设置页「支持作者」按钮跳转目标）。
+
+    与 GITHUB_REPO 同源，避免仓库地址在多处硬编码各写一份。
+    """
+    return f"https://github.com/{GITHUB_REPO}"
+
+
 # ==================== 自动更新 ====================
 
 def _archive_url(tag):

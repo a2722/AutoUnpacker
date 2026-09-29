@@ -570,6 +570,40 @@ def _share_parent_usable(win):
     return True
 
 
+def _notify_fallback_allowed(hub, title):
+    """兜底直投 `hub.q` 前的门控检查：镜像 `Hub.notify` 对标题的过滤口径。
+
+    `hub.notify` 正常时会按 `notify_enabled` 总开关 + `NOTIFY_KEYS[title]` 过滤，
+    但它写日志文件若抛异常，调用方会退到「直接投 `hub.q`」的兜底分支——那条路径
+    原先不受任何开关约束，导致这些气泡无法关闭。本函数把同一套口径搬过来：
+
+      - `state` 为 None（轻量宿主 / 测试桩）：不过滤（与 Hub.notify 一致）；
+      - `notify_enabled` 为假：整体关闭，不投递；
+      - title 命中 `NOTIFY_KEYS`：值可为单键或键元组，**全部为真**才允许
+        （元组 = 分组开关 + 专用开关叠加，见 Hub.notify）；
+      - title 不在映射内：只受总开关约束。
+
+    读快照失败按「允许」处理：宁可送达也不静默丢通知（与兜底「不丢提示」的初衷
+    一致）。只读 `Hub.NOTIFY_KEYS`，不改动 hub.py。
+    """
+    state = getattr(hub, "state", None)
+    if state is None:
+        return True
+    try:
+        cfg = state.snapshot()
+    except Exception:
+        return True
+    if not cfg.get("notify_enabled", True):
+        return False
+    from ...hub import Hub
+    key = Hub.NOTIFY_KEYS.get(title)
+    keys = key if isinstance(key, (tuple, list)) else (key,)
+    for k in keys:
+        if k and not cfg.get(k, True):
+            return False
+    return True
+
+
 def _share_notify_via(win, title, msg):
     """托盘气泡（module 级）：三级收口。
 
@@ -578,6 +612,7 @@ def _share_notify_via(win, title, msg):
     2) `hub.notify`；
     3) 直接投 `hub.q`——给轻量宿主（测试桩只有 `hub.q`、既无 `_share_notify`
        也无 `hub.notify`）兜底，否则通知会被静默丢掉，用户看不到任何提示。
+       兜底同样受 `notify_enabled` + `NOTIFY_KEYS` 门控（见 _notify_fallback_allowed）。
     """
     fn = getattr(win, "_share_notify", None)
     if callable(fn):
@@ -591,6 +626,8 @@ def _share_notify_via(win, title, msg):
         return
     except Exception:
         pass
+    if not _notify_fallback_allowed(getattr(win, "hub", None), title):
+        return
     try:
         win.hub.q.put({"type": "notify", "title": title, "msg": msg})
     except Exception:
@@ -742,9 +779,13 @@ def _show_share_code_window(win, surl, url, share_uk, open_browser=False,
         try:
             cw.show_home(raise_=True)
             _force_pick = bool(getattr(win, "_share_ask_force_pick", False))
-            cw.enter_code(surl, url, share_uk, force_pick=_force_pick,
-                          open_browser=bool(open_browser), deadline=deadline)
-            if open_browser:
+            _is_new_page = cw.enter_code(
+                surl, url, share_uk, force_pick=_force_pick,
+                open_browser=bool(open_browser), deadline=deadline)
+            # 新开 CODE 页时 `enter_code` 内部已跑过一次未知分享者探针（实验性静默
+            # 拦截的说明行也已在其中记过）；本块只补「复用」这一次——复用时
+            # `enter_code` 跳过探针，才轮到本块探一次，绝不重复同一行。
+            if open_browser and not _is_new_page:
                 # 未知分享者：沿用既有「浏览器打开分享页做探针」行为。
                 # UX-4：实验性开启时 pan.baidu 一律静默，绝不显式打开浏览器。
                 if not _share_pan_open_blocked(win, url):

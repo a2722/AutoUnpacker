@@ -402,6 +402,44 @@ def _restore_one(original_path, rec=None, items=None):
         return False, "", "还原过程出错"
 
 
+def _intermediate_dirs(rec, targets, items):
+    """在 targets 里挑出「程序自建的中间目录」——**不还原**它们（返回 set）。
+
+    背景（真机）：2.2.9 之前产生的历史记录会把「提升后已空的输出目录」也记进
+    `deleted_paths`（形如 `<源目录>/<源文件去扩展名>`）。那个路径是**目录**（源文件
+    都是文件），还原它只会让用户凭空多出一个空文件夹；而且它本就不该出现在记录里。
+
+    判定用回收站条目的 `IsFolder`（精确、不看名字）：**除记录原路径之外的目录**一律
+    视为解压中间产物、跳过。判不出（打不开回收站 / 替身没有该属性）时返回**空集**——
+    退化为旧行为，绝不误伤。
+    """
+    out = set()
+    try:
+        orig = os.path.normcase(str((rec or {}).get("original_path") or ""))
+        for t in (targets or []):
+            if os.path.normcase(str(t)) == orig:
+                continue                 # 记录的原源文件本身：永远要还原
+            name = os.path.basename(str(t))
+            parent = os.path.dirname(str(t))
+            for item in (items or []):
+                try:
+                    if (os.path.normcase(str(item.Name or ""))
+                            != os.path.normcase(name)):
+                        continue
+                    it_parent = str(
+                        item.ExtendedProperty("System.Recycle.DeletedFrom") or "")
+                    if os.path.normcase(it_parent) != os.path.normcase(parent):
+                        continue
+                    if bool(item.IsFolder):
+                        out.add(t)
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        return set()
+    return out
+
+
 def restore_record(rec_id):
     """还原记录中已删除（在回收站）的初始源文件。
 
@@ -421,7 +459,12 @@ def restore_record(rec_id):
     restored, failed = [], []   # restored: [(原路径, 实际落点)]；failed: [(原路径, 原因)]
     # 回收站只枚举一次，本记录所有目标共用（枚举很慢，逐目标重来会线性变慢）。
     items = _recycle_items()
+    # 老记录里可能混着「程序自建的中间目录」（提升后已空的输出目录）：还原它们只会
+    # 让用户凭空多一个空文件夹。这里先把它们挑出来跳过，且**不计入失败**（不是失败）。
+    _skip = _intermediate_dirs(rec, targets, items)
     for t in targets:
+        if t in _skip:
+            continue
         if items is None:
             ok, dest, reason = False, "", "无法打开回收站"
         else:
@@ -430,6 +473,8 @@ def restore_record(rec_id):
             restored.append((t, dest))
         else:
             failed.append((t, reason))
+    if _skip and not restored and not failed:
+        return False, "记录里只有解压中间目录（程序自建），没有可还原的源文件"
     if restored:
         status = "restored" if not failed else "deleted"
         renamed = [(t, d) for t, d in restored

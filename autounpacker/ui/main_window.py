@@ -1753,6 +1753,10 @@ class MainWindow(QMainWindow):
             self._input_password_for_task(task_id)
         elif kind == "ignore":
             self._ignore_task(task_id)
+        elif kind == "mark_done":
+            # 「需要处理」侧栏与任务详情弹窗共用同一套动作（用户 2026-09-29 统一）：
+            # mark_done =「忽略」= 手动转为完成，必须能从这里直达。
+            self._mark_task_done(task_id)
 
     def _open_task_details(self, task_id):
         """打开任务详情弹窗：遮罩（Scrim）当模态窗口、弹窗当它的子窗。"""

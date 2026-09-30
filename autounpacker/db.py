@@ -569,6 +569,94 @@ def update_task_state(task_id, state, *, error=None, password_src=None,
         return False
 
 
+# 「未终态」集合：处于这两态的任务仍在流水线上，解压线程可以推进它；一旦被写成
+# 终态（done / failed / canceled / need_password），解压线程就不得再覆盖
+# （见 update_task_state_if_open）。
+_OPEN_STATES = ("queued", "extracting")
+
+
+def update_task_state_if_open(task_id, state, error=None, password_src=None,
+                              output_dir=None, started_at=None, finished_at=None,
+                              layer=None):
+    """**仅当任务仍在「未终态」（queued / extracting）时**才写状态；返回是否真的写了。
+
+    为什么需要它（真机竞态）：用户在解压**进行中**点了「忽略 / 从队列移除」，宿主
+    立即把任务置为 done / canceled；但解压线程随后拿到失败结果，旧实现会无条件再写
+    一次 `failed`，把用户的人工判定覆盖掉，还弹一条假的「智能解压失败」。
+    这里把「是否仍未终态」做成 **SQL 原子条件**（`WHERE state IN (...)`），与解压线程
+    的写入天然互斥：用户先写 ⇒ 这里 rowcount=0 ⇒ 调用方据此**保持用户终态**、不改写、
+    也不报失败。
+
+    字段语义与 update_task_state 完全一致（只写显式传入的非 None 字段）；任何异常都不抛。
+    """
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        return False
+    if tid <= 0:
+        return False
+    sets = ["state = ?"]
+    params = [str(state or "")]
+    for col, val in (("error", error), ("password_src", password_src),
+                     ("output_dir", output_dir), ("started_at", started_at),
+                     ("finished_at", finished_at), ("layer", layer)):
+        if val is not None:
+            sets.append(col + " = ?")
+            params.append(val)
+    params.append(tid)
+    try:
+        with _lock:
+            conn = _connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE tasks SET " + ", ".join(sets)
+                    + " WHERE id = ? AND state IN (?, ?)",
+                    params + list(_OPEN_STATES))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
+
+def count_history_since(since_ts):
+    """统计 [since_ts, ∞) 内**完成 / 失败 / 用到密码**的历史任务数（不带 LIMIT）。
+
+    时间口径与界面展示一致：以 `finished_at` 为准，为 0/空时回退 `created_at`。
+    **为什么要单独一个查询**：旧实现是「取最近 N 条历史再按当天过滤」，历史任务超过 N
+    条的机器上会**漏算**——漏的正是「更早创建、当天才跑完」的那批（它们排在 N 名之外）。
+
+    任何异常一律返回全 0，绝不让统计把页面拖崩。返回 {"done": n, "pwd": n, "failed": n}。
+    """
+    out = {"done": 0, "pwd": 0, "failed": 0}
+    try:
+        t0 = int(since_ts or 0)
+    except Exception:
+        t0 = 0
+    try:
+        rows = _execute(
+            "SELECT state, COUNT(*), "
+            "SUM(CASE WHEN password_src IS NOT NULL AND password_src <> '' "
+            "THEN 1 ELSE 0 END) FROM tasks "
+            "WHERE state IN ('done', 'failed') "
+            "AND COALESCE(NULLIF(finished_at, 0), created_at, 0) >= ? "
+            "GROUP BY state", (t0,), fetch=True)
+    except Exception:
+        return out
+    for row in (rows or []):
+        try:
+            state, n, pwd = str(row[0]), int(row[1] or 0), int(row[2] or 0)
+        except Exception:
+            continue
+        if state == "done":
+            out["done"] = n
+            out["pwd"] = pwd
+        elif state == "failed":
+            out["failed"] = n
+    return out
+
+
 def get_task(task_id):
     """按 id 取单个任务（dict）；不存在 / 非法 id / 异常一律返回 None。"""
     try:

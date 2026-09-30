@@ -1956,27 +1956,48 @@ class FolderWatcher(threading.Thread):
                                 pass
                         return "defer"
                     self._lock_retry.pop(abs_fp, None)
-                if (result or {}).get("keep_output_dir"):
-                    # 主层已解出真实内容、只是更深的嵌套层失败：不回退、不报「失败」，
-                    # 如实说「部分完成」，并点明输出目录里保留着已解出的内容。
-                    self.hub.log(f"{name} 部分完成: {err}（已保留已解出的内容）")
-                    self.hub.notify("智能解压部分完成",
-                                    f"{name}\n{err}\n已解出的内容已保留在输出目录")
-                else:
-                    self.hub.log(f"{name} 解压失败: {err}")
-                    self.hub.notify("智能解压失败", f"{name}\n{err}")
-                db.update_task_state(
+                # 终态写入用**原子守卫**：仅当任务仍在 queued/extracting 时才写。
+                # 用户在解压中点了「忽略 / 从队列移除」→ 任务已是 done/canceled，
+                # 这里绝不能再把它改成 failed（真机竞态：人工判定被解压线程覆盖），
+                # 更不能报一条假的「智能解压失败」吓用户。
+                _wrote = db.update_task_state_if_open(
                     tid, ("need_password" if "密码" in err else "failed"),
                     error=err, finished_at=int(time.time()))
-                _tasks_changed(self.hub)
-                self._set_dir_state(wc.get("path"), "error", name=name)
-                if record is not None:
-                    deletion_trail.mark_failed(record["id"], err)
+                if not _wrote:
+                    _now = str((db.get_task(tid) or {}).get("state") or "已终态")
+                    self.hub.log(
+                        f"{name} 解压未完成，但任务状态已是「{_now}」，不再改写"
+                        f"（尊重先到的终态；本次未消费源文件）")
+                    self._set_dir_state(wc.get("path"), "listening", name=name)
+                    if record is not None:
+                        # 本次解压没消费源文件：撤掉刚建的删除回溯记录，免得留一条
+                        # 永远停在「已记录」的僵尸记录（prune_records 对 recorded 态不清）。
+                        try:
+                            deletion_trail.save_records(
+                                [r for r in deletion_trail.load_records()
+                                 if r.get("id") != record["id"]])
+                        except Exception:
+                            pass
+                else:
+                    if (result or {}).get("keep_output_dir"):
+                        # 主层已解出真实内容、只是更深的嵌套层失败：不回退、不报「失败」，
+                        # 如实说「部分完成」，并点明输出目录里保留着已解出的内容。
+                        self.hub.log(f"{name} 部分完成: {err}（已保留已解出的内容）")
+                        self.hub.notify("智能解压部分完成",
+                                        f"{name}\n{err}\n已解出的内容已保留在输出目录")
+                    else:
+                        self.hub.log(f"{name} 解压失败: {err}")
+                        self.hub.notify("智能解压失败", f"{name}\n{err}")
+                    _tasks_changed(self.hub)
+                    self._set_dir_state(wc.get("path"), "error", name=name)
+                    if record is not None:
+                        deletion_trail.mark_failed(record["id"], err)
         except BaseException as e:
             self.hub.log(f"{name} 解压出错: {e}")
             self.hub.notify("智能解压出错", f"{name}\n{e}")
             if tid:
-                db.update_task_state(
+                # 同样走原子守卫：用户已人工定性（忽略 / 从队列移除）时不覆盖其终态。
+                db.update_task_state_if_open(
                     tid, ("need_password" if "密码" in str(e) else "failed"),
                     error=str(e), finished_at=int(time.time()))
                 _tasks_changed(self.hub)

@@ -59,59 +59,11 @@ def _fmt_ts(value):
         return "—"
 
 
-def source_exists(task):
-    """源文件是否仍在监听目录（重试类动作的成立条件）。"""
-    try:
-        src = str((task or {}).get("source_dir") or "")
-        name = str((task or {}).get("file_name") or "")
-        if not src or not name:
-            return False
-        return os.path.isfile(os.path.join(src, name))
-    except Exception:
-        return False
+# 动作集合的**唯一真源**已下沉到叶子模块 `ui.task_actions`（本弹窗、队列行内按钮、
+# 右栏「需要处理」三处共用）；这里再导出一次，保持既有 `from ...task_details import
+# source_exists, task_action_set` 的引用路径可用。
+from ..task_actions import source_exists, task_action_set  # noqa: F401
 
-
-def task_action_set(state, src_exists):
-    """按状态 + 源文件是否存在计算动作集合 -> [(kind, label, role)]。
-
-    role: "primary" / "danger" / ""（默认样式）。不变量：任何输入都至少返回
-    一个动作——未知状态兜底为「从队列移除」，任务永远不会无处可去。
-
-    出路语义（2026-09-26 起）：
-    - 「从队列移除」(ignore) = **软取消**：置 canceled 终态，**保留**记录与日志；
-    - 「忽略」(mark_done) = **手动转为完成**：把失败 / 队列中的条目置 done 终态，
-      并在该任务日志里补一条注明「人工转换」的记录（绝不冒充真实解压产出）；
-    - 原先的「删除记录」(delete) 硬删除入口已按要求从本弹窗移除。宿主侧的
-      `delete` 处理器**仍然保留**（硬删除能力不丢，只是界面不再暴露入口）。
-    """
-    s = _task_state_key({"state": state})
-    acts = []
-    if s == "need_password":
-        acts.append(("input_password", "跳转到密码本", "primary"))
-        if src_exists:
-            acts.append(("retry", "重试", ""))
-        acts.append(("open_dir", "打开输出目录", ""))
-        acts.append(("ignore", "从队列移除", "danger"))
-    elif s == "failed":
-        if src_exists:
-            acts.append(("retry", "重试", ""))
-        acts.append(("copy_error", "复制错误", ""))
-        acts.append(("open_dir", "打开输出目录", ""))
-        acts.append(("mark_done", "忽略", ""))
-        acts.append(("ignore", "从队列移除", "danger"))
-    elif s in ("queued", "extracting"):
-        acts.append(("open_dir", "打开输出目录", ""))
-        acts.append(("mark_done", "忽略", ""))
-        acts.append(("ignore", "从队列移除", "danger"))
-    elif s == "done":
-        acts.append(("open_dir", "打开输出目录", ""))
-        acts.append(("copy_output", "复制输出去向", ""))
-    elif s == "canceled":
-        if src_exists:
-            acts.append(("retry", "重试", ""))
-    if not acts:
-        acts = [("ignore", "从队列移除", "danger")]
-    return acts
 
 
 class TaskDetailsDialog(QDialog):
@@ -342,7 +294,12 @@ class TaskDetailsDialog(QDialog):
             self.reject()
             return
         self.actionRequested.emit(int(self.task_id), kind)
-        if kind in ("view_log", "input_password"):
+        # 「收尾类」动作点完即关闭详情窗（用户预期：这一条已经处理完了，窗口不该留着）：
+        #   - 「从队列移除」(ignore)：条目已离开队列；
+        #   - 「忽略」(mark_done)：条目被人工转为完成，同样离开「待处理」范围；
+        #   - 「跳转到密码本」(input_password)：要把界面交棒给密码本页。
+        # 其余动作（重试 / 打开输出目录 / 复制…）留在窗内，让用户看到执行后的新状态。
+        if kind in ("view_log", "input_password", "ignore", "mark_done"):
             self.reject()
             return
         self._reload()

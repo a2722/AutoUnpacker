@@ -150,9 +150,14 @@ class StatusTipTicker(QWidget):
         anim.start()
 
 
-# 行内操作词表（mockup 13 的「需要处理」）
+# 行内操作词表（mockup 13 的「需要处理」）。
+# 口径与任务详情弹窗**一致**（用户 2026-09-29 定稿）：
+#   ignore    = 软取消（置 canceled、保留记录）=「从队列移除」（旧名「忽略」已废弃，
+#               它曾与 mark_done 的「忽略」互相打架）；
+#   mark_done = 人工转为完成 =「忽略」。
 _NEED_ACTION_TEXT = {"retry": "重试", "open_dir": "打开目录",
-                     "input_password": "输入密码", "ignore": "忽略"}
+                     "input_password": "输入密码", "ignore": "从队列移除",
+                     "mark_done": "忽略"}
 
 # 行内操作 tooltip（文案用户定稿）：说明「输入密码」去哪补码，以及待密码行
 # 为什么「重试」仍可能失败。失败行的「重试」不挂此 tip，避免对非密码失败误导。

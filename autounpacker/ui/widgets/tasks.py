@@ -19,6 +19,19 @@ _STATE_TEXT = {
     "done": "已完成", "failed": "失败", "canceled": "已取消",
 }
 
+# 行内动作图标表：kind -> (glyph, tooltip)。动作集合与任务详情弹窗**同一真源**
+# （dialogs.task_details.task_action_set），这里只把文字按钮换成图标按钮：
+# 已完成行不再出现「重试」，失败 / 待密码行则能直接在行内「忽略 / 从队列移除」
+# （用户 2026-09-29 定稿：动作随状态变化）。
+_ROW_ACT = {
+    "details": ("info", "详细信息"),
+    "open_dir": ("external", "打开输出目录"),
+    "retry": ("refresh", "重试"),
+    "mark_done": ("check", "忽略（手动转为完成）"),
+    "ignore": ("close", "从队列移除"),
+}
+_ROW_ACT_FALLBACK = ("details", "open_dir", "retry")
+
 
 class TaskModel(QAbstractTableModel):
     """任务表数据模型：列见 FINAL-SPEC §2.3；UserRole=task id，ToolTip=完整文件名/输出路径。"""
@@ -266,7 +279,34 @@ class TaskTable(QTableView):
     def task_at(self, row):
         return self._model.task_at(row)
 
+    def _row_action_kinds(self, task_id):
+        """本行该显示哪些动作：与详情弹窗同一口径，只保留行内支持的图标动作，
+        「详细信息」恒在首位（它是进入详情窗的入口）。
+
+        绝不写死「每行都一样」：已完成行不该出现「重试」，失败 / 待密码行必须能
+        直接在行内「忽略 / 从队列移除」。任何异常退化为旧的 3 按钮集合。
+        """
+        try:
+            # function-local import：真源是叶子模块 ui.task_actions（不依赖本包，无环）。
+            from ..task_actions import source_exists, task_action_set
+        except Exception:
+            return list(_ROW_ACT_FALLBACK)
+        try:
+            task = {}
+            for r in self._model.tasks():
+                if r.get("id") == task_id:
+                    task = r
+                    break
+            kinds = [k for k, _l, _r in
+                     task_action_set(str(task.get("state") or ""),
+                                     source_exists(task))]
+        except Exception:
+            return list(_ROW_ACT_FALLBACK)
+        picked = [k for k in kinds if k in _ROW_ACT and k != "details"]
+        return ["details"] + picked
+
     def _build_actions(self):
+        widest = 1
         for row in range(self._model.rowCount()):
             task_id = self._model.data(
                 self._model.index(row, TaskModel.COL_STATE), Qt.UserRole)
@@ -274,19 +314,28 @@ class TaskTable(QTableView):
                 tid = int(task_id)
             except Exception:
                 continue
-            widget = self._make_action_widget(tid)
+            kinds = self._row_action_kinds(tid)
+            widest = max(widest, len(kinds))
+            widget = self._make_action_widget(tid, kinds)
             self.setIndexWidget(self._model.index(row, TaskModel.COL_ACT), widget)
             self._action_widgets.append(widget)
+        # 动作列按「本次最宽的一行」给宽：动作数随状态变化，固定宽度会挤掉按钮。
+        try:
+            self.setColumnWidth(TaskModel.COL_ACT,
+                                max(106, widest * 30 + (widest - 1) * 4 + 8))
+        except Exception:
+            pass
 
-    def _make_action_widget(self, task_id):
+    def _make_action_widget(self, task_id, kinds=None):
         w = QWidget(self)
         lay = QHBoxLayout(w)
         lay.setContentsMargins(0, 0, 6, 0)
         lay.setSpacing(4)
         lay.addStretch(1)
-        for action, glyph, tip in (("details", "info", "详细信息"),
-                                   ("open_dir", "external", "打开输出目录"),
-                                   ("retry", "refresh", "重试")):
+        if not kinds:
+            kinds = self._row_action_kinds(task_id)
+        for action in kinds:
+            glyph, tip = _ROW_ACT.get(str(action), ("info", str(action)))
             btn = QPushButton(w)
             btn.setObjectName("rowAct")
             btn.setFixedSize(30, 30)

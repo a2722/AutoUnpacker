@@ -131,50 +131,57 @@ def count_today_logs(limit=5000):
     return n
 
 
-def today_stats(limit=500):
+def today_stats():
     """今日统计卡（原型 13 右栏）：今日解压 / 密码命中 / 失败 / 回收站待还原。
 
-    前 3 项来自 tasks 表（最近 limit 条终态任务按 finished_at 过滤当天），
-    回收站项来自 trail。任何异常都退化为 0，绝不让页面因统计失败而崩。
+    前 3 项走 `db.count_history_since(今天零点)`——**按时间条件直查、不受条数封顶**。
+    旧实现是「取最近 500 条历史任务再筛当天」，历史任务多的机器会漏算
+    （漏的是更早创建、当天才跑完的那批：它们排在 500 名之外）。回收站项来自 trail。
+    任何异常都退化为 0，绝不让页面因统计失败而崩。
     """
     out = {"done": 0, "pwd": 0, "failed": 0, "trail": count_trail_pending()}
     try:
-        rows = db.list_tasks(scope="history", limit=limit) or []
+        out.update(db.count_history_since(_today_start()))
     except Exception:
-        rows = []
-    t0 = _today_start()
-    for r in rows:
-        if not isinstance(r, dict) or _row_ts(r) < t0:
-            continue
-        state = str(r.get("state") or "")
-        if state == "done":
-            out["done"] += 1
-            if r.get("password_src"):
-                out["pwd"] += 1
-        elif state == "failed":
-            out["failed"] += 1
+        pass
     return out
 
 
 def needs_item(task):
-    """把一个任务行转成 NeedsAttentionCard 的一行（urgency / 说明 / 可用操作）。"""
+    """把一个任务行转成 NeedsAttentionCard 的一行（urgency / 说明 / 可用操作）。
+
+    可用操作与任务详情弹窗**同一真源**（`task_action_set`）——两处动作集合必须一致，
+    绝不出现「详情窗能忽略、侧栏却不能」。侧栏是紧凑列表：去掉复制类动作
+    （copy_error / copy_output，那里没有可粘贴的上下文），其余原样保留顺序。
+    """
     state = str(task.get("state") or "")
     err = str(task.get("error") or "").strip()
     try:
         when = time.strftime("%H:%M", time.localtime(_row_ts(task) or time.time()))
     except Exception:
         when = ""
+    try:
+        # function-local import：动作集合真源是叶子模块 ui.task_actions（无环），
+        # 这里保持局部导入以免与页面构建期互相牵连。
+        from .task_actions import source_exists, task_action_set
+        kinds = [k for k, _l, _r in
+                 task_action_set(state, source_exists(task))]
+        kinds = [k for k in kinds if k not in ("copy_error", "copy_output")]
+    except Exception:
+        kinds = ["retry", "open_dir"]
+    if not kinds:
+        kinds = ["ignore"]
     if state == "need_password":
         return {"task_id": int(task.get("id") or 0),
                 "name": str(task.get("file_name") or ""), "ts": when,
                 "urgency": "warn",
                 "note": err[:80] or "密码未命中 · 可在密码本补充后重试",
-                "actions": ["input_password", "retry", "ignore"]}
+                "actions": kinds}
     return {"task_id": int(task.get("id") or 0),
             "name": str(task.get("file_name") or ""), "ts": when,
             "urgency": "err",
             "note": err[:80] or "解压失败 · 建议重试",
-            "actions": ["retry", "open_dir"]}
+            "actions": kinds}
 
 
 # ---------------------------------------------------------------------------

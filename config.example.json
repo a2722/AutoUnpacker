@@ -69,7 +69,28 @@
     "fetch": {
       "new_domain_action": "ask",
       "whitelist": [],
-      "blacklist": []
+      "blacklist": [
+        "pan.baidu.com",
+        "uc.cn",
+        "aliyundrive.com",
+        "alipan.com",
+        "pan.quark.cn",
+        "pan.xunlei.com",
+        "115.com",
+        "anxia.com",
+        "123pan.com",
+        "lanzou.com",
+        "lanzoux.com",
+        "lanzoui.com",
+        "lanzoup.com",
+        "cloud.189.cn",
+        "caiyun.139.com",
+        "weiyun.com",
+        "jianguoyun.com",
+        "ctfile.com",
+        "wenshushu.cn",
+        "quqi.com"
+      ]
     }
   },
   "tls_skip_verify": false,

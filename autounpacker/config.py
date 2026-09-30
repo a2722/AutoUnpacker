@@ -50,6 +50,41 @@ def delete_policy_permanent_fallback(policy):
         normalize_delete_policy(policy), True))
 
 
+# 「复制网址去识别二维码」的默认黑名单：常见网盘 / 文件分享页（只挑常见的，不求穷尽）。
+# 复制进剪贴板的网址会先被抓一次、判断是不是二维码图片；而网盘 / 文件分享链接指向的是
+# **文件页（分享页）**，不会挂二维码。不预先拉黑的话，每粘一次这类链接都白摸一次对方的
+# 服务器 —— 多一次无谓请求，还把本机 IP 暴露给站点的风控。所以默认写进「自动识别 · 黑名单」
+# （设置页：复制网址去识别二维码时，遇到新网站 → 自动识别 · 黑名单）。
+# 口径：
+#   - 匹配走后缀（trust._host_matches）：条目既是它自己，也含其全部子域；
+#   - 只影响 fetch（下载识别）用途，open（二维码解出的链接要不要打开）另有名单，互不影响；
+#   - 门户站只写「文件页子域」（pan./drive./pan.xunlei. 等），绝不写 baidu.com 这类父域
+#     —— 否则会连累同域的图片 CDN；
+#   - 用户可在设置里自行增删；要放行某个域名时，加进该用途的白名单即可（白名单只在
+#     用户黑名单之后判定，所以默认名单不会硬锁死任何域名）。
+DEFAULT_FETCH_BLACKLIST = (
+    "pan.baidu.com",      # 百度网盘（分享页 /s/…）
+    "uc.cn",              # UC 网盘（含 drive./fast. 等全部子域）
+    "aliyundrive.com",    # 阿里云盘
+    "alipan.com",         # 阿里云盘（新域名）
+    "pan.quark.cn",       # 夸克网盘
+    "pan.xunlei.com",     # 迅雷云盘
+    "115.com",            # 115 网盘
+    "anxia.com",          # 115 网盘（新分享域）
+    "123pan.com",         # 123 云盘
+    "lanzou.com",         # 蓝奏云
+    "lanzoux.com",        # 蓝奏云（常见镜像）
+    "lanzoui.com",        # 蓝奏云（常见镜像）
+    "lanzoup.com",        # 蓝奏云（常见镜像）
+    "cloud.189.cn",       # 天翼云盘（电信）
+    "caiyun.139.com",     # 和彩云 / 移动云盘
+    "weiyun.com",         # 腾讯微云
+    "jianguoyun.com",     # 坚果云
+    "ctfile.com",         # 城通网盘
+    "wenshushu.cn",       # 文叔叔
+    "quqi.com",           # 曲奇云盘
+)
+
 DEFAULT_CONFIG = {
     "qr_enabled": True,
     "clipboard_enabled": True,   # 剪贴板监听总开关：关闭后本程序完全不读取剪贴板（拖入文件/图片不受影响）
@@ -105,7 +140,9 @@ DEFAULT_CONFIG = {
         "fetch": {
             "new_domain_action": "ask",  # 同上；两用途互不影响
             "whitelist": [],
-            "blacklist": [],
+            # 默认拉黑常见网盘 / 文件分享页（逐条理由见上方 DEFAULT_FETCH_BLACKLIST）；
+            # 用户可增删，或加进白名单覆盖。
+            "blacklist": list(DEFAULT_FETCH_BLACKLIST),
         },
     },
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）

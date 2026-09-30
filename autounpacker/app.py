@@ -357,6 +357,12 @@ def main():
     if not QR_AVAILABLE:
         win.log_box.appendPlainText(
             "[信息] 二维码识别功能依赖缺失（已禁用二维码，临时密码捕获不受影响）")
+        # 直写这一处也要同步空态：启动时任务页日志区可能正处于「暂无日志」空态，
+        # 不收起来就会盖住这行提示（与 _append_log 的「追加即收起」同口径）。
+        try:
+            win.task_page.set_log_empty(False)
+        except Exception:
+            pass
 
     # 自动更新自证：启动 2s 后（晚于 900ms/1200ms 启动定时器）写握手，证明新版
     # 已成功导入、主窗口已建、事件循环已在运行；更新执行器据此提交而非回滚。

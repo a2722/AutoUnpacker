@@ -494,11 +494,15 @@ class TaskPage(QWidget):
         rows = [r for r in (rows or []) if isinstance(r, dict)]
         keep = self.current_task_id()
         scroll = self.table.scroll_value() if preserve_view else None
-        self.table.set_tasks(rows, scroll_to_top=not preserve_view)
         try:
-            self.table_empty.set_empty(not rows)
-        except Exception:
-            pass
+            self.table.set_tasks(rows, scroll_to_top=not preserve_view)
+        finally:
+            # 空态永远按「这批 rows 是否为空」重算：表格装载即使抛错，也绝不把
+            # 「暂无任务」留在错误状态上（否则只能切页重载才消）。
+            try:
+                self.table_empty.set_empty(not rows)
+            except Exception:
+                pass
         restored = bool(keep is not None and self.table.select_task(keep))
         if preserve_view and scroll is not None:
             self.table.set_scroll_value(scroll)
@@ -863,8 +867,16 @@ class LogPage(QWidget):
         self.seg_level.set_label("error", "错误 %d" % counts["error"])
 
     def append_line(self, msg):
-        """活日志：按当前级别/路径/搜索判定后追加（宿主在 _append_log 里调用）。"""
+        """活日志：按当前级别/路径/搜索判定后追加（宿主在 _append_log 里调用）。
+
+        追加成功即收起空态 —— 空态原先只在整页 reload() 时重算，而「清除日志」是
+        「先置空态、再由回执行实时追加」的次序：不在这里同步，那句「暂无日志」就会
+        一直盖在回执行上，之后再来多少条日志都不消，必须切页重载（真机现象）。"""
         self._feed_line(msg)
+        try:
+            self.log_empty.set_empty(False)
+        except Exception:
+            pass
         if self.auto_scroll.isChecked():
             self.scroll_bottom()
 

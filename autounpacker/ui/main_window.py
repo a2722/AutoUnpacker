@@ -2335,15 +2335,28 @@ class MainWindow(QMainWindow):
                 pass                         # 任务视图快照里已有这一行
             else:
                 ctl = getattr(self, "log_box_folds", None)
+                _written = False
                 try:
                     if ctl is not None:
                         ctl.feed(view_msg)   # 该任务日志同样折叠（与日志页共用一套）
+                        _written = True
                     else:
                         box = getattr(self, "log_box", None)
                         if box is not None:
                             _append_log_html(self, box, view_msg)
+                            _written = True
                 except Exception:
-                    pass
+                    _written = False
+                # 追加即收起空态（与 LogPage.append_line 同口径）：clear_logs() 是
+                # 「先置空态、再由回执行实时追加」的次序，不在这里同步，那句
+                # 「暂无日志」就一直盖在那行上，必须切页重载才消（真机现象）。
+                if _written:
+                    try:
+                        _tp = getattr(self, "task_page", None)
+                        if _tp is not None:
+                            _tp.set_log_empty(False)
+                    except Exception:
+                        pass
         lp = getattr(self, "log_page", None)
         if lp is not None:
             try:

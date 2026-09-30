@@ -105,6 +105,12 @@ _CLIP_BADGE_TEXT = "需开启剪贴板监听"
 # 让出同宽内边距，否则竖条会压住行名，见 _row / _manual_row）
 _RISK_BAR_W = 3
 
+# 设置向导入口开关（2026-09-30）：向导**尚未施工完成**，先把顶部工具条的入口按钮
+# **隐藏**起来。注意：只隐藏按钮 —— 点击处理、配置键 `settings_wizard_done` 的持久化
+# 与「跳过后不再显示」的规则**一字未动**（该控件仍是这个配置键的归属控件，覆盖契约
+# 不受影响）。施工完成后把本开关改回 True 即可恢复入口。
+_WIZARD_ENTRY_ENABLED = False
+
 # 补充信息气泡：悬停延迟（对齐现有设置页的 Qt 原生 tooltip 唤醒延迟 = 700ms）
 _BUBBLE_DELAY_MS = 700
 # 补充信息气泡目标宽度（§7：宽 380，上限 屏宽-24）
@@ -842,6 +848,9 @@ class SettingsPage(QWidget):
         self.wizard_btn.setCursor(Qt.PointingHandCursor)
         self.wizard_btn.setToolTip("跳过后不再显示")
         self.wizard_btn.clicked.connect(self._on_wizard_clicked)
+        # 向导未施工完成：入口先不显示（首帧就不显示，避免未及刷新时闪一下）。
+        # 功能与配置键保留，见 _WIZARD_ENTRY_ENABLED。
+        self.wizard_btn.setVisible(_WIZARD_ENTRY_ENABLED)
         # 副标题留空（不显示「可跳过」），但仍占一行，保证与右侧「导入 / 导出」
         # 按钮纵向对齐。
         t.addLayout(self._btn_with_sub(top, self.wizard_btn, ""))
@@ -3507,9 +3516,14 @@ class SettingsPage(QWidget):
         return None
 
     def _refresh_wizard_visibility(self):
+        """向导入口可见性：**向导未施工完成 -> 恒不显示**（_WIZARD_ENTRY_ENABLED）。
+
+        开关为 True 时恢复原有规则：「跳过/完成过」就永久收起入口。这里只是把开关
+        与旧规则**与**起来，规格本身未改。
+        """
         try:
             done = bool(self._snapshot().get("settings_wizard_done", False))
-            self.wizard_btn.setVisible(not done)
+            self.wizard_btn.setVisible(_WIZARD_ENTRY_ENABLED and not done)
         except Exception:
             pass
 

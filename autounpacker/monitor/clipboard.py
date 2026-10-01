@@ -78,6 +78,45 @@ _imagegrab_mod = None   # 探测成功后缓存的 PIL.ImageGrab 模块
 _URL_FAIL_NOTIFY_TTL = 120
 
 
+class _ClipboardRace(OSError):
+    """Win32 剪贴板竞态（良性）：可用性检查与读取之间剪贴板换了主人。
+
+    别的进程 EmptyClipboard / 复制了别的格式 / 来源窗口销毁，都会让
+    `GetClipboardData(CF_UNICODETEXT)` 在「刚才明明有文本」的前提下失败
+    （典型文案 "Specified clipboard format is not available"，或 1418
+    ERROR_CLIPBOARD_NOT_OPEN）。下一轮轮询自然就恢复了，因此：
+      - 捕获路径**静默跳过本轮**，绝不记成用户可见的「临时密码捕获出错」；
+      - 基线路径照旧按「读取失败」处理（置 _baseline_unread，吸收一次即可）。
+    单独成一类，就是为了让这两条路径各自按上面对待，互不牵连。"""
+
+
+# 良性竞态的错误码：0 = GetClipboardData 时格式已不在；1418 = 剪贴板已不在本线程手里
+_CLIPBOARD_RACE_CODES = (0, 1418)
+# 良性竞态的文案（系统语言不同，pywin32 给的是本地化文案 → 中英都认）
+_CLIPBOARD_RACE_HINTS = ("format is not available",
+                         "thread does not have a clipboard open",
+                         "剪贴板格式", "没有打开的剪贴板")
+
+
+def _is_clipboard_race_error(exc):
+    """判定「Win32 剪贴板竞态」的唯一口径（pywin32 error / OSError 都适用）。"""
+    try:
+        args = getattr(exc, "args", None) or ()
+        if args and args[0] in _CLIPBOARD_RACE_CODES:
+            return True
+    except Exception:
+        pass
+    text = str(exc)
+    low = text.lower()
+    for hint in _CLIPBOARD_RACE_HINTS:
+        if hint.isascii():
+            if hint in low:
+                return True
+        elif hint in text:
+            return True
+    return False
+
+
 def _ensure_clipboard():
     """首次调用时探测剪贴板依赖；结果缓存到模块级标志。返回 (win32clipboard, ImageGrab)。
 
@@ -631,6 +670,11 @@ class QRMonitor(threading.Thread):
                         self.state.add_long_password(text)
                         self.hub.log(f"已自动加入长期密码本: {text}")
             return text
+        except _ClipboardRace:
+            # 良性竞态（剪贴板在读取瞬间换了主人）：本轮没有文本可捕获，直接跳过。
+            # 绝不记「临时密码捕获出错」—— 那不是错，下一轮轮询就恢复；真机见过的
+            # 误报：「临时密码捕获出错: Specified clipboard format is not available」。
+            return None
         except Exception as e:
             self.hub.log(f"临时密码捕获出错: {e}")
             return None
@@ -659,6 +703,15 @@ class QRMonitor(threading.Thread):
             raise OSError("OpenClipboard 重试失败（剪贴板被其他进程占用）")
         try:
             text = wc.GetClipboardData(wc.CF_UNICODETEXT)
+        except Exception as e:
+            # 读取这一步也会撞竞态：上面 IsClipboardFormatAvailable 到真正取数据之间，
+            # 剪贴板所有者换了（别的进程 EmptyClipboard / 复制了别的格式 / 来源窗口
+            # 销毁）—— Win32 报「Specified clipboard format is not available」或 1418。
+            # 良性竞态：本轮没文本可读，下一轮轮询自然恢复；单独立类，交给调用方
+            # 各自处置（捕获路径静默跳过；基线路径照旧进入吸收模式）。
+            if _is_clipboard_race_error(e):
+                raise _ClipboardRace(str(e)) from e
+            raise
         finally:
             try:
                 wc.CloseClipboard()

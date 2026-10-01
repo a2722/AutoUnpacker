@@ -49,7 +49,8 @@ from .page_trail import TrailPage
 from .page_settings import SettingsPage, _apply_card_shadow
 from .dialogs import (SevenZipSetupDialog,
                       CloseActionDialog, TrustAskDialog, WatchDirDialog,
-                      DragBehaviorDialog, TaskDetailsDialog, Scrim)
+                      DragBehaviorDialog, TaskDetailsDialog, Scrim,
+                      RecommendConfigDialog, apply_recommended_config)
 
 # ---------------------------------------------------------------------------
 # Stage 6f：模块级常量与助手已拆分到 .window 包（consts/logview/share_flow/chrome）。
@@ -4632,11 +4633,15 @@ class _SevenZipCheckBridge(QObject):
         self.checked.connect(self._on_checked)
 
     def _on_checked(self, info):
-        """在主线程处理检测结果：ok/探测失败直接标记完成；否则弹安装引导。"""
+        """在主线程处理检测结果：ok/探测失败直接标记完成；否则弹安装引导。
+
+        三条分支收尾都问一次「要不要用推荐配置」（见 _maybe_ask_recommended）——
+        客户口径：首次打开时 7-Zip 引导**之后**问；已装 7-Zip 就直接问。"""
         try:
             if info is None:
                 # 探测本身失败（纯本地读取失败）：这次既不引导也不标记完成，
-                # 下次启动再试一次；因为不弹窗，也不会打扰用户。
+                # 下次启动再试一次；7-Zip 引导不弹，推荐配置照问（仍是首次运行）。
+                self._maybe_ask_recommended()
                 return
             if info.get("status") == "ok":
                 # 无需引导；直接标记完成（state.set 持锁，线程安全）
@@ -4644,6 +4649,7 @@ class _SevenZipCheckBridge(QObject):
                     self.state.set("sevenzip_check_done", True)
                 except Exception:
                     pass
+                self._maybe_ask_recommended()
                 return
             self.hub.log(f"首次启动检测: 7-Zip {info.get('status')}"
                          + (f"（{info['version_str']}）"
@@ -4661,9 +4667,39 @@ class _SevenZipCheckBridge(QObject):
             if _sevenzip_should_mark_done(info.get("status"),
                                           getattr(dlg, "outcome", "closed")):
                 self.state.set("sevenzip_check_done", True)
+            self._maybe_ask_recommended()
         except Exception as e:
             try:
                 self.hub.log(f"7-Zip 引导异常: {e}")
+            except Exception:
+                pass
+
+    def _dialog_host(self):
+        """模态窗宿主：精简模式下主窗是隐藏的，改挂可见的小窗，避免孤立/不可见。"""
+        try:
+            if getattr(self.parent, "is_compact", lambda: False)():
+                return getattr(self.parent, "_compact_window", None) or self.parent
+        except Exception:
+            pass
+        return self.parent
+
+    def _maybe_ask_recommended(self):
+        """首次运行问一次「要不要用推荐配置」，选「使用推荐配置」则写那四项。
+
+        只认「首次运行」这一个时机：本桥只由 app.main 在 sevenzip_check_done=False 时
+        调起（见 app.py 的 1200ms 定时器），所以不另加配置键；用户选哪边都只影响
+        apply_recommended_config 写的那四项，其余键一律不动。全程异常安全，绝不因为
+        这个弹窗打断首次启动。"""
+        try:
+            if RecommendConfigDialog.ask(self._dialog_host()):
+                written = apply_recommended_config(self.state)
+                try:
+                    self.hub.log("已按推荐配置调整设置：" + "、".join(written))
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.hub.log(f"推荐配置询问异常: {e}")
             except Exception:
                 pass
 

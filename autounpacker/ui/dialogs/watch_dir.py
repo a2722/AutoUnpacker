@@ -87,6 +87,17 @@ class WatchDirDialog(QDialog):
         fit_text_heights(self)
 
     # ---- 读取入口 ----
+    def _experimental_on(self):
+        """配置里「启用实验性功能」是否开启（优先 state.get，退化快照；异常按未开）。"""
+        for getter in (lambda: self.state.get("experimental_enabled", False),
+                       lambda: (self.state.snapshot() or {}).get(
+                           "experimental_enabled", False)):
+            try:
+                return bool(getter())
+            except Exception:
+                continue
+        return False
+
     def _load_entry(self):
         """取当前 entry：优先 state.snapshot()，退化到 state.cfg；异常一律空字典。"""
         for getter in (lambda: self.state.snapshot(),
@@ -175,6 +186,22 @@ class WatchDirDialog(QDialog):
         self.mode_sel.set_mode(str(self._orig.get("mode") or "surface"))
         row3.addWidget(self.mode_sel, 1)
         lay.addLayout(row3)
+
+        # 实验性功能关闭时：「百度清单 · 含子目录」并不真正生效（清单模式整个藏在
+        # 实验性开关后面），实际只能降级按「表层」处理。这里把那张卡**变灰**（仍可
+        # 点选，绝不 setEnabled(False)），并紧跟一行提示说明；重新开启实验性后提示
+        # 自动消失 —— 弹窗每次打开都重读配置，不需要额外刷新。
+        self.mode_dim_hint = None
+        if not self._experimental_on():
+            for _card in self.mode_sel.cards():
+                if _card.value == "baidu":
+                    _card.set_dimmed(True)
+            self.mode_dim_hint = QLabel(
+                "实验性功能未开启：选「百度清单 · 含子目录」目前也只能按「表层 · 安全」"
+                "处理；在设置里开启「启用实验性功能」后才会真正跟随网盘清单。", self)
+            self.mode_dim_hint.setObjectName("dlgHint")
+            self.mode_dim_hint.setWordWrap(True)
+            lay.addWidget(self.mode_dim_hint)
 
         # 开关
         row4 = QHBoxLayout()

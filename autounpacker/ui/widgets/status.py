@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QWidget, QLabel, QFrame, QVBoxLayout,
 from PyQt5.QtCore import (Qt, QTimer, QPoint, QPropertyAnimation,
                           QEasingCurve, pyqtSignal)
 
-from .common import _clear_layout, repolish_tree
+from .common import _clear_layout, repolish, repolish_tree
 from .inputs import Glyph, LayoutButton
 from .nav import DEFAULT_TIPS
 class StatusTipTicker(QWidget):
@@ -339,6 +339,7 @@ class ModeCard(LayoutButton):
     def __init__(self, value, title, desc, badge=None, parent=None):
         super().__init__(parent)
         self.value = str(value)
+        self._dimmed = False
         self.setObjectName("modeCard")
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -384,6 +385,33 @@ class ModeCard(LayoutButton):
         except Exception:
             pass
         repolish_tree(self)
+        # 勾背后那块「选中底色」由后代选择器
+        # `QPushButton#modeCard[checked="true"] QFrame#modeCheck` 决定，颜色挂在
+        # QFrame 上；repolish_tree 只覆盖 QLabel 子控件，漏了它就等于没重算 ——
+        # 真机表现：勾和大框都换到新卡片了，蓝底却留在上一次选中那张上。
+        try:
+            repolish(self.check_box)
+        except Exception:
+            pass
+
+    def set_dimmed(self, flag):
+        """降级外观：变灰暗示当前能力受限，但**仍可点选**（不 setEnabled(False)）。
+
+        语义由调用方在旁边给提示解释（例如「实验性未开启 → 只能按表层处理」）。
+        动态属性 repolish 同 _on_toggled：样式挂在 QSS 的 [dim="true"] 上。"""
+        self._dimmed = bool(flag)
+        try:
+            self.setProperty("dim", "true" if self._dimmed else "false")
+        except Exception:
+            pass
+        repolish_tree(self)
+        try:
+            repolish(self.check_box)
+        except Exception:
+            pass
+
+    def is_dimmed(self):
+        return bool(self._dimmed)
 
     def description(self):
         return self.desc_label.text()

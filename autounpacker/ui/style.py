@@ -764,6 +764,10 @@ QPushButton#modeCard[checked="false"] { border: 1px solid $ctl_border; backgroun
 QPushButton#modeCard:hover { border: 1px solid $ctl_focus; }
 QFrame#modeCheck { background: $ind_bg; border: 1px solid $ind_border; border-radius: 3px; }
 QPushButton#modeCard[checked="true"] QFrame#modeCheck { background: $sel_bg; border: 1px solid $sel_bg; }
+/* 降级态（如「按网盘清单」在实验性关闭时）：用禁用态底色/边框，一眼看出「现在
+   只有表层能力」，但**仍可点选**（不 setEnabled(False)），语义由旁边那行提示说明。 */
+QPushButton#modeCard[dim="true"] { background: $btn_dis_bg; border: 1px solid $btn_dis_border; }
+QPushButton#modeCard[dim="true"] QLabel#modeTitle { color: $chip_off_fg; }
 QLabel#modeTitle { font-size: 13px; font-weight: 600; color: $ctl_fg; }
 QLabel#modeDesc { font-size: 11.5px; color: $chip_off_fg; }
 QLabel#modeBadge {

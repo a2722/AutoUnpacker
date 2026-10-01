@@ -46,6 +46,8 @@ from .delete_policy import DeletePolicyAskDialog  # noqa: F401
 from .watch_dir import WatchDirDialog  # noqa: F401
 from .drag_behavior import DragBehaviorDialog  # noqa: F401
 from .task_details import TaskDetailsDialog  # noqa: F401
+from .recommend import (RecommendConfigDialog,  # noqa: F401
+                        apply_recommended_config, RECOMMENDED_ITEMS)
 from .scrim import Scrim  # noqa: F401
 
 __all__ = [
@@ -56,4 +58,5 @@ __all__ = [
     "CloseActionDialog", "TrustAskDialog",
     "ShareCodeAskDialog", "DeletePolicyAskDialog", "WatchDirDialog",
     "DragBehaviorDialog", "TaskDetailsDialog", "Scrim",
+    "RecommendConfigDialog", "apply_recommended_config", "RECOMMENDED_ITEMS",
 ]

@@ -827,11 +827,18 @@ class QRMonitor(threading.Thread):
         image.save(buf, format="PNG")
         return hashlib.md5(buf.getvalue()).hexdigest()
 
-    def _process(self, image):
+    def _process(self, image, track=True):
         """轮询线程侧：剪贴板图片按 md5 去重后入队，解码交给工作线程。
 
         去重必须留在轮询线程：否则未变化的剪贴板图片会每 0.5s 重复入队，很快
         淹没 task_q。仅在图片确实变化（哈希不同）时入队一次。
+
+        `track=False`：**不**参与剪贴板去重（既不比对 `last_hash`、也不更新它），
+        直接入队。专供「用户主动拖入的图片文件」这类显式意图使用——拖入的图片
+        与剪贴板里的图片是两条独立来源，绝不能共用同一个去重键。否则：拖入一张
+        新图会把 `last_hash` 覆盖成拖入图的 md5，导致剪贴板里**未变化**的旧图
+        在下一轮被误判为「新图」重新入队、再打开一次浏览器（真机已复现：
+        复制一张二维码图后拖入另一张，会多打开一次旧图的网页）。
 
         防御性收口：Pillow 的 grabclipboard() 在 Windows 上返回
         Image.Image | list[str] | None；剪贴板为文件引用（CF_HDROP，如资源管理器
@@ -839,6 +846,10 @@ class QRMonitor(threading.Thread):
         调用点的 CF_DIB 判断）。非真实图片（None / list 等无 save 方法者）直接返回，
         避免 image.save 抛 'list' object has no attribute 'save'。"""
         if image is None or not hasattr(image, "save"):
+            return
+        if not track:
+            # 拖入图片：显式意图，直接入队，绝不触碰剪贴板去重键
+            self._enqueue(("image", image))
             return
         h = self._image_md5(image)
         if h == self.last_hash:
@@ -878,9 +889,11 @@ class QRMonitor(threading.Thread):
             self.hub.log(f"二维码图片投放失败：无法打开图片 {path}: {e}")
             return False
         try:
-            # 与剪贴板图片完全同一条链路：md5 去重 + _enqueue(("image", image))，
-            # 解码由工作线程 _decode_qr + _handle_decoded_texts 统一完成。
-            self._process(image)
+            # 与剪贴板图片同为「解码入队」链路，但**不参与剪贴板去重**（track=False）：
+            # 拖入图片是用户显式意图，与剪贴板里的图是两条独立来源；若共用 last_hash，
+            # 拖入新图会覆盖去重键、让剪贴板里未变的旧图被误判为新图再打开一次。
+            # 解码仍由工作线程 _decode_qr + _handle_decoded_texts 统一完成。
+            self._process(image, track=False)
         except Exception as e:
             self.hub.log(f"二维码图片投放失败：入队出错: {e}")
             return False

@@ -908,56 +908,56 @@ class WinRarEngine:
                     return self._fail(f"启动 WinRAR 失败: {e}",
                                       raw=str(e),
                                       logs=[f"使用 {self.name} 引擎失败"])
-            if pauser is not None:
-                pauser.register(proc, task_id)
-            last_ratio = -1.0
-            last_progress_t = 0.0
-            aborted = False
-            try:
-                while True:
-                    if pauser is not None:
-                        if task_id is not None and pauser.is_aborted(task_id):
-                            proc.kill()
-                            aborted = True
-                            break
-                        pauser.wait_if_paused()
-                        last_progress_t = time.time()
-                    if proc.poll() is not None:
-                        break
-                    now = time.time()
-                    if total and now - last_progress_t >= 0.5:
-                        last_progress_t = now
-                        ratio = min(0.999, _dir_size(out) / total)
-                        if ratio != last_ratio:
-                            last_ratio = ratio
-                            if progress_cb is not None:
-                                progress_cb(ratio, layer, archive.name)
-                    time.sleep(0.1)
-                rc = proc.wait()
-            finally:
                 if pauser is not None:
-                    pauser.unregister(proc)
-            last_rc = rc
-            last_log = self._read_log(log_path)
-            self._unlink(log_path)
-            if aborted:
-                if progress_cb is not None:
-                    progress_cb(None, layer, archive.name)
-                return {"success": False, "used_password": None,
-                        "encrypted": False,
-                        "error": "已取消（用户中止）",
-                        "raw_error": "用户中止解压",
-                        "logs": [f"使用 {self.name} 引擎解压已取消（用户中止）"]}
-            if rc == 0:
-                if progress_cb is not None:
-                    progress_cb(1.0, layer, archive.name)
-                return {"success": True,
-                        "used_password": pwd or None,
-                        "encrypted": bool(pwd),
-                        "error": None,
-                        "logs": [f"使用 {self.name} 引擎解压"]}
-            # 非零：若是「密码错」则继续试下一个候选；否则（打不开/损坏）
-            # 也继续试——候选耗尽后由下方统一报错。last_log 保留最后一条。
+                    pauser.register(proc, task_id)
+                last_ratio = -1.0
+                last_progress_t = 0.0
+                aborted = False
+                try:
+                    while True:
+                        if pauser is not None:
+                            if task_id is not None and pauser.is_aborted(task_id):
+                                proc.kill()
+                                aborted = True
+                                break
+                            pauser.wait_if_paused()
+                            last_progress_t = time.time()
+                        if proc.poll() is not None:
+                            break
+                        now = time.time()
+                        if total and now - last_progress_t >= 0.5:
+                            last_progress_t = now
+                            ratio = min(0.999, _dir_size(out) / total)
+                            if ratio != last_ratio:
+                                last_ratio = ratio
+                                if progress_cb is not None:
+                                    progress_cb(ratio, layer, archive.name)
+                        time.sleep(0.1)
+                    rc = proc.wait()
+                finally:
+                    if pauser is not None:
+                        pauser.unregister(proc)
+                last_rc = rc
+                last_log = self._read_log(log_path)
+                self._unlink(log_path)
+                if aborted:
+                    if progress_cb is not None:
+                        progress_cb(None, layer, archive.name)
+                    return {"success": False, "used_password": None,
+                            "encrypted": False,
+                            "error": "已取消（用户中止）",
+                            "raw_error": "用户中止解压",
+                            "logs": [f"使用 {self.name} 引擎解压已取消（用户中止）"]}
+                if rc == 0:
+                    if progress_cb is not None:
+                        progress_cb(1.0, layer, archive.name)
+                    return {"success": True,
+                            "used_password": pwd or None,
+                            "encrypted": bool(pwd),
+                            "error": None,
+                            "logs": [f"使用 {self.name} 引擎解压"]}
+                # 非零：若是「密码错」则继续试下一个候选；否则（打不开/损坏）
+                # 也继续试——候选耗尽后由下方统一报错。last_log 保留最后一条。
         finally:
             self._unlink(temp_link)
         if progress_cb is not None:

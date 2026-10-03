@@ -248,8 +248,34 @@ def format_from_extension(path):
     return EXT_FORMATS.get(path.suffix.lower().lstrip("."))
 
 
+def normalize_volume_name(name):
+    """把「首卷名里被插了脏字符」的分卷名归一为标准形式。
+
+    现场：`Huge is good.7z.除001` —— 上传方在 `001` 前插了个非 ASCII 标记字符
+    （防和谐字符；程序原有的 `删` 也在清理之列）。这种名不是标准分卷名
+    （`.001` 恰 4 字符），`is_volume_name` 判否 → 程序不认为它是分卷 → 把单个
+    文件交给 7-Zip → `Cannot open`（分卷集认不出）。
+
+    仅当「去掉 `NNN` 前的 1~4 个纯非 ASCII 字符后能得到一个**合法分卷名**」
+    时才归一，绝不误伤普通文件名（ASCII 名、非分卷名一律原样返回）。
+    取不到合法结果 / 任何异常时返回原样，绝不抛异常。
+    """
+    try:
+        s = str(name or "")
+        if not s or is_volume_name(s):
+            return s
+        # 前缀 . + 1~4 个非 ASCII 标记 + 3 位数字（.001 / .002 ...）
+        m = re.match(r"^(.*)\.([^\x00-\x7f]{1,4})(\d{3})$", s)
+        if not m:
+            return s
+        cand = f"{m.group(1)}.{m.group(3)}"
+        return cand if is_volume_name(cand) else s
+    except Exception:
+        return str(name or "")
+
+
 def sanitize_filename(name):
-    return name.replace("删", "")
+    return normalize_volume_name(name.replace("删", ""))
 
 
 def is_disguised(path, real_format):

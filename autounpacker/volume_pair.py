@@ -495,14 +495,17 @@ def _assembly_names(first_name, plan, fmt):
     try:
         if fmt not in _ASSEMBLY_FORMATS:
             return None
+        # 用归一后的名字判后缀：脏名（xxx.删除7z.删除001）原名不以 .NNN 结尾，
+        # 会让这里误判「不支持决断」；归一后再判即可正确装配。
+        norm = smart_extract.normalize_volume_name(first_name)
         base = _base_of(first_name)
         if not base:
             return None
-        if re.search(r"\.\d{3}$", first_name):
+        if re.search(r"\.\d{3}$", norm):
             if not base.lower().endswith("." + fmt):
                 base = base + "." + fmt
             return [f"{base}.{num:03d}" for num, _ in plan]
-        if re.search(r"\.[zZ]\d{2}$", first_name) and fmt == "zip":
+        if re.search(r"\.[zZ]\d{2}$", norm) and fmt == "zip":
             return [f"{base}.z{num:02d}" for num, _ in plan]
     except Exception:
         pass

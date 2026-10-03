@@ -804,7 +804,12 @@ def is_fake_volume_name(path):
 
 
 def _volume_base(name):
-    """剥离分卷编号，得到分卷基础名。如 2056.7z.002 -> 2056.7z、a.r00 -> a。"""
+    """剥离分卷编号，得到分卷基础名。如 2056.7z.002 -> 2056.7z、a.r00 -> a。
+
+    先做脏字符归一（xxx.删除7z.删除001 -> xxx.7z.001）再取基础名：这样被插字/
+    改名的卷能和它的干净兄弟卷归到同一基础名（volume_pair 的跨名配对、
+    is_volume_file 的兄弟判定都依赖这个口径）。"""
+    name = normalize_volume_name(name)
     m = re.search(r"\.([zr]?\d{2,3})$", name, re.I)
     return name[:m.start()] if m else None
 

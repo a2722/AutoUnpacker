@@ -83,7 +83,8 @@ from .extraction.formats import (  # noqa: F401
     is_disguised, is_do_not_extract,
     is_fake_volume_name, is_first_volume, is_incomplete_download,
     is_non_first_rar_part, is_non_first_volume, is_split_gap_error,
-    is_volume_file, is_volume_name, parse_sevenzip_listing,
+    is_volume_file, is_volume_name, normalize_volume_name,
+    parse_sevenzip_listing,
     perform_sanitization, sanitize_filename, should_skip_volume,
     volume_download_pending)
 from .extraction.post import (  # noqa: F401

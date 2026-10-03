@@ -5,12 +5,25 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.21] - 2026-10-03
+
+> **本轮重点**：让「跨名分卷兜底」（volume_pair：看包头 + 硬链接装配后丢给 7z 验证）对**脏名首卷**也能生效。
+
+### 修改
+- **修复（跨名分卷兜底对脏名首卷失效）**：`volume_pair` 是「同目录里各分卷被改成互不相同随机名」时的内容兜底——按**包头**（首卷有魔数、续卷没有）打分，再硬链接装配整链丢给 `7z l` 验证。但它的入口**也按名**：经 `_base_of`(=`_volume_base`) 取基础名，而 `_volume_base` 没做脏字符归一 → 返回 `None` → `best_chain` 直接 `no_candidates`，整条内容兜底被名判挡在门外。
+  修复：`_volume_base` 先做脏字符归一再取基础名（`xxx.删除7z.删除001` → 基础名 `xxx.7z`，与干净兄弟同基础名）；`volume_pair._assembly_names` 用归一后的名字判分卷后缀（否则脏名原名不以 `.NNN` 结尾，装配名生成不出、`verify` 只会 `inconclusive`）；`extract.py` 补 `normalize_volume_name` 的 import（此前只进了 `__all__`）。
+  实测：脏名首卷 + 改名续卷（跨名）→ `best_chain` 找到链、`7z` 验证 → **`verified`**。
+
+### 测试
+- 新增 `test_volume_pair_dirty.py`（5）：`_volume_base` 归一反证 + 跨名分卷兜底 e2e（脏首卷 + 改名续卷 → 7z `verified`）。
+- 串行全量 **182 项 / FAILCOUNT=3**（`test_dead_share_flow` / `test_need_code_gate` / `test_polish_three` 三个既有环境性失败）。
+
 ## [2.2.20] - 2026-10-03
 
 > **本轮重点**：①分卷名脏字符改用「同目录干净兄弟卷反推」的通用兜底（不枚举标记字符）；②网盘残留任务（僵尸行）不再误报「未完成」。
 
 ### 修改
-- **修复（分卷名带任意脏字符识别不到）**：上传者常往分卷名里插任意字符（本次见到「删除」二字，如 `Huge is good.删除7z.删除001`）。程序原有分卷判定全按「名尾是否为 `.001`」，脏名一进来就匹配不上 → 不认分卷 → 单文件交给 7-Zip → `Cannot open`。**仅枚举「删除/删/除」不可维护**（上传者随时换字符），故新增通用兜底 `infer_volume_name_from_siblings`：用同目录里「干净的标准分卷兄弟」（如 `xxx.7z.002`）的系列基名 + 本文件末尾 3 位卷号，反推出正确名（`Huge is good.删除7z.删除001` → `Huge is good.7z.001`），**不依赖任何具体标记字符**；接入 `analyze_file`（→ `perform_sanitization` 改名）与拖放门槛。另保留快速的「名字式归一」（`删`/`除`/末尾非 ASCII 段）作首通道，`is_volume_name` / `is_first_volume` / `_volume_number` 先归一再判。
+- **修复（分卷名带任意脏字符识别不到）**：上传者常往分卷名里插任意字符（本次见到「删除」二字，如 `xxx.删除7z.删除001`）。程序原有分卷判定全按「名尾是否为 `.001`」，脏名一进来就匹配不上 → 不认分卷 → 单文件交给 7-Zip → `Cannot open`。**仅枚举「删除/删/除」不可维护**（上传者随时换字符），故新增通用兜底 `infer_volume_name_from_siblings`：用同目录里「干净的标准分卷兄弟」（如 `xxx.7z.002`）的系列基名 + 本文件末尾 3 位卷号，反推出正确名（`xxx.删除7z.删除001` → `xxx.7z.001`），**不依赖任何具体标记字符**；接入 `analyze_file`（→ `perform_sanitization` 改名）与拖放门槛。另保留快速的「名字式归一」（`删`/`除`/末尾非 ASCII 段）作首通道，`is_volume_name` / `is_first_volume` / `_volume_number` 先归一再判。
 - **修复（网盘残留任务误报「未完成」）**：启动探测读客户端 `download_file` 表，只要有行就弹「网盘任务未完成」。但客户端会残留「任务实际已结束、文件已删」的僵尸行（真机：一条 6 小时前的记录，目标文件已不在磁盘）→ 误报。`leftover_tasks` 增补 `local_exists`（目标文件是否还在磁盘）；`probe_and_log` 只对「文件还在」的任务弹通知，文件不在的记为「疑似客户端残留，不提醒」。
 
 ### 测试

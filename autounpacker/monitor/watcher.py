@@ -1765,6 +1765,11 @@ class FolderWatcher(threading.Thread):
             # A1：防 zip bomb 配置从实时配置中心抽入 options（含 max_size_ratio），
             # 不再硬编码 max_size_ratio=100.0；改配置无需重启即生效。
             options.update(bomb_options_from_cfg(self.state.snapshot()))
+            # WinRAR 兜底（可选）：开关与路径带进 options，供 ExtractService 在
+            # 「7-Zip 打不开」时选择性尝试；缺 WinRAR 绝不影响其它回退路径。
+            _au_snap = self.state.snapshot()
+            options["winrar_enabled"] = bool(_au_snap.get("winrar_enabled", True))
+            options["winrar_path"] = str(_au_snap.get("winrar_path", "") or "")
             args = types.SimpleNamespace(
                 move_to=None,
                 delete_source=bool(wc.get("delete_source")),

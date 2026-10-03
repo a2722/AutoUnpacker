@@ -61,6 +61,7 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
 from ..config import DEFAULT_CONFIG, _sanitize_cfg
 from ..config import load_config
 from .. import sevenzip as sz
+from ..winrar import find_winrar
 from . import style as ui_style
 from .style import METRICS, PALETTE
 from .textfit import ensure_min_height, fit_text_heights
@@ -2195,6 +2196,7 @@ class SettingsPage(QWidget):
         # 「7-Zip」一等设置组：原「解压引擎」组的开关行 + 原「7-Zip 管理…」弹窗
         # 的全部动作，现内联成一组，位置在「历史」与「版本与更新」之间。
         self._build_sevenzip_group(box)
+        self._build_winrar_group(box)
         self._build_update_group(box)
         self._build_support_group(box)
 
@@ -2272,6 +2274,108 @@ class SettingsPage(QWidget):
         # 首屏状态：先给不跑子进程的占位，真状态由后台检测填充（UI 线程不跑 7z）
         self._update_sevenzip_uninstall_enabled()
         self._sevenzip_start("recheck")
+
+    def _build_winrar_group(self, box):
+        """WinRAR 兜底组（可选引擎，绝不作为硬依赖）。
+
+        两个配置键都必须经 _reg 登记（覆盖契约：covered_top_keys() 恰为
+        DEFAULT_CONFIG 顶层键）：winrar_enabled 走 _check（内部已 _reg +
+        _rows），winrar_path 走手工行（QLineEdit + 浏览…），与「网盘任务库
+        路径」同一套结构。find_winrar 只查文件系统 / 注册表、不跑子进程，
+        可在 UI 线程直接调用；本组绝不启动 WinRAR。"""
+        g = self._group(box, "WinRAR 兜底")
+
+        self.winrar_enabled_cb = self._check(
+            g, "启用 WinRAR 兜底解压", "winrar_enabled",
+            "7-Zip 打不开某些合法的加密 Zip64 ZIP 时，交给 WinRAR 解（更快）；"
+            "关闭本项或本机没有 WinRAR 时回退内置解压。WinRAR 是可选的，"
+            "缺失不影响程序运行，也不会自动安装。",
+            syn=("winrar", "WinRAR", "rar", "兜底", "解压", "引擎",
+                 "Zip64", "备用"),
+            default=True)
+
+        # 路径行：手工行（QLineEdit + 浏览…），与「网盘任务库路径」逐字同构
+        wh, wl = self._manual_row(g)
+        path_meta = _SettingRow(
+            "WinRAR 路径（留空=自动探测）",
+            "WinRAR.exe 的完整路径；留空 = 自动探测注册表 / 常见安装目录 / PATH，"
+            "支持绿色版放在任意位置。",
+            "winrar_path", None, "system", "WinRAR 兜底")
+        path_meta.host = wh
+        wl.addWidget(self._make_name(
+            wh, "WinRAR 路径（留空=自动探测）", path_meta))
+        self.winrar_path_edit = QLineEdit(wh)
+        self.winrar_path_edit.setPlaceholderText("留空 = 自动探测 WinRAR.exe")
+        self.winrar_path_edit.setToolTip(
+            "WinRAR.exe 的完整路径（指向 exe 本身，不是安装目录）；"
+            "留空自动探测（支持绿色版任意位置）。")
+        wl.addWidget(self.winrar_path_edit, 1)
+        self.winrar_browse_btn = QPushButton("浏览…", wh)
+        self.winrar_browse_btn.setCursor(Qt.PointingHandCursor)
+        self.winrar_browse_btn.clicked.connect(self._browse_winrar)
+        wl.addWidget(self.winrar_browse_btn)
+        self._reg("winrar_path", self.winrar_path_edit)
+        self._bind_text(self.winrar_path_edit, "winrar_path",
+                        lambda: str(self.winrar_path_edit.text()).strip())
+        path_row = _SettingRow(
+            "WinRAR 路径（留空=自动探测）",
+            "WinRAR.exe 的完整路径；留空 = 自动探测注册表 / 常见安装目录 / PATH，"
+            "支持绿色版放在任意位置。",
+            "winrar_path", self.winrar_path_edit, "system", "WinRAR 兜底",
+            syn=("winrar", "WinRAR", "rar", "路径", "绿色版", "便携版",
+                 "兜底", "解压"),
+            default_key="winrar_path")
+        path_row.host = wh
+        self._rows.append(path_row)
+        # 路径变更（含回填）即重算检测状态：find_winrar 纯文件系统 + 注册表
+        self.winrar_path_edit.textChanged.connect(
+            lambda *_a: self._refresh_winrar_status())
+
+        # 只读检测状态行（没有配置键，不进 _rows —— 同 7-Zip 状态行的规矩）
+        sh, sl = self._manual_row(g)
+        sl.addWidget(self._make_name(
+            sh, "检测状态",
+            _SettingRow("检测状态",
+                        "当前是否能在本机找到可用的 WinRAR.exe（只读）。",
+                        "", None, "system", "WinRAR 兜底")))
+        sl.addStretch(1)
+        self.winrar_status_lbl = QLabel("", sh)
+        self.winrar_status_lbl.setObjectName("roval")
+        sl.addWidget(self.winrar_status_lbl)
+        self._refresh_winrar_status()
+
+    def _refresh_winrar_status(self):
+        """重算 WinRAR 检测状态（只读展示）。
+
+        find_winrar 只做文件系统 / 注册表查询，不跑子进程，故可在 UI 线程直接
+        调用；异常一律退回「未检测到」，绝不因探测失败打断设置页。"""
+        try:
+            path = str(self.winrar_path_edit.text()).strip()
+        except Exception:
+            path = ""
+        try:
+            found = find_winrar(path)
+        except Exception:
+            found = None
+        try:
+            if found:
+                self.winrar_status_lbl.setText("已找到: %s" % found)
+            else:
+                self.winrar_status_lbl.setText("未检测到（留空自动探测）")
+        except Exception:
+            pass
+
+    def _browse_winrar(self):
+        """选 WinRAR.exe（绿色版任意位置）；选中即回填并立即提交。"""
+        try:
+            path, _flt = QFileDialog.getOpenFileName(
+                self, "选择 WinRAR.exe", "",
+                "WinRAR (WinRAR.exe);;可执行文件 (*.exe);;所有文件 (*)")
+        except Exception:
+            path = ""
+        if path:
+            self.winrar_path_edit.setText(path)
+            self._flush_text(self.winrar_path_edit)   # 不等 400ms 防抖
 
     def _sevenzip_name(self, parent, text):
         """7-Zip 动作行的名称标签（objectName=setName，与其它行同名样式）。
@@ -3467,6 +3571,11 @@ class SettingsPage(QWidget):
             self.interval_spin.setValue(max(1, min(30, i("poll_interval", 2))))
             # 语义反转：已检测过(True) => 界面不勾选；否则勾选（下次重检）
             self.sevenzip_cb.setChecked(not b("sevenzip_check_done", False))
+            # WinRAR 兜底（可选引擎）：勾选状态 + 显式路径（空 = 自动探测）；
+            # setText 触发 textChanged -> 重算只读检测状态
+            self.winrar_enabled_cb.setChecked(b("winrar_enabled", True))
+            self.winrar_path_edit.setText(s("winrar_path"))
+            self._refresh_winrar_status()
             self.task_limit_spin.setValue(max(1, min(100000, i("task_history_limit", 500))))
             # 开机自启：以注册表实际状态为准回填（config 缓存可能被手工改注册表搞脏）
             self.autostart_cb.setChecked(self._autostart_actual())

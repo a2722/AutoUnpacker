@@ -10,8 +10,10 @@ import ctypes
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -778,6 +780,237 @@ class SevenZipEngine:
         return {"success": False, "used_password": None, "encrypted": bool(encrypted),
                 "error": concise, "raw_error": last_raw or last_error,
                 "logs": raw_logs}
+
+
+class WinRarEngine:
+    """WinRAR 引擎（可选）：解某些 7-Zip 打不开的合法 Zip64/大偏移加密 ZIP。
+
+    为什么存在：7-Zip 的 zip 解析器对「本地头在超大偏移 + Zip64 数据描述符 +
+    加密」的合法 ZIP 无能为力（真机案：伪装 MP4 的加密 Zip64，内含 7z 分卷，
+    7z 三个版本全 `Cannot open`），而 WinRAR 用正确密码 60s 解出 6GB。原先这类
+    文件只能回退 Python zipfile（纯 Python 20+ 分钟且占 GIL 冻结界面）。
+
+    调用契约（已实测，WinRAR 6.24）：
+        WinRAR.exe x -ibck -y -inul [-ilog<tmp>] -p<pwd> <archive> <outdir>
+      - `-ibck`：后台，不占前台；**实测不弹窗**（错误时配合 -inul 也不弹）。
+      - `-inul`：抑制错误弹窗（否则错误会弹诊断窗 → 无人值守挂起）。
+      - `-y`：全部查询默认 Yes（覆盖已存在文件等）。
+      - `-ilog<file>`：把错误写日志文件（-inul 后屏幕无输出，靠它拿文本）。
+      - `-p<pwd>`：密码**必须给**，否则加密归档会弹密码框并挂起；无候选时给
+        `-p-`（实测不弹、立即失败）。
+      绝不使用 `-ioff`（那是「解压完关机」）。
+      退出码（实测 6.24）：0=成功；10=失败（密码错 / 打不开 / 无匹配）；
+      其余非零按失败处理。
+
+    安全：密码经 `-p` 落在命令行 → 任务管理器/命令行可见（WinRAR 无 stdin
+    传密码能力，这是它的固有限制）。因此本引擎**只作末位可选兜底**（7z 与
+    Python zipfile 都搞不定时才用），且调用方**绝不把 argv 写进日志**。
+    """
+
+    name = "WinRAR"
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def _total_bytes(self, archive):
+        """从 zipfile 读未压缩总量作进度分母（WinRAR CLI 无机器可读进度）。
+
+        只读中心目录（不解压），失败返回 None（进度退化为忙碌态）。"""
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                total = sum(int(i.file_size) for i in zf.infolist()
+                            if not i.is_dir())
+            return total or None
+        except Exception:
+            return None
+
+    # WinRAR 按扩展名认归档：伪装文件（如 xxx.mp4 实为 ZIP）直接被拒（实测 rc=1）。
+    # 故喂给 WinRAR 前，若源扩展名不是压缩包后缀，用**同盘硬链接**造一个带
+    # 正确后缀、零拷贝的路径（实测 6GB 瞬间建好，WinRAR 正常解）。跨盘/硬链接
+    # 失败时回退临时复制（有 I/O 成本，仅在不得以时用）。
+    _ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz")
+
+    def _winrar_friendly_path(self, archive):
+        """返回一个 WinRAR 认可扩展名的等效路径（可能等于原路径）。
+
+        返回 (path, temp_link_or_None)。调用方必须在用完后清理 temp_link。
+        原路径已是压缩包后缀 → 原样返回。否则尝试同盘硬链接；失败则复制到
+        临时目录（同盘优先，避免跨盘大文件复制）。任何异常都退回原路径
+        （宁可按原样试一次，也绝不因造链失败而放弃）。"""
+        try:
+            if archive.suffix.lower() in self._ARCHIVE_EXTS:
+                return archive, None
+        except Exception:
+            return archive, None
+        link = None
+        try:
+            # 同盘硬链接：放在源文件同目录（保证同卷），名字加唯一后缀避免冲突
+            link = archive.with_name(
+                archive.name + ".au_winrar_" + uuid.uuid4().hex[:8] + ".zip")
+            os.link(str(archive), str(link))
+            return link, link
+        except OSError:
+            # 跨盘 / 不支持硬链接：退回临时复制（放临时目录即可）
+            try:
+                if link is not None and link.exists():
+                    link.unlink()
+            except OSError:
+                pass
+            try:
+                tmp = Path(tempfile.gettempdir()) / (
+                    "au_winrar_" + uuid.uuid4().hex + ".zip")
+                shutil.copyfile(str(archive), str(tmp))
+                return tmp, tmp
+            except OSError:
+                return archive, None
+
+    def extract(self, task, options, layer):
+        archive = Path(task["source_path"])
+        out = Path(task["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        pauser = task.get("pauser")
+        task_id = task.get("id")
+        progress_cb = task.get("progress_cb")
+        total = self._total_bytes(archive)
+        if progress_cb is not None:
+            progress_cb(None if total is None else 0.0, layer, archive.name)
+
+        # 伪装文件（如 xxx.mp4 实为 ZIP）：WinRAR 按扩展名拒绝，用同盘硬链接造
+        # 一个 .zip 等效路径（零拷贝）再喂给它；用完清理。
+        wr_archive, temp_link = self._winrar_friendly_path(archive)
+
+        passwords = list(task.get("passwords") or [])
+        if not passwords:
+            passwords = [None]
+
+        last_rc = None
+        last_log = ""
+        try:
+            for pwd in passwords:
+                if pauser is not None:
+                    pauser.wait_if_paused()
+                # 密码必给：空候选用 -p-（实测不弹密码框、立即失败），防无人值守挂起
+                pwd_arg = ("-p" + str(pwd)) if pwd else "-p-"
+                # -ilog 临时文件：-inul 后屏幕无输出，靠它拿错误文本（诊断用）
+                log_path = Path(tempfile.gettempdir()) / (
+                    "au_winrar_" + uuid.uuid4().hex + ".log")
+                args = [str(self.path), "x", "-ibck", "-y", "-inul",
+                        "-ilog" + str(log_path), pwd_arg,
+                        str(wr_archive), str(out)]
+                try:
+                    proc = subprocess.Popen(
+                        args, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW)
+                except Exception as e:
+                    self._unlink(log_path)
+                    self._unlink(temp_link)
+                    return self._fail(f"启动 WinRAR 失败: {e}",
+                                      raw=str(e),
+                                      logs=[f"使用 {self.name} 引擎失败"])
+            if pauser is not None:
+                pauser.register(proc, task_id)
+            last_ratio = -1.0
+            last_progress_t = 0.0
+            aborted = False
+            try:
+                while True:
+                    if pauser is not None:
+                        if task_id is not None and pauser.is_aborted(task_id):
+                            proc.kill()
+                            aborted = True
+                            break
+                        pauser.wait_if_paused()
+                        last_progress_t = time.time()
+                    if proc.poll() is not None:
+                        break
+                    now = time.time()
+                    if total and now - last_progress_t >= 0.5:
+                        last_progress_t = now
+                        ratio = min(0.999, _dir_size(out) / total)
+                        if ratio != last_ratio:
+                            last_ratio = ratio
+                            if progress_cb is not None:
+                                progress_cb(ratio, layer, archive.name)
+                    time.sleep(0.1)
+                rc = proc.wait()
+            finally:
+                if pauser is not None:
+                    pauser.unregister(proc)
+            last_rc = rc
+            last_log = self._read_log(log_path)
+            self._unlink(log_path)
+            if aborted:
+                if progress_cb is not None:
+                    progress_cb(None, layer, archive.name)
+                return {"success": False, "used_password": None,
+                        "encrypted": False,
+                        "error": "已取消（用户中止）",
+                        "raw_error": "用户中止解压",
+                        "logs": [f"使用 {self.name} 引擎解压已取消（用户中止）"]}
+            if rc == 0:
+                if progress_cb is not None:
+                    progress_cb(1.0, layer, archive.name)
+                return {"success": True,
+                        "used_password": pwd or None,
+                        "encrypted": bool(pwd),
+                        "error": None,
+                        "logs": [f"使用 {self.name} 引擎解压"]}
+            # 非零：若是「密码错」则继续试下一个候选；否则（打不开/损坏）
+            # 也继续试——候选耗尽后由下方统一报错。last_log 保留最后一条。
+        finally:
+            self._unlink(temp_link)
+        if progress_cb is not None:
+            progress_cb(None, layer, archive.name)
+        # 失败文案：优先从 -ilog 里认「密码错」，否则给通用失败。绝不含密码/argv。
+        msg = "WinRAR 解压失败"
+        if self._looks_wrong_password(last_log):
+            msg = "密码错误"
+        elif last_rc is not None:
+            msg = f"WinRAR 解压失败（退出码 {last_rc}）"
+        logs = [f"使用 {self.name} 引擎解压失败"]
+        if last_log:
+            logs.append("--- WinRAR 诊断 ---")
+            logs.extend(str(last_log).splitlines()[:20])
+        return {"success": False, "used_password": None, "encrypted": False,
+                "error": msg, "raw_error": msg, "logs": logs}
+
+    @staticmethod
+    def _fail(msg, raw="", logs=None):
+        return {"success": False, "used_password": None, "encrypted": False,
+                "error": msg, "raw_error": raw or msg,
+                "logs": logs or [msg]}
+
+    @staticmethod
+    def _looks_wrong_password(text):
+        t = str(text or "").lower()
+        return ("wrong password" in t or "密码错误" in t
+                or "incorrect password" in t or "bad password" in t)
+
+    @staticmethod
+    def _read_log(path):
+        """读 -ilog 文本（WinRAR 写 UTF-16LE，含 BOM；容错多种编码）。"""
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return ""
+        if not data:
+            return ""
+        for enc in ("utf-16", "utf-8", "gbk"):
+            try:
+                return data.decode(enc)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        return data.decode("utf-8", "replace")
+
+    @staticmethod
+    def _unlink(path):
+        if path is None:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 ZIP_OPEN_ERROR_MARKERS = (

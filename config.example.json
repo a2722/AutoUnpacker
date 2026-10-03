@@ -31,6 +31,8 @@
     }
   ],
   "sevenzip_check_done": false,
+  "winrar_enabled": true,
+  "winrar_path": "",
   "poll_interval": 2,
   "task_history_limit": 500,
   "incomplete_download_suffixes": [

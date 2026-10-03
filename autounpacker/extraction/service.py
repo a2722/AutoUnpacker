@@ -314,34 +314,49 @@ class ExtractService:
                               "logs": list(best.get("logs") or [])
                                        + ["[警告] 7-Zip 返回非零退出码，但校验文件数量与大小后确认全部解出"]}
                 else:
-                    # Python zipfile 兜底：纯 Python 逐字节解压，超大归档会非常慢
-                    # （真机案：1.79GB ZipCrypto 包 ~25 分钟、期间无任何输出）。
-                    # 收紧（B）：**回退前先确认 Python 真的能打开它**——7z 与 zipfile
-                    # 都可能打不开，若 Python 也打不开（zipfile.is_zipfile 为假），
-                    # 再花几十分钟做一次注定失败的纯 Python 解压纯属浪费。此时直接
-                    # 按 7z 的原始错误如实失败，绝不进长尾。
-                    if not self._python_can_open(item["archive"]):
-                        self.emit(f"[第{depth}层] 7-Zip 打不开且 Python zipfile 也无法"
-                                  f"识别该归档，跳过纯 Python 兜底（避免长时间空转）")
-                        result["logs"] = list(result.get("logs") or []) + [
-                            "[兜底跳过] 7-Zip 与 Python zipfile 均无法打开该归档"]
-                    else:
-                        size_mb = _archive_size_mb(item["archive"])
-                        self.emit(f"[第{depth}层] 改用 Python zipfile 重试"
-                                  + (f"（{size_mb:.0f} MB，纯 Python 解压可能需较长时间）"
-                                     if size_mb >= _PYZIP_SLOW_MB else ""))
-                        if size_mb >= _PYZIP_SLOW_MB:
-                            self.emit(f"[第{depth}层] 提示：7-Zip 未能处理该归档，"
-                                      f"Python 兜底正在解压，请耐心等待（期间无进度输出）")
-                        fallback_attempts.append(PythonZipEngine().extract(layer_task, self.options, depth))
-                        winner = next((a for a in fallback_attempts if a["success"]), None)
-                        if winner is not None:
-                            result = winner
+                    # 第一步：WinRAR 兜底（可选）——某些合法 Zip64/大偏移加密 ZIP
+                    # 7-Zip 打不开，但 WinRAR 能快速解（真机案：伪装 MP4 的加密
+                    # Zip64 内含 7z 分卷，7z 全版本 Cannot open，WinRAR 60s 解出
+                    # 6GB）。仅在开关开、且本机确实装了 WinRAR 时尝试；解出即用，
+                    # 否则继续走 Python zipfile。缺 WinRAR 绝不影响后续回退。
+                    winrar_engine = self._make_winrar_engine()
+                    if winrar_engine is not None:
+                        self.emit(f"[第{depth}层] 尝试 WinRAR 兜底解压"
+                                  f"（7-Zip 无法处理该归档）")
+                        wr = winrar_engine.extract(layer_task, self.options, depth)
+                        fallback_attempts.append(wr)
+                        if wr.get("success"):
+                            result = wr
+                    if not result["success"]:
+                        # 第二步：Python zipfile 兜底：纯 Python 逐字节解压，超大
+                        # 归档会非常慢（真机案：1.79GB ZipCrypto 包 ~25 分钟、期间
+                        # 无任何输出）。收紧：**回退前先确认 Python 真的能打开它**——
+                        # 若 Python 也打不开（is_zipfile 为假），再花几十分钟做一次
+                        # 注定失败的纯 Python 解压纯属浪费，直接按原始错误失败。
+                        if not self._python_can_open(item["archive"]):
+                            self.emit(f"[第{depth}层] 7-Zip/WinRAR 打不开且 Python "
+                                      f"zipfile 也无法识别该归档，跳过纯 Python 兜底"
+                                      f"（避免长时间空转）")
+                            result["logs"] = list(result.get("logs") or []) + [
+                                "[兜底跳过] 各引擎均无法打开该归档"]
                         else:
-                            errs = [a["error"] for a in fallback_attempts if a.get("error")]
-                            for a in fallback_attempts:
-                                result["logs"].extend(a["logs"])
-                            result["error"] = "；".join(dict.fromkeys(errs)) or result["error"]
+                            size_mb = _archive_size_mb(item["archive"])
+                            self.emit(f"[第{depth}层] 改用 Python zipfile 重试"
+                                      + (f"（{size_mb:.0f} MB，纯 Python 解压可能需较长时间）"
+                                         if size_mb >= _PYZIP_SLOW_MB else ""))
+                            if size_mb >= _PYZIP_SLOW_MB:
+                                self.emit(f"[第{depth}层] 提示：7-Zip 未能处理该归档，"
+                                          f"Python 兜底正在解压，请耐心等待（期间无进度输出）")
+                            fallback_attempts.append(
+                                PythonZipEngine().extract(layer_task, self.options, depth))
+                            winner = next((a for a in fallback_attempts if a["success"]), None)
+                            if winner is not None:
+                                result = winner
+                            else:
+                                errs = [a["error"] for a in fallback_attempts if a.get("error")]
+                                for a in fallback_attempts:
+                                    result["logs"].extend(a["logs"])
+                                result["error"] = "；".join(dict.fromkeys(errs)) or result["error"]
             for log in result["logs"]:
                 self.emit(f"[第{depth}层] {log}")
 
@@ -833,6 +848,25 @@ class ExtractService:
             return bool(zipfile.is_zipfile(str(archive)))
         except Exception:
             return False
+
+    def _make_winrar_engine(self):
+        """按配置与可用性返回 WinRAR 引擎实例；不可用返回 None（绝不抛异常）。
+
+        门控：config `winrar_enabled` 为真 **且** 能定位到 WinRAR.exe 才返回。
+        用户可显式指定路径（config `winrar_path`，支持绿色版）；为空则自动探测。
+        缺 WinRAR / 开关关 → None，调用方静默跳过，绝不影响其它回退路径。"""
+        try:
+            cfg = self.options or {}
+            if not bool(cfg.get("winrar_enabled", True)):
+                return None
+            from ..winrar import find_winrar
+            exe = find_winrar(cfg.get("winrar_path") or "")
+            if exe is None:
+                return None
+            from .engines import WinRarEngine
+            return WinRarEngine(exe)
+        except Exception:
+            return None
 
     def move_to_output(self, src_dir, dst_dir):
         dst_dir.mkdir(parents=True, exist_ok=True)

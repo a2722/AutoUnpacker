@@ -114,6 +114,11 @@ DEFAULT_CONFIG = {
         {"from": "example1.com", "to": "example2.com"},
     ],
     "sevenzip_check_done": False,   # 首次启动的 7-Zip 检测已完成（避免每次启动都检查/弹窗）
+    # WinRAR 兜底（可选，绝不作为硬依赖）：7-Zip 打不开某些合法 Zip64/大偏移加密
+    # ZIP 时，若本机有 WinRAR 则用它解（快）；没有则回退 Python zipfile（慢）。
+    # winrar_path 为空 = 自动探测；显式指定可支持绿色版任意位置。
+    "winrar_enabled": True,
+    "winrar_path": "",
     "poll_interval": 2,
     "task_history_limit": 500,     # 任务历史保留条数（只清理终态任务，非终态永不删）
     # 未完成下载后缀（小写 + 前导点）：命中则暂不解压，等下载器改名后再处理。
@@ -414,6 +419,8 @@ def _sanitize_cfg(cfg):
         cfg["url_redirect_rules"] = rules
         cfg["auto_add_clipboard_password"] = bool(cfg.get("auto_add_clipboard_password", False))
         cfg["sevenzip_check_done"] = bool(cfg.get("sevenzip_check_done", False))
+        cfg["winrar_enabled"] = bool(cfg.get("winrar_enabled", True))
+        cfg["winrar_path"] = str(cfg.get("winrar_path", "") or "").strip()
         close_action = str(cfg.get("close_action", "ask")).strip()
         cfg["close_action"] = close_action if close_action in ("ask", "tray", "exit") else "ask"
         # 网址信任机制（按用途 open/fetch 拆两套：默认行为 + 白/黑名单）

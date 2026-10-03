@@ -903,6 +903,14 @@ def leftover_tasks(db_path=None):
         except Exception:
             add = 0.0
         d["age_s"] = int(now - add) if add else None
+        # 目标文件是否还在磁盘：不在的多半是客户端残留的僵尸行（任务实际已结束/
+        # 文件已删，客户端却没把它移出 download_file）。启动提示据此区分
+        # 「真未完成」与「疑似残留」，避免对僵尸行弹「未完成」通知。
+        try:
+            lp = str(d.get("local_path") or "")
+            d["local_exists"] = bool(lp) and Path(lp).exists()
+        except Exception:
+            d["local_exists"] = False
         out.append(d)
     return out
 

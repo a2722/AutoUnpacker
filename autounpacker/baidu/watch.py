@@ -383,15 +383,25 @@ def probe_and_log(state, hub):
         try:
             left = leftover_tasks(str(db) if db else None)
             if left:
-                hub.log(f"[实验性] 检测到 {len(left)} 个未完成的网盘任务：")
-                for t in left[:10]:
-                    hub.log(f"[实验性]   {_as_text(t.get('local_path'))} "
-                            f"({t.get('file_size')} B)")
-                try:
-                    hub.notify("网盘任务未完成",
-                               f"有 {len(left)} 个网盘任务未完成（或仍在下载）")
-                except Exception:
-                    pass
+                # A：区分「真未完成」（目标文件还在盘上）与「疑似残留」（文件已不在，
+                # 多半是客户端僵尸行）——只对前者弹通知，后者仅记日志，避免误报。
+                live = [t for t in left if t.get("local_exists")]
+                stale = [t for t in left if not t.get("local_exists")]
+                if live:
+                    hub.log(f"[实验性] 检测到 {len(live)} 个未完成的网盘任务：")
+                    for t in live[:10]:
+                        hub.log(f"[实验性]   {_as_text(t.get('local_path'))} "
+                                f"({t.get('file_size')} B)")
+                    try:
+                        hub.notify("网盘任务未完成",
+                                   f"有 {len(live)} 个网盘任务未完成（或仍在下载）")
+                    except Exception:
+                        pass
+                if stale:
+                    hub.log(f"[实验性] 另有 {len(stale)} 条任务记录的目标文件已不在磁盘"
+                            f"（疑似客户端残留，不提醒）：")
+                    for t in stale[:5]:
+                        hub.log(f"[实验性]   {_as_text(t.get('local_path'))}")
         except Exception:
             pass
         try:

@@ -902,8 +902,17 @@ class MainWindow(QMainWindow):
                     threading.Thread(target=_feed_qr, daemon=True).start()
                     return
 
-        # 非压缩包且不是分卷：跳过
-        if not smart_extract.is_archive_file(path) and not smart_extract.is_volume_name(path.name):
+        # 非压缩包且不是分卷：跳过。分卷判定额外走「同目录干净兄弟卷反推」兜底，
+        # 应对上传者用任意脏字符插进分卷名（如 xxx.删除7z.删除001）的情况。
+        _vol_by_sibling = False
+        try:
+            _vol_by_sibling = bool(
+                smart_extract.infer_volume_name_from_siblings(path))
+        except Exception:
+            _vol_by_sibling = False
+        if (not smart_extract.is_archive_file(path)
+                and not smart_extract.is_volume_name(path.name)
+                and not _vol_by_sibling):
             self.hub.log(f"拖放: 不是压缩包，跳过: {path.name}")
             return
 

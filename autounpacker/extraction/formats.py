@@ -248,36 +248,99 @@ def format_from_extension(path):
     return EXT_FORMATS.get(path.suffix.lower().lstrip("."))
 
 
+def infer_volume_name_from_siblings(path):
+    """用同目录里「干净的标准分卷兄弟」反推本文件的正确分卷名；取不到返回 None。
+
+    应对上传者用**任意字符**往分卷名里插垃圾（无法穷举）的情况：本文件名末尾的
+    3 位卷号是真信号，而同目录里其它标准分卷（如 `xxx.7z.002`）给出了正确的
+    系列基名 —— 两者拼起来即为正确名。例：
+        `Huge is good.删除7z.删除001` + 兄弟 `Huge is good.7z.002`
+        -> `Huge is good.7z.001`
+    仅当「本文件不是标准分卷名、且同目录存在标准分卷兄弟」时才推断，绝不误伤
+    普通文件名。绝不抛异常。
+    """
+    try:
+        p = Path(path)
+        if _is_volume_suffix(p.name):
+            return None
+        m = re.search(r"(\d{3})$", p.name)
+        if not m:
+            return None
+        num = m.group(1)
+        parent = p.parent
+        if not parent.is_dir():
+            return None
+        from collections import Counter
+        bases = Counter()
+        try:
+            for e in parent.iterdir():
+                if e.is_file() and _is_volume_suffix(e.name):
+                    b = _volume_base(e.name)
+                    if b:
+                        bases[b] += 1
+        except OSError:
+            return None
+        if not bases:
+            return None
+        base = bases.most_common(1)[0][0]
+        cand = f"{base}.{num}"
+        return cand if (cand != p.name and _is_volume_suffix(cand)) else None
+    except Exception:
+        return None
+
+
+def _is_volume_suffix(name):
+    """底层：按后缀字面判断是否分卷名（不做脏字符归一；供 normalize 复用，避免递归）。"""
+    try:
+        low = str(name or "").lower()
+        ext = Path(low).suffix
+        if len(ext) == 4 and ext[1:].isdigit():
+            return True
+        if len(ext) == 4 and ext[1].lower() == "z" and ext[2:].isdigit():
+            return True
+        if ".part" in low and low.endswith(".rar"):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def normalize_volume_name(name):
-    """把「首卷名里被插了脏字符」的分卷名归一为标准形式。
+    """把「被插了防和谐标记」的分卷名归一为标准形式。
 
-    现场：`Huge is good.7z.除001` —— 上传方在 `001` 前插了个非 ASCII 标记字符
-    （防和谐字符；程序原有的 `删` 也在清理之列）。这种名不是标准分卷名
-    （`.001` 恰 4 字符），`is_volume_name` 判否 → 程序不认为它是分卷 → 把单个
-    文件交给 7-Zip → `Cannot open`（分卷集认不出）。
+    上传方常在文件名里插「删除」二字（或单字「删」/「除」），约定用户自行删掉，
+    以规避直链检测。现场：`Huge is good.删除7z.删除001` —— 程序原有净化只去单字
+    `删`，留下 `除`，名仍非标准分卷（`.001` 恰 4 字符）→ `is_volume_name` 判否
+    → 不认为分卷 → 单文件交 7-Zip → `Cannot open`。
 
-    仅当「去掉 `NNN` 前的 1~4 个纯非 ASCII 字符后能得到一个**合法分卷名**」
-    时才归一，绝不误伤普通文件名（ASCII 名、非分卷名一律原样返回）。
-    取不到合法结果 / 任何异常时返回原样，绝不抛异常。
+    依次尝试去掉 `删除` / `删` / `除`，以及「`NNN` 前的 1~4 个纯非 ASCII 字符」；
+    任一候选成为**合法分卷名**即采用，绝不误伤普通文件名（非分卷名一律原样返回）。
+    绝不抛异常。
     """
     try:
         s = str(name or "")
-        if not s or is_volume_name(s):
+        if not s or _is_volume_suffix(s):
             return s
-        # 前缀 . + 1~4 个非 ASCII 标记 + 3 位数字（.001 / .002 ...）
+        cands = []
+        if "删除" in s:
+            cands.append(s.replace("删除", ""))
+        if "删" in s:
+            cands.append(s.replace("删", ""))
+        if "除" in s:
+            cands.append(s.replace("除", ""))
         m = re.match(r"^(.*)\.([^\x00-\x7f]{1,4})(\d{3})$", s)
-        if not m:
-            return s
-        cand = f"{m.group(1)}.{m.group(3)}"
-        return cand if is_volume_name(cand) else s
+        if m:
+            cands.append(f"{m.group(1)}.{m.group(3)}")
+        for c in cands:
+            if c and _is_volume_suffix(c):
+                return c
+        return s
     except Exception:
         return str(name or "")
 
 
 def sanitize_filename(name):
-    return normalize_volume_name(name.replace("删", ""))
-
-
+    return normalize_volume_name(name.replace("\u5220", ""))
 def is_disguised(path, real_format):
     if not real_format:
         return False
@@ -394,16 +457,8 @@ def _strip_download_suffix(name):
 
 
 def is_volume_name(name):
-    """是否为分卷文件名：.001/.002、.z01、xxx.partN.rar 等。"""
-    low = name.lower()
-    ext = Path(name).suffix
-    if len(ext) == 4 and ext[1:].isdigit():
-        return True
-    if len(ext) == 4 and ext[1].lower() == "z" and ext[2:].isdigit():
-        return True
-    if ".part" in low and low.endswith(".rar"):
-        return True
-    return False
+    """是否为分卷文件名：.001/.002、.z01、xxx.partN.rar 等（含脏字符归一后的）。"""
+    return _is_volume_suffix(normalize_volume_name(name))
 
 
 def is_split_gap_error(archive_name, err_text):
@@ -464,6 +519,11 @@ def analyze_file(path, manual_format=None):
             "stego_content": None,
         }
     sanitized = sanitize_filename(original_name)
+    if sanitized == original_name:
+        # 名字式净化没改：再用同目录干净兄弟卷反推（应对任意脏字符）
+        inferred = infer_volume_name_from_siblings(path)
+        if inferred:
+            sanitized = inferred
     sanitized_path = path.with_name(sanitized) if sanitized != original_name else None
 
     if manual_format:
@@ -496,6 +556,10 @@ def analyze_file(path, manual_format=None):
 
 def perform_sanitization(path):
     new_name = sanitize_filename(path.name)
+    if new_name == path.name:
+        inferred = infer_volume_name_from_siblings(path)
+        if inferred:
+            new_name = inferred
     if new_name != path.name:
         new_path = path.with_name(new_name)
         path.rename(new_path)
@@ -635,6 +699,7 @@ def is_first_volume(name):
 
     首卷是解压入口；多分卷首卷出现时后续分卷可能尚未下载/创建，
     监听层需要据此进入观察期，避免后续分卷没到齐就提前解压。"""
+    name = normalize_volume_name(name)
     low = name.lower()
     info = _part_info(name)
     if info:
@@ -651,6 +716,7 @@ def _volume_number(name):
     xxx.r00 → 1（r00 系列把 r00 视为第 1 卷）。
 
     用于判断分卷编号是否连续（缺中间卷时能检测出来）。无法识别返回 None。"""
+    name = normalize_volume_name(name)
     low = name.lower()
     info = _part_info(name)
     if info:

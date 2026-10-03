@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.20] - 2026-10-03
+
+> **本轮重点**：①分卷名脏字符改用「同目录干净兄弟卷反推」的通用兜底（不枚举标记字符）；②网盘残留任务（僵尸行）不再误报「未完成」。
+
+### 修改
+- **修复（分卷名带任意脏字符识别不到）**：上传者常往分卷名里插任意字符（本次见到「删除」二字，如 `Huge is good.删除7z.删除001`）。程序原有分卷判定全按「名尾是否为 `.001`」，脏名一进来就匹配不上 → 不认分卷 → 单文件交给 7-Zip → `Cannot open`。**仅枚举「删除/删/除」不可维护**（上传者随时换字符），故新增通用兜底 `infer_volume_name_from_siblings`：用同目录里「干净的标准分卷兄弟」（如 `xxx.7z.002`）的系列基名 + 本文件末尾 3 位卷号，反推出正确名（`Huge is good.删除7z.删除001` → `Huge is good.7z.001`），**不依赖任何具体标记字符**；接入 `analyze_file`（→ `perform_sanitization` 改名）与拖放门槛。另保留快速的「名字式归一」（`删`/`除`/末尾非 ASCII 段）作首通道，`is_volume_name` / `is_first_volume` / `_volume_number` 先归一再判。
+- **修复（网盘残留任务误报「未完成」）**：启动探测读客户端 `download_file` 表，只要有行就弹「网盘任务未完成」。但客户端会残留「任务实际已结束、文件已删」的僵尸行（真机：一条 6 小时前的记录，目标文件已不在磁盘）→ 误报。`leftover_tasks` 增补 `local_exists`（目标文件是否还在磁盘）；`probe_and_log` 只对「文件还在」的任务弹通知，文件不在的记为「疑似客户端残留，不提醒」。
+
+### 测试
+- 新增 `test_volume_sibling_infer.py`（8）：用任意脏字符（`删除` / `★`）经兄弟卷反推正确名 + 不误伤反证（标准名/无兄弟卷/不存在路径均返回 None）。
+- `test_volume_name_normalize.py` 更新 C3 断言（脏名现被认作分卷）+ 新增 `删除7z.删除001` 用例，共 20。
+- 串行全量 **182 项 / FAILCOUNT=3**（`test_dead_share_flow` / `test_need_code_gate` / `test_polish_three` 三个既有环境性失败；另 `test_log_page_defects` / `test_tab_shortcuts` 为既有偶发崩溃/时序，复跑即过，与本轮无关）。
+
 ## [2.2.19] - 2026-10-03
 
 > **本轮重点**：修复 2.2.18 引入的 WinRAR 兜底密码迭代失效（严重），并归一「首卷名带脏字符」的分卷名。

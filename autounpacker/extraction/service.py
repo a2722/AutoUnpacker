@@ -316,24 +316,32 @@ class ExtractService:
                 else:
                     # Python zipfile 兜底：纯 Python 逐字节解压，超大归档会非常慢
                     # （真机案：1.79GB ZipCrypto 包 ~25 分钟、期间无任何输出）。
-                    # 仅在 7-Zip 也拿不下的情况下才用，且超阈值时先如实告知用户
-                    # 「需要多久」，不让人误以为卡死。
-                    size_mb = _archive_size_mb(item["archive"])
-                    self.emit(f"[第{depth}层] 改用 Python zipfile 重试"
-                              + (f"（{size_mb:.0f} MB，纯 Python 解压可能需较长时间）"
-                                 if size_mb >= _PYZIP_SLOW_MB else ""))
-                    if size_mb >= _PYZIP_SLOW_MB:
-                        self.emit(f"[第{depth}层] 提示：7-Zip 未能处理该归档，"
-                                  f"Python 兜底正在解压，请耐心等待（期间无进度输出）")
-                    fallback_attempts.append(PythonZipEngine().extract(layer_task, self.options, depth))
-                    winner = next((a for a in fallback_attempts if a["success"]), None)
-                    if winner is not None:
-                        result = winner
+                    # 收紧（B）：**回退前先确认 Python 真的能打开它**——7z 与 zipfile
+                    # 都可能打不开，若 Python 也打不开（zipfile.is_zipfile 为假），
+                    # 再花几十分钟做一次注定失败的纯 Python 解压纯属浪费。此时直接
+                    # 按 7z 的原始错误如实失败，绝不进长尾。
+                    if not self._python_can_open(item["archive"]):
+                        self.emit(f"[第{depth}层] 7-Zip 打不开且 Python zipfile 也无法"
+                                  f"识别该归档，跳过纯 Python 兜底（避免长时间空转）")
+                        result["logs"] = list(result.get("logs") or []) + [
+                            "[兜底跳过] 7-Zip 与 Python zipfile 均无法打开该归档"]
                     else:
-                        errs = [a["error"] for a in fallback_attempts if a.get("error")]
-                        for a in fallback_attempts:
-                            result["logs"].extend(a["logs"])
-                        result["error"] = "；".join(dict.fromkeys(errs)) or result["error"]
+                        size_mb = _archive_size_mb(item["archive"])
+                        self.emit(f"[第{depth}层] 改用 Python zipfile 重试"
+                                  + (f"（{size_mb:.0f} MB，纯 Python 解压可能需较长时间）"
+                                     if size_mb >= _PYZIP_SLOW_MB else ""))
+                        if size_mb >= _PYZIP_SLOW_MB:
+                            self.emit(f"[第{depth}层] 提示：7-Zip 未能处理该归档，"
+                                      f"Python 兜底正在解压，请耐心等待（期间无进度输出）")
+                        fallback_attempts.append(PythonZipEngine().extract(layer_task, self.options, depth))
+                        winner = next((a for a in fallback_attempts if a["success"]), None)
+                        if winner is not None:
+                            result = winner
+                        else:
+                            errs = [a["error"] for a in fallback_attempts if a.get("error")]
+                            for a in fallback_attempts:
+                                result["logs"].extend(a["logs"])
+                            result["error"] = "；".join(dict.fromkeys(errs)) or result["error"]
             for log in result["logs"]:
                 self.emit(f"[第{depth}层] {log}")
 
@@ -812,6 +820,19 @@ class ExtractService:
         except OSError:
             return False
         return actual == expected
+
+    @staticmethod
+    def _python_can_open(archive):
+        """Python zipfile 能否识别该归档（回退前的门槛，收紧 B）。
+
+        纯只读探测：`zipfile.is_zipfile` 为假时，Python 兜底注定失败——此时再花
+        几十分钟做一次纯 Python 全量解压毫无意义（真机案：大 zip 回退后 CPU 空转
+        二十几分钟且界面冻结）。异常一律返回 False（保守：不冒险进长尾）。
+        注意：仅判「能否识别」，不判内容是否完整（完整性由解压本身决定）。"""
+        try:
+            return bool(zipfile.is_zipfile(str(archive)))
+        except Exception:
+            return False
 
     def move_to_output(self, src_dir, dst_dir):
         dst_dir.mkdir(parents=True, exist_ok=True)

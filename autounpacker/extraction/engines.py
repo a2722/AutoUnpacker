@@ -408,37 +408,153 @@ class PythonZipEngine:
                              f"{blocked}"]}
         out = Path(task["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
+        # 解压丢进独立子进程（zip_worker）：Python zipfile 的紧密解密循环会长时间
+        # 持有 GIL，在主进程里跑会把 Qt 主线程饿死 → 界面整体冻结（真机案：大 zip
+        # 回退本引擎后切任何页面都卡死）。子进程隔离 GIL 与原生崩溃，主进程照常。
+        return self._extract_via_subprocess(task, archive, out, layer)
+
+    def _extract_via_subprocess(self, task, archive, out, layer):
+        """把 zipfile 解压交给 zip_worker 子进程，父进程只等 + 报进度/暂停/中止。
+
+        结果契约与内联版逐字一致：成功返回 used_password/encrypted；失败按
+        bad_zip / password / 其它分类回填 error。密码**绝不进命令行**——与 7z
+        路径同一安全口径：写进临时请求文件（仅本进程与子进程可见），argv 只带
+        请求文件路径，任务管理器/命令行参数里看不到任何密码。
+        """
+        from ..workers import worker_command
+        import json
+        import tempfile
+        import uuid
+
         pauser = task.get("pauser")
-        last_error = None
-        for pwd in task["passwords"]:
-            if pauser is not None:
-                pauser.wait_if_paused()
+        task_id = task.get("id")
+        progress_cb = task.get("progress_cb")
+        if progress_cb is not None:
+            progress_cb(None, layer, archive.name)
+
+        req_path = Path(tempfile.gettempdir()) / f"au_zipreq_{uuid.uuid4().hex}.json"
+        req = {
+            "archive": str(archive),
+            "out": str(out),
+            # 保留 None（表示「不带密码」这一候选轮次）；只把真正的字符串码原样
+            # 传递。绝不能 str(None) 成 "None"——那会变成一个真密码去试，把
+            # 「需要密码」误报成「密码错误」。
+            "passwords": [None if p is None else str(p)
+                          for p in (task.get("passwords") or [])],
+        }
+        try:
+            req_path.write_text(json.dumps(req, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            return {"success": False, "used_password": None, "encrypted": False,
+                    "error": f"准备解压请求失败: {e}", "logs": []}
+
+        try:
             try:
-                with self._open(archive) as zf:
-                    # 「真的需要密码」的判据：归档里存在非目录的加密条目（bit 0）。
-                    # 未加密归档即使传了候选密码，也绝不能让该候选被记为「命中」，
-                    # 否则 GUI 把整本密码本当候选时，每个未加密包都会误报命中。
-                    encrypted = any(i.flag_bits & 0x1 for i in zf.infolist() if not i.is_dir())
-                    if pwd:
-                        pb = self._test_password_any(zf, self._password_bytes(pwd))
-                        if pb is None:
-                            raise RuntimeError("密码错误")
-                        zf.extractall(out, pwd=pb)
-                    else:
-                        if encrypted:
-                            raise RuntimeError("需要密码")
-                        zf.extractall(out)
-                return {"success": True,
-                        "used_password": (pwd or None) if encrypted else None,
-                        "encrypted": bool(encrypted),
-                        "error": None, "logs": [f"使用 {self.name} 引擎解压 ZIP"]}
-            except zipfile.BadZipFile as e:
+                proc = subprocess.Popen(
+                    worker_command("zip", str(req_path)),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
+            except Exception as e:
                 return {"success": False, "used_password": None, "encrypted": False,
-                        "error": f"不是有效的 ZIP 文件: {e}", "logs": []}
-            except (RuntimeError, OSError, ValueError) as e:
-                last_error = str(e)
-        return {"success": False, "used_password": None, "encrypted": False,
-                "error": last_error or "解压失败", "logs": []}
+                        "error": f"启动解压子进程失败: {e}", "logs": []}
+            if pauser is not None:
+                pauser.register(proc, task_id)
+            buf = []
+
+            def _drain():
+                try:
+                    for raw in proc.stdout:
+                        buf.append(raw.decode("utf-8", "replace"))
+                except Exception:
+                    pass
+
+            th = threading.Thread(target=_drain, daemon=True)
+            th.start()
+            # 进度：子进程只输出一行结果，无中间进度；用输出目录体积估算（与 7z
+            # 路径同一算法），让用户看到"还在动"。总量取自 task（service 已传入）。
+            total = task.get("declared_total")
+            last_ratio = -1.0
+            last_progress_t = 0.0
+            aborted = False
+            try:
+                while True:
+                    if pauser is not None:
+                        if task_id is not None and pauser.is_aborted(task_id):
+                            proc.kill()
+                            aborted = True
+                            break
+                        pauser.wait_if_paused()
+                        # 暂停期间不推进进度，避免 pause 时长被算成解压耗时
+                        last_progress_t = time.time()
+                    if proc.poll() is not None:
+                        break
+                    now = time.time()
+                    if total and now - last_progress_t >= 0.5:
+                        last_progress_t = now
+                        try:
+                            ratio = min(0.999, _dir_size(out) / total)
+                        except Exception:
+                            ratio = last_ratio
+                        if ratio != last_ratio:
+                            last_ratio = ratio
+                            if progress_cb is not None:
+                                progress_cb(ratio, layer, archive.name)
+                    time.sleep(0.1)
+                rc = proc.wait()
+            finally:
+                if pauser is not None:
+                    pauser.unregister(proc)
+            th.join(timeout=2)
+            if aborted:
+                if progress_cb is not None:
+                    progress_cb(None, layer, archive.name)
+                return {"success": False, "used_password": None,
+                        "encrypted": False,
+                        "error": "已取消（用户中止）",
+                        "raw_error": "用户中止解压",
+                        "logs": [f"使用 {self.name} 引擎解压已取消（用户中止）"]}
+            payload = self._parse_worker_result("".join(buf))
+            if payload is None:
+                if progress_cb is not None:
+                    progress_cb(None, layer, archive.name)
+                return {"success": False, "used_password": None, "encrypted": False,
+                        "error": f"解压子进程异常退出（rc={rc}）", "logs": []}
+            if payload.get("success"):
+                if progress_cb is not None:
+                    progress_cb(1.0, layer, archive.name)
+                return {"success": True,
+                        "used_password": payload.get("used_password"),
+                        "encrypted": bool(payload.get("encrypted")),
+                        "error": None,
+                        "logs": [f"使用 {self.name} 引擎解压 ZIP"]}
+            if progress_cb is not None:
+                progress_cb(None, layer, archive.name)
+            kind = payload.get("kind")
+            err = str(payload.get("error") or "解压失败")
+            if kind == "bad_zip":
+                return {"success": False, "used_password": None, "encrypted": False,
+                        "error": err, "logs": []}
+            return {"success": False, "used_password": None, "encrypted": False,
+                    "error": err, "logs": []}
+        finally:
+            try:
+                req_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _parse_worker_result(text):
+        """从子进程 stdout 里取最后一行 `RESULT:{json}`；解析失败返回 None。"""
+        import json
+        payload = None
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if line.startswith("RESULT:"):
+                try:
+                    payload = json.loads(line[len("RESULT:"):])
+                except Exception:
+                    payload = None
+        return payload
 
     @staticmethod
     def _open(archive):

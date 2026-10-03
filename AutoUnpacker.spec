@@ -23,6 +23,7 @@ hiddenimports = [
     "autounpacker.workers",
     "autounpacker.workers.qr_worker",
     "autounpacker.workers.clipboard_worker",
+    "autounpacker.workers.zip_worker",
     "PIL",
     "PIL.Image",
     "PIL.ImageFile",

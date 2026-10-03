@@ -15,7 +15,7 @@ def worker_command(name, *args):
         [sys.executable, "--run-worker", name, *args]
         由 app.main() 在导入 Qt 前转交给对应 worker 的 main()。
 
-    `name` 为 "qr" 或 "clipboard"。paths 延迟导入，保持本包导入零副作用。
+    `name` 为 "qr"、"clipboard" 或 "zip"。paths 延迟导入，保持本包导入零副作用。
     """
     import sys
     if getattr(sys, "frozen", False):

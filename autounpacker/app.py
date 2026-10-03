@@ -140,6 +140,8 @@ def main():
             from .workers import qr_worker as _worker
         elif _worker_name == "clipboard":
             from .workers import clipboard_worker as _worker
+        elif _worker_name == "zip":
+            from .workers import zip_worker as _worker
         else:
             print(f"未知工作进程: {_worker_name}")
             sys.exit(2)

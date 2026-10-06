@@ -16,10 +16,11 @@ from pathlib import Path
 from ..passwords.resolution import get_dict_passwords, get_password_for_layer
 from .engines import (PythonZipEngine, SevenZipEngine, is_archive_open_error,
                       is_zip_open_error, result_raw_error, run_silent)
-from .formats import (_volume_number, analyze_file, detect_format_by_magic,
-                      find_sevenzip_path, is_archive_file, is_do_not_extract,
-                      is_fake_volume_name, is_first_volume, is_split_gap_error,
-                      is_volume_file, is_volume_name, should_skip_volume)
+from .formats import (_series_base, _volume_number, analyze_file,
+                      detect_format_by_magic, find_sevenzip_path, is_archive_file,
+                      is_do_not_extract, is_fake_volume_name, is_first_volume,
+                      is_split_gap_error, is_volume_file, is_volume_name,
+                      should_skip_volume)
 from .post import (_recycle_paths, _stage_rar_volumes, is_clean_success,
                    remove_empty_dirs, strip_embedded_zip, unique_dest_path)
 
@@ -68,6 +69,9 @@ class ExtractService:
         self.logs = []
         self.layer_records = []
         self.temp_dirs = set()
+        # 每个队列条目一个临时目录的自增序号（见 _make_temp）：同层可能解出
+        # 多个归档，各条目必须各用各的目录，绝不互相清场。
+        self._temp_seq = 0
         self.temp_root = Path(tempfile.gettempdir())
         # 失败路径标记：置位后 _cleanup 把中间目录移入回收站（绝不永久删除）；
         # 成功路径保持原有 rmtree 行为不变。
@@ -78,7 +82,13 @@ class ExtractService:
         print(msg)
 
     def _make_temp(self, task_id, depth):
-        path = self.temp_root / f"extract_{task_id}_{depth}"
+        # 目录名必须「每个队列条目一个」（task_id + depth + 自增序号）：同一层
+        # 可能解出多个归档，若同深度的兄弟条目复用同一目录，下一个条目会先
+        # rmtree 再重建，把上一个条目解出、仍在排队等下一层处理的嵌套包一并
+        # 抹掉（真机案：一层 8 个条目，7 组的 NO.*.7z.001 被后一条目清掉，
+        # 下一层只剩最后一组，其余报「系统找不到指定的文件」，7-Zip 退出码 2）。
+        self._temp_seq += 1
+        path = self.temp_root / f"extract_{task_id}_{depth}_{self._temp_seq}"
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
         path.mkdir(parents=True, exist_ok=True)
@@ -160,6 +170,16 @@ class ExtractService:
 
     def _extract_inner(self, task):
         task_id = task["id"]
+        # 开跑前清场：只扫掉「本任务」上次中断运行残留的中间目录（前缀精确到
+        # task_id），得到与旧版「同名目录先删再建」等价的干净起点。绝不能动
+        # temp_root 里的其它东西——poly_*.zip（strip_embedded_zip 产物）与
+        # 并发任务的 extract_<其它 task_id>_* 目录都必须原样保留（共用一个
+        # temp_root）。逐条 rmtree(ignore_errors=True)：目录/残留文件都不抛错。
+        try:
+            for stale in self.temp_root.glob(f"extract_{task_id}_*"):
+                shutil.rmtree(stale, ignore_errors=True)
+        except OSError:
+            pass
         output_dir = Path(task["output_dir"])
         user_passwords = task.get("passwords", [])
         original_size = Path(task["source_path"]).stat().st_size
@@ -495,10 +515,15 @@ class ExtractService:
             if depth > 1 and item["archive"].exists():
                 if not self._retry_unlink(item["archive"]):
                     self.emit(f"[第{depth}层] 警告: 删除主卷失败: {item['archive'].name}")
-            if depth > 1 and is_volume_name(item["archive"].name):
-                # 仅当被解压的本身就是分卷（如 xxx.7z.001）时才清理其分卷兄弟
-                #（.002 等）。普通压缩包（如 xx.mp4）执行这步会误删内部嵌套
-                # 分卷的 .002（stem 前缀匹配过于宽松），导致下层解压缺卷失败。
+            if depth > 1 and (is_volume_name(item["archive"].name)
+                              or _series_base(item["archive"].name) is not None):
+                # 被解压的可能是分卷（如 xxx.7z.001），也可能是 zip/rar 系列的
+                # 末卷——base.zip / base.rar 不带编号，不在 is_volume_name 内，
+                # 但它的 .z01/.r00… 兄弟卷同样已被本层解压消费，必须一并回收，
+                # 否则会留下 10GiB 级冗余残留并挡住提升。普通压缩包（如
+                # xx.mp4）不满足任一条件，仍跳过这步：宽松的 stem 前缀匹配会
+                # 误删它内部嵌套分卷的 .002，导致下层解压缺卷失败；真正的兄弟
+                # 判定始终交给严格的 is_volume_file()（基础名一致才命中）。
                 arch_name = item["archive"].name
                 arch_stem = item["archive"].stem
                 parent = item["archive"].parent
@@ -729,7 +754,7 @@ class ExtractService:
         """从只读清单结果里提取「分卷缺兄弟卷」证据行（无则空串）。
 
         只认两个「结构上确实缺卷」的硬证据（本机 7z 26.03 实测）：
-          - WinZip 跨卷（B7236.zip 缺 .z01）→ `Missing volume`；
+          - WinZip 跨卷（xxx.zip 缺 .z01）→ `Missing volume`；
           - 7-Zip -v 的 zip 分卷（set.zip.001..）缺任一卷 → `Unexpected end of
             archive`（缺首/中/末卷都报它、退出码 2）。
         末卷 base.zip 不带编号也照样命中（Missing volume 不看文件名）。

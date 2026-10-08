@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import QApplication, QWidget
 from ...utils import split_urls, is_baidu_pan_url
 from ... import baidu_manifest as bm
 from .consts import (PENDING_SHARE_TTL_SEC, SHARE_GESTURE_DEDUP_SEC,
-                     SHARE_INVOKE_BUSY_MAX_SEC, _SHARE_ASK_NOTIFIED)
+                     SHARE_INVOKE_BUSY_MAX_SEC, PENDING_SHARE_TAG,
+                     QUEUED_SHARE_INTENT_MAX, _SHARE_ASK_NOTIFIED)
 from .logview import _share_log
 
 # ---------------------------------------------------------------------------
@@ -528,6 +529,48 @@ def _share_invoke_busy_stale(win):
         return bool(started) and (time.time() - started) > SHARE_INVOKE_BUSY_MAX_SEC
     except Exception:
         return False
+
+
+def _queue_share_intent(win, intent):
+    """忙时把手动拉起意图排进队列，由 `_drain` 在忙标志释放后按序补执行。
+
+    同一时刻只允许一条分享管线：Alt+2/Alt+3 在忙时产生的**手动**意图绝不丢弃
+    （旧行为只记一行「请稍候」后 return，这次按压永久丢失），而是排进
+    `win._queued_share_intents`；`_share_invoke_busy` 释放后由 `_drain` 每 200ms
+    的 tick 按 FIFO 补执行。列表惰性创建（轻量桩没有该属性），达到
+    QUEUED_SHARE_INTENT_MAX 上限时不再排队并记一行。绝不抛异常。"""
+    try:
+        q = getattr(win, "_queued_share_intents", None)
+        if not isinstance(q, list):
+            q = []
+            setattr(win, "_queued_share_intents", q)
+        url = str(intent.get("url") or "")
+        if len(q) >= QUEUED_SHARE_INTENT_MAX:
+            _share_log(win, f"[分享] 排队的手动拉起已达上限，本次未排队: {url}")
+            return
+        q.append(intent)
+        # 标签只用于日志说明是哪一路手势：意图自带 tag 优先，否则按 kind 反查
+        # PENDING_SHARE_TAG（invoke→Alt+2 / pick→Alt+3）。
+        _kind = "share_code" if intent.get("kind") == "pick" else "share"
+        _tag = str(intent.get("tag") or PENDING_SHARE_TAG.get(_kind, _kind))
+        _share_log(win,
+                   f"[分享] 上一个拉起尚未结束，已排到其后自动拉起（{_tag}）: {url}")
+    except Exception:
+        pass
+
+
+def _pop_queued_share_intent(win):
+    """取出并移除队首的排队手动拉起意图；队列为空/属性缺失/不是列表一律 None。
+
+    只做列表 `pop(0)`，不解释 dict 内容——kind 派发口径由 `_drain` 的补执行块
+    统一决定。绝不抛异常。"""
+    try:
+        q = getattr(win, "_queued_share_intents", None)
+        if isinstance(q, list) and q:
+            return q.pop(0)
+    except Exception:
+        pass
+    return None
 
 
 def _call_start_share_pick(win, url, surl, pwd, manual=False, item=None,

@@ -90,6 +90,7 @@ from .window.share_flow import (  # noqa: F401
     _clipboard_share_target, _share_input_inflight, _share_gesture_wait_sec,
     _share_uk_for_surl, _mark_gesture_launch, _gesture_launched_recently,
     _share_invoke_busy_stale, _call_start_share_pick,
+    _queue_share_intent, _pop_queued_share_intent,
     _manual_reinvoke_guard, _share_parent_usable,
     _share_notify_via, _notify_fallback_allowed,
     _take_share_ask_notified, _announce_ask_code_hidden,
@@ -423,6 +424,10 @@ class MainWindow(QMainWindow):
         # 登记一次性补按（{kind, at}），解码出百度分享链接（share_link 事件）后自动
         # 执行；超过 PENDING_SHARE_TTL_SEC 作废。Alt+3 本次不接线，kind 备用。
         self._pending_share_gesture = None
+        # 手动拉起意图排队：同一时刻只允许一条分享管线，忙时（Alt+2/Alt+3）产生的
+        # 手动意图排进队列，由 _drain 在忙标志释放后按序补执行；自动路径（manual=
+        # False）不排队，保持原「已跳过」行为。
+        self._queued_share_intents = []
         # d3：当前打开的「提取码询问」/「文件挑选」面板（防叠加）。后台 worker 只
         # 通过 hub 队列请求，控件一律在 Qt 线程构造。
         self._share_ask_dlg = None
@@ -3098,6 +3103,25 @@ class MainWindow(QMainWindow):
                 pass
             self._append_log(
                 f"[分享] 上一个拉起已超时（>{SHARE_INVOKE_BUSY_MAX_SEC}s），已强制复位")
+        # 忙标志释放后按序补执行排队的手动拉起意图（Alt+2/Alt+3 忙时不再丢弃）：
+        # 重放会再次置位 _share_invoke_busy，下一 tick（200ms 后）自然不会再取第二条
+        # ——同一时刻只保留一条分享管线，FIFO 顺序。
+        if not getattr(self, "_share_invoke_busy", False):
+            _qi = _pop_queued_share_intent(self)
+            if isinstance(_qi, dict):
+                try:
+                    if _qi.get("kind") == "pick":
+                        _call_start_share_pick(
+                            self, _qi.get("url"), _qi.get("surl"),
+                            _qi.get("pwd") or "", manual=True,
+                            item=_qi.get("item"),
+                            force_pick=bool(_qi.get("force_pick")))
+                    else:
+                        self._start_share_invoke(_qi.get("url"),
+                                                 _qi.get("pwd") or "",
+                                                 manual=True)
+                except Exception as e:
+                    self._append_log(f"[分享] 排队的手动拉起补执行出错: {e}")
         while True:
             try:
                 item = self.hub.q.get_nowait()
@@ -3697,7 +3721,9 @@ class MainWindow(QMainWindow):
         return True
 
     def _start_share_invoke(self, url, pwd, manual=False):
-        """统一的分享拉起入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
+        """统一的分享拉起入口：**手动**意图忙时排队（由 `_drain` 在忙标志释放后按序
+        补执行，绝不丢弃本次按压），自动意图忙时跳过；不忙则起后台 daemon 线程
+        （不阻塞界面）。
 
         `invoke_download` 的复核轮询最多约 4.5s，但**绝不能**在 UI 线程调用。
         忙标志带看门狗：超过 SHARE_INVOKE_BUSY_MAX_SEC 仍未复位（worker 卡死）
@@ -3707,8 +3733,15 @@ class MainWindow(QMainWindow):
             self._append_log(
                 f"[分享] 上一个拉起已超时（>{SHARE_INVOKE_BUSY_MAX_SEC}s），已强制复位")
         if self._share_invoke_busy:
-            self._append_log("[分享] 上一个拉起尚未结束，已跳过"
-                             if not manual else "[分享] 上一个拉起尚未结束，请稍候")
+            if manual:
+                # 手动意图绝不丢弃：排进队列，忙标志释放后由 _drain 按序补执行
+                # （旧行为是记一行「请稍候」后直接丢弃，本次按压永久丢失）。
+                _queue_share_intent(self, {
+                    "kind": "invoke", "tag": "share", "url": url, "surl": url,
+                    "pwd": pwd, "manual": True, "item": None,
+                    "force_pick": False, "at": time.time()})
+                return
+            self._append_log("[分享] 上一个拉起尚未结束，已跳过")
             return
         self._share_invoke_busy = True
         try:
@@ -3813,7 +3846,9 @@ class MainWindow(QMainWindow):
     # ---------- d3：分享「准备 →（可选）挑选 → 提交」管线 ----------
     def _start_share_pick(self, url, surl, pwd, manual=False, item=None,
                           force_pick=False):
-        """统一的分享管线入口：忙则跳过，否则起后台 daemon 线程（不阻塞界面）。
+        """统一的分享管线入口：**手动**意图忙时排队（由 `_drain` 在忙标志释放后按序
+        补执行，`force_pick` 原样保留），自动意图忙时跳过；不忙则起后台 daemon 线程
+        （不阻塞界面）。
 
         `prepare_share` / `commit_download` / `list_share_dir` 均含网络 IO，**绝不能**
         在 UI 线程调用。与旧的 `_start_share_invoke` 共用同一个忙标志：同一时刻只允许
@@ -3823,8 +3858,8 @@ class MainWindow(QMainWindow):
         `force_pick=True`（Alt+3 挑选手势）：worker 无条件打开文件挑选窗（旧版的
         按分享者「需挑选」标记与全局挑选开关已随该功能一并退场，无需再判断）。
 
-        d7 计数在**忙检查通过之后**才计入（被忙标志跳过的启动不计），询问路径最终也
-        汇入本入口，故同样计入一次。
+        d7 计数在**忙检查通过之后**才计入（被忙标志跳过的自动启动不计；手动意图排队后
+        在补执行通过忙检查时才计入一次），询问路径最终也汇入本入口，故同样计入一次。
         忙标志带看门狗：超过 SHARE_INVOKE_BUSY_MAX_SEC 仍未复位（worker 卡死）
         则强制复位并记一行，避免后续手势被永久挡住。"""
         if self._share_invoke_busy and _share_invoke_busy_stale(self):
@@ -3832,8 +3867,15 @@ class MainWindow(QMainWindow):
             self._append_log(
                 f"[分享] 上一个拉起已超时（>{SHARE_INVOKE_BUSY_MAX_SEC}s），已强制复位")
         if self._share_invoke_busy:
-            self._append_log("[分享] 上一个拉起尚未结束，已跳过"
-                             if not manual else "[分享] 上一个拉起尚未结束，请稍候")
+            if manual:
+                # 手动意图绝不丢弃：排进队列，忙标志释放后由 _drain 按序补执行
+                # （force_pick 原样保留，重放仍按挑选手势打开挑选窗）。
+                _queue_share_intent(self, {
+                    "kind": "pick", "tag": "share_code", "url": url,
+                    "surl": surl, "pwd": pwd, "manual": True, "item": item,
+                    "force_pick": force_pick, "at": time.time()})
+                return
+            self._append_log("[分享] 上一个拉起尚未结束，已跳过")
             return
         # 小窗统一取值：属于该分享的小窗里若有校验通过的码，覆盖本次 pwd（覆盖
         # Alt+3 / 询问 / 自动三条路）。此处**只**读小窗，不重算 recent——自动路径的

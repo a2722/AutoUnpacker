@@ -838,11 +838,109 @@ def batch_state(batch):
     return len(fs), a, d, g
 
 
+# ---------- 历史补录：未被本次运行观察到的下载也要进期望清单 ----------
+# 背景（真实故障）：此前清单只来自 _TRACK / 活动表——重启前已下完、或两次轮询
+# 之间就下完的文件永远不会被观察为「活动任务」，清单一空，_baidu_poll 就整轮早
+# 退；下载到子目录里的压缩包因此从未被处理（日志里一行都没有）。历史行与活动行
+# 同权：客户端下载历史里「本机在盘、较新、非未完成下载」的记录，一样是合法的
+# 下载产物，必须能触发处理。
+#
+# 保守回看窗口（天）：只捞本地文件 mtime 在此窗口内的历史记录，避免把陈年旧文件
+# （可能早已被手工处理/移走）重新翻出来解压。
+HISTORY_PICKUP_DAYS = 30
+
+# 历史读取的短缓存（秒）：expected_files() 在 watcher 轮询循环里约 1s 调一次，不能
+# 让它变成每秒一次读库。窗口内复用上次结果（含空结果与读取失败——失败最多把补录
+# 延迟一个窗口）；绝不抛异常、绝不阻塞轮询。
+HISTORY_CACHE_SEC = 30.0
+
+# 每次读取最多考虑的历史行数（按 op_starttime 取最新 N 行），避免全表扫描。
+HISTORY_READ_LIMIT = 300
+
+# 历史补录缓存：(key, ts, rows) 单个不可变快照，整体替换、绝不分步写。
+# 旧实现把 key/ts/rows 分三次写进同一个 dict，并发读可能看到「新 key + 旧 rows」
+# 而返回别的 db_path 的行；改成一个 tuple 后任何时刻读到的要么是完整旧快照、要么
+# 是完整新快照。key = 调用方给的 db_path 文本（None 记为空串）——调用方若在 None
+# 与显式路径之间来回切换会错过缓存并各读一次库，这一「抖动」是可接受的（生产调用
+# 一律是 bt.expected_files()，key 恒为空串）；rows 只在发布前构造，发布后不再改动。
+_HISTORY_CACHE = (None, 0.0, [])
+
+
+def _history_files(db_path=None):
+    """历史补录候选：下载历史里「本机在盘、较新、非未完成下载」的条目（带短缓存）。
+
+    - 回看 HISTORY_PICKUP_DAYS 天（按本地文件 mtime），每次最多读最新
+      HISTORY_READ_LIMIT 行；HISTORY_CACHE_SEC 秒内直接复用上次结果。
+    - 只保留 local_path 是磁盘上真实文件、且非未完成下载的行；分卷组、程序目录、
+      已处理（粘性记忆 / deletion_trail）等判定一律交给下游现有闸门，不在这里重复。
+      历史行没有分享参数（download_url/param2 只在活动表），批次按 server_path 首段
+      归并（与活动行口径一致）；state 固定为 "done"。
+    - 任何失败（库缺失/锁定/读不出）都降级为空列表，绝不抛异常、绝不阻塞轮询。
+    """
+    try:
+        global _HISTORY_CACHE
+        now = time.time()
+        ck = str(db_path or "")
+        # 原子读：一次性取出整份快照，绝不横跨多个字段读取（避免读到半新半旧态）
+        try:
+            ck0, ts0, rows0 = _HISTORY_CACHE
+            hit = (ck0 == ck
+                   and (now - float(ts0 or 0.0)) < HISTORY_CACHE_SEC)
+        except Exception:
+            hit = False
+            rows0 = None
+        if hit:
+            return rows0 if isinstance(rows0, list) else []
+        out = []
+        try:
+            db = Path(db_path) if db_path else select_task_db("")[0]
+        except Exception:
+            db = None
+        if db and Path(db).is_file():
+            hist = _select(db, "download_history_file",
+                           ("server_path", "local_path", "isdir", "size"),
+                           order_by="op_starttime", limit=HISTORY_READ_LIMIT)
+            cutoff = now - HISTORY_PICKUP_DAYS * 86400.0
+            for r in (hist or []):
+                try:
+                    lp = _as_text(r.get("local_path"))
+                    if not lp or r.get("isdir"):
+                        continue
+                    p = Path(lp)
+                    if not p.is_file():
+                        continue
+                    try:
+                        if p.stat().st_mtime < cutoff:
+                            continue
+                    except OSError:
+                        continue
+                    if is_incomplete_download(p):
+                        continue
+                    bkey, bname = _batch_identity(
+                        _as_text(r.get("server_path")), None)
+                    out.append({"local_path": lp, "size": r.get("size"),
+                                "isdir": False, "batch": bkey,
+                                "batch_name": bname, "state": "done"})
+                except Exception:
+                    continue
+        # 原子写：用一条赋值发布完整快照，任何并发读都不会看到半新半旧的组合。
+        _HISTORY_CACHE = (ck, now, out)
+        return out
+    except Exception:
+        return []
+
+
 def expected_files(db_path=None):
-    """B：批次预登记——本次运行内「已登记」的期望文件清单。
+    """B：批次预登记——期望文件清单（本次运行内已登记 + 客户端历史补录）。
 
     返回 {batch: [{local_path, size, isdir, state}, ...]}。跟踪器为空时回退到
     当前活动任务（只读一次），便于独立调用。
+
+    历史补录：除已跟踪/活动条目外，还纳入客户端**下载历史**里「本机在盘、较新
+    （HISTORY_PICKUP_DAYS 天）、非未完成下载」的记录（state="done"）。原因：只认
+    「本次运行观察到的活动任务」时，重启前下完、或两次轮询之间就下完的文件永远进
+    不了清单，子目录里的下载产物会一直没人处理。历史读取带短缓存（HISTORY_CACHE_SEC），
+    窗口内不重复读库；读库失败一律降级为「无补录」，绝不抛异常、绝不阻塞轮询。
     """
     files = list(_TRACK["files"].values())
     if not files:
@@ -858,6 +956,16 @@ def expected_files(db_path=None):
                 "batch_name": bname,
                 "state": "active",
             })
+    # 历史补录：已跟踪/活动条目优先——同路径不重复、状态不被历史行覆盖，只补差额。
+    seen = set()
+    for v in files:
+        seen.add(_norm_path(v.get("local_path")))
+    for h in _history_files(db_path):
+        key = _norm_path(h.get("local_path"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        files.append(h)
     out = {}
     for v in files:
         out.setdefault(v.get("batch") or "(root)", []).append(

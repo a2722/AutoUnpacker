@@ -58,6 +58,11 @@ SEVENZIP_CANDIDATES = [
 POLYGLOT_FULL_SCAN_LIMIT = 64 * 1024 * 1024
 POLYGLOT_EOCD_RANGE = 65557
 
+# 「按扩展名打发」的兜底：正常的图片/文档/文本不可能有这么大，而且这些文件是
+# 程序运行期间被下载进监听目录的 —— 体积本身即强嫌疑。达到此体积的非压缩包
+# 后缀文件也要过一次深层格式探测（尾部 EOCD / 前部扫描 / SFX，均有上限，廉价）。
+SUSPECT_BIG_FILE_BYTES = 16 * 1024 * 1024
+
 
 def _scan_chunk_for_archive(data):
     if b"PK\x05\x06" in data or b"PK\x06\x07" in data:
@@ -102,6 +107,15 @@ def _scan_sfx_for_archive(path):
         if marker in data:
             return fmt
     return None
+
+
+def _head_is_mz(path):
+    """文件头两字节是否 MZ（PE/SFX 可执行包）。读取失败一律返回 False，绝不抛异常。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
 
 
 def _full_scan_for_archive(path):
@@ -162,6 +176,33 @@ def _confirm_polyglot(path, fmt):
     return fmt
 
 
+def _verify_polyglot_7z_rar(path, fmt):
+    """多段伪装扫描命中 7z/rar 后，用真实 7-Zip 复核签名不是巧合。
+
+    _scan_tail_for_archive / _scan_sfx_for_archive / 全量扫描只做几字节签名
+    匹配：安装包等二进制里恰好内嵌 7z\\xbc\\xaf\\x27\\x1c / Rar!\\x1a\\x07 时
+    会被误判为「头部伪装 + 内嵌压缩包」，watcher 随后可能真的解压并把用户
+    文件当结果隔离。zip 已由 _confirm_polyglot 用 zipfile 实检；这里补上
+    7z/rar 的缺口：调 7-Zip 做一次廉价列表（`l -t#`，与 detect_steganography
+    同款 parser 模式调用），退出码为 0 才接受，否则视为签名巧合。
+    找不到 7-Zip（find_sevenzip_path 返回 None 或抛异常）时 fail-open，
+    维持旧行为；仅在已扫到 7z/rar 签名时才会走到这里，且 run_silent 自带
+    超时，绝不抛异常。"""
+    if fmt not in ("7z", "rar"):
+        return fmt
+    try:
+        sevenzip = find_sevenzip_path()
+    except Exception:
+        return fmt
+    if not sevenzip:
+        return fmt
+    try:
+        r = run_silent([str(sevenzip), "l", "-t#", str(path)])
+    except Exception:
+        return fmt
+    return fmt if r.returncode == 0 else None
+
+
 def _header_matches_format(path, fmt):
     """文件头部魔数是否确实匹配该格式（防止顶着 .zip 后缀的伪装文件被当普通 zip）"""
     try:
@@ -191,33 +232,47 @@ def _header_matches_format(path, fmt):
     return False
 
 
+def head_archive_format(path):
+    """只读头部魔数识别压缩包格式（8 字节读取 + tar 的 257 偏移 ustar 检查）。
+
+    返回 "zip"/"rar"/"7z"/"gz"/"bz2"/"xz"/"tar"，识别不出或读取失败返回 None，
+    绝不抛异常。廉价：普通文件只多读 8 字节。detect_archive_format 与
+    is_archive_file 的改名/伪装识别共用这一份判定（旧内联块的 xz 判定写成
+    header[:4] 与 5 字节字面量比较、永远不成立，这里一并修正为 header[:5]）。
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(8)
+        if header[:4] == b"PK\x03\x04":
+            return "zip"
+        if header[:4] == b"Rar!":
+            return "rar"
+        if header[:4] == b"7z\xbc\xaf":
+            return "7z"
+        if header[:2] == b"\x1f\x8b":
+            return "gz"
+        if header[:3] == b"BZh":
+            return "bz2"
+        if header[:5] == b"\xfd7zXZ":  # 旧内联块写 header[:4] 永远匹配不上（笔误）
+            return "xz"
+        with open(path, "rb") as f:
+            f.seek(257)
+            if f.read(5) == b"ustar":
+                return "tar"
+    except OSError:
+        pass
+    return None
+
+
 def detect_archive_format(path):
     """返回 (格式, 是否多段伪装)。
 
     多段伪装 = 文件头部是真实内容（如视频），真实压缩包被内嵌在文件末尾，
     直接把扩展名改成压缩包后缀即可解压。
     """
-    try:
-        with open(path, "rb") as f:
-            header = f.read(8)
-        if header[:4] == b"PK\x03\x04":
-            return "zip", False
-        if header[:4] == b"Rar!":
-            return "rar", False
-        if header[:4] == b"7z\xbc\xaf":
-            return "7z", False
-        if header[:2] == b"\x1f\x8b":
-            return "gz", False
-        if header[:3] == b"BZh":
-            return "bz2", False
-        if header[:4] == b"\xfd7zXZ":
-            return "xz", False
-        with open(path, "rb") as f:
-            f.seek(257)
-            if f.read(5) == b"ustar":
-                return "tar", False
-    except OSError:
-        pass
+    head_fmt = head_archive_format(path)
+    if head_fmt:
+        return head_fmt, False
     ext_fmt = format_from_extension(path)
     if ext_fmt:
         # 扩展名是压缩包后缀但头部对不上（如 MP4 伪装顶着 .zip 后缀）：
@@ -226,14 +281,25 @@ def detect_archive_format(path):
             return ext_fmt, False
     tail = _confirm_polyglot(path, _scan_tail_for_archive(path))
     if tail:
-        return tail, True
+        # 7z/rar 仅为签名命中，再经真实 7-Zip 复核（zip 已在 _confirm_polyglot 实检）
+        return _verify_polyglot_7z_rar(path, tail), True
     # SFX 自解压包：MZ 头 + 内嵌 7z/zip/rar（签名在文件中部，不在尾部）
     sfx = _scan_sfx_for_archive(path)
     if sfx:
-        return _confirm_polyglot(path, sfx), True
-    full = _confirm_polyglot(path, _full_scan_for_archive(path))
+        return _verify_polyglot_7z_rar(path, _confirm_polyglot(path, sfx)), True
+    # 成本护栏：只对「伪装载体后缀」（含新增的文本族）或 MZ/SFX 头部做全量扫描。
+    # 其余后缀（.iso/.bin/.dat/无后缀等）在 16–64MB 区间会被 _full_scan_for_archive
+    # 整文件读一遍（最坏时同一轮 _handle 触发两次），却不增加识别力：尾部 EOCD
+    # （后 64KB）与前部扫描已覆盖「尾部追加/前部内嵌」两类真实伪装。故此处只保留
+    # 「前 32MB 扫描」（与原 >64MB 分支所用完全相同的廉价扫描），跳过中段全量读；
+    # 载体后缀（图片/视频/文本等）与 SFX（MZ）头的既有全量扫描一字不改。
+    ext = Path(path).suffix.lower().lstrip(".")
+    if ext in DISGUISE_CARRIER_EXTS or _head_is_mz(path):
+        full = _confirm_polyglot(path, _full_scan_for_archive(path))
+    else:
+        full = _confirm_polyglot(path, _scan_front_for_archive(path))
     if full:
-        return full, True
+        return _verify_polyglot_7z_rar(path, full), True
     if ext_fmt:
         return ext_fmt, False
     return None, False
@@ -632,17 +698,26 @@ DISGUISE_CARRIER_EXTS = {
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "tif", "tiff",
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mp3", "wav",
     "flac", "m4a", "aac", "pdf", "doc", "docx", "xls", "xlsx",
+    # 文本族也常被用来伪装压缩包（改名 .txt 的 zip/7z）。普通文本只多读 8 字节
+    # 头部 magic；真正的识别仍由 detect_archive_format 完成，不会误报。
+    "txt", "csv", "log", "md",
 }
 
 
 def is_archive_file(path):
-    """判断文件是否可能是压缩包（含伪装格式）。
+    """判断文件是否可能是压缩包（含改名伪装 / 分卷）。
 
-    - 扩展名是压缩包后缀 → True
-    - 扩展名是常见伪装载体（图片/视频/音频/文档）→ 用深层格式探测
-      （detect_archive_format 会扫头部 magic + 尾部 + 前部 + 全量小文件），
-      识别「头部伪装 + 内嵌真实压缩包」的多段伪装文件
-    -     其他扩展名 → False
+    决定顺序（廉价优先，绝不抛异常）：
+    1. 扩展名是压缩包后缀 → True；
+    2. 名字像分卷（.001/.002/.z01/.r00/.partN.rar，含脏字符归一）→ True
+       （首卷/非首卷由 _handle 既有分卷分支分辨处理）；
+    3. 头部魔数是压缩包（改名伪装：.txt 的 zip、脏名 7z 等）→ True；
+    4. 扩展名是常见伪装载体（图片/视频/音频/文档/文本），或体积 ≥
+       SUSPECT_BIG_FILE_BYTES（正常图片/文档/文本不可能这么大，且是运行期间
+       被下载进监听目录的 → 体积本身即强嫌疑）→ 用深层格式探测
+       （detect_archive_format：尾部 EOCD + 前部扫描 + SFX，受 POLYGLOT 上限约束），
+       识别「头部伪装 + 内嵌真实压缩包」的多段伪装文件；
+    5. 其他 → False。
     """
     path = Path(path)
     if not path.is_file():
@@ -650,7 +725,24 @@ def is_archive_file(path):
     ext = path.suffix.lower().lstrip(".")
     if ext in ARCHIVE_EXTS:
         return True
-    if ext in DISGUISE_CARRIER_EXTS:
+    try:
+        if is_volume_name(path.name):
+            return True
+    except Exception:
+        pass
+    try:
+        if head_archive_format(path) is not None:
+            return True
+    except Exception:
+        pass
+    suspect = ext in DISGUISE_CARRIER_EXTS
+    if not suspect:
+        # 体积兜底：扩展名打发不掉的（.dat/.bin/无后缀等）也按体积放行深层探测
+        try:
+            suspect = path.stat().st_size >= SUSPECT_BIG_FILE_BYTES
+        except OSError:
+            suspect = False
+    if suspect:
         try:
             fmt, _ = detect_archive_format(path)
             return fmt is not None

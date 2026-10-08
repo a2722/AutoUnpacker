@@ -86,6 +86,29 @@ PAIR_DIR_ACTIVE_MAX_SEC = 1800
 SPLIT_INCOMPLETE_MAX = 3
 SPLIT_INCOMPLETE_DELAYS = (300, 900, 1800)
 
+# 大文件慢速复查（「监控被释放了」修复）：下载器预分配/多段并行写入时，文件大小可能
+# 很早就到达终值，而内容仍在写入——唯一信号是 mtime 推进（size 不变）。此时观察期/
+# churn 预算耗尽后，旧规则「size 未变 → 绝不重走」会让文件永久失联（此后一条日志都
+# 没有）。对 ≥ RECHECK_MIN_BYTES 的文件：观察期耗尽即排入慢速复查（不依赖 mtime 是否
+# 推进，防「预分配后 mtime 一直不动」也失联）；mtime 推进即视为「仍在写入」，按
+# RECHECK_MIN_INTERVAL_SEC 节流复查（每次可能扫描数十 MB，必须限速）；最多
+# RECHECK_MAX_TRIES 次，文件稳定（一个完整间隔内 mtime 不再推进）时给最后一次机会
+# 后停止。小文件绝不进入本路径（保持既有零 churn 语义）。
+RECHECK_MIN_BYTES = 16 * 1024 * 1024
+RECHECK_MIN_INTERVAL_SEC = 60
+RECHECK_MAX_TRIES = 10
+# 慢速复查「总预算」：跨尺寸纪元也最多做 RECHECK_LIFETIME_MAX 次 _handle。此前
+# 每次尺寸变化都把次数预算重置，导致持续增长的大文件（大 .log/.db/虚拟机镜像/续传
+# 下载）以约 1 次/间隔无限期重走（每次数十 MB 读）。总预算耗尽后只更新观察点、不再
+# 复查，直到 RECHECK_QUIET_RESET_SEC 内「零变化」的长静默（写入早已结束/新一轮下载）
+# 才重新给满。既有 churn 上限约束的是「观察期直接重走」，本预算约束的是「慢速复查」，
+# 两者共同给大文件一个上界。
+RECHECK_LIFETIME_MAX = 30
+# 慢速复查「长静默遗忘」周期（秒）：一个周期内 size/mtime 都没有被观察到变化，即视为
+# 写入早已结束——放弃记忆直接丢弃会话（长期稳定的非压缩包大文件绝不被周期性深层
+# 扫描）；同名文件之后再次变化 = 新一轮下载，按初始流程重新排入。
+RECHECK_QUIET_RESET_SEC = 600
+
 
 def _restored_exempt(fp):
     """该源文件是否处于「已还原 ⇒ 豁免」状态（防御性：取不到方法/异常一律按不豁免）。
@@ -155,6 +178,11 @@ class FolderWatcher(threading.Thread):
     PAIR_DIR_ACTIVE_MAX_SEC = PAIR_DIR_ACTIVE_MAX_SEC  # 兼容「类属性常量」访问（值同模块常量）
     SPLIT_INCOMPLETE_MAX = SPLIT_INCOMPLETE_MAX        # 截断分卷链最多重试次数（同模块常量）
     SPLIT_INCOMPLETE_DELAYS = SPLIT_INCOMPLETE_DELAYS  # 截断分卷链退避序列（秒）
+    RECHECK_MIN_BYTES = RECHECK_MIN_BYTES              # 大文件慢速复查阈值（同模块常量）
+    RECHECK_MIN_INTERVAL_SEC = RECHECK_MIN_INTERVAL_SEC  # 慢速复查节流间隔（秒）
+    RECHECK_MAX_TRIES = RECHECK_MAX_TRIES              # 慢速复查次数上限（每尺寸纪元）
+    RECHECK_LIFETIME_MAX = RECHECK_LIFETIME_MAX        # 慢速复查总预算（跨尺寸纪元）
+    RECHECK_QUIET_RESET_SEC = RECHECK_QUIET_RESET_SEC  # 慢速复查长静默遗忘周期（秒）
     SPLIT_MAX_WAIT = 1800        # 跨目录分卷等待兄弟卷的最长时间(秒)：超时放弃（仅保留不删）
     SPLIT_RECHECK_INTERVAL = 10  # 跨目录分卷复查间隔(秒)：节流「全监听根 rglob」
     OFFLINE_NOTIFY_SEC = 300     # 监听目录连续离线超过 5 分钟告警一次（每段离线只发一次）
@@ -181,6 +209,12 @@ class FolderWatcher(threading.Thread):
         # 大小变化（等大小稳定后再给一次机会）}}。随「大小稳定 / 成功处理 / 文件
         # 消失」复位，避免长期占内存。
         self._rewalk = {}
+        # 大文件慢速复查（「监控被释放了」修复）：{(watch_key, name): {"tries": 剩余
+        # 复查次数, "size": 进入本路径时的大小, "last_check": 上次检查时刻,
+        # "last_mtime": 上次检查时 mtime, "giveup": 该大小已最终放弃}}。只服务
+        # ≥ RECHECK_MIN_BYTES 的文件；成功/消失/离开 seen 时清理，详见
+        # _slow_recheck_step。
+        self._slow_recheck = {}
         # 已处理过的文件身份 {norm_path: (size, mtime)}：同名但内容不同的
         # 新文件（重新下载/替换）不会被误当成已处理而跳过。有界 LRU：
         # 超 TRACED_MAX 淘汰最旧；仍被等待/重试引用的条目不淘汰（见 _traced_put）。
@@ -271,6 +305,108 @@ class FolderWatcher(threading.Thread):
             st["blocked"] = True
             return False
         return True
+
+    def _slow_recheck_step(self, key, name, fp, wc, ident, mtime_advanced=False,
+                           probe_expired=False):
+        """大文件慢速复查（「监控被释放了」修复的逃生舱）：返回 _handle 结果或 None。
+
+        只在 seen 复查与被观察期耗尽处调用。背景：下载器预分配/多段并行写入时
+        size 可能很早就到终值、内容仍在写入；观察期/churn 预算耗尽后旧规则
+        「size 未变 → 绝不重走」会让文件永久失联（此后一条日志都没有）。本方法只
+        服务 ≥ RECHECK_MIN_BYTES 的文件（小文件直接返回 None，绝不进入本路径）：
+
+        - 排入条件：mtime 相对上一轮推进（仍在写入）、观察期预算刚好耗尽
+          （probe_expired：防「预分配后 mtime 一直不动」同样失联），或调用方判定为
+          可疑（如曾被 churn 上限封禁的大文件）；已成功处理过的同尺寸文件（仅 mtime
+          被碰）绝不排入——防止假阳性重解压，与 _size_changed 的既有口径一致。
+        - 节流：每文件每 RECHECK_MIN_INTERVAL_SEC 最多一次 _handle（每次可能扫描
+          数十 MB，必须限速）。
+        - 有界：mtime 仍推进时每尺寸纪元最多 RECHECK_MAX_TRIES 次；并且整个会话
+          （跨尺寸变化）最多 RECHECK_LIFETIME_MAX 次 _handle——尺寸变化绝不重置总
+          预算，持续增长的大文件因此不会被无限期复查。文件稳定（一个完整间隔 mtime
+          未变）时给最后一次机会，仍 skip 则记一条放弃日志并停止（该大小不再复查，
+          除非大小又变化 = 新一轮下载）。一个 RECHECK_QUIET_RESET_SEC 的长静默
+          （期间 size/mtime 都没有变化）会遗忘会话或给未放弃的会话重新给满预算。
+        首次排入与最终放弃各记恰好一条日志，其余路径零日志（绝不逐轮刷屏）。
+        """
+        try:
+            if ident is None or ident[0] < self.RECHECK_MIN_BYTES:
+                return None
+            rk = (key, name)
+            now = time.time()
+            sr = self._slow_recheck.get(rk)
+            if sr is None:
+                if not (mtime_advanced or probe_expired):
+                    return None    # 大文件但已稳定：不值得进入慢速复查
+                tr_ident = self.traced.get(self._norm_path(fp))
+                if tr_ident is not None and tr_ident[0] == ident[0]:
+                    return None    # 同尺寸已成功处理过（仅 mtime 被碰）→ 不复查
+                self._slow_recheck[rk] = {
+                    "tries": self.RECHECK_MAX_TRIES, "size": ident[0],
+                    "last_check": now, "last_mtime": ident[1],
+                    "giveup": False, "checks": 0, "last_change": now}
+                self.hub.log(f"[监听] 文件较大且可能仍在写入，已排入慢速复查: {name}")
+                return None
+            # 任何 size/mtime 变化都刷新「静默起算点」。长静默（一个周期内零变化）
+            # = 写入早已结束/新一轮下载：已放弃的会话直接遗忘（长期稳定的非压缩包
+            # 大文件绝不被周期性深扫）；未放弃的会话重新给满预算。
+            changed = (sr.get("size") != ident[0]
+                       or sr.get("last_mtime") != ident[1])
+            quiet = ((now - float(sr.get("last_change") or 0.0))
+                     >= self.RECHECK_QUIET_RESET_SEC)
+            if changed:
+                sr["last_change"] = now
+                quiet = False
+            if quiet and sr.get("giveup"):
+                self._slow_recheck.pop(rk, None)
+                return None
+            if quiet:
+                sr["tries"] = self.RECHECK_MAX_TRIES
+                sr["checks"] = 0
+                sr["giveup"] = False
+                sr["size"] = ident[0]
+                sr["last_mtime"] = ident[1]
+            if sr.get("size") != ident[0]:
+                # 大小又变了 = 新一轮下载：解除放弃标记，但绝不重置次数预算
+                # （总预算 RECHECK_LIFETIME_MAX 跨纪元封顶，防持续增长无界复查）
+                sr["size"] = ident[0]
+                sr["giveup"] = False
+            if sr.get("giveup"):
+                return None        # 该大小已最终放弃：静默，不再复查
+            if now - sr.get("last_check", 0.0) < self.RECHECK_MIN_INTERVAL_SEC:
+                return None        # 节流：每文件每间隔最多一次
+            if sr.get("last_mtime") != ident[1]:
+                # mtime 仍在推进（仍在写入）：预算内复查一次；预算用尽则只推进
+                # 观察点，等文件稳定（绝不无界重试）
+                sr["last_check"] = now
+                sr["last_mtime"] = ident[1]
+                if (sr.get("tries", 0) <= 0
+                        or sr.get("checks", 0) >= self.RECHECK_LIFETIME_MAX):
+                    return None
+                sr["tries"] = sr.get("tries", 0) - 1
+                sr["checks"] = sr.get("checks", 0) + 1
+                res = self._handle(fp, wc)
+                if res != "skip":
+                    self._slow_recheck.pop(rk, None)
+                return res
+            # mtime 一个完整间隔未变：文件已稳定，给最后一次机会后停止。
+            # 「最后机会」不占用 tries（否则增长期耗尽预算会漏掉完成事件），但计入
+            # 总预算且只给一次（giveup 兜底，防止反复稳定/增长无限给机会）。
+            sr["last_check"] = now
+            if sr.get("checks", 0) >= self.RECHECK_LIFETIME_MAX:
+                sr["giveup"] = True
+                return None
+            sr["checks"] = sr.get("checks", 0) + 1
+            res = self._handle(fp, wc)
+            if res == "skip":
+                sr["giveup"] = True
+                self.hub.log(
+                    f"[监听] 慢速复查结束（仍不是压缩包，文件已稳定）: {name}")
+            else:
+                self._slow_recheck.pop(rk, None)
+            return res
+        except Exception:
+            return None
 
     # ---------- traced 有界化（LRU，详见 TRACED_MAX 注释） ----------
     def _traced_protected(self):
@@ -475,6 +611,8 @@ class FolderWatcher(threading.Thread):
                     self._seen_ident.pop(key, None)  # 身份镜像随 seen 一起清理
                     for rk in [k for k in self._rewalk if k[0] == key]:
                         self._rewalk.pop(rk, None)   # churn 计数随监听路径移除清理
+                    for rk in [k for k in self._slow_recheck if k[0] == key]:
+                        self._slow_recheck.pop(rk, None)  # 慢速复查状态随路径移除清理
                     self._purge_traced_under(key)    # 该路径不再监听：去重记忆一并清理
             for key in list(self._offline):
                 if key not in enabled:               # 不再监听的路径：离线记忆一并清理
@@ -597,6 +735,7 @@ class FolderWatcher(threading.Thread):
             if name not in current:
                 probe.pop(name, None)
                 self._rewalk.pop(rk, None)   # 文件消失：churn 计数复位
+                self._slow_recheck.pop(rk, None)  # 文件消失：慢速复查状态清理
                 continue
             fp = watch / name
             ident = self._identity_safe(fp)
@@ -633,6 +772,7 @@ class FolderWatcher(threading.Thread):
                 probe.pop(name, None)
                 done_now.add(name)
                 self._rewalk.pop(rk, None)   # 成功处理：churn 计数复位
+                self._slow_recheck.pop(rk, None)  # 成功处理：慢速复查状态清理
             else:  # 仍不是压缩包
                 # 身份相对上一轮发生变化 = 仍在写入/下载（尾部 zip 还没落盘）：
                 # 重置观察期继续盯着它（而不是递减）。否则长下载会在固定 4 轮后
@@ -650,6 +790,16 @@ class FolderWatcher(threading.Thread):
                     probe[name] -= 1
                     if probe[name] <= 0:
                         probe.pop(name, None)  # 观察期结束，放弃（留在 seen）
+            if (name not in probe and res == "skip"
+                    and ident is not None
+                    and ident[0] >= self.RECHECK_MIN_BYTES):
+                # 观察期预算耗尽仍未识别的大文件：不依赖 mtime 是否推进，强制排入
+                # 慢速复查一次（有界）。否则「预分配下载 mtime 一直不动」的同类文件
+                # 仍会在 size 未变分支被永久释放（首次排入即本修复的核心）。
+                # 仅对真正 skip 的条目排入：defer（如分卷未到齐）本轮会被移出 seen、
+                # 状态随即清理，排入只会产生一条误导日志。
+                self._slow_recheck_step(key, name, fp, wc, ident,
+                                        probe_expired=True)
             if ident is not None:
                 ident_map[name] = ident
         # seen 中「身份变了」的文件重走 _handle：覆盖下载窗口早已关闭后文件才变
@@ -677,16 +827,44 @@ class FolderWatcher(threading.Thread):
                     if res == "defer":
                         deferred.add(name)
                     elif res == "skip":
-                        st["streak"] = self.REWALK_MAX_STREAK
-                        st["blocked"] = True
+                        if ident[0] >= self.RECHECK_MIN_BYTES:
+                            # 大文件不永久封死：转交慢速复查继续盯（「监控被释放了」）
+                            self._rewalk.pop(rk, None)
+                            self._slow_recheck_step(key, name, fp, wc, ident,
+                                                    mtime_advanced=True)
+                        else:
+                            st["streak"] = self.REWALK_MAX_STREAK
+                            st["blocked"] = True
                     else:
                         self._rewalk.pop(rk, None)   # 成功处理：计数复位
+                        self._slow_recheck.pop(rk, None)
                 else:
+                    was_blocked = bool(st is not None and st.get("blocked"))
                     self._rewalk.pop(rk, None)       # 大小稳定 → churn 计数复位
+                    # 大文件慢速复查：size 未变但 mtime 仍在推进（下载器预分配、内容
+                    # 仍在写入），或曾被 churn 上限封禁（可疑）→ 交给慢速复查，
+                    # 绝不因「size 未变」永久释放该文件。小文件在方法内直接跳过。
+                    res = self._slow_recheck_step(
+                        key, name, fp, wc, ident,
+                        mtime_advanced=(prev[1] != ident[1]) or was_blocked)
+                    if res == "defer":
+                        deferred.add(name)
                 if prev != ident:
                     ident_map[name] = ident
                 continue
             # size 变化（含身份首次可读）
+            # 已在慢速复查会话中的大文件：尺寸变化也只走慢速会话（统一由
+            # RECHECK_LIFETIME_MAX 封顶），绝不再开新的 churn 预算——否则「持续增长
+            # 的非压缩包大文件」每约 REWALK_MAX_STREAK 次尺寸变化就重置一次重走
+            # 额度，无限期复查（本项为「rearm 击穿 churn 上限」的修复）。
+            sr = self._slow_recheck.get(rk)
+            if sr is not None and ident[0] >= self.RECHECK_MIN_BYTES:
+                res = self._slow_recheck_step(key, name, fp, wc, ident,
+                                              mtime_advanced=True)
+                if res == "defer":
+                    deferred.add(name)
+                ident_map[name] = ident
+                continue
             st = self._rewalk.get(rk)
             if st is not None and st.get("blocked"):
                 # 已达 churn 硬上限：连续增长不再重走，仅记待稳定；等大小稳定后
@@ -698,12 +876,14 @@ class FolderWatcher(threading.Thread):
             if res == "defer":
                 deferred.add(name)
                 self._rewalk.pop(rk, None)           # 交给下轮重查：计数不复用
+                self._slow_recheck.pop(rk, None)     # 交给下轮重查：慢速复查状态不复用
             elif res == "skip":
                 probe[name] = self.PROBE_CYCLES
                 if not self._bump_rewalk(rk):
                     probe.pop(name, None)            # 达上限：移出观察期，避免重走
             else:
                 self._rewalk.pop(rk, None)           # 成功处理：计数复位
+                self._slow_recheck.pop(rk, None)     # 成功处理：慢速复查状态清理
             ident_map[name] = ident
         # 再处理新出现的文件
         for name in sorted(new):
@@ -723,7 +903,8 @@ class FolderWatcher(threading.Thread):
         for name in list(ident_map):
             if name not in self.seen[key]:
                 ident_map.pop(name, None)
-                self._rewalk.pop((key, name), None)   # 文件离开 seen：churn 计数复位
+                self._rewalk.pop((key, name), None)       # 文件离开 seen：churn 计数复位
+                self._slow_recheck.pop((key, name), None)  # 文件离开 seen：慢速复查清理
         for name in self.seen[key]:
             if name not in ident_map:
                 ident = self._identity_safe(watch / name)

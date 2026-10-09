@@ -155,6 +155,60 @@ def _state_get(state, key, default=None):
     return state.snapshot().get(key, default)
 
 
+def _call_volume_ready(win, fp, wc):
+    """调用 `win._volume_ready` 并转发 `wc`；兼容只接受 `fp` 的旧测试桩。
+
+    真实实现接受 `wc`（等待尾卷时的跨目录归拢用）；既有测试把 `_volume_ready`
+    换成不含该形参的桩（如 `lambda fp: False`）。这里按签名判断：不接受 `wc`
+    且没有 `**kwargs` 时退回旧的单参调用式，绝不因签名差异让调用抛错。module
+    级定义使旧桩（未绑定本方法）也能直接调用；签名取不到时按接受处理，与真实
+    实现行为一致。getattr/inspect 全部设防：自身绝不抛异常，取不到可调用体
+    按「未到齐」处理。"""
+    try:
+        fn = getattr(win, "_volume_ready", None)
+    except Exception:
+        return False
+    if not callable(fn):
+        return False
+    accepts = True
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        accepts = ("wc" in params) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except Exception:
+        accepts = True
+    if accepts:
+        return fn(fp, wc=wc)
+    return fn(fp)
+
+
+def _call_pair_probe_or_timeout(win, fp, abs_fp, state, name, now, wc):
+    """调用 `win._pair_probe_or_timeout` 并转发 `wc`；兼容旧形参的测试桩。
+
+    与 `_call_volume_ready` 同一口径：签名不接受 `wc` 且无 `**kwargs` 时退回
+    旧调用式。当前离线测试没有替换它的桩，保留本入口只为与 `_volume_ready`
+    边界同规则，防未来桩在等待路径上报签名错。一样 getattr/inspect 设防：
+    自身绝不抛异常，取不到可调用体按「继续等待」处理。"""
+    try:
+        fn = getattr(win, "_pair_probe_or_timeout", None)
+    except Exception:
+        return False
+    if not callable(fn):
+        return False
+    accepts = True
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        accepts = ("wc" in params) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except Exception:
+        accepts = True
+    if accepts:
+        return fn(fp, abs_fp, state, name, now, wc=wc)
+    return fn(fp, abs_fp, state, name, now)
+
+
 class FolderWatcher(threading.Thread):
     """多路径监听线程（只监听目录表面，不递归子孙文件夹）"""
 
@@ -1250,7 +1304,7 @@ class FolderWatcher(threading.Thread):
         self._trans_given_up.pop(str(src_dir), None)
 
     # ---------- 首卷分卷观察期 ----------
-    def _volume_ready(self, fp):
+    def _volume_ready(self, fp, wc=None):
         """用「编号连续性 + 末卷存在性 + 大小」判断首卷分卷是否到齐。
 
         分卷命名分两类：
@@ -1375,7 +1429,7 @@ class FolderWatcher(threading.Thread):
                           f"（已到编号分卷 {sorted(vols)}）")
                 # 洞2：末卷缺失时同样进入「跨名链探测 + 有界兜底」共享逻辑，
                 # 使改名上传的兄弟卷会被探测、300s 兜底也能到点触发。
-                return self._pair_probe_or_timeout(fp, abs_fp, state, name, now)
+                return _call_pair_probe_or_timeout(self, fp, abs_fp, state, name, now, wc)
             self._vol_wait.pop(abs_fp, None)
             self.hub.log(f"分卷已到齐（含末卷，共 {len(vols)} 个编号分卷）: {name}")
             return True
@@ -1394,10 +1448,10 @@ class FolderWatcher(threading.Thread):
                   f"首卷已出现，分卷未到齐（等待更小的尾卷）: {name}"
                   f"（已到 {len(vols)} 个满卷）")
         # 跨名分卷链配对 + 目录活跃度 + 有界兜底放行（与「缺独立末卷」分支共用）
-        return self._pair_probe_or_timeout(fp, abs_fp, state, name, now)
+        return _call_pair_probe_or_timeout(self, fp, abs_fp, state, name, now, wc)
 
     # ---------- 分卷等待共用出口：跨名探测 + 目录活跃 + 有界兜底 ----------
-    def _pair_probe_or_timeout(self, fp, abs_fp, state, name, now):
+    def _pair_probe_or_timeout(self, fp, abs_fp, state, name, now, wc=None):
         """「全满卷等待尾卷」与「缺独立末卷（xxx.7z.001 风格）」两个等待分支共用的收尾。
 
         顺序：跨名分卷链探测 → 目录活跃度重置空闲计时 → 有界兜底放行。
@@ -1413,6 +1467,22 @@ class FolderWatcher(threading.Thread):
         # 改名上传的兄弟卷正是这样被看见的。连续活动超上限后不再压制兜底。
         if self._pair_dir_active(fp, state, now):
             state["last_change"] = now
+        # 尾卷可能被程序自己解压到**子目录**（本 bug 的真实形态）：等待尾卷时也要在
+        # 监听范围内找同系列兄弟卷并归拢，凑齐后下一轮 _volume_ready 复判到齐即可
+        # 放行。_gather_and_consolidate 会 rglob 整个监听根，开销大，必须节流：按
+        # SPLIT_RECHECK_INTERVAL 每文件最多一次（state["last_gather"] 记账）。仅 wc
+        # 可用且是首卷时执行；归拢到兄弟卷就返回 False 继续等；异常一律吞掉，绝不
+        # 改变既有等待语义。
+        try:
+            if wc and smart_extract.is_first_volume(name):
+                _last_gather = state.get("last_gather", 0.0)
+                if now - _last_gather >= self.SPLIT_RECHECK_INTERVAL:
+                    state["last_gather"] = now
+                    if self._gather_and_consolidate(fp, wc) > 0:
+                        # 已归拢到兄弟卷：保持等待，下一轮复判到齐（勿在本轮强解）
+                        return False
+        except Exception:
+            pass
         # 截断分卷链的有界重试：按已尝试次数提升本次退避阈值（300→900→1800s）；
         # 已放弃或达上限则不再放行（继续等新分卷，源文件与分卷一律保留）。
         # 源文件身份或源目录内容变化 → _split_retry_gate 清计数重新武装。
@@ -1890,7 +1960,7 @@ class FolderWatcher(threading.Thread):
         # (part1..N-1) 大小一致，最后一个尾卷通常更小。只要还没出现更小的
         # 尾卷，就继续等待。
         elif smart_extract.is_volume_name(name) and smart_extract.is_first_volume(name):
-            if not self._volume_ready(fp):
+            if not _call_volume_ready(self, fp, wc):
                 self._set_dir_state(wc.get("path"), "waiting", name=name)
                 return "defer"
         elif smart_extract.volume_download_pending(fp):
@@ -2078,7 +2148,7 @@ class FolderWatcher(threading.Thread):
                         and not (result or {}).get("split_gap_archive")
                         and ("Unexpected end of archive" in err
                              or "Missing volume" in err
-                             or not self._volume_ready(fp))):
+                             or not _call_volume_ready(self, fp, wc))):
                     self.hub.log(f"{name} 分卷可能未到齐，稍后重试: {err}")
                     db.update_task_state(tid, "queued", error="分卷可能未到齐，稍后重试")
                     _tasks_changed(self.hub)

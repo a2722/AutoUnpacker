@@ -5,6 +5,35 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.25] - 2026-10-09
+
+> **本轮重点**：修「分卷套装明明都在、却永远解不出来」—— 尾卷被程序自己解压到**子目录**后，等待尾卷的判定只看首卷所在目录，
+> 能把它搬过来的跨目录归拢又只挂在「解压后才发现缺兄弟卷」那条路上，于是整套永远「缺末卷」→ 超时强解 →
+> `Unexpected end of archive` → 保留源文件循环等待。
+
+### 修改
+
+- **修复（等待尾卷时不找跨目录兄弟卷）**：`_volume_ready()` 判定「到齐」只扫**首卷所在目录**（`fp.parent.iterdir()`）；
+  而 `_gather_and_consolidate()`（会把同系列分卷从子目录**搬**到首卷旁，隔离区 / 未完成下载 / 同名冲突 / 可写性等
+  安全规则齐全）此前**只挂在解压后的 `split_gap_archive` 路径**。真实故障：一套 `x.7z.001` + `x.7z.002` 在监听目录、
+  尾卷 `x.7z.003` 是程序解压另一个压缩包后**落在子目录**里的 → 首卷判「缺末卷」直接 `defer`，永远走不到归拢 →
+  超时强解报 `Unexpected end of archive` → 保留源文件循环等待（**源文件与分卷全程安全，只是解不出来**）。
+  现在把归拢接进等待尾卷的共用出口 `_pair_probe_or_timeout`（按 `SPLIT_RECHECK_INTERVAL` **每文件最多一次**；
+  仅监听配置可用且是首卷时执行；异常一律吞掉；归拢到即返回、继续等下一轮复判到齐），并把监听配置从 `_handle`
+  透传到 `_volume_ready`。
+- **加固（对测试替身向后兼容）**：`_volume_ready` 新增 `wc` 形参后，既有测试里 `lambda fp: False` 形状的桩会因
+  `unexpected keyword argument` 抛错。新增 `_call_volume_ready` / `_call_pair_probe_or_timeout` 两个**按签名容忍**的
+  调用助手（口径同 `share_flow._call_start_share_pick`：不接受新形参且无 `**kwargs` 时退回旧调用式），真实实现行为不变。
+
+### 测试
+
+- 扩展 `test_volume_pair_wait.py`（28 → **43**）：用户形态（首卷两卷在监听目录、尾卷在子目录 → 自动归拢并解压）、
+  护栏（未完成下载 / 隔离区 / 同名冲突都不搬）、限速（每文件每间隔最多一次）、监听配置缺失或实验性关闭时行为不变。
+- **反证**：回退 `monitor/watcher.py` 后该测试 **FAILED 6/43**，恢复后全过。
+- 回归点 `test_dir_state_missing.py` **36/36**（曾因未设防的 `wc=` 调用回归，已修）。
+- 串行全量 **189 项 / FAILCOUNT=2**（`test_dead_share_flow` / `test_need_code_gate` 两个既有环境性失败；
+  另 `test_tab_shortcuts` 一次 Qt 退出期偶发崩溃，单独连跑 3 次全过，与本轮改动无关）。
+
 ## [2.2.24] - 2026-10-08
 
 > **本轮重点**：把「下载进来的压缩包没被解压」这一类问题连根拔掉三处 —— ① 只认扩展名的识别门把**改名 / 超大的伪装包**

@@ -67,7 +67,12 @@ SUSPECT_BIG_FILE_BYTES = 16 * 1024 * 1024
 def _scan_chunk_for_archive(data):
     if b"PK\x05\x06" in data or b"PK\x06\x07" in data:
         return "zip"
-    if b"Rar!\x1a\x07\x00" in data:
+    # RAR4 = Rar!\x1a\x07\x00，RAR5 = Rar!\x1a\x07\x01\x00。旧实现写死 RAR4 的
+    # 7 字节签名，会漏掉 RAR5——而「封面图/视频头 + 紧跟 RAR5」的伪装包（签名落在
+    # 偏移处，百度网盘很常见）正是本函数要覆盖的场景。改用 RAR4/RAR5 共同前缀
+    # （与 _scan_sfx_for_archive 口径一致）；签名巧合由 _verify_polyglot_7z_rar 的
+    # 真实 7-Zip 列表复核兜底，不会误报。
+    if b"Rar!\x1a\x07" in data:
         return "rar"
     if b"7z\xbc\xaf\x27\x1c" in data:
         return "7z"

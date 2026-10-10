@@ -5,6 +5,29 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.26] - 2026-10-10
+
+> **本轮重点**：修「伪装成图片的 RAR5 整包不被识别」—— 多段伪装扫描里的 RAR 判定写死了 **RAR4** 的 7 字节签名
+> （`Rar!\x1a\x07\x00`），于是「文件头 + 偏移处紧跟 RAR5（`Rar!\x1a\x07\x01\x00`）」的包被判「非压缩包」，
+> watcher 零日志静默跳过；而 7-Zip 自动模式本就能按偏移解出。
+
+### 修改
+
+- **修复（偏移 RAR5 多段伪装不被识别）**：`_scan_chunk_for_archive()`（尾部 / 前部 / 全量三路扫描共用的签名判定）
+  此前只匹配 RAR4 签名 `Rar!\x1a\x07\x00`，漏掉 RAR5 的 `Rar!\x1a\x07\x01\x00`（第 5 字节 `00` vs `01`）。
+  现场形态：网盘「封面图 + 压缩包」合并包 —— 一个 343MB 的文件 = 54KB JPEG 头 + 偏移 54,198 处的 RAR5
+  （`7z l` 报 `Type=Rar5, Offset=54198`），RAR5 里装的才是真正要解出的文件。改用 RAR4/RAR5 共同前缀
+  `Rar!\x1a\x07`（与 `_scan_sfx_for_archive` 口径一致）；签名巧合仍由 `_verify_polyglot_7z_rar` 的真实
+  7-Zip 列表复核兜底，不会误报。zip（尾部 EOCD）与 7z（`7z\xbc\xaf\x27\x1c`，任意偏移）判定不受影响。
+
+### 测试
+
+- 扩展 `test_disguise_recognize.py`（40 → **45**）：新增 I 段锁定 RAR5 —— 单元验 `_scan_chunk_for_archive` 对
+  RAR4/RAR5 签名均返回 `"rar"`；本机有 `Rar.exe` 时端到端验「JPEG 前缀 + 真 RAR5」→ `("rar", True)` 且
+  `is_archive_file()=True`。
+- **反证**：回退 `extraction/formats.py` 后新增的 I1/I3b/I3c **FAILED 3/45**，恢复后全过。
+- 串行全量 **189 项 / FAILCOUNT=2**（`test_dead_share_flow` / `test_need_code_gate` 两个既有环境性失败）。
+
 ## [2.2.25] - 2026-10-09
 
 > **本轮重点**：修「分卷套装明明都在、却永远解不出来」—— 尾卷被程序自己解压到**子目录**后，等待尾卷的判定只看首卷所在目录，

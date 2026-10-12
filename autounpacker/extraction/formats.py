@@ -963,3 +963,74 @@ def is_volume_file(source_name, candidate, stem):
     if final_part and candidate == final_part:
         return True
     return False
+
+
+def _split_set_base(name):
+    """分卷集合标识：首卷基础名去掉末尾归档格式后缀后的词干。取不到返回 None。
+
+    - `29.z01`      -> `29`（无格式后缀可去）
+    - `foo.zip.001` -> `foo`（去掉 `.zip`）
+    - `foo.7z.001`  -> `foo`（去掉 `.7z`）
+    - `base.r00`    -> `base`
+
+    用于把「被改名上传的末卷」（如 `29.tnt`）与首卷归到同一集合：改名末卷
+    `29.tnt` 的 `stem` 恰为 `29`，与首卷集合标识一致。绝不抛异常。"""
+    try:
+        base = _volume_base(name)
+        if not base:
+            return None
+        low = base.lower()
+        for ext in (".zip", ".7z", ".rar"):
+            if low.endswith(ext):
+                return base[:-len(ext)]
+        return base
+    except Exception:
+        return None
+
+
+def find_renamed_final_volume(first_path):
+    """split-zip 首卷：在同目录里找「被改名上传的末卷」，返回其 Path 或 None。
+
+    末卷的中央目录（含 EOCD）一定在最后一个分卷的末尾，故「尾部含 zip EOCD」
+    即「它就是末卷」。上传者可能把末卷改成任意名字（.tnt/.jpg/.dat/无后缀），
+    只按标准名（`base.zip`）找会永久漏判到齐（真机 `29.z01`+`29.z02`+`29.tnt`）。
+
+    判定（全部满足）：
+    - 首卷是分卷第 1 卷；
+    - 候选是同目录普通文件、不是下载中、不是标准编号分卷（后者走既有分支）；
+    - 候选 `stem`（去最后一个后缀）与首卷「集合标识」大小写不敏感相等；
+    - 候选末尾含 zip EOCD（`has_zip_eocd`）。
+    唯一候选才返回；无候选或多个候选一律 None（绝不猜）。绝不抛异常。"""
+    try:
+        first = Path(first_path)
+        if not first.is_file():
+            return None
+        if _volume_number(first.name) != 1:
+            return None
+        base = _split_set_base(first.name)
+        if not base:
+            return None
+        key = base.lower()
+        standard_final = _volume_final_name(first.name)
+        matches = []
+        for e in first.parent.iterdir():
+            try:
+                if not e.is_file() or e.name == first.name:
+                    continue
+                if standard_final and e.name == standard_final:
+                    continue          # 标准末卷名：由既有「末卷存在」分支处理
+                if is_incomplete_download(e):
+                    continue
+                if is_volume_name(e.name):
+                    continue          # 标准编号分卷：既有「末卷为编号分卷」分支负责
+                if Path(e.name).stem.lower() != key:
+                    continue
+                if has_zip_eocd(e):
+                    matches.append(e)
+            except OSError:
+                continue
+        if len(matches) == 1:
+            return matches[0]
+        return None
+    except Exception:
+        return None

@@ -577,6 +577,7 @@ class MainWindow(QMainWindow):
         self.task_page.taskDoubleClicked.connect(self._on_task_double_clicked)
         self.task_page.taskDeselected.connect(lambda: self._select_task(None))
         self.task_page.actionTriggered.connect(self._on_task_action)
+        self.task_page.bulkIgnoreRequested.connect(self._ignore_tasks)
         self.task_page.copyRequested.connect(self._copy_task_log)
         self.task_page.scopeChanged.connect(lambda _s: self._refresh_tasks())
         self.task_page.resultFilterChanged.connect(self._set_failed_filter)
@@ -1923,21 +1924,18 @@ class MainWindow(QMainWindow):
             "均无匹配密码；请到「密码本」页补充后点「重试」。")
         self._goto_page("password")
 
-    def _ignore_task(self, task_id):
-        """「从队列移除」（软取消）：标记为已取消（终态），任何状态都可执行。
+    def _cancel_task_row(self, task_id):
+        """软取消单个任务（不刷新、不记日志）：置 canceled 终态；解压中先请求中止。
 
-        这是队列行「从队列移除」的唯一实现：待密码/失败之外的状态
-        （queued/extracting/done/canceled）同样可被用户主动清出队列——卡在
-        need_password 且源文件已删除的任务因此不会永远留在队列里。
-        若被忽略的任务正在解压，顺带请求中止其卡住的子进程；abort_task 为
-        可选能力，测试桩 pauser 未实现时静默跳过，绝不因此崩溃。"""
+        返回 (是否命中记录, 显示名)。`_ignore_task`（单行）与 `_ignore_tasks`
+        （批量）共用这一份语义，绝不复制两套。abort_task 是可选能力，测试桩
+        pauser 未实现时静默跳过，绝不因此崩溃。"""
         try:
             task = db.get_task(task_id) or {}
         except Exception:
             task = {}
         if not task:
-            self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
-            return
+            return False, str(task_id)
         if str(task.get("state") or "") == "extracting":
             abort = getattr(self.pauser, "abort_task", None)
             if callable(abort):
@@ -1950,9 +1948,51 @@ class MainWindow(QMainWindow):
                                  finished_at=int(time.time()))
         except Exception:
             pass
+        return True, str(task.get("file_name") or task_id)
+
+    def _ignore_task(self, task_id):
+        """「从队列移除」（软取消）：标记为已取消（终态），任何状态都可执行。
+
+        待密码/失败之外的状态（queued/extracting/done/canceled）同样可被用户主动
+        清出队列——卡在 need_password 且源文件已删除的任务因此不会永远留在队列里。
+        批量入口见 `_ignore_tasks`（共用同一份 `_cancel_task_row` 语义）。"""
+        ok, name = self._cancel_task_row(task_id)
+        if not ok:
+            self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
+            return
         self._emit_tasks_changed()
-        self._append_log(f"[任务] 已忽略: {task.get('file_name') or task_id}")
-        self._refresh_all()
+        self._append_log(f"[任务] 已忽略: {name}")
+        # 只刷任务表 + 统计/徽标，**绝不 _refresh_all()**：软取消保留记录与日志，
+        # 日志内容没变，新那一行也已由上面的 _append_log 实时追加；而 _refresh_all
+        # 会 force 整页重载两个日志视图（各最多 3000 行富文本），实测 ~550ms（真机
+        # 757 任务 / 10901 日志行），低配设备更久——正是「点从队列移除卡一下」的成因。
+        self._refresh_tasks()
+        self._refresh_meta(force=True)
+
+    def _ignore_tasks(self, task_ids):
+        """批量「从队列移除」：逐个软取消，但**收尾只刷新一次**。
+
+        若照单行入口逐条调用，N 行会触发 N 次任务表 + 统计重载（每次数十 ms），
+        选中较多时叠加成明显卡顿（与刚修掉的「点一下卡 0.5s」同类）。这里把 N 次
+        状态写入合并，收尾只 _refresh_tasks + _refresh_meta 各一次；日志仍只记
+        一条汇总，绝不整页重载日志视图。"""
+        ids = []
+        for tid in (task_ids or []):
+            try:
+                ids.append(int(tid))
+            except Exception:
+                pass
+        if not ids:
+            return
+        done = 0
+        for tid in ids:
+            ok, _name = self._cancel_task_row(tid)
+            if ok:
+                done += 1
+        self._emit_tasks_changed()
+        self._append_log(f"[任务] 已从队列移除 {done} 项（批量）")
+        self._refresh_tasks()
+        self._refresh_meta(force=True)
 
     def _mark_task_done(self, task_id):
         """「忽略」：把失败 / 队列中的条目**手动转为完成**（done 终态）。
@@ -1992,7 +2032,10 @@ class MainWindow(QMainWindow):
             pass
         self._emit_tasks_changed()
         self._append_log(f"[任务] 已忽略（转为完成）: {name}")
-        self._refresh_all()
+        # 与 _ignore_task 同口径：只刷任务表 + 统计/徽标，不整页重载日志视图
+        # （人工转换只改任务状态，日志行由 hub.log 落库后经 drain 实时追加）。
+        self._refresh_tasks()
+        self._refresh_meta(force=True)
 
     def _delete_task(self, task_id):
         """「删除记录」（硬删除）：删 tasks 行 + 该任务日志行，刷新队列/徽标。

@@ -299,6 +299,7 @@ class TaskPage(QWidget):
     taskDoubleClicked = pyqtSignal(int)
     taskDeselected = pyqtSignal()
     actionTriggered = pyqtSignal(int, str)
+    bulkIgnoreRequested = pyqtSignal(list)   # 批量「从队列移除」：一次带全部选中 id
     copyRequested = pyqtSignal()
     scopeChanged = pyqtSignal(str)
     resultFilterChanged = pyqtSignal(bool)
@@ -335,6 +336,16 @@ class TaskPage(QWidget):
         self.seg_result.set_items([("全部", "all"), ("失败 0", "failed")])
         self.seg_result.currentChanged.connect(self._on_result)
         row.addWidget(self.seg_result)
+        # 批量「从队列移除」：任务表出现多选（>=2 行）才显示，日常 0/1 选中永远隐藏。
+        # 只经既有行内动作信号（kind="ignore"）派发，宿主 _ignore_task 是唯一实现。
+        self.bulk_remove_btn = QPushButton("从队列移除", self)
+        self.bulk_remove_btn.setObjectName("danger")
+        self.bulk_remove_btn.setCursor(Qt.PointingHandCursor)
+        self.bulk_remove_btn.setToolTip(
+            "从队列移除选中的任务（软取消：保留记录与日志）")
+        self.bulk_remove_btn.clicked.connect(self._on_bulk_remove)
+        self.bulk_remove_btn.setVisible(False)      # 默认隐藏：日常使用看不到
+        row.addWidget(self.bulk_remove_btn)
         self.refresh_btn = _icon_button("refresh", "刷新", self)
         self.refresh_btn.clicked.connect(self.refreshRequested.emit)
         row.addWidget(self.refresh_btn)
@@ -358,6 +369,10 @@ class TaskPage(QWidget):
         self.table.taskActivated.connect(self.taskActivated)
         self.table.taskDoubleClicked.connect(self.taskDoubleClicked)
         self.table.actionTriggered.connect(self.actionTriggered)
+        # 多选联动：选中数变化即时同步批量按钮显隐（与密码本页同口径）
+        sm = self.table.selectionModel()
+        if sm is not None:
+            sm.selectionChanged.connect(self._on_table_selection)
         self.table_empty = _EmptyOverlay(self.table, EMPTY_TASKS)
 
         # 日志区 = 日志视图（「该任务日志」头部行已移入分隔条手柄，见下方）
@@ -506,11 +521,12 @@ class TaskPage(QWidget):
         restored = bool(keep is not None and self.table.select_task(keep))
         if preserve_view and scroll is not None:
             self.table.set_scroll_value(scroll)
-        if restored:
-            return                          # 保留选中：table 会发 taskActivated
-        if keep is not None:
+        if not restored and keep is not None:
             self.set_current_task(None)
             self.taskDeselected.emit()
+        # 模型重置不保证发 selectionChanged：每次装载（含换范围 / 换过滤）后
+        # 显式同步一次批量按钮——旧选中已被重置清空，按钮必须随之收起。
+        self._sync_bulk_button()
 
     def set_counts(self, counts):
         """刷新分段文案与统计 micro（队列 N / 历史 N / 失败 N / 统计行）。"""
@@ -614,6 +630,45 @@ class TaskPage(QWidget):
         except Exception:
             pass
         self.set_current_task(None)
+        self._sync_bulk_button()
+
+    # ---- 多选批量「从队列移除」 ----
+    def _selected_task_ids(self):
+        """选中行的任务 id（按视图顺序）；任何异常都退化为 []（勾选出错绝不外抛）。"""
+        try:
+            return list(self.table.selected_task_ids())
+        except Exception:
+            return []
+
+    def _sync_bulk_button(self):
+        """按选中数同步批量按钮显隐：>=2 显示；0/1（或清空 / 刷新后）隐藏。
+
+        模型重置（set_tasks）不保证发 selectionChanged，装载与清选后都要显式同步。"""
+        btn = getattr(self, "bulk_remove_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.setVisible(len(self._selected_task_ids()) >= 2)
+        except Exception:
+            pass
+
+    def _on_table_selection(self, *_args):
+        self._sync_bulk_button()
+
+    def _on_bulk_remove(self):
+        """批量「从队列移除」：一次把全部选中 id 交给宿主（宿主批量只刷一次）。
+
+        先快照 id 再发放——宿主批量取消会重载任务表（模型重置即清选中），循环里
+        现取会漏发。收尾清选中、收起按钮；绝不整页重载日志。"""
+        ids = self._selected_task_ids()
+        if len(ids) < 2:
+            return                          # 按钮本就隐藏；防御性兜底
+        try:
+            self.bulkIgnoreRequested.emit([int(t) for t in ids])
+        except Exception:
+            pass
+        self._clear_task_selection()
+        self._sync_bulk_button()
 
     def _on_log_scope(self, data):
         self._log_scope = "all" if str(data) == "all" else "task"

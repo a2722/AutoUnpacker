@@ -78,7 +78,8 @@ from .extraction.formats import (  # noqa: F401
     _scan_tail_for_archive, _series_base, _strip_download_suffix, _volume_base,
     _volume_final_name, _volume_number, analyze_file, detect_archive_format,
     detect_format_by_magic, detect_steganography, detect_volumes_quick,
-    extract_password_from_filename, find_sevenzip_path, format_from_extension,
+    extract_password_from_filename, find_renamed_final_volume, find_sevenzip_path,
+    format_from_extension,
     has_zip_eocd, infer_volume_name_from_siblings, is_archive_file,
     is_disguised, is_do_not_extract,
     is_fake_volume_name, is_first_volume, is_incomplete_download,
@@ -89,11 +90,11 @@ from .extraction.formats import (  # noqa: F401
     volume_download_pending)
 from .extraction.post import (  # noqa: F401
     _dirs_conflict, _final_output_targets, _merge_dir, _recycle_paths,
-    _set_created_time, _stage_fake_volume, _stage_rar_volumes,
-    _stamp_output_times, apply_post_actions, build_post_actions, delete_source,
-    is_clean_success, move_result_dir, promote_extracted_content,
-    remove_empty_dirs, run_script, stamp_output_now, strip_embedded_zip,
-    unique_dest_path)
+    _set_created_time, _stage_fake_volume, _stage_final_volume_set,
+    _stage_rar_volumes, _stamp_output_times, apply_post_actions,
+    build_post_actions, delete_source, is_clean_success, move_result_dir,
+    promote_extracted_content, remove_empty_dirs, run_script, stamp_output_now,
+    strip_embedded_zip, unique_dest_path)
 from .extraction.service import (  # noqa: F401
     CONTENT_STOP_MIN_BUCKETS, CONTENT_STOP_MIN_FILES, CONTENT_STOP_MIN_SMALL,
     ExtractService, looks_like_complete_content)
@@ -115,7 +116,8 @@ __all__ = [
     "_full_scan_for_archive", "_header_matches_format", "_merge_dir", "_part_info",
     "_pwd_stdin_bytes", "_recycle_paths", "_scan_chunk_for_archive",
     "_scan_front_for_archive", "_scan_sfx_for_archive", "_scan_tail_for_archive",
-    "_series_base", "_set_created_time", "_stage_fake_volume", "_stage_rar_volumes",
+    "_series_base", "_set_created_time", "_stage_fake_volume",
+    "_stage_final_volume_set", "_stage_rar_volumes",
     "_stamp_output_times", "_strip_download_suffix", "_volume_base",
     "_volume_final_name", "_volume_number", "add_dict_password", "analyze_file",
     "apply_post_actions", "argparse", "bomb_options_from_cfg", "build_post_actions", "concise_error",
@@ -123,7 +125,8 @@ __all__ = [
     "delete_policy_permanent_fallback", "delete_source", "deletion_engine", "deque",
     "detect_archive_format", "detect_format_by_magic", "detect_steganography",
     "detect_volumes_quick", "extract_one", "extract_password_from_filename",
-    "find_sevenzip_path", "format_from_extension", "get_dict_passwords",
+    "find_renamed_final_volume", "find_sevenzip_path", "format_from_extension",
+    "get_dict_passwords",
     "get_password_for_layer", "has_zip_eocd", "infer_volume_name_from_siblings", "is_archive_file",
     "is_archive_open_error", "is_clean_success", "is_disguised", "is_do_not_extract",
     "is_fake_volume_name", "is_first_volume", "is_incomplete_download",
@@ -249,6 +252,16 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
         if staged_info:
             extract_src, staged = staged_info
             print(f"分卷命名不规范（含 .删除rar/.除rar 等），已规范化命名后交给引擎: {extract_src.name}")
+    elif (info.get("is_volume") and is_first_volume(extract_src.name)
+          and _volume_final_name(extract_src.name) is not None):
+        # split-zip 末卷被改名上传（如 29.zip -> 29.tnt）：标准末卷名缺失、7-Zip
+        # 必然报 Missing volume。把整套分卷零拷贝硬链接到临时子目录并按标准名
+        # 统一命名（改名末卷呈现为 base.zip），7-Zip 才能解开整条链。装配失败
+        # （跨盘/硬链接不可用）时返回 None，交既有等待/重试逻辑，绝不复制大文件。
+        staged_info = _stage_final_volume_set(extract_src)
+        if staged_info:
+            extract_src, staged = staged_info
+            print(f"末卷被改名上传，已零拷贝装配整套分卷后交给引擎: {extract_src.name}")
     elif is_fake_volume_name(extract_src):
         # 文件名像分卷（.z11/.111 等）但内容是完整自包含压缩包（改后缀迷惑）：
         # 复制到临时目录改名为标准后缀，7-Zip 才不会误判为 split 缺卷。

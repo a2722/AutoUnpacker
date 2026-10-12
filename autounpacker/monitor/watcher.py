@@ -1363,7 +1363,15 @@ class FolderWatcher(threading.Thread):
         # 解压」；拿不到信息（未开启实验性/未被跟踪）就回退下面的磁盘启发式。
         try:
             from .. import baidu_task as _baidu_task
-            if _baidu_task.volume_hint(str(fp)) is True:
+            # 曾经解压报过「分卷链不完整」就不再采信本捷径：清单只是「客户端把清单里
+            # 的文件下完了」，与压缩包层面是否真到齐是两回事（清单可能只含 .z01/.z02，
+            # 实际还缺末卷 29.zip）。若此处仍每轮 return True，就会绕开下面的
+            # 300→900→1800s 有界退避与「放弃」闸门 → 每轮重解、报缺卷、回退，无限
+            # 死循环（真机：同一首卷每 ~3s 一轮、连刷 42 分钟）。让位给闸门后，重试按
+            # 退避走、到顶即放弃；新分卷到达会改变目录签名 → 闸门重新武装，届时本捷径
+            # 自然恢复生效（重新下载完成的场景不受影响）。
+            if (self._split_incomplete_retry.get(abs_fp) is None
+                    and _baidu_task.volume_hint(str(fp)) is True):
                 state["last_sig"] = None
                 _wlog(("db-ready", name),
                       f"分卷已到齐（依据网盘任务清单）: {name}")
@@ -1408,6 +1416,17 @@ class FolderWatcher(threading.Thread):
                 if last_part is not None and smart_extract.has_zip_eocd(last_part):
                     self._vol_wait.pop(abs_fp, None)
                     self.hub.log(f"分卷已到齐（末卷为编号分卷，共 {len(vols)} 个分卷）: {name}")
+                    return True
+                # 末卷可能被改名上传（如 29.zip -> 29.tnt）：标准名缺失，但同目录里
+                # 可能有「同集合标识 + 尾部含 zip EOCD」的兄弟文件 —— 它就是末卷，
+                # 据此判到齐。否则本分支会永久等待（真机 29.z01+29.z02+29.tnt）。
+                # 只认唯一候选；装配与解压由 extract._stage_final_volume_set 零拷贝完成。
+                renamed_final = smart_extract.find_renamed_final_volume(fp)
+                if renamed_final is not None:
+                    self._vol_wait.pop(abs_fp, None)
+                    self.hub.log(
+                        f"分卷已到齐（末卷为改名兄弟 {renamed_final.name}，"
+                        f"共 {len(vols)} 个编号分卷）: {name}")
                     return True
                 # 既无独立末卷、也不是 zip EOCD：可能是 7-Zip 分卷
                 # （xxx.7z.001+xxx.7z.002...，真正的末卷就是最高编号的分卷本身，

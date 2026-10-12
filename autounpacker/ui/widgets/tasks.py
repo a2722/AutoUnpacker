@@ -212,7 +212,9 @@ class TaskTable(QTableView):
         self.setModel(self._model)
         self.setItemDelegate(_StatePillDelegate(self))
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        # ExtendedSelection：单击 = 单选（原有行为不变）；Ctrl 点按切换；Shift 范围；
+        # Ctrl+A 全选。失败列表的批量「从队列移除」依赖它（与密码本页同口径）。
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setAlternatingRowColors(True)
         self.setShowGrid(False)
@@ -397,6 +399,24 @@ class TaskTable(QTableView):
                 self.selectRow(row)
                 return True
         return False
+
+    def selected_task_ids(self):
+        """当前选中行的任务 id 列表（按视图从上到下的顺序；无选中 / 异常返回 []）。
+
+        批量动作取 id 的唯一入口：先在此快照，再逐个发放——宿主每次软取消都会
+        重载模型（模型重置即清选中），循环中途按行号现取必漏。"""
+        try:
+            idxs = sorted(self.selectionModel().selectedRows(),
+                          key=lambda i: i.row())
+        except Exception:
+            return []
+        out = []
+        for idx in idxs:
+            try:
+                out.append(int(self._model.data(idx, Qt.UserRole)))
+            except Exception:
+                continue
+        return out
 
     def scroll_to_top(self):
         try:

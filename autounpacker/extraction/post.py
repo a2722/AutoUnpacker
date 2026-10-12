@@ -22,7 +22,10 @@ from pathlib import Path
 from ..config import delete_policy_permanent_fallback
 from ..deletion import engine as deletion_engine
 from .engines import CREATE_NO_WINDOW
-from .formats import PART_RE, _part_info, is_volume_file, is_volume_name
+from .formats import (
+    PART_RE, _part_info, _volume_base, _volume_final_name, _volume_number,
+    find_renamed_final_volume, is_incomplete_download, is_volume_file,
+    is_volume_name, normalize_volume_name)
 
 
 def strip_embedded_zip(path, dest_dir):
@@ -167,6 +170,84 @@ def _stage_fake_volume(source, fmt):
     except Exception:
         # staging 构造失败：半成品临时目录移入回收站（绝不永久删除）
         _recycle_paths([stage], permanent_fallback=False)
+        return None
+
+
+def _stage_final_volume_set(source):
+    """split-zip 首卷：末卷被改名上传时，把整套分卷硬链接到源目录下的临时子目录，
+    并按标准名（base.z01/.z02/… 或 base.001/.002/… + base.zip）统一命名，
+    末卷用「改名兄弟」硬链接成标准末卷名 —— 7-Zip 因此能按真实格式解开整条链。
+
+    零拷贝：只 `os.link`，同卷瞬时完成、不占额外空间；跨盘/硬链接失败一律返回
+    None（**绝不退化成复制多 GB 文件**），源文件与分卷永远只读、绝不动原文件。
+    仅当「标准末卷名缺失、但存在改名末卷（尾部含 zip EOCD）」时才装配。
+    返回 (规范后的首卷路径, 临时目录) 或 None。绝不抛异常。
+    """
+    try:
+        source = Path(source)
+        first_name = source.name
+        if not source.is_file():
+            return None
+        base = _volume_base(first_name)
+        final_name = _volume_final_name(first_name)
+        if not base or not final_name:
+            return None
+        if _volume_number(first_name) != 1:
+            return None
+        # 标准末卷名已在：无需装配，交既有流程
+        if (source.parent / final_name).exists():
+            return None
+        renamed = find_renamed_final_volume(source)
+        if renamed is None:
+            return None
+        # 命名模板：沿用首卷编号风格（.z01 → .zNN；.001 → .NNN）
+        norm = normalize_volume_name(first_name)
+        if re.search(r"\.z\d{2}$", norm, re.I):
+            def _vname(n):
+                return f"{base}.z{n:02d}"
+        elif re.search(r"\.\d{3}$", norm):
+            def _vname(n):
+                return f"{base}.{n:03d}"
+        else:
+            return None
+        # 收集同套编号分卷（含首卷），必须从 1 起连续；有缺口/下载中 → None
+        vols = {}
+        try:
+            entries = list(source.parent.iterdir())
+        except OSError:
+            return None
+        for e in entries:
+            try:
+                if e.name == first_name or not e.is_file():
+                    continue
+                if is_incomplete_download(e):
+                    continue
+                if not is_volume_file(first_name, e.name, source.stem):
+                    continue
+                n = _volume_number(e.name)
+                if n is not None:
+                    vols[n] = e
+            except OSError:
+                continue
+        vols[1] = source
+        maxn = max(vols)
+        if set(vols) != set(range(1, maxn + 1)):
+            return None     # 编号不连续：留给既有等待/重试逻辑
+        stage = source.parent / f".stage_{uuid.uuid4().hex[:6]}"
+        try:
+            stage.mkdir(exist_ok=True)
+            for n in range(1, maxn + 1):
+                os.link(str(vols[n]), str(stage / _vname(n)))
+            os.link(str(renamed), str(stage / final_name))
+        except OSError:
+            shutil.rmtree(stage, ignore_errors=True)
+            return None
+        master = stage / _vname(1)
+        if not master.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+            return None
+        return master, stage
+    except Exception:
         return None
 
 
@@ -508,6 +589,16 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
         for entry in parent.iterdir():
             if entry.is_file() and is_volume_file(source.name, entry.name, source.stem):
                 targets.append(entry)
+        # 末卷被改名上传时（如 29.zip -> 29.tnt），上面的**名字**匹配收不到它——解压
+        # 成功后它就成了孤儿：留在监听目录里被反复当独立压缩包重试（必失败、刷失败
+        # 通知，真机 29.z01+29.z02+29.tnt）。按内容认出的改名末卷同属本次已消费的
+        # 源分卷，一并回收；源文件永远只读，绝不改名/移动原文件（回收=移入回收站/隔离区）。
+        try:
+            renamed = find_renamed_final_volume(source)
+        except Exception:
+            renamed = None
+        if renamed is not None and renamed not in targets:
+            targets.append(renamed)
     if not targets:
         if hook:
             hook([], [], None)

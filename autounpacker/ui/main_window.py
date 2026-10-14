@@ -3880,7 +3880,21 @@ class MainWindow(QMainWindow):
                     elif manual:
                         # 用户明确按了手势却毫无反馈是最糟的体验：手动失败必须通知。
                         # 自动路径（manual=False）保持只有日志，避免噪音。
-                        self._share_notify("分享拉起失败", f"{url}\n{detail}")
+                        try:
+                            net_timeout = bs.is_network_timeout_reason(detail)
+                        except Exception:
+                            net_timeout = False
+                        if net_timeout:
+                            # 偶发网络超时/连接失败：链接本身没坏，给可操作的友好提示
+                            # （区别于「链接失效」「缺提取码」等确定性失败）。**不重试**——
+                            # 分享链路维持「一次失败即停」的防反爬口径，只把文案说清楚。
+                            self.hub.log("[分享] 疑似偶发网络超时（非死链/非缺码），稍后重试即可")
+                            self._share_notify(
+                                "分享网络超时",
+                                f"{url}\n网络一时没连上百度（链接本身没问题）。"
+                                f"稍等几秒再按一次即可；提取码已记住。")
+                        else:
+                            self._share_notify("分享拉起失败", f"{url}\n{detail}")
         except Exception as e:
             self.hub.log(f"[分享] 拉取出错: {e}")
         finally:

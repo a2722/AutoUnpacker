@@ -167,16 +167,59 @@ def _scan_front_for_archive(path):
     return _scan_chunk_for_archive(data)
 
 
+def _zip_eocd_within_file(path):
+    """廉价护栏：尾部 EOCD 声明的中央目录不得越过文件末尾。
+
+    视频/图片数据里偶然出现的 `PK\\x05\\x06`（假 EOCD）其 cd_off / cd_size 常常
+    荒唐地大（真机 mp4：cd_off ≈ 1.7GB ≫ 13MB 文件），据此先挡掉绝大多数巧合，
+    避免随后 zipfile 按伪造的 cd_size 读入巨量数据。多段伪装时 cd_off 相对 zip
+    数据起点，绝对位置 = zip 起点 + cd_off ≤ 文件尾，故 cd_off + cd_size 仍必然
+    ≤ 文件大小。读失败 / 无标准 EOCD（仅 ZIP64 定位符）一律放行（fail-open）。"""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - POLYGLOT_EOCD_RANGE))
+            tail = f.read()
+    except OSError:
+        return True
+    e = tail.rfind(b"PK\x05\x06")
+    if e < 0 or e + 22 > len(tail):
+        return True
+    cd_size = int.from_bytes(tail[e + 12:e + 16], "little")
+    cd_off = int.from_bytes(tail[e + 16:e + 20], "little")
+    return (cd_off + cd_size) <= size
+
+
 def _confirm_polyglot(path, fmt):
     if fmt == "zip":
         try:
-            return "zip" if zipfile.is_zipfile(path) else None
+            if not zipfile.is_zipfile(path):
+                return None
         except OSError:
             return "zip"
         except zipfile.BadZipFile:
+            return "zip"
+        if not _zip_eocd_within_file(path):
+            return None
+        # is_zipfile 只校验 EOCD 签名 + 注释长度，不解析中央目录：普通视频/图片
+        # 数据里偶然出现的假 EOCD 也能骗过它（真机 sombra.mp4：is_zipfile=True，
+        # 但 7-Zip / WinRAR / zipfile 真解均报 "Bad offset for central directory"）。
+        # 这里真正解析一次中央目录，能打开才认作 zip，杜绝把普通视频/图片误判成
+        # 嵌套压缩包（否则会连累整包被判「解压失败」，见 service 的失败层汇总）。
+        try:
+            zipfile.ZipFile(path).close()
+            return "zip"
+        except zipfile.BadZipFile as e:
             # 多盘分卷 zip（base.zip + base.z01...zNN）：Python zipfile 不支持
             # （"zipfiles that span multiple disks are not supported"），
             # 但 7-Zip 能解。尾部已扫到 EOCD 签名，直接按 zip 处理。
+            if "span multiple disks" in str(e):
+                return "zip"
+            return None
+        except OSError:
+            return "zip"
+        except Exception:
+            # 其余异常一律 fail-open（与模块「绝不误伤正常文件」的既有口径一致）
             return "zip"
     return fmt
 

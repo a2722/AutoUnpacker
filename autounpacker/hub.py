@@ -117,6 +117,7 @@ class Hub:
         "磁盘空间不足": "notify_error",
         "分卷等待放弃": "notify_error",
         # 必要提醒（默认开）
+        "分享网络超时": "notify_reminder",
         "分享手势超时": "notify_reminder",
         "分享链接正在解析": "notify_reminder",
         "二维码正在解析": "notify_reminder",

@@ -278,6 +278,33 @@ def is_need_code_reason(reason):
         return False
 
 
+# 「偶发网络超时 / 连接层失败」的失败标记（小写比对）。分享链路里的 urlopen 超时、
+# 连接被重置/拒绝、DNS 解析失败等属于**偶发网络问题**，与「死链」「缺码」等确定性
+# 失败不同：链接本身没问题，稍后重试即可。上层据此换成更友好、可操作的提示文案。
+# 刻意**不含**泛化的「网络错误」前缀——那类原因信息量不足，仍走通用文案。
+NETWORK_TIMEOUT_MARKERS = (
+    "timed out", "timeout", "urlopen error",
+    "connection reset", "connection aborted", "connection refused",
+    "remote end closed", "remote disconnected",
+    "getaddrinfo", "name resolution", "temporary failure in name",
+    "eof occurred", "read operation timed out",
+    "网络超时", "连接超时", "连接被重置", "连接被拒绝", "无法连接",
+)
+
+
+def is_network_timeout_reason(reason):
+    """失败原因是否属于「偶发网络超时 / 连接失败」。绝不抛异常。
+
+    仅用于把失败提示换成更友好的文案（链接本身没坏、稍后重试即可），
+    **不改变任何重试行为**——分享链路维持「一次失败即停」的防反爬口径。
+    """
+    try:
+        t = str(reason or "").lower()
+        return any(m in t for m in NETWORK_TIMEOUT_MARKERS)
+    except Exception:
+        return False
+
+
 def _html_ids(html):
     """从分享页 HTML 取 (share_uk, shareid)（`window.yunData` / locals 都能命中）。
 

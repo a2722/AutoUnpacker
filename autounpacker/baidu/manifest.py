@@ -801,10 +801,18 @@ def observe_tasks(rows, hist_rows=None):
                 # 重新下载：当作一次新任务上报（便于日志/预登记）
                 events["started"].append(dict(info))
         try:
-            if int(r.get("error_code") or 0) != 0:
-                events["failed"].append(dict(info))
+            err = int(r.get("error_code") or 0)
         except Exception:
-            pass
+            err = 0
+        # 只在「错误码首次出现 / 变化」时上报一次：客户端的 error_code 是**「上次错误」
+        # 留存标记**——任务出错后即使续传成功也不清零（真机 2026-10-15 任务出错、10-16
+        # 续传成功，该字段全程非 0，最终正常完成；健康下载时它恒为 0）。若每拍都报，
+        # 3 秒一条会把日志刷爆（10-16 实测 94 条；10-13 同类场景 3248 条）。
+        # 归 0 后再次出错会重新上报。
+        changed = err != 0 and info.get("last_error_code") != err
+        info["last_error_code"] = err
+        if changed:
+            events["failed"].append(dict(info))
     _TRACK["active_ids"] = cur_ids
     # 按「是否仍在当前 downloading 集合」判定完成 / 失联 —— 而不是只看相邻两拍
     # 的差集。原因：同一路径被重新下载时任务 id 会变，用旧 task_id 去查差集必然
@@ -1159,7 +1167,10 @@ def report_events(events, hub, notify=True, max_lines=12):
             except Exception:
                 pass
     for it in (events.get("failed") or []):
-        _log(f"网盘任务出错（error_code≠0）：{it.get('local_path')}")
+        _log(f"网盘任务出错（error_code={it.get('last_error_code')}）："
+             f"{it.get('local_path')}"
+             f"（客户端的 error_code 是「上次错误」留存标记，续传成功也不清零；"
+             f"此提示每条任务只报一次）")
     for it in (events.get("gone") or []):
         _log(f"网盘任务从列表移除但历史未确认：{it.get('local_path')}")
 

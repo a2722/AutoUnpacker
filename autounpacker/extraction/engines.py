@@ -8,6 +8,7 @@ SevenZipEngine（解压主循环与进度上报）、PauseController（NtSuspend
 """
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -676,6 +677,110 @@ class SevenZipEngine:
         """兼容旧签名：只返回未压缩字节总和（进度条基准）。"""
         return self._listing_info(archive, password)[0]
 
+    def _listing_ok_with_pwd(self, archive, pwd):
+        """带密码列一次清单：rc==0 即密码正确。
+
+        专治**头部加密**（7z -mhe / RAR 加密文件名）：无密码连条目都列不出，
+        选不了探针，此时用「带密码的清单」验证最便宜（不创建任何文件）。
+        密码经 stdin 传递。异常一律 False。"""
+        try:
+            sevenzip = getattr(self, "path", None)
+            if not sevenzip:
+                return False
+            r = run_silent([str(sevenzip), "l", "-slt", str(archive)], password=pwd)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # 多文件大包走「廉价密码预验」的阈值：条目数超过它、且候选密码多于 1 个时，
+    # 才值得先探测（避免为小包引入多余一次子进程）。
+    CHEAP_PROBE_MIN_ENTRIES = 200
+
+    def _cheap_probe_entry(self, archive):
+        """挑一条最小文件用于快速验密码；不适用（小包/列不出/没文件）返回 None。
+
+        真机教训：1.83 GB / 9,970 文件的加密 RAR、密码候选 62 个，旧逻辑对每个
+        候选都真解压一遍（错误密码会先把整套文件树创建出来），单次约 13 秒，
+        合计约 14 分钟才轮到正确密码。改成只解最小一条即可把单次降到毫秒级。
+        """
+        try:
+            sevenzip = getattr(self, "path", None)
+            if not sevenzip:
+                return None
+            r = run_silent([str(sevenzip), "l", "-slt", str(archive)])
+            if r.returncode != 0:
+                return None
+            name = None
+            size = None
+            is_dir = False
+            count = 0
+            best = None
+            for line in (r.stdout or "").splitlines():
+                s = line.strip()
+                if s.startswith("Path = "):
+                    name = s[7:]
+                    size = None
+                    is_dir = False
+                elif s.startswith("Folder = "):
+                    is_dir = (s[9:].strip() == "+")
+                elif s.startswith("Size = "):
+                    try:
+                        size = int(s[7:].strip())
+                    except ValueError:
+                        size = None
+                elif s.startswith("Attributes = "):
+                    if name is not None and not is_dir and size is not None:
+                        count += 1
+                        if size > 0 and (best is None or size < best[1]):
+                            best = (name, size)
+                    name = None
+            if count < self.CHEAP_PROBE_MIN_ENTRIES or best is None:
+                return None
+            return best[0]
+        except Exception:
+            return None
+
+    def _password_ok_by_probe(self, archive, pwd, entry):
+        """只解 entry 这一条到临时目录来验密码：rc==0 视为密码正确。
+
+        密码经 stdin 传递（绝不拼进命令行）。任何异常一律返回 False（保守：当作
+        不匹配，换下一个候选）；临时目录无论成败都清掉。"""
+        tmp = None
+        try:
+            sevenzip = getattr(self, "path", None)
+            if not sevenzip:
+                return False
+            tmp = tempfile.mkdtemp(prefix="au_pwprobe_")
+            proc = subprocess.Popen(
+                [str(sevenzip), "x", str(archive), str(entry), f"-o{tmp}", "-y"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+            try:
+                proc.communicate(_pwd_stdin_bytes(pwd), timeout=60)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False
+            if proc.returncode != 0:
+                return False
+            # rc==0 还不够：条目名不存在时 7z 也返回 0（"No files to process"）。
+            # 必须确认文件真的落在临时目录里，否则任何密码都会被误判为「正确」。
+            try:
+                rel = str(entry).replace("\\", "/").lstrip("/")
+                return (Path(tmp) / rel).is_file()
+            except Exception:
+                return False
+        except Exception:
+            return False
+        finally:
+            if tmp:
+                try:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                except Exception:
+                    pass
+
     def extract(self, task, options, layer):
         archive = Path(task["source_path"])
         out = Path(task["output_dir"])
@@ -689,9 +794,29 @@ class SevenZipEngine:
         last_error = None
         last_rc = None
         last_raw = ""
-        for pwd in task["passwords"]:
+        # 多候选 + 多文件大包：先「只解最小一条」把密码验掉，避免每个候选都整包
+        # 解压一遍（错误密码会先把整套文件树创建出来 —— 真机 1.83GB / 9,970 文件
+        # × 62 候选 ≈ 14 分钟）。单候选 / 小包 / 列不出清单时不开探测，旧行为不变。
+        cand = list(task["passwords"])
+        probe_entry = self._cheap_probe_entry(archive) if len(cand) > 1 else None
+        # 无密码列不出清单 ⇒ 头部加密：此时用「带密码的清单」验密码（最便宜）。
+        header_enc = bool(len(cand) > 1 and total is None)
+        for pwd in cand:
             if pauser is not None:
                 pauser.wait_if_paused()
+            if header_enc and pwd:
+                if not self._listing_ok_with_pwd(archive, pwd):
+                    last_error = "密码错误"
+                    last_rc = 2
+                    last_raw = "Wrong password"
+                    continue
+            if probe_entry is not None and pwd:
+                if not self._password_ok_by_probe(archive, pwd, probe_entry):
+                    # 预验不通过：直接换下一个候选，绝不落整套文件、绝不整包解压
+                    last_error = "密码错误"
+                    last_rc = 2
+                    last_raw = "Wrong password"
+                    continue
             # 头部加密（RAR/7z 加密文件名）空密码列不出总量：用候选密码逐个试，
             # 一旦列出即把进度条从忙碌切换为真实百分比；顺带确认加密标记。
             if total is None and pwd:

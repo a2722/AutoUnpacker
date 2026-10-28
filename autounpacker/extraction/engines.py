@@ -198,6 +198,22 @@ class PauseController:
             self._event.clear()
             self._resume_all()
 
+    @staticmethod
+    def _base_key(task_id):
+        """把多段解压的层 id `"<base>-layer-<n>"` 归一成 `"<base>"`。
+
+        service 按层派发时把任务 id 改成 `f"{task_id}-layer-{depth}"` 登记，而 UI 的
+        「忽略 / 标记完成」只有数据库里的任务 id。两者必须靠这层前缀关系对上，否则
+        `abort_task(dbid)` 永远匹配不到层进程 —— 表现为「点了忽略，7z 还在跑，文件
+        被咬住删不掉」。绝不抛异常。
+        """
+        try:
+            s = str(task_id if task_id is not None else "")
+        except Exception:
+            return ""
+        i = s.rfind("-layer-")
+        return s[:i] if i > 0 else s
+
     def register(self, proc, task_id=None):
         """登记一个正在运行的解压子进程；若已暂停则立即挂起它。
 
@@ -218,24 +234,46 @@ class PauseController:
             for procs in self._by_task.values():
                 procs.discard(proc)
 
-    def abort_task(self, task_id):
-        """标记任务已中止，并杀掉该任务正在运行的子进程（卡住的 7z 可被用户结束）。
+    def clear_abort(self, task_id):
+        """清除某任务的中止标记（新一轮解压开始时调用）。
 
-        只标记 + 杀进程：解压循环自己检测到中止后返回「已取消」，产物回退/保留
-        由上层决定。可重复调用（幂等）。"""
-        if task_id is None:
+        层 id 每次解压都相同（`"<dbid>-layer-<n>"`），标记若不清会一直留着，
+        让「中止过的任务」再次解压时被立刻秒杀。绝不抛异常。"""
+        base = self._base_key(task_id)
+        if not base:
             return
         with self._lock:
-            self._aborted.add(task_id)
-            procs = list(self._by_task.get(task_id, ()))
+            self._aborted.discard(base)
+            self._aborted.discard(str(task_id if task_id is not None else ""))
+
+    def abort_task(self, task_id):
+        """标记任务已中止，并杀掉该任务（含其各层）正在运行的子进程。
+
+        只标记 + 杀进程：解压循环自己检测到中止后返回「已取消」，产物回退/保留
+        由上层决定。可重复调用（幂等）。**前缀匹配**：`abort_task(dbid)` 会连带
+        杀掉 `"<dbid>-layer-N"` 下标着的层进程，这样 UI 手动忽略才能真正打断
+        咬住文件句柄的 7z / WinRAR。"""
+        if task_id is None:
+            return
+        base = self._base_key(task_id)
+        if not base:
+            return
+        with self._lock:
+            self._aborted.add(base)
+            self._aborted.add(str(task_id))
+            procs = []
+            for k, ps in self._by_task.items():
+                if k == base or self._base_key(k) == base:
+                    procs.extend(ps)
         for proc in procs:
             self._kill(proc)
 
     def is_aborted(self, task_id):
         if task_id is None:
             return False
+        base = self._base_key(task_id)
         with self._lock:
-            return task_id in self._aborted
+            return base in self._aborted or str(task_id) in self._aborted
 
     def _kill(self, proc):
         try:

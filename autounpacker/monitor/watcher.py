@@ -2082,7 +2082,8 @@ class FolderWatcher(threading.Thread):
             try:
                 result = smart_extract.extract_one(
                     engine, str(fp), out_dir, passwords, options, args,
-                    progress_cb=self._progress_cb, pauser=self.pauser)
+                    progress_cb=self._progress_cb, pauser=self.pauser,
+                    task_id=tid)   # 用数据库任务 id：手动「忽略」才能精确杀掉本任务的 7z/WinRAR
             finally:
                 self.hub.q.put({"type": "progress_done"})
             if out is not None:

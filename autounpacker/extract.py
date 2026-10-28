@@ -214,15 +214,24 @@ def parse_passwords(items):
 
 
 def extract_one(engine, source, out_arg, user_passwords, options, args,
-                progress_cb=None, pauser=None):
+                progress_cb=None, pauser=None, task_id=None):
     source = Path(source)
     if not source.exists():
         print(f"文件不存在: {source}")
         return None
 
+    # 优先用调用方给的「数据库任务 id」：UI 的「忽略 / 标记完成」按这个 id 调
+    # abort_task，只有同一个 id 才能精确杀掉本任务卡住的 7z / WinRAR——否则
+    # 「忽略」只是把状态改成 canceled，子进程照跑、文件句柄不放，用户删不掉目录。
+    # 缺省才退回随机 id（CLI / 离线测试路径）。
+    if not task_id:
+        task_id = uuid.uuid4().hex[:8]
     if pauser is not None:
+        try:
+            pauser.clear_abort(task_id)
+        except Exception:
+            pass
         pauser.wait_if_paused()
-    task_id = uuid.uuid4().hex[:8]
     print(f"=== 处理: {source.name} ===")
     if is_do_not_extract(source.name):
         print(f"移动安装包/交付物，保持原样不自动解压（需手动处理）: {source.name}")

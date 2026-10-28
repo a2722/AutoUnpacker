@@ -1022,7 +1022,8 @@ class MainWindow(QMainWindow):
                 try:
                     result = smart_extract.extract_one(
                         engine, str(path), None, passwords, options, args,
-                        progress_cb=self._progress_cb, pauser=self.pauser)
+                        progress_cb=self._progress_cb, pauser=self.pauser,
+                        task_id=tid)   # 拖放同样要能用数据库任务 id 被「忽略」精确打断
                 finally:
                     self.hub.q.put({"type": "progress_done"})
                 # C2：后处理（删除源/提升/移动/脚本）的日志与失败对用户可见。
@@ -1936,13 +1937,15 @@ class MainWindow(QMainWindow):
             task = {}
         if not task:
             return False, str(task_id)
-        if str(task.get("state") or "") == "extracting":
-            abort = getattr(self.pauser, "abort_task", None)
-            if callable(abort):
-                try:
-                    abort(task_id)
-                except Exception:
-                    pass
+        # 手动「从队列移除」= 用户要人工干预：**无条件**请求中止该任务的解压子进程。
+        # 不再依赖「数据库状态恰好是 extracting」——状态与子进程可能不同步，漏杀的
+        # 7z/WinRAR 会继续咬住文件句柄，让用户删不掉目录（abort_task 幂等，安全）。
+        abort = getattr(self.pauser, "abort_task", None)
+        if callable(abort):
+            try:
+                abort(task_id)
+            except Exception:
+                pass
         try:
             db.update_task_state(int(task_id), "canceled",
                                  finished_at=int(time.time()))
@@ -2011,13 +2014,14 @@ class MainWindow(QMainWindow):
         if not task:
             self._append_log(f"[任务] 忽略失败：记录已不存在（{task_id}）")
             return
-        if str(task.get("state") or "") == "extracting":
-            abort = getattr(self.pauser, "abort_task", None)
-            if callable(abort):
-                try:
-                    abort(task_id)
-                except Exception:
-                    pass
+        # 同「从队列移除」：手动判定即为人工干预，无条件打断该任务卡住的
+        # 7z / WinRAR（否则解压线程随后写回的终态会与人为判定打架，文件句柄也不放）。
+        abort = getattr(self.pauser, "abort_task", None)
+        if callable(abort):
+            try:
+                abort(task_id)
+            except Exception:
+                pass
         name = str(task.get("file_name") or task_id)
         try:
             db.update_task_state(int(task_id), "done",

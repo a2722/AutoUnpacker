@@ -44,6 +44,43 @@ def _collect_pems() -> list[str]:
     return sorted(pem_set)
 
 
+# 本机 Windows 证书库可能含**非公共**根（自签名工具根 / MITM 根 / 设备唯一 ID 根），
+# 一旦随包发布就会泄漏机器指纹或用户装过的工具。构建期用 cryptography（若可用）
+# 按 subject 剔除；不可用则原样保留并在 stderr 提示。
+_PRIVATE_SUBJECT_MARKERS = ("steamcommunity", "intc-keyid-")
+
+
+def _looks_private_subject(subject):
+    low = str(subject or "").lower()
+    if any(m in low for m in _PRIVATE_SUBJECT_MARKERS):
+        return True
+    import re as _re
+    if _re.search(r"(?:^|,)(?:L|ST|O|OU)=XX(?:,|$)", str(subject or "")):
+        return True
+    return False
+
+
+def _strip_private_pems(pems):
+    """剔除本机私有根；cryptography 缺失时原样返回（并提示）。"""
+    try:
+        from cryptography import x509 as _x509
+    except Exception:
+        print("!! cryptography 不可用，无法过滤本机私有根证书（将原样导出）", file=sys.stderr)
+        return pems
+    out = []
+    for body in pems:
+        try:
+            subj = _x509.load_pem_x509_certificate(body.encode()).subject.rfc4514_string()
+        except Exception:
+            out.append(body)
+            continue
+        if _looks_private_subject(subj):
+            print("-- 已剔除本机私有根: %s" % subj[:100], file=sys.stderr)
+            continue
+        out.append(body)
+    return out
+
+
 def main() -> int:
     try:
         pems = _collect_pems()
@@ -53,6 +90,7 @@ def main() -> int:
     if not pems:
         print("!! ROOT/CA 存储里一张证书都没读到，拒绝写空包")
         return 1
+    pems = _strip_private_pems(pems)
     content = "\n".join(pems) + "\n"
     try:
         if OUT.exists() and OUT.read_text(encoding="ascii") == content:

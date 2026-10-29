@@ -678,17 +678,55 @@ class SevenZipEngine:
         return self._listing_info(archive, password)[0]
 
     def _listing_ok_with_pwd(self, archive, pwd):
-        """带密码列一次清单：rc==0 即密码正确。
+        """带密码列一次清单：返回 (是否成功, 原始输出文本)。
 
         专治**头部加密**（7z -mhe / RAR 加密文件名）：无密码连条目都列不出，
         选不了探针，此时用「带密码的清单」验证最便宜（不创建任何文件）。
-        密码经 stdin 传递。异常一律 False。"""
+        密码经 stdin 传递。异常一律 (False, "")。
+
+        为什么要把原始文本带出去：失败原因不止「密码错」一种 —— 文件根本不是
+        7-Zip 认识的归档时同样 rc!=0（真机：视频头部 + 内嵌 zip 的假 EOCD，7z 报
+        `Cannot open the file as archive`）。上层据此决定是把错误原样透传（好让
+        多段伪装剥离兜底接手），还是当作候选密码不匹配。绝不在这里臆造
+        "Wrong password" 覆盖掉真实错误。"""
+        try:
+            sevenzip = getattr(self, "path", None)
+            if not sevenzip:
+                return False, ""
+            r = run_silent([str(sevenzip), "l", "-slt", str(archive)], password=pwd)
+            if r.returncode == 0:
+                return True, str(getattr(r, "stdout", "") or "")
+            return False, (str(getattr(r, "stdout", "") or "")
+                           + str(getattr(r, "stderr", "") or ""))
+        except Exception:
+            return False, ""
+
+    def _listing_is_unopenable(self, archive):
+        """无密码清单失败时，判断失败原因是「7-Zip 根本打不开这个文件」而非「缺密码」。
+
+        调用时机：仅在 `total is None`（无密码列不出清单）且候选密码多于 1 个时，
+        用来决定要不要走「头部加密」分支。
+
+        为什么需要：旧口径「列不出清单 ⇒ 头部加密」会把「文件不是归档」也归进去
+        （真机 `doro31028.mp4`：视频头 + 内嵌 zip，尾部的 PK\\x05\\x06 是数据里
+        的假 EOCD；Python zipfile 能读、7-Zip 报 `Cannot open the file as
+        archive`）。误判后每个候选都先做一次带密码清单、全部失败，真实错误被
+        "Wrong password" 覆盖，既报错「密码错误」，又让 service 里已有的
+        `strip_embedded_zip` 兜底彻底失去触发条件。
+
+        判据刻意只认 7-Zip 的这句固定文案（大小写不敏感），其余失败一律维持旧的
+        「可能是头部加密」判断（保守：宁可按头部加密试密码，也不误伤真加密包）。
+        异常一律 False（不改变既有行为）。"""
         try:
             sevenzip = getattr(self, "path", None)
             if not sevenzip:
                 return False
-            r = run_silent([str(sevenzip), "l", "-slt", str(archive)], password=pwd)
-            return r.returncode == 0
+            r = run_silent([str(sevenzip), "l", "-slt", str(archive)])
+            if r.returncode == 0:
+                return False
+            text = (str(getattr(r, "stdout", "") or "")
+                    + str(getattr(r, "stderr", "") or "")).lower()
+            return "cannot open the file as archive" in text
         except Exception:
             return False
 
@@ -799,16 +837,25 @@ class SevenZipEngine:
         # × 62 候选 ≈ 14 分钟）。单候选 / 小包 / 列不出清单时不开探测，旧行为不变。
         cand = list(task["passwords"])
         probe_entry = self._cheap_probe_entry(archive) if len(cand) > 1 else None
-        # 无密码列不出清单 ⇒ 头部加密：此时用「带密码的清单」验密码（最便宜）。
-        header_enc = bool(len(cand) > 1 and total is None)
+        # 无密码列不出清单 ⇒ 可能是头部加密：此时用「带密码的清单」验密码（最便宜）。
+        # 但必须先排除「7-Zip 根本不认这个文件」：那种情况错误原样透传，交给 service
+        # 里已有的 strip_embedded_zip 多段伪装兜底，绝不能被误当成「密码错误」。
+        header_enc = bool(
+            len(cand) > 1
+            and total is None
+            and not self._listing_is_unopenable(archive)
+        )
         for pwd in cand:
             if pauser is not None:
                 pauser.wait_if_paused()
             if header_enc and pwd:
-                if not self._listing_ok_with_pwd(archive, pwd):
+                ok, err_text = self._listing_ok_with_pwd(archive, pwd)
+                if not ok:
                     last_error = "密码错误"
                     last_rc = 2
-                    last_raw = "Wrong password"
+                    # 保留真实错误文本：这里是「带密码清单失败」，既可能是密码错，
+                    # 也可能是文件根本打不开；后者要让 is_zip_open_error 命中。
+                    last_raw = err_text or "Wrong password"
                     continue
             if probe_entry is not None and pwd:
                 if not self._password_ok_by_probe(archive, pwd, probe_entry):

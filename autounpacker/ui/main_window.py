@@ -544,6 +544,14 @@ class MainWindow(QMainWindow):
         self.compact_btn.setObjectName("compact")
         self.compact_btn.clicked.connect(lambda *_: self._toggle_compact(True))
         top_lay.addWidget(self.compact_btn, 0, Qt.AlignVCenter)
+        # 问题反馈：走「系统邮件客户端 / 复制到剪贴板」，不建任何自建接口
+        # （客户端里的提交地址必被挖出，直连接口只会变成刷垃圾的入口）。
+        self.feedback_btn = QPushButton("! 问题反馈", top)
+        self.feedback_btn.setObjectName("feedback")
+        self.feedback_btn.setCursor(Qt.PointingHandCursor)
+        self.feedback_btn.setToolTip("遇到问题？点这里反馈（发送邮件 / 复制反馈信息）")
+        self.feedback_btn.clicked.connect(self._open_feedback)
+        top_lay.addWidget(self.feedback_btn, 0, Qt.AlignVCenter)
         root.addWidget(top)
 
         # 目录胶囊条（三个页面常显）
@@ -2715,6 +2723,18 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _open_feedback(self):
+        """打开问题反馈窗口。
+
+        任何异常都只弹提示，绝不影响主界面 —— 反馈入口不能成为崩溃点。
+        渠道走「系统邮件客户端 / 复制到剪贴板」，不带任何自建接口。
+        """
+        try:
+            from .feedback import FeedbackDialog
+            FeedbackDialog(self, db_file=db.DB_FILE).exec_()
+        except Exception as e:
+            QMessageBox.warning(self, "问题反馈", "打开反馈窗口失败：%s" % e)
+
     def _toggle_compact(self, on=None):
         """完整界面 ⇄ 精简小窗（互斥显示，规格 §6.1/§7）。
 
@@ -3089,6 +3109,12 @@ class MainWindow(QMainWindow):
         """深色主题时把 Windows 原生标题栏也变深。
 
         DWMWA_USE_IMMERSIVE_DARK_MODE：新系统属性号 20，旧版 Win10 用 19（两个都试）。
+
+        设完属性**必须强制重画非客户区**：只调 DwmSetWindowAttribute 时，标题栏
+        经验上会偶发保持白底、三个窗口按钮（最小化/最大化/关闭）不绘制，直到切走
+        焦点或改变窗口高度才恢复 —— 暗色主题下整条发白，用户看起来像「程序无响应」。
+        SetWindowPos(SWP_FRAMECHANGED) + RedrawWindow(RDW_FRAME) 会立刻让
+        DWM 重画标题栏，消除这个竞态。
         """
         try:
             import ctypes
@@ -3097,13 +3123,32 @@ class MainWindow(QMainWindow):
             hwnd = wintypes.HWND(int(self.winId()))
             v = ctypes.c_int(dark)
             dwm = ctypes.windll.dwmapi
+            applied = False
             for attr in (20, 19):
                 try:
                     if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v),
                                                  ctypes.sizeof(v)) == 0:
+                        applied = True
                         break
                 except Exception:
                     continue
+            if not applied:
+                return
+            user32 = ctypes.windll.user32
+            # 只改外观，不动位置/大小/Z 序，也不激活窗口
+            flags = (0x0001  # SWP_NOSIZE
+                     | 0x0002  # SWP_NOMOVE
+                     | 0x0004  # SWP_NOZORDER
+                     | 0x0010  # SWP_NOACTIVATE
+                     | 0x0020)  # SWP_FRAMECHANGED
+            try:
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags)
+            except Exception:
+                pass
+            try:
+                user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0400)  # INVALIDATE|FRAME
+            except Exception:
+                pass
         except Exception:
             pass
 

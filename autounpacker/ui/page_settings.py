@@ -2637,6 +2637,15 @@ class SettingsPage(QWidget):
             "（都在「链接与网盘」里）。",
             syn=("实验性", "总开关", "不稳定", "测试", "网盘"), default=False)
         self.experimental_cb.toggled.connect(lambda _s: self._sync_experimental())
+        # 常驻一句话：说清开启后最容易被注意到的行为差异（扫码得到的网盘链接不再
+        # 交给默认浏览器，而是走网盘客户端/任务库）。#stripHint 由 _finalize_group_cards
+        # 统一补 16px 缩进，与卡内其它说明文字对齐。
+        self.experimental_hint = QLabel(
+            "开启后，二维码解析出的百度网盘链接不再自动用浏览器打开。",
+            g.parentWidget())
+        self.experimental_hint.setObjectName("stripHint")
+        self.experimental_hint.setWordWrap(True)
+        g.addWidget(self.experimental_hint)
 
     def _build_dirs(self, box):
         self.dirs_box = box

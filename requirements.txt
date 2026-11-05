@@ -8,3 +8,8 @@ Pillow>=10.0.0,<11
 pyzbar>=0.1.9; sys_platform == "win32"
 numpy>=1.24.0,<2.0
 opencv-python>=4.6.0,<4.10
+
+# 可选：实验性「UC 网盘网页端」通路的内嵌浏览器内核。
+# 发布包已内置，源码运行且需要该通路时再执行：pip install PyQtWebEngine==5.15.7
+# 未安装不影响其它任何功能（程序会自动把该通路显示为不可用）。
+# PyQtWebEngine>=5.15.7,<5.16

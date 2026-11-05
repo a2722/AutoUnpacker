@@ -213,6 +213,8 @@ URL_TRAIL_JUNK = ".,;:!?、。，；：！？）】》」』)]}>·…"
 _URL_RE = re.compile(r"(?:https?://|www\.)[" + URL_CHARS + r"]+", re.I)
 # 百度网盘主机（含子域）：pan（网页版分享/文件页）/ yun（旧域名）/ eyun（企业版）。
 _BAIDU_PAN_HOSTS = ("pan.baidu.com", "yun.baidu.com", "eyun.baidu.com")
+# UC 网盘主机（含子域）：fast（文件传输助手分享页）/ drive（网盘主站/文件页）。
+_UC_PAN_HOSTS = ("fast.uc.cn", "drive.uc.cn")
 
 
 def _drop_unmatched_tail(text, opener, closer):
@@ -297,6 +299,30 @@ def is_baidu_pan_url(url):
     if not host:
         return False
     for base in _BAIDU_PAN_HOSTS:
+        if host == base or host.endswith("." + base):
+            return True
+    return False
+
+
+def is_uc_pan_url(url):
+    """网址主机是否属于 UC 网盘：fast.uc.cn / drive.uc.cn 及其子域。
+
+    与 is_baidu_pan_url 平行、互不影响（百度那条链路的判定绝不改）。
+    只判主机，不判路径 —— 具体是不是分享页由 uc/detect.py 的
+    parse_uc_share_url() 进一步确认（要求 /s/<id>）。
+    解析失败/空值一律返回 False，绝不抛异常。
+    """
+    try:
+        s = str(url or "").strip()
+        if not s:
+            return False
+        parts = urlsplit(s if "://" in s else "//" + s)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    if not host:
+        return False
+    for base in _UC_PAN_HOSTS:
         if host == base or host.endswith("." + base):
             return True
     return False

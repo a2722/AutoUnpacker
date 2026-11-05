@@ -105,6 +105,18 @@ def _setup_high_dpi():
                 QCoreApplication.setAttribute(attr, True)
         except Exception:
             pass
+    # UC 网盘通路的可选组件 QtWebEngine 是**懒加载**的（缺组件时主程序照常跑）。
+    # 但 PyQt5 要求：QtWebEngineWidgets 在 QApplication 之后 import 时，必须在
+    # 创建 QApplication 之前设过 AA_ShareOpenGLContexts，否则报
+    # 「QtWebEngineWidgets must be imported or Qt.AA_ShareOpenGLContexts must be
+    # set before a QCoreApplication instance is created」。这里无条件设上（对不用
+    # QtWebEngine 的路径无副作用），才能既懒加载又不炸。
+    try:
+        attr = getattr(Qt, "AA_ShareOpenGLContexts", None)
+        if attr is not None:
+            QCoreApplication.setAttribute(attr, True)
+    except Exception:
+        pass
     try:
         from PyQt5.QtGui import QGuiApplication
         policy = getattr(Qt, "HighDpiScaleFactorRoundingPolicy", None)

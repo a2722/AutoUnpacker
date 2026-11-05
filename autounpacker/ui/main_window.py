@@ -637,6 +637,12 @@ class MainWindow(QMainWindow):
         self.settings_page.hotkeyChanged.connect(
             lambda _hk: self._sync_hotkey_display())
         self.settings_page.settingsSaved.connect(self._on_settings_saved)
+        try:
+            self.settings_page.ucWindowRequested.connect(
+                lambda: self._open_uc_window())
+        except Exception:
+            # 测试里的 StubSettingsPage 没有该信号：缺了也不影响其它功能。
+            pass
         for page in (self.password_page, self.trail_page, self.settings_page):
             self.pages.addWidget(_make_scrollable_page(page))
         root.addWidget(self.pages, 1)
@@ -3171,6 +3177,81 @@ class MainWindow(QMainWindow):
         if self._pending_trust:
             QTimer.singleShot(0, self._process_pending_trust)
 
+    # ------------------------------------------------------------------
+    # UC 网盘网页端（实验性，与百度链路完全独立）
+    # ------------------------------------------------------------------
+    def _open_uc_window(self, url=""):
+        """打开内嵌 UC 浏览器窗口（缺可选组件时只提示，绝不影响其它功能）。"""
+        try:
+            from ..uc import capability
+        except Exception as e:
+            self._append_log("[UC] 组件探测失败：%s" % e)
+            return
+        if not capability.web_engine_available():
+            self._append_log("[UC] " + capability.INSTALL_HINT)
+            try:
+                QMessageBox.information(self, "UC 网盘通路不可用",
+                                        capability.INSTALL_DETAIL)
+            except Exception:
+                pass
+            return
+        try:
+            from .uc_window import UcBrowserWindow as _UcBrowserWindow
+        except Exception as e:
+            self._append_log("[UC] 加载浏览器窗口失败：%s" % e)
+            return
+
+        win = getattr(self, "_uc_window", None)
+        try:
+            alive = win is not None and win.isVisible()
+        except Exception:
+            alive = False
+        if not alive:
+            try:
+                win = _UcBrowserWindow(
+                    self, phone=str(self.state.snapshot().get("uc_phone") or ""))
+            except Exception as e:
+                self._append_log("[UC] 创建窗口失败：%s" % e)
+                return
+            try:
+                win.download_ready.connect(self._on_uc_download)
+                win.status.connect(lambda s: self._append_log("[UC] %s" % s))
+                win.phone_changed.connect(
+                    lambda p: self.state.set("uc_phone", str(p or "").strip()))
+            except Exception:
+                pass
+            self._uc_window = win
+        try:
+            win.show()
+            win.raise_()
+            win.activateWindow()
+        except Exception:
+            pass
+        if url:
+            try:
+                win.load_share(url)
+            except Exception as e:
+                self._append_log("[UC] 加载分享页失败：%s" % e)
+
+    def _on_uc_download(self, url, filename=""):
+        """浏览器拦截到下载直链 → 按配置交给 IDM / 默认浏览器 / 剪贴板。"""
+        try:
+            from ..uc import handoff as uc_handoff
+        except Exception as e:
+            self._append_log("[UC] 交接模块加载失败：%s" % e)
+            return
+        cfg = self.state.snapshot()
+        mode = str(cfg.get("uc_downloader") or "auto")
+        save_dir = str(cfg.get("uc_download_dir") or "").strip()
+        ok, detail, used = uc_handoff.handoff(
+            url, mode=mode, save_dir=save_dir, filename=filename or "")
+        self._append_log("[UC] %s%s" % (detail, "" if ok else "（失败）"))
+        try:
+            self.hub.notify("UC 网盘下载" if ok else "UC 网盘下载失败",
+                            "%s\n%s" % (filename or url[:80], detail))
+        except Exception:
+            pass
+
     def _drain(self):
         # 二维码「预定任务」过期清理：每轮 tick（200ms）一次；无任务时 O(1) 早退。
         # 超时仍未见 share_link 事件 → 作废 + 记一行 + 一条托盘通知；**绝不**回退到
@@ -3283,6 +3364,14 @@ class MainWindow(QMainWindow):
                     _copy_toast(self, "复制失败")
             elif item["type"] == "url_trust_ask":
                 self._handle_trust_ask(item)
+            elif item["type"] == "uc_share":
+                # 实验性：识别到 UC 分享链接。只记一行 + 打开内嵌窗口，
+                # **不自动下载、不发任何网络请求**（登录与下载都由用户在窗口内完成）。
+                _uc_url = item.get("url") or item.get("canonical") or ""
+                self._append_log("[UC] 已识别 UC 分享链接: %s"
+                                 % (item.get("canonical") or _uc_url))
+                if self.state.snapshot().get("uc_web_enabled"):
+                    self._open_uc_window(_uc_url)
             elif item["type"] == "share_link":
                 # 分享记录行：显示补 "[HH:MM:SS] " 前缀（与重载后 task_log_line 的形态
                 # 一致：同一逻辑行不再因刷新而变形），落库仍是原正文（存储格式不变）。

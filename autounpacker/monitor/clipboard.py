@@ -1227,6 +1227,31 @@ class QRMonitor(threading.Thread):
         return None
 
     # ---------- 网址形式的二维码图片识别 ----------
+    def _handle_uc_share(self, text):
+        """实验性：UC 网盘分享链接的识别入口（与百度链路完全独立）。
+
+        **只识别 + 记日志 + 投递事件**，不做任何网络请求、不自动下载：
+        真正的登录/下载由主窗口打开的内嵌浏览器窗口完成（用户手动登录）。
+        命中返回 True（不再走二维码/信任链路），非 UC 分享页返回 False。
+        """
+        try:
+            from ..uc import detect as _uc_detect
+            rec = _uc_detect.parse_uc_share_url(self._extract_url(text) or text)
+            if not rec:
+                return False
+            self.hub.log("已识别 UC 分享链接: %s（实验性通路，不自动下载）"
+                         % rec.get("canonical"))
+            try:
+                self.hub.q.put({"type": "uc_share",
+                                "url": rec.get("url"),
+                                "canonical": rec.get("canonical"),
+                                "share_id": rec.get("share_id")})
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def _handle_baidu_share(self, text):
         """2.F：百度分享链接的独立处理入口（**不受**「网址信任」限制）。
 
@@ -1392,6 +1417,12 @@ class QRMonitor(threading.Thread):
         # 「提取码：XXXX」，其内部会再自行截出干净 URL 用于抓页与记录
         # （见 _handle_baidu_share）。原先传 text=url 会把提取码整段丢掉。
         if cfg.get("experimental_enabled") and self._handle_baidu_share(raw):
+            return
+        # 实验性：UC 网盘分享链接（与百度链路完全独立的两条通路，互不影响）。
+        # 必须挂在「实验性总开关 + uc_web_enabled」双开关之后：任一关闭都完全
+        # 不捕获，行为与改动前逐字节一致。
+        if (cfg.get("experimental_enabled") and cfg.get("uc_web_enabled")
+                and self._handle_uc_share(raw)):
             return
         # UX-4（实验性）：pan.baidu（含 yun/eyun 子域）一律静默——不进信任询问、
         # 不抓页、不在浏览器打开。未开实验性或非百度网址时行为完全不变。

@@ -26,8 +26,10 @@
 - 两段共用同一个 CookieJar / OpenerDirector：`prepare_share` 把它放进 prep 的内部
   键 `_op`（连同原始分享链接 `_share_url`），`commit_download` 原样复用，保证请求
   会话与旧的单函数版本逐字节一致；
-- 第 9 步 `os.startfile("baiduyunguanjia://evoked-download/…")` 需要客户端已安装；
-  本模块只负责把令牌投递过去，实际下载由客户端完成；
+- 第 9 步唤起 `baiduyunguanjia://evoked-download/…` **前**会用 `AssocQueryStringW`
+  做一次只读探测，把「协议关联到哪个处理器 / 有没有关联」写进日志，便于排查
+  「点了没反应 / 弹商店窗口」。探测结果**不参与任何拦截**：无论查到什么都照旧
+  `os.startfile`，主流程行为与旧版一致；
 - **登录态保护门**：`commit_download` 在发出任何百度请求之前先做「客户端是否在
   运行」检查（`_WAKE_GUARD_ENABLED`，默认开）。客户端未运行时直接拒绝提交、一个
   请求都不发——因为此刻投递唤醒会用「无登录态」冷启动客户端，导致用户被迫重新
@@ -685,6 +687,71 @@ def _probe_client_version():
     return ver
 
 
+def _protocol_client_exe(proto="baiduyunguanjia"):
+    """只读查询该协议关联的处理器 exe；查不到 / 异常返回 None。
+
+    用 `AssocQueryStringW`（资源管理器自己的解析器）：它天然处理 ProgID 间接层
+    （`baiduyunguanjia` 默认值 → ProgID → shell\\open\\command），不会像「直接读
+    `HKCR\\baiduyunguanjia\\shell\\open\\command`」那样漏判形态 B。
+
+    **仅用于诊断日志**，不参与任何拦截判断（作用域：只增强可排查性，不改主流程）。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ASSOCSTR_EXECUTABLE = 2
+
+        buf = ctypes.create_unicode_buffer(1024)
+        n = wintypes.DWORD(len(buf))
+        hr = ctypes.windll.shlwapi.AssocQueryStringW(
+            0, ASSOCSTR_EXECUTABLE, proto, "open", buf,
+            ctypes.byref(n)) & 0xFFFFFFFF
+        if hr == 0 and buf.value:
+            return buf.value
+        return None
+    except Exception:
+        return None
+
+
+def _wake_client(uri):
+    """唤起 baiduyunguanjia 协议。**只补诊断日志，不拦截、不改主流程。**
+
+    背景：旧实现直接 `os.startfile`。协议没注册（客户端没装 / 重装系统后没修）时
+    Windows 会弹「在 Microsoft Store 中查找应用」，而 `os.startfile` 不抛异常 ——
+    表面上像成功，日志里却没有任何线索，非常难排查。
+
+    因此这里只在唤起**前**做一次只读探测，把结果写进日志：
+    - 能解析出处理器且文件存在 → debug 记录路径；
+    - 能解析但文件不存在 → warning（客户端可能被卸载/移动）；
+    - 完全查不到关联 → warning（可能没装 / 协议未注册）。
+    然后**无条件**照旧 `os.startfile` —— 探测结果绝不影响是否唤起。
+
+    返回 (ok, reason)：仅当 `os.startfile` 自身抛异常时返回 False。绝不抛异常。
+    """
+    try:
+        # 诊断段**完全隔离**：任何异常（探测失败、os 被替换成桩、日志系统异常…）
+        # 都只吞掉，绝不影响下面的唤起 —— 否则「增强排查」反而会挡住主流程。
+        try:
+            exe = _protocol_client_exe()
+            if exe and os.path.isfile(exe):
+                _log.debug("唤起客户端前：协议关联处理器 = %s", exe)
+            elif exe:
+                _log.warning(
+                    "唤起客户端前：协议关联指向的处理器不存在（%s）——客户端可能已被"
+                    "卸载或移动。仍按原流程尝试唤起", exe)
+            else:
+                _log.warning(
+                    "唤起客户端前：未查到 baiduyunguanjia 协议关联——客户端可能未安装或"
+                    "协议未注册。仍按原流程尝试唤起；若没弹出客户端，请安装/修复百度网盘客户端")
+        except Exception:
+            pass
+        os.startfile(str(uri))
+        return True, ""
+    except Exception as e:
+        return False, "唤起百度网盘客户端失败：%s" % e
+
+
 def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
     """分享「提交」段：用 prep 调 sharedownload 并唤起客户端（步骤 5~10）。
 
@@ -703,7 +770,8 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
     6. `/api/invoker/get` → browserId；
     7. `/api/invoker/online` 上报在线；
     8. `/api/invoker/send` 投递 downloadInfo → seq；
-    9. `os.startfile("baiduyunguanjia://evoked-download/?…")` 唤起客户端，随后
+    9. `_wake_client()` 唤起客户端：唤起前把协议关联探测结果写进日志（只诊断，
+       不拦截），随后照旧 `os.startfile`，紧接着
        **立即回调 `on_wake(detail)`**（在复核轮询之前，供上层「唤醒即通知」）。
        成功文案带上 prepare 阶段探测到的客户端版本「客户端 x.y.z」（未知则不带；
        低于软阈值只在 prepare 阶段记一条 warning，绝不阻断）。
@@ -854,7 +922,11 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         ver = prep.get("_client_version") if isinstance(prep, dict) else None
         wake = (f"baiduyunguanjia://evoked-download/?browserId={bid}&seq={seq}"
                 f"&src_from=wp-download_web_share&src_type=web_sharelink_page")
-        os.startfile(wake)
+        ok_wake, wake_err = _wake_client(wake)
+        if not ok_wake:
+            # 系统拒绝了唤起（最常见：客户端未安装 / 协议没注册）。绝不能继续把
+            # 「已请求客户端下载」回报给用户 —— 那正是旧实现在协议缺失时的假成功。
+            return False, wake_err
 
         # 9.5 唤醒已发出：先回调 on_wake（在复核轮询之前），让上层立即通知用户
         #     「已请求客户端下载」。复核只作为静默兜底，不再阻塞这条告知。

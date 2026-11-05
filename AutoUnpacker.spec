@@ -12,6 +12,7 @@
 
 用法：python tools\\build_exe.py（会先生成图标与版本信息，再调本文件）
 """
+import os
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
@@ -67,7 +68,7 @@ _ca_pem = ASSETS / "cacert.pem"
 if _ca_pem.exists():
     datas.append((str(_ca_pem), "."))
 
-# 明确排掉不用的重家伙（Qt 的多媒体/WebEngine/QML 等绝无引用）
+# 明确排掉不用的重家伙（Qt 的多媒体/QML 等绝无引用）
 excludes = [
     "tkinter",
     "matplotlib",
@@ -75,8 +76,6 @@ excludes = [
     "pandas",
     "IPython",
     "notebook",
-    "PyQt5.QtWebEngineWidgets",
-    "PyQt5.QtWebEngineCore",
     "PyQt5.QtQuick",
     "PyQt5.QtQml",
     "PyQt5.QtMultimedia",
@@ -88,6 +87,28 @@ excludes = [
     "PyQt5.QtNfc",
     "PyQt5.QtPositioning",
 ]
+
+# UC 网盘通路（实验性）的可选组件：PyQtWebEngine。
+#   默认**不打进主包**（+约 100~150MB），主程序检测不到就当「该功能不可用」，
+#   其余功能完全不受影响（见 autounpacker/uc/capability.py 的软依赖契约）。
+#   需要出「带 UC 通路」的构建时，设环境变量 AU_WITH_WEBENGINE=1 再打包：
+#       set AU_WITH_WEBENGINE=1 && pyinstaller AutoUnpacker.spec
+#   QtWebEngine 的 QtWebEngineProcess.exe / resources / translations 由
+#   PyInstaller 的 PyQt5 hook 自动收集；这里只负责「不排掉」。
+_WITH_WEBENGINE = os.environ.get("AU_WITH_WEBENGINE", "").strip() in ("1", "true", "yes", "on")
+if _WITH_WEBENGINE:
+    hiddenimports += [
+        "PyQt5.QtWebEngineWidgets",
+        "PyQt5.QtWebEngineCore",
+        "PyQt5.QtWebChannel",
+        "PyQt5.QtNetwork",
+        "PyQt5.QtPrintSupport",
+    ]
+else:
+    excludes += [
+        "PyQt5.QtWebEngineWidgets",
+        "PyQt5.QtWebEngineCore",
+    ]
 
 a = Analysis(
     [str(ROOT / "main.py")],

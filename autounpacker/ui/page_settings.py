@@ -101,6 +101,15 @@ _EXP_BADGE_TEXT = "该功能需要开启实验性"
 # 显隐由 _apply_clip_gate 控制，独立于实验性 / 通知两套门控）
 _CLIP_BADGE_TEXT = "需开启剪贴板监听"
 
+# UC 网盘通路（实验性）：两行说明文案。缺可选组件时用 MISSING 文案，避免用户
+# 开了开关却「点了没反应」。
+_UC_HINT_READY = (
+    "UC 网盘走「内嵌浏览器 + 登录态」，与上面的百度链路完全独立、互不影响。"
+    "登录一次可复用约 2~4 周；过期后再点一次「全部下载」重新登录即可。")
+_UC_HINT_MISSING = (
+    "UC 网盘通路需要可选组件 PyQtWebEngine（未安装）。未安装不影响其它任何功能；"
+    "需要时执行：pip install PyQtWebEngine==5.15.7")
+
 # 风险行左侧 danger 竖条宽度（与 style.py `QWidget#setRow[risk="true"]` 的
 # `border-left: 3px` 一致；QSS border 不改变布局 contentsRect，行内容左侧必须
 # 让出同宽内边距，否则竖条会压住行名，见 _row / _manual_row）
@@ -709,6 +718,9 @@ class SettingsPage(QWidget):
     hotkeyChanged = pyqtSignal(str)
     themeChanged = pyqtSignal(str)
     notice = pyqtSignal(str)
+    # UC 网盘通路：用户在设置页点「打开 UC 窗口」时抛给主窗口（主窗口负责窗口
+    # 生命周期与下载交接；设置页不直接依赖 uc.window / QtWebEngine）。
+    ucWindowRequested = pyqtSignal()
     # 更新任务的「工作线程 -> 主线程」桥：跨线程发信号是队列投递，可靠。
     # 绝不在工作线程里用 QTimer.singleShot —— 那个线程没有事件循环，定时器
     # 永远不触发、回调不执行（旧表现：一直卡在「正在检查更新…」且不报错）。
@@ -1846,90 +1858,9 @@ class SettingsPage(QWidget):
             "把 pan.baidu.com 加进「下载识别」的黑名单，拦不住分享链路的这次抓取。",
             self, warn=True))
 
-        g = self._group(box, "网盘与分享")
-        self.share_wait_spin = self._spin_row(
-            g, "分享等待时长", "share_gesture_wait_sec",
-            "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
-            5, 600, syn=("分享", "手势", "等待", "超时", "解析中"),
-            unit="秒", default=120, experimental=True)
-        self.baidu_auto_invoke_cb = self._check(
-            g, "检测到分享链接时自动拉起客户端下载", "baidu_auto_invoke",
-            "复制到百度网盘分享链接时，自动交给网盘客户端下载（整包）。会自动触发下载，请确认来源可信。",
-            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
-            experimental=True)
-        # 注意：方案 §5.5 的「分享下载前先让我挑选文件」(baidu_pick_before_download)
-        # 在本机 config 里已被 _sanitize_cfg 显式 pop（该功能 v2.1.6 退场）。若在此
-        # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
-        # 界面报「保存失败」。故按落地纪律「冲突项先搁置」不渲染该项（见交回清单）。
-        bah, bal = self._manual_row(g)
-        db_meta = _SettingRow("网盘任务库路径",
-                              "BaiduYunGuanjia.db 的位置；留空自动探测。",
-                              "baidu_task_db", None, "links", "网盘与分享")
-        db_meta.host = bah
-        db_meta.note = _EXP_NOTE
-        bal.addWidget(self._make_name(bah, "网盘任务库路径", db_meta))
-        bal.addWidget(self._exp_badge(bah, bah), 0, Qt.AlignVCenter)
-        self.baidu_db_edit = QLineEdit(bah)
-        self.baidu_db_edit.setPlaceholderText("留空 = 自动探测网盘客户端任务库")
-        self.baidu_db_edit.setToolTip("BaiduYunGuanjia.db 路径；留空自动探测。")
-        bal.addWidget(self.baidu_db_edit, 1)
-        self.baidu_db_browse_btn = QPushButton("浏览", bah)
-        self.baidu_db_browse_btn.setCursor(Qt.PointingHandCursor)
-        self.baidu_db_browse_btn.clicked.connect(self._browse_baidu_db)
-        bal.addWidget(self.baidu_db_browse_btn)
-        self._reg("baidu_task_db", self.baidu_db_edit)
-        self._bind_text(self.baidu_db_edit, "baidu_task_db",
-                        lambda: str(self.baidu_db_edit.text()).strip())
-        db_row = _SettingRow(
-            "网盘任务库路径", "BaiduYunGuanjia.db 的位置；留空自动探测。",
-            "baidu_task_db", self.baidu_db_edit, "links", "网盘与分享",
-            syn=("任务库", "数据库", "路径", "探测", "百度"))
-        db_row.host = bah
-        db_row.note = _EXP_NOTE
-        self._rows.append(db_row)
-        # 手工行的控件簇（编辑框 + 浏览按钮）纳入实验性门控
-        self._exp_gate.append((bah, (self.baidu_db_edit, self.baidu_db_browse_btn)))
-        # 网盘客户端进程名（两个「客户端是否在运行」检测点共用）：与上一行同一套
-        # 手工行结构；离线验收把 _exp_gate/_exp_badges/_exp_subs 锁定为 10/10/4，
-        # 故本行走独立登记表 _exp_extra_gate/_exp_extra_badges，门控效果一致。
-        pah, pal = self._manual_row(g)
-        proc_meta = _SettingRow(
-            "网盘客户端进程名",
-            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
-            "baidu_client_proc_names", None, "links", "网盘与分享")
-        proc_meta.host = pah
-        proc_meta.note = _EXP_NOTE
-        pal.addWidget(self._make_name(pah, "网盘客户端进程名", proc_meta))
-        pal.addWidget(self._exp_extra_badge(pah, pah), 0, Qt.AlignVCenter)
-        self.baidu_proc_edit = QLineEdit(pah)
-        self.baidu_proc_edit.setPlaceholderText(
-            "留空 = 使用内置默认（BaiduNetdisk.exe 等 3 个）")
-        self.baidu_proc_edit.setToolTip(
-            "逗号分隔的客户端进程名（半角 / 全角逗号都行）；留空 = 使用内置默认；"
-            "百度更换客户端进程名后在此补充。")
-        pal.addWidget(self.baidu_proc_edit, 1)
-        self._reg("baidu_client_proc_names", self.baidu_proc_edit)
-        self._bind_text(self.baidu_proc_edit, "baidu_client_proc_names",
-                        lambda: str(self.baidu_proc_edit.text()).strip())
-        proc_row = _SettingRow(
-            "网盘客户端进程名",
-            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
-            "baidu_client_proc_names", self.baidu_proc_edit, "links", "网盘与分享",
-            syn=("客户端", "进程名", "进程", "百度", "网盘", "BaiduNetdisk"))
-        proc_row.host = pah
-        proc_row.note = _EXP_NOTE
-        self._rows.append(proc_row)
-        self._exp_extra_gate.append((pah, (self.baidu_proc_edit,)))
-        self.share_nologin_hint = self._hint(
-            "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
-            "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
-            "因此自动拉起前会先检查客户端进程，未运行时跳过并提示。", self, warn=True)
-        g.addWidget(self.share_nologin_hint)
-        self._share_nologin_hint = self.share_nologin_hint
-
-        self._exp_subs = (self.baidu_auto_invoke_cb,
-                          self.baidu_db_edit, self.baidu_db_browse_btn,
-                          self.share_nologin_hint)
+        # 「网盘与分享」整组已整体搬到「实验性」页（2026-11）：
+        # 实验性总开关之下分「百度网盘（客户端）」与「UC 网盘网页端」两条并列通路，
+        # 各自带子开关与细项。这里不再重复渲染，避免同一开关出现两处。
 
     def _build_trust_purpose(self, lay, purpose, title, tip):
         """某用途的信任分区：新域名默认行为单选 + 白/黑名单编辑框。
@@ -2630,22 +2561,253 @@ class SettingsPage(QWidget):
                  "仓库", "github", "作者", "打赏", "赞助")))
 
     def _build_lab(self, box):
+        """实验性：一个总开关 + 两条**并列**的网盘通路（百度 / UC 网页端）。
+
+        结构（2026-11 按用户要求重排）：
+            总开关
+              └─ 百度网盘（客户端拉起）   ← 子开关 + 自己的细项
+              └─ UC 网盘网页端（fast）    ← 子开关 + 自己的细项
+        两条通路互不影响：关掉其中一条，另一条照常工作。
+        """
         g = self._group(box, "总开关")
         self.experimental_cb = self._check(
             g, "开启实验性功能", "experimental_enabled",
-            "默认关闭。开启后解锁：网盘任务库只读探测、自动拉起客户端、分享前挑选文件"
-            "（都在「链接与网盘」里）。",
+            "默认关闭、可能不稳定。开启后解锁下面两条独立的网盘通路，"
+            "它们各自还有自己的子开关，互不影响。",
             syn=("实验性", "总开关", "不稳定", "测试", "网盘"), default=False)
         self.experimental_cb.toggled.connect(lambda _s: self._sync_experimental())
-        # 常驻一句话：说清开启后最容易被注意到的行为差异（扫码得到的网盘链接不再
-        # 交给默认浏览器，而是走网盘客户端/任务库）。#stripHint 由 _finalize_group_cards
-        # 统一补 16px 缩进，与卡内其它说明文字对齐。
+        # 常驻一句话：说清开启后最容易被注意到的行为差异。#stripHint 由
+        # _finalize_group_cards 统一补 16px 缩进，与卡内其它说明文字对齐。
         self.experimental_hint = QLabel(
-            "开启后，二维码解析出的百度网盘链接不再自动用浏览器打开。",
+            "开启后，二维码解析出的百度网盘链接不再自动用浏览器打开，"
+            "并按下面两条通路各自的开关决定行为。",
             g.parentWidget())
         self.experimental_hint.setObjectName("stripHint")
         self.experimental_hint.setWordWrap(True)
         g.addWidget(self.experimental_hint)
+
+        self._build_lab_baidu(box)
+        self._build_lab_uc(box)
+
+    def _build_lab_baidu(self, box):
+        """百度网盘通路（实验性子开关 + 细项）。
+
+        原来在「链接与网盘」页的「网盘与分享」组，2026-11 整体搬到这里，
+        与 UC 通路并列。**行为与配置键一个都没改**（baidu_auto_invoke /
+        baidu_task_db / baidu_client_proc_names），只换了展示位置。
+        """
+        g = self._group(box, "百度网盘链路")
+        self.share_wait_spin = self._spin_row(
+            g, "分享等待时长", "share_gesture_wait_sec",
+            "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
+            5, 600, syn=("分享", "手势", "等待", "超时", "解析中"),
+            unit="秒", default=120, experimental=True)
+        self.baidu_auto_invoke_cb = self._check(
+            g, "启用百度网盘链路", "baidu_auto_invoke",
+            "开启后：复制到百度网盘分享链接时自动交给网盘客户端下载（整包）。"
+            "会自动触发下载，请确认来源可信。",
+            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
+            experimental=True)
+        # 注意：方案 §5.5 的「分享下载前先让我挑选文件」(baidu_pick_before_download)
+        # 在本机 config 里已被 _sanitize_cfg 显式 pop（该功能 v2.1.6 退场）。若在此
+        # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
+        # 界面报「保存失败」。故按落地纪律「冲突项先搁置」不渲染该项（见交回清单）。
+        bah, bal = self._manual_row(g)
+        db_meta = _SettingRow("网盘任务库路径",
+                              "BaiduYunGuanjia.db 的位置；留空自动探测。",
+                              "baidu_task_db", None, "lab", "百度网盘链路")
+        db_meta.host = bah
+        db_meta.note = _EXP_NOTE
+        bal.addWidget(self._make_name(bah, "网盘任务库路径", db_meta))
+        bal.addWidget(self._exp_badge(bah, bah), 0, Qt.AlignVCenter)
+        self.baidu_db_edit = QLineEdit(bah)
+        self.baidu_db_edit.setPlaceholderText("留空 = 自动探测网盘客户端任务库")
+        self.baidu_db_edit.setToolTip("BaiduYunGuanjia.db 路径；留空自动探测。")
+        bal.addWidget(self.baidu_db_edit, 1)
+        self.baidu_db_browse_btn = QPushButton("浏览", bah)
+        self.baidu_db_browse_btn.setCursor(Qt.PointingHandCursor)
+        self.baidu_db_browse_btn.clicked.connect(self._browse_baidu_db)
+        bal.addWidget(self.baidu_db_browse_btn)
+        self._reg("baidu_task_db", self.baidu_db_edit)
+        self._bind_text(self.baidu_db_edit, "baidu_task_db",
+                        lambda: str(self.baidu_db_edit.text()).strip())
+        db_row = _SettingRow(
+            "网盘任务库路径", "BaiduYunGuanjia.db 的位置；留空自动探测。",
+            "baidu_task_db", self.baidu_db_edit, "lab", "百度网盘链路",
+            syn=("任务库", "数据库", "路径", "探测", "百度"))
+        db_row.host = bah
+        db_row.note = _EXP_NOTE
+        self._rows.append(db_row)
+        # 与搬家前一致：仍走 _exp_gate（离线验收把该表锁定为 5 条，只换展示位置）。
+        self._exp_gate.append(
+            (bah, (self.baidu_db_edit, self.baidu_db_browse_btn)))
+        # 网盘客户端进程名（两个「客户端是否在运行」检测点共用）：同一套手工行结构。
+        pah, pal = self._manual_row(g)
+        proc_meta = _SettingRow(
+            "网盘客户端进程名",
+            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
+            "baidu_client_proc_names", None, "lab", "百度网盘链路")
+        proc_meta.host = pah
+        proc_meta.note = _EXP_NOTE
+        pal.addWidget(self._make_name(pah, "网盘客户端进程名", proc_meta))
+        pal.addWidget(self._exp_extra_badge(pah, pah), 0, Qt.AlignVCenter)
+        self.baidu_proc_edit = QLineEdit(pah)
+        self.baidu_proc_edit.setPlaceholderText(
+            "留空 = 使用内置默认（BaiduNetdisk.exe 等 3 个）")
+        self.baidu_proc_edit.setToolTip(
+            "逗号分隔的客户端进程名（半角 / 全角逗号都行）；留空 = 使用内置默认；"
+            "百度更换客户端进程名后在此补充。")
+        pal.addWidget(self.baidu_proc_edit, 1)
+        self._reg("baidu_client_proc_names", self.baidu_proc_edit)
+        self._bind_text(self.baidu_proc_edit, "baidu_client_proc_names",
+                        lambda: str(self.baidu_proc_edit.text()).strip())
+        proc_row = _SettingRow(
+            "网盘客户端进程名",
+            "逗号分隔的客户端进程名；留空 = 使用内置默认。百度更换客户端进程名后在此补充。",
+            "baidu_client_proc_names", self.baidu_proc_edit, "lab", "百度网盘链路",
+            syn=("客户端", "进程名", "进程", "百度", "网盘", "BaiduNetdisk"))
+        proc_row.host = pah
+        proc_row.note = _EXP_NOTE
+        self._rows.append(proc_row)
+        self._exp_extra_gate.append((pah, (self.baidu_proc_edit,)))
+        self.share_nologin_hint = self._hint(
+            "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
+            "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
+            "因此自动拉起前会先检查客户端进程，未运行时跳过并提示。", self, warn=True)
+        g.addWidget(self.share_nologin_hint)
+        self._share_nologin_hint = self.share_nologin_hint
+
+        self._exp_subs = (self.baidu_auto_invoke_cb,
+                          self.baidu_db_edit, self.baidu_db_browse_btn,
+                          self.share_nologin_hint)
+
+    def _build_lab_uc(self, box):
+        """UC 网盘网页端（实验性）：子开关 + 细项。
+
+        与百度链路**并列但完全独立**：用自己的键（uc_web_enabled / uc_downloader /
+        uc_download_dir / uc_phone），百度那条链路的任何配置与逻辑都不动。
+        门控走独立登记表 _exp_extra_gate/_exp_extra_badges（_exp_gate 的计数被离线
+        验收锁定，后加行不得扩它）。
+        """
+        g = self._group(box, "UC 网页端链路")
+        self.uc_hint = self._hint(_UC_HINT_READY, g.parentWidget())
+        g.addWidget(self.uc_hint)
+
+        # ---- 行1：总开关 ----
+        uh, ul = self._manual_row(g)
+        uc_meta = _SettingRow(
+            "启用 UC 网盘网页端",
+            "开启后：识别到 UC 分享链接时打开内嵌浏览器下载；与百度链路互不影响。",
+            "uc_web_enabled", None, "lab", "UC 网页端链路",
+            syn=("UC", "uc", "网盘", "uc网盘", "fast.uc.cn", "网页端", "实验性", "浏览器"))
+        uc_meta.host = uh
+        uc_meta.note = _EXP_NOTE
+        ul.addWidget(self._make_name(uh, "启用 UC 网页端链路（fast.uc.cn）", uc_meta))
+        ul.addWidget(self._exp_extra_badge(uh, uh), 0, Qt.AlignVCenter)
+        ul.addStretch(1)
+        self.uc_web_cb = _Switch(uh)
+        self.uc_web_cb.toggled.connect(
+            lambda checked: self._commit("uc_web_enabled", bool(checked)))
+        self._reg("uc_web_enabled", self.uc_web_cb)
+        ul.addWidget(self.uc_web_cb)
+        self.uc_open_btn = QPushButton("打开 UC 窗口", uh)
+        self.uc_open_btn.setToolTip("立即打开内嵌浏览器（也可直接粘贴 UC 分享链接自动触发）")
+        self.uc_open_btn.clicked.connect(lambda: self.ucWindowRequested.emit())
+        ul.addWidget(self.uc_open_btn)
+        uc_meta.widget = self.uc_web_cb
+        self._rows.append(uc_meta)
+
+        # ---- 行2：记住的登录手机号（仅本地，可清空）----
+        nh, nl = self._manual_row(g)
+        phone_meta = _SettingRow(
+            "UC 登录手机号",
+            "记住登录用的手机号，下次打开 UC 窗口时自动预填；只保存在本地配置里。",
+            "uc_phone", None, "lab", "UC 网页端链路",
+            syn=("UC", "手机号", "登录", "记住", "账号", "预填"))
+        phone_meta.host = nh
+        phone_meta.note = _EXP_NOTE
+        nl.addWidget(self._make_name(nh, "UC 登录手机号", phone_meta))
+        nl.addWidget(self._exp_extra_badge(nh, nh), 0, Qt.AlignVCenter)
+        self.uc_phone_edit = QLineEdit(nh)
+        self.uc_phone_edit.setPlaceholderText("留空 = 不预填")
+        self.uc_phone_edit.setMaximumWidth(200)
+        self.uc_phone_edit.setMaxLength(11)
+        self._reg("uc_phone", self.uc_phone_edit)
+        self._bind_text(self.uc_phone_edit, "uc_phone",
+                        lambda: str(self.uc_phone_edit.text()).strip())
+        nl.addWidget(self.uc_phone_edit)
+        nl.addStretch(1)
+        phone_meta.widget = self.uc_phone_edit
+        self._rows.append(phone_meta)
+
+        # ---- 行2：下载链接交给谁 ----
+        dh, dl = self._manual_row(g)
+        dl_meta = _SettingRow(
+            "UC 下载链接交给",
+            "自动：装了 IDM 就用 IDM，否则交给默认浏览器。也可以只复制链接，"
+            "让迅雷 / FDM 等「监视剪贴板」的下载器自己接管。",
+            "uc_downloader", None, "lab", "UC 网页端链路",
+            syn=("UC", "下载器", "IDM", "迅雷", "剪贴板", "浏览器", "接管"))
+        dl_meta.host = dh
+        dl_meta.note = _EXP_NOTE
+        dl.addWidget(self._make_name(dh, "UC 下载链接交给", dl_meta))
+        dl.addWidget(self._exp_extra_badge(dh, dh), 0, Qt.AlignVCenter)
+        dl.addStretch(1)
+        self.uc_dl_combo = QComboBox(dh)
+        for label, value in (
+            ("自动（有 IDM 用 IDM，否则浏览器）", "auto"),
+            ("始终用 IDM", "idm"),
+            ("总是交给默认浏览器", "browser"),
+            ("只复制链接（迅雷 / FDM 自动接管）", "clipboard"),
+        ):
+            self.uc_dl_combo.addItem(label, value)
+        self.uc_dl_combo.setMinimumWidth(260)
+        self.uc_dl_combo.currentIndexChanged.connect(
+            lambda _i: self._commit("uc_downloader",
+                                    str(self.uc_dl_combo.currentData() or "auto")))
+        self._reg("uc_downloader", self.uc_dl_combo)
+        dl.addWidget(self.uc_dl_combo)
+        dl_meta.widget = self.uc_dl_combo
+        self._rows.append(dl_meta)
+
+        # ---- 行3：IDM 保存目录（留空 = IDM 默认）----
+        ph, pl = self._manual_row(g)
+        dir_meta = _SettingRow(
+            "UC 下载保存目录",
+            "仅「用 IDM 下载」时生效；留空 = 用 IDM 自己的默认目录。",
+            "uc_download_dir", None, "lab", "UC 网页端链路",
+            syn=("UC", "保存目录", "下载目录", "IDM", "文件夹"))
+        dir_meta.host = ph
+        dir_meta.note = _EXP_NOTE
+        pl.addWidget(self._make_name(ph, "UC 下载保存目录", dir_meta))
+        pl.addWidget(self._exp_extra_badge(ph, ph), 0, Qt.AlignVCenter)
+        self.uc_dir_edit = QLineEdit(ph)
+        self.uc_dir_edit.setPlaceholderText("留空 = 使用 IDM 默认下载目录")
+        self._reg("uc_download_dir", self.uc_dir_edit)
+        self._bind_text(self.uc_dir_edit, "uc_download_dir",
+                        lambda: str(self.uc_dir_edit.text()).strip())
+        pl.addWidget(self.uc_dir_edit, 1)
+        self.uc_dir_btn = QPushButton("浏览…", ph)
+        self.uc_dir_btn.clicked.connect(self._pick_uc_dir)
+        pl.addWidget(self.uc_dir_btn)
+        dir_meta.widget = self.uc_dir_edit
+        self._rows.append(dir_meta)
+
+        cluster = (self.uc_web_cb, self.uc_open_btn, self.uc_phone_edit,
+                   self.uc_dl_combo, self.uc_dir_edit, self.uc_dir_btn)
+        for host in (uh, nh, dh, ph):
+            host.setProperty("off", False)
+        self._exp_extra_gate.append((uh, (self.uc_web_cb, self.uc_open_btn)))
+        self._exp_extra_gate.append((nh, (self.uc_phone_edit,)))
+        self._exp_extra_gate.append((dh, (self.uc_dl_combo,)))
+        self._exp_extra_gate.append((ph, (self.uc_dir_edit, self.uc_dir_btn)))
+        self._uc_cluster = cluster
+
+    def _pick_uc_dir(self):
+        start = str(self.uc_dir_edit.text() or "").strip()
+        path = QFileDialog.getExistingDirectory(self, "选择 UC 下载保存目录", start)
+        if path:
+            self.uc_dir_edit.setText(path)
 
     def _build_dirs(self, box):
         self.dirs_box = box
@@ -3541,10 +3703,6 @@ class SettingsPage(QWidget):
                 _format_redirect_rules(cfg.get("url_redirect_rules")))
             self._load_trust(cfg)
             self.tls_cb.setChecked(b("tls_skip_verify", False))
-            self.share_wait_spin.setValue(max(5, min(600, i("share_gesture_wait_sec", 60))))
-            self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
-            self.baidu_db_edit.setText(s("baidu_task_db"))
-            self.baidu_proc_edit.setText(s("baidu_client_proc_names"))
 
         if did == "ui":
             # 外观与快捷键
@@ -3593,6 +3751,21 @@ class SettingsPage(QWidget):
             # 实验性
             self.experimental_cb.setChecked(b("experimental_enabled", False))
             self._sync_experimental()
+            # 百度网盘通路（子开关 + 细项）
+            if hasattr(self, "share_wait_spin"):
+                self.share_wait_spin.setValue(
+                    max(5, min(600, i("share_gesture_wait_sec", 60))))
+                self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
+                self.baidu_db_edit.setText(s("baidu_task_db"))
+                self.baidu_proc_edit.setText(s("baidu_client_proc_names"))
+            # UC 网盘网页端（与百度链路完全独立的实验性通路）
+            if hasattr(self, "uc_web_cb"):
+                self.uc_web_cb.setChecked(b("uc_web_enabled", False))
+                self.uc_phone_edit.setText(s("uc_phone"))
+                _ucdl = s("uc_downloader", "auto") or "auto"
+                _uci = self.uc_dl_combo.findData(_ucdl)
+                self.uc_dl_combo.setCurrentIndex(_uci if _uci >= 0 else 0)
+                self.uc_dir_edit.setText(s("uc_download_dir"))
 
         if did == "dirs":
             # 监听目录
@@ -4123,6 +4296,24 @@ class SettingsPage(QWidget):
             for w in widgets:
                 if w is not None:
                     w.setEnabled(exp)
+        # UC 网盘通路：除实验性总开关外，还要求可选组件 PyQtWebEngine 存在。
+        # 缺组件时开关仍可见（解释得清），但一律禁用并换成「去装组件」的说明，
+        # 避免用户开了开关却「点了没反应」。
+        if hasattr(self, "uc_web_cb"):
+            try:
+                from ..uc import capability
+                uc_ready = capability.web_engine_available()
+            except Exception:
+                uc_ready = False
+            for w in getattr(self, "_uc_cluster", ()) or ():
+                try:
+                    w.setEnabled(exp and uc_ready)
+                except Exception:
+                    pass
+            try:
+                self.uc_hint.setText(_UC_HINT_READY if uc_ready else _UC_HINT_MISSING)
+            except Exception:
+                pass
         # 「监听剪贴板」门控在这里一并收口：懒建领域（clipboard / links 的物化
         # 顺序不定）与既有重贴路径（通知 / 实验性切换、_ensure_domain、
         # _load_from_cfg）都会经过 _apply_gates，门控状态因此始终一致。

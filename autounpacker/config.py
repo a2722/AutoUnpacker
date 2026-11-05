@@ -158,6 +158,13 @@ DEFAULT_CONFIG = {
     # 百度更换客户端进程名后无需改代码，两个「客户端是否在运行」检测点共用
     # （解析与回退见 baidu/share.py 的 _effective_client_proc_names）。
     "baidu_client_proc_names": "BaiduNetdisk.exe,YunDetectService.exe,BaiduNetdiskHost.exe",
+    # ---------- 实验性：UC 网盘网页端（fast.uc.cn）通路 ----------
+    # 与百度链路完全独立：百度走客户端协议，UC 走内嵌浏览器 + 登录态。
+    # 依赖可选组件 PyQtWebEngine；未安装时该通路自动降级为「不可用」，其余功能不受影响。
+    "uc_web_enabled": False,        # 实验性：启用 UC 网页端下载通路（默认关）
+    "uc_phone": "",                 # 实验性：记住的 UC 登录手机号（仅本地明文，方便下次预填；可清空）
+    "uc_downloader": "auto",        # 直链交接方式：auto=有 IDM 用 IDM 否则默认浏览器 / idm / browser / clipboard
+    "uc_download_dir": "",          # IDM 保存目录（留空 = 用 IDM 默认目录）
     "share_gesture_wait_sec": 120,  # 分享手势等待「解析中链接」的秒数（超时取消，绝不回退旧链接；5~600）
     # pair_split_auto 已退场（2026-09-18）：「7z 验证通过即配对」已并入基础解压逻辑、
     # 强制开启；旧 config.json 里的该陈旧键会被 _sanitize_cfg 静默丢弃，不影响任何行为。
@@ -464,6 +471,17 @@ def _sanitize_cfg(cfg):
         if not isinstance(_cpn, str):
             _cpn = str(DEFAULT_CONFIG["baidu_client_proc_names"])
         cfg["baidu_client_proc_names"] = _cpn.strip()
+        # UC 网页端通路（实验性）：缺键/畸形一律回退默认，绝不抛。
+        # 手机号只做「去空白 + 长度出息」，不校验格式（换号/国际号都能存）；
+        # 交接方式与保存目录是自由字符串，非法值在 uc/handoff.py 里按 auto 处理。
+        cfg["uc_web_enabled"] = bool(cfg.get("uc_web_enabled", False))
+        _uph = cfg.get("uc_phone")
+        cfg["uc_phone"] = (_uph if isinstance(_uph, str) else "").strip()[:32]
+        _udl = cfg.get("uc_downloader")
+        _udl = (_udl if isinstance(_udl, str) else "").strip().lower()
+        cfg["uc_downloader"] = _udl if _udl in ("auto", "idm", "browser", "clipboard") else "auto"
+        _udd = cfg.get("uc_download_dir")
+        cfg["uc_download_dir"] = (_udd if isinstance(_udd, str) else "").strip()
         # baidu_pick_before_download 已退场：丢弃陈旧键（与 pair_split_auto 同口径）。
         cfg.pop("baidu_pick_before_download", None)
         cfg["pair_split_enabled"] = bool(cfg.get("pair_split_enabled", True))

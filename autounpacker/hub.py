@@ -116,6 +116,7 @@ class Hub:
         "监听目录不可用": "notify_error",
         "磁盘空间不足": "notify_error",
         "分卷等待放弃": "notify_error",
+        "UC 网盘下载失败": "notify_error",
         # 必要提醒（默认开）
         "分享网络超时": "notify_reminder",
         "分享手势超时": "notify_reminder",
@@ -132,6 +133,7 @@ class Hub:
         "网盘任务未完成": "notify_reminder",
         "网盘重复下载": "notify_reminder",
         "有新的网址等待确认": "notify_reminder",
+        "UC 网盘下载": "notify_reminder",
     }
 
     def __init__(self, state=None):

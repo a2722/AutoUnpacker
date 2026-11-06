@@ -30,10 +30,12 @@ from ..uc import detect, login
 
 _WEB_IMPORT_ERROR = None
 try:  # 软依赖：没装 PyQtWebEngine 时这里失败，但不影响模块可导入
-    from PyQt5.QtWebEngineWidgets import QWebEngineProfile, QWebEngineView
+    from PyQt5.QtWebEngineWidgets import (QWebEnginePage, QWebEngineProfile,
+                                          QWebEngineView)
 
     WEB_OK = True
 except Exception as _exc:  # pragma: no cover - 只在缺组件时走
+    QWebEnginePage = None
     QWebEngineProfile = None
     QWebEngineView = None
     WEB_OK = False
@@ -52,6 +54,20 @@ _LOGIN_METHODS = (
 
 
 if WEB_OK:
+
+    class _UcPage(QWebEnginePage):
+        """带 JS 控制台转发的页面：站点报错/风控提示能直接进运行日志。"""
+
+        def __init__(self, profile, parent=None, on_console=None):
+            super().__init__(profile, parent)
+            self._on_console = on_console
+
+        def javaScriptConsoleMessage(self, level, message, line, source):  # noqa: N802
+            try:
+                if self._on_console is not None:
+                    self._on_console(level, message, line, source)
+            except Exception:
+                pass
 
     class UcBrowserWindow(QDialog):
         """内嵌浏览器 + 登录助手 + 下载拦截。"""
@@ -93,6 +109,14 @@ if WEB_OK:
                         self._on_download_requested)
                 except Exception:
                     pass
+                # 自定义页面：把网页控制台输出转发到运行日志（排查用）
+                try:
+                    self._page = _UcPage(self.view.page().profile(), self.view,
+                                         self._on_js_console)
+                    self.view.setPage(self._page)
+                except Exception as e:
+                    self._page = None
+                    self._js_console_error = str(e)
 
             self._build_ui(phone)
             self._timer = QTimer(self)
@@ -161,6 +185,11 @@ if WEB_OK:
             self.btn_manual.clicked.connect(self._toggle_helper)
             row2.addWidget(self.btn_manual)
 
+            self.btn_snap = QPushButton("诊断快照")
+            self.btn_snap.setToolTip("把当前页面截图 + HTML + 元素状态存到日志目录，排查用")
+            self.btn_snap.clicked.connect(lambda: self.snapshot("手动"))
+            row2.addWidget(self.btn_snap)
+
             row2.addStretch(1)
             root.addLayout(row2)
 
@@ -206,6 +235,8 @@ if WEB_OK:
 
         def _on_load_finished(self, ok):
             self._set_status("页面已加载" if ok else "页面加载失败（检查网络）")
+            if not ok:
+                self.snapshot("加载失败")
             if ok and self._on_login_page():
                 # 进登录页就把「已阅读并同意」勾上（不勾的话点登录只弹红字）
                 QTimer.singleShot(600, self._ensure_agreement)
@@ -229,6 +260,78 @@ if WEB_OK:
                 if cb is not None:
                     cb(res)
             self._run(login.js_debug_dump(), got)
+
+        def _on_js_console(self, level, message, line, source):
+            """网页控制台输出 → 运行日志（JS 报错、风控提示都能看见）。"""
+            try:
+                lv = {0: "info", 1: "warn", 2: "error"}.get(int(level), str(level))
+            except Exception:
+                lv = str(level)
+            self._dbg("JS[%s] %s (%s:%s)" % (lv, str(message)[:200], source, line))
+
+        def _debug_dir(self):
+            try:
+                from .. import paths
+                d = paths.LOGS_DIR / "uc_debug"
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+            except Exception:
+                return None
+
+        def snapshot(self, tag="snap"):
+            """调试快照：页面截图 + HTML + 元素状态，全部落盘并写路径到日志。"""
+            d = self._debug_dir()
+            if d is None:
+                self._dbg("快照失败：拿不到日志目录")
+                return None
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_"
+                           for ch in str(tag))[:24]
+            base = "%s_%s" % (ts, safe or "snap")
+            try:
+                pm = self.view.grab()
+                png = d / (base + ".png")
+                ok = pm.save(str(png), "PNG")
+                self._dbg("快照: %s (%dx%d, save=%s)"
+                          % (png.name, pm.width(), pm.height(), ok))
+            except Exception as e:
+                self._dbg("截图失败: %s" % e)
+            try:
+                html_path = d / (base + ".html")
+
+                def got_html(html):
+                    try:
+                        html_path.write_text(html or "", encoding="utf-8")
+                        self._dbg("HTML: %s (%d 字符)"
+                                  % (html_path.name, len(html or "")))
+                    except Exception as e:
+                        self._dbg("HTML 保存失败: %s" % e)
+                self.view.page().toHtml(got_html)
+            except Exception as e:
+                self._dbg("取 HTML 失败: %s" % e)
+            self._dump("快照上下文")
+            self._log_cookies()
+            return base
+
+        def _log_cookies(self):
+            """把当前 Cookie 的 域名/名字 打进日志（**不打值**，只用于判断登录态）。"""
+            try:
+                store = self.view.page().profile().cookieStore()
+                got = []
+
+                def on_cookie(c):
+                    try:
+                        got.append("%s/%s" % (c.domain(), c.name()))
+                    except Exception:
+                        pass
+                store.cookieAdded.connect(on_cookie)
+                store.loadAllCookies()
+                QTimer.singleShot(
+                    800, lambda: self._dbg(
+                        "Cookie(域名/名) %d 条: %s"
+                        % (len(set(got)), ", ".join(sorted(set(got))[:25]))))
+            except Exception as e:
+                self._dbg("读 Cookie 失败: %s" % e)
 
         def _ensure_agreement(self, then=None):
             """自动勾选同意协议；失败时把原因显示出来（用户可手动勾）。"""
@@ -444,6 +547,7 @@ if WEB_OK:
                                 left, code, captcha_wait + 1))
                     else:
                         self._set_status("安全验证一直未完成：请手动拖滑块后再点「登录」")
+                        self.snapshot("安全验证超时")
                     return
                 err = (st.get("error") or "").strip()
                 if err:
@@ -462,6 +566,7 @@ if WEB_OK:
                 if left <= 0:
                     self._set_status("已提交但页面既没报错也没跳转，"
                                      "请手动点页面上的「登录/注册」")
+                    self.snapshot("登录无响应")
                     self.refresh_state()
                     return
                 QTimer.singleShot(1200, lambda: self._poll_login_result(left - 1, code))
@@ -503,6 +608,7 @@ if WEB_OK:
                     else:
                         self._set_status("提取码似乎不对，请重试")
                         self.code_result.emit(False, "未通过：请检查提取码")
+                        self.snapshot("提取码未通过")
                 self._run(login.js_share_code_state(), got)
 
             def check1():
@@ -560,6 +666,7 @@ if WEB_OK:
                 else:
                     self._set_status("没有捕获到下载请求：请确认页面已加载完、"
                                      "并已点过「② 全部下载」")
+                    self.snapshot("未捕获下载")
             self._run(login.js_state(), got)
 
         def _toggle_helper(self):

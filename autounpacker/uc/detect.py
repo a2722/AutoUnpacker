@@ -53,7 +53,10 @@ def parse_uc_share_url(url):
           "share_id": "67c130c3452d4",
           "pwd":      "1234" 或 "",
           "url":      原始输入（strip 后）,
-          "canonical": "https://fast.uc.cn/s/<share_id>"（不含提取码, 便于去重）,
+          "canonical": "https://fast.uc.cn/s/<share_id>"（固定 fast 域、不含提取码，
+                       便于去重；也是唯一应该交给内嵌浏览器的地址 ——
+                       drive.uc.cn 是「UC 客户端」引导页，手机号登录面板与
+                       fast 网页端不同，必须改写掉）,
         }
     解析失败/非分享页一律返回 None，绝不抛异常。
     """
@@ -85,7 +88,7 @@ def parse_uc_share_url(url):
             "share_id": share_id,
             "pwd": pwd,
             "url": raw,
-            "canonical": "https://%s/s/%s" % (host, share_id),
+            "canonical": "https://fast.uc.cn/s/%s" % share_id,
         }
     except Exception:
         return None

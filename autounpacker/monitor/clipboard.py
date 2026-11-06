@@ -1271,8 +1271,12 @@ class QRMonitor(threading.Thread):
                          % rec.get("canonical"))
             try:
                 self.hub.q.put({"type": "uc_share",
-                                "url": rec.get("url"),
+                                # url 固定用 canonical（fast 域）：drive.uc.cn 是
+                                # 「UC 客户端」引导页，登录面板与网页端不同，交给
+                                # 内嵌窗口只会卡在「没找到手机登录标签」。
+                                "url": rec.get("canonical"),
                                 "canonical": rec.get("canonical"),
+                                "raw_url": rec.get("url"),
                                 "share_id": rec.get("share_id")})
             except Exception:
                 pass

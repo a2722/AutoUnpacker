@@ -23,7 +23,7 @@ from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel,  # noqa: E402
                              QLineEdit, QPushButton, QVBoxLayout, QWidget)
 
-from ..uc import login
+from ..uc import detect, login
 
 _WEB_IMPORT_ERROR = None
 try:  # 软依赖：没装 PyQtWebEngine 时这里失败，但不影响模块可导入
@@ -231,7 +231,20 @@ if WEB_OK:
 
         # ---------------- 动作 ----------------
         def load_share(self, url):
-            self.view.load(QUrl(str(url)))
+            """加载分享页（一律改写成 fast.uc.cn 网页端）。
+
+            drive.uc.cn 是「UC 客户端」引导页：它的登录面板与网页端不同，
+            没有「手机登录」标签，助手点「填入并获取验证码」必然失败。
+            这里统一改写成 canonical（fast 域），任何来源的链接都不会漏。
+            """
+            target = str(url or "").strip()
+            try:
+                rec = detect.parse_uc_share_url(target)
+                if rec and rec.get("canonical"):
+                    target = rec["canonical"]
+            except Exception:
+                pass
+            self.view.load(QUrl(target))
             self._timer.start()
 
         def reload(self):

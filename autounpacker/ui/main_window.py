@@ -3367,7 +3367,7 @@ class MainWindow(QMainWindow):
             elif item["type"] == "uc_share":
                 # 实验性：识别到 UC 分享链接。只记一行 + 打开内嵌窗口，
                 # **不自动下载、不发任何网络请求**（登录与下载都由用户在窗口内完成）。
-                _uc_url = item.get("url") or item.get("canonical") or ""
+                _uc_url = item.get("canonical") or item.get("url") or ""
                 self._append_log("[UC] 已识别 UC 分享链接: %s"
                                  % (item.get("canonical") or _uc_url))
                 if self.state.snapshot().get("uc_web_enabled"):

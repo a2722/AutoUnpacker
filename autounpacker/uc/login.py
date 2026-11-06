@@ -161,13 +161,22 @@ def js_fill_phone(phone):
 
 
 def js_send_sms():
-    """点「获取短信验证码」（滑块如果没拖，点了也不会发码）。"""
+    """点「获取短信验证码」。
+
+    真机坑：按钮点完后会变成「获取短信验证码 (59s)」倒计时。倒计时期间再点
+    不会发新码，但**每请求一次都会让上一条码失效** —— 用户拿到第一条码去提交，
+    却因为中途又请求过而判「无效或过期」。所以倒计时中直接拒绝，不点。
+    """
     return _wrap(r"""
-      var el = q('#send_sms_code') ||
+      var el = q('#send_sms_code') || q('.smsCode-btn') ||
                firstByText('a,button,span', ['获取短信验证码','获取验证码']);
       if(!el) return JSON.stringify({ok:false,msg:'没找到「获取验证码」按钮'});
+      var txt = norm(el);
+      var m = txt.match(/(\d+)\s*[sS]/);
+      if (m) return JSON.stringify({ok:false,
+        msg:'验证码已发送，请等倒计时结束（约 ' + m[1] + ' 秒）再重发；期间重发会让上一条失效'});
       clickIt(el);
-      return JSON.stringify({ok:true,msg:'已点击「获取验证码」'});
+      return JSON.stringify({ok:true,msg:'已点击获取验证码'});
     """)
 
 
@@ -233,6 +242,22 @@ def js_submit():
       return JSON.stringify({ok:true,
         msg: cb ? (now ? '已勾选协议并点击登录' : '已点击登录（协议未勾上，请手动勾选）')
                 : '已点击登录'});
+    """)
+
+
+def js_login_error():
+    """读登录页错误提示 + 验证码框当前值（判断「点登录后到底发生了什么」）。
+
+    真机：提交后不论成败页面都会清空验证码框；失败时正文出现
+    「短信验证码无效或过期」/「请输入短信验证码」等。不读这个的话，用户只能看到
+    「已提交登录」然后干等，完全不知道服务端拒绝的原因。
+    """
+    return _wrap(r"""
+      var body = ((document.body && document.body.innerText) || '').replace(/\s+/g,'');
+      var m = body.match(/(请先输入短信验证码|请输入短信验证码|短信验证码无效或过期|验证码错误|验证码已失效|操作过于频繁)/);
+      var el = q('#sms_code');
+      return JSON.stringify({ok:true, error: m ? m[1] : '',
+                             code_value: el ? (el.value || '') : ''});
     """)
 
 

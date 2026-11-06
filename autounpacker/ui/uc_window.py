@@ -19,6 +19,8 @@
    （交给 IDM / 默认浏览器 / 剪贴板），不让浏览器自己落盘。
 4. 滑块一律由用户手动拖；本模块只负责「填号、点获取验证码、填码、点登录、点全部下载」。
 """
+import time
+
 from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel,  # noqa: E402
                              QLineEdit, QPushButton, QVBoxLayout, QWidget)
@@ -366,34 +368,55 @@ if WEB_OK:
             if not code:
                 self._set_status("请先填短信验证码")
                 return
+            # 防重复提交：真机验证过——同一验证码提交第二次，服务端会直接判
+            # 「短信验证码无效或过期」（第一次其实已经消费掉了）。5 秒内再点只
+            # 提示、不重复发请求。
+            if time.time() - getattr(self, "_last_submit_at", 0.0) < 5.0:
+                self._set_status("已提交过，请等结果（重复提交会让验证码作废）")
+                return
             if not self._on_login_page():
                 self._goto_login_page()
                 self._set_status("请先在登录页获取验证码，再点「登录」")
                 return
 
-            def step_submit(res):
+            def after_submit(res):
                 st = self._parse(res)
                 if not st.get("ok"):
                     self._set_status("点登录失败：%s" % st.get("msg"))
                     return
-                self._set_status("已提交登录，等待跳转…")
-                QTimer.singleShot(3000, self._after_login)
+                self._last_submit_at = time.time()
+                self._set_status("已提交登录，等待结果…")
+                QTimer.singleShot(1200, lambda: self._poll_login_result(3))
 
             def step_fill(res):
                 st = self._parse(res)
                 if not st.get("ok"):
                     self._set_status("填验证码失败：%s" % st.get("msg"))
                     return
-                self._run(login.js_submit(), step_submit)
+                self._run(login.js_submit(), after_submit)
 
             self._run(login.js_fill_code(code), step_fill)
 
-        def _after_login(self):
-            """登录提交后的收尾：还停在登录页说明没成功；已跳走就回分享页。"""
-            if self._on_login_page():
-                self.refresh_state()
+        def _poll_login_result(self, left):
+            """提交后读页面：报错就明说，跳走了就回分享页，都不行才等下一轮。"""
+            if not self._on_login_page():
+                self._back_to_share()
                 return
-            self._back_to_share()
+
+            def got(res):
+                st = self._parse(res)
+                err = (st.get("error") or "").strip()
+                if err:
+                    self._set_status("登录未成功：%s（可重新获取验证码再试）" % err)
+                    self.refresh_state()
+                    return
+                if left <= 0:
+                    self._set_status("已提交但页面既没报错也没跳转，请手动看一眼")
+                    self.refresh_state()
+                    return
+                QTimer.singleShot(1200, lambda: self._poll_login_result(left - 1))
+
+            self._run(login.js_login_error(), got)
 
         # ---------------- 提取码（小窗映射） ----------------
         def current_share_url(self):

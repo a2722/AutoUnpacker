@@ -59,6 +59,10 @@ if WEB_OK:
         status = pyqtSignal(str)
         # 手机号变更（用于记住手机号）
         phone_changed = pyqtSignal(str)
+        # 当前分享需要提取码（主窗口据此弹小窗；同一链接只发一次）
+        code_required = pyqtSignal()
+        # 提取码填入结果：成功与否 + 一句说明
+        code_result = pyqtSignal(bool, str)
 
         def __init__(self, parent=None, phone=""):
             super().__init__(parent)
@@ -69,6 +73,8 @@ if WEB_OK:
             self._logged_in = False
             self._last_code = ""
             self._pending_downloads = 0
+            self._share_url = ""
+            self._code_asked = ""
 
             prof = QWebEngineProfile.defaultProfile()
             try:
@@ -224,6 +230,18 @@ if WEB_OK:
                 self._set_status("登录页：填手机号 → 获取验证码（拖滑块）→ 登录")
                 return
 
+            def cb_code(res):
+                st = self._parse(res)
+                if st.get("need_code"):
+                    self.btn_download.setEnabled(False)
+                    self._set_status("该分享需要提取码（在上方小窗输入）")
+                    url = self.current_share_url()
+                    if url and getattr(self, "_code_asked", "") != url:
+                        self._code_asked = url
+                        self.code_required.emit()
+                    return
+                self._run(login.js_state(), cb)
+
             def cb(res):
                 st = self._parse(res)
                 if not st.get("ok"):
@@ -238,7 +256,7 @@ if WEB_OK:
                     self._set_status("未登录：点「① 打开登录面板」，或用上方助手登录")
                 else:
                     self._set_status("页面还在加载…")
-            self._run(login.js_state(), cb)
+            self._run(login.js_share_code_state(), cb_code)
 
         # ---------------- 动作 ----------------
         def load_share(self, url):
@@ -360,6 +378,78 @@ if WEB_OK:
                 return
             self._back_to_share()
 
+        # ---------------- 提取码（小窗映射） ----------------
+        def current_share_url(self):
+            return getattr(self, "_share_url", "") or ""
+
+        def apply_code(self, code, _retry=True):
+            """把提取码填进分享页。
+
+            真机行为：填满正确位数后站点**自动校验**（错误码 2 秒内出现
+            「文件密码有误」），所以不需要点「查看文件」；点击只作兜底。
+            """
+            code = str(code or "").strip()
+            if not code:
+                self.code_result.emit(False, "提取码为空")
+                return
+            if self._on_login_page() or not self._on_share_page():
+                if _retry:
+                    self._back_to_share()
+                    QTimer.singleShot(2500, lambda: self.apply_code(code, False))
+                else:
+                    self.code_result.emit(False, "分享页未就绪，请稍后重试")
+                return
+
+            def check2():
+                def got(res):
+                    st = self._parse(res)
+                    if st.get("error"):
+                        self._set_status("提取码错误，请重新输入")
+                        self.code_result.emit(False, "提取码错误")
+                    elif not st.get("need_code"):
+                        self._set_status("已进入文件页")
+                        self.code_result.emit(True, "已进入文件页")
+                        self.refresh_state()
+                    else:
+                        self._set_status("提取码似乎不对，请重试")
+                        self.code_result.emit(False, "未通过：请检查提取码")
+                self._run(login.js_share_code_state(), got)
+
+            def check1():
+                def got(res):
+                    st = self._parse(res)
+                    if st.get("error"):
+                        self._set_status("提取码错误，请重新输入")
+                        self.code_result.emit(False, "提取码错误")
+                        return
+                    if not st.get("need_code"):
+                        self._set_status("已进入文件页")
+                        self.code_result.emit(True, "已进入文件页")
+                        self.refresh_state()
+                        return
+                    # 还在提取码页且没报错：兜底点一次「查看文件」再判
+                    self._run(login.js_click_view(),
+                              lambda _r: QTimer.singleShot(1500, check2))
+                self._run(login.js_share_code_state(), got)
+
+            def step_fill(res):
+                st = self._parse(res)
+                if not st.get("ok"):
+                    msg = st.get("msg") or "填入提取码失败"
+                    self._set_status(msg)
+                    self.code_result.emit(False, msg)
+                    return
+                QTimer.singleShot(1800, check1)
+
+            self._run(login.js_fill_share_code(code), step_fill)
+
+        def _on_share_page(self):
+            try:
+                u = self.view.url().toString()
+            except Exception:
+                return False
+            return bool(u) and not login.is_login_url(u)
+
         def do_download_all(self):
             self._pending_downloads = 0
             self._run(login.js_download_all(), lambda r: self._after(self._parse(r)))
@@ -408,3 +498,63 @@ else:  # pragma: no cover - 缺组件时的占位
             raise RuntimeError(
                 "未安装可选组件 PyQtWebEngine，UC 网盘窗口不可用（%s）"
                 % (_WEB_IMPORT_ERROR,))
+
+class UcCodeDialog(QDialog):
+    """UC 分享提取码小窗（与百度那套完全独立，只做「收码 → 交给页面」）。
+
+    不依赖 PyQtWebEngine：没有浏览器组件时也能单独弹出（只是提交无处可去）。
+    真机行为：UC 的提取码页填满正确位数后会**自动校验**，不需要再点「查看文件」，
+    所以这里只负责收码，校验结果由 UcBrowserWindow 回写。
+    """
+
+    submitted = pyqtSignal(str)
+
+    def __init__(self, parent=None, url="", hint=""):
+        super().__init__(parent)
+        self.setWindowTitle("UC 提取码")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setFixedSize(460, 150)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 10)
+        lay.setSpacing(8)
+
+        self.url_label = QLabel(str(url or ""))
+        self.url_label.setStyleSheet("color:#888;")
+        self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.url_label)
+
+        row = QHBoxLayout()
+        self.edit = QLineEdit(str(hint or ""))
+        self.edit.setPlaceholderText("输入提取码（4 位字母/数字）")
+        self.edit.setMaxLength(32)
+        self.edit.returnPressed.connect(self._ok)
+        row.addWidget(self.edit, 1)
+        self.btn_ok = QPushButton("填入")
+        self.btn_ok.clicked.connect(self._ok)
+        row.addWidget(self.btn_ok)
+        lay.addLayout(row)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        lay.addWidget(self.status_label)
+
+    def reset(self, url="", hint=""):
+        self.url_label.setText(str(url or ""))
+        self.edit.setText(str(hint or ""))
+        self.edit.selectAll()
+        self.status_label.setText("")
+
+    def set_status(self, text):
+        self.status_label.setText(str(text or ""))
+
+    def _ok(self):
+        code = self.edit.text().strip()
+        if not code:
+            self.set_status("请先输入提取码")
+            return
+        self.set_status("正在填入…")
+        try:
+            self.submitted.emit(code)
+        except Exception as e:
+            self.set_status("提交失败：%s" % e)

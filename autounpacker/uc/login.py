@@ -211,3 +211,50 @@ def js_page_text():
       var t = ((document.body && document.body.innerText) || '').replace(/\s+/g,' ').trim();
       return JSON.stringify({ok:true, text: t.slice(0, 400)});
     """)
+
+
+# ---------------------------------------------------------------------------
+# 提取码（分享密码）页
+#
+# 真机 DOM（fast.uc.cn/s/<id> 有码分享）：
+#   输入框  input.text-input[placeholder="请输入密码"]
+#   按钮    div.view-btn（文本「查看文件」）
+#   填满正确位数后站点**自动校验**（填错误码 2 秒内出现「文件密码有误，请重新输入」），
+#   所以正常路径不需要点「查看文件」；点击只作兜底。
+# ---------------------------------------------------------------------------
+def js_share_code_state():
+    """读提取码页状态：是否需要码、是否有错、是否已进文件页。"""
+    return _wrap(r"""
+      var inp = q('input[placeholder*="密码"]') || q('input.text-input');
+      var body = ((document.body && document.body.innerText) || '').replace(/\s+/g,'');
+      return JSON.stringify({
+        ok: true,
+        need_code: !!inp,
+        error: body.indexOf('文件密码有误') >= 0 ? '文件密码有误' : '',
+        has_files: !!q('.ant-btn.task-footer-down'),
+        url: location.href
+      });
+    """)
+
+
+def js_fill_share_code(code):
+    """把提取码写进分享页输入框（触发 input/change，站点会自动校验）。"""
+    lit = json.dumps(str(code or ""), ensure_ascii=False)
+    return _wrap("""
+      var el = q('input[placeholder*="密码"]') || q('input.text-input');
+      if(!el) return JSON.stringify({ok:false,msg:'当前页面没有提取码输入框'});
+      if(!setVal(el, %s)) return JSON.stringify({ok:false,msg:'写入提取码失败'});
+      try{ el.focus() }catch(e){}
+      return JSON.stringify({ok:true,msg:'已填入提取码'});
+    """ % lit)
+
+
+def js_click_view():
+    """兜底：点「查看文件」（正常情况下填满后站点会自动提交，不需要点）。"""
+    return _wrap(r"""
+      var el = q('.view-btn');
+      if(!el){ el = exact('div,span,button', '查看文件') }
+      if(!el) return JSON.stringify({ok:false,msg:'没找到「查看文件」按钮'});
+      clickIt(el);
+      return JSON.stringify({ok:true,msg:'已点击查看文件'});
+    """)

@@ -3218,6 +3218,8 @@ class MainWindow(QMainWindow):
                 win.status.connect(lambda s: self._append_log("[UC] %s" % s))
                 win.phone_changed.connect(
                     lambda p: self.state.set("uc_phone", str(p or "").strip()))
+                win.code_required.connect(self._on_uc_code_required)
+                win.code_result.connect(self._on_uc_code_result)
             except Exception:
                 pass
             self._uc_window = win
@@ -3232,6 +3234,46 @@ class MainWindow(QMainWindow):
                 win.load_share(url)
             except Exception as e:
                 self._append_log("[UC] 加载分享页失败：%s" % e)
+
+    def _on_uc_code_required(self):
+        """分享页要求提取码 → 弹小窗（与浏览器窗口并存，调试期两个都开着）。"""
+        win = getattr(self, "_uc_window", None)
+        if win is None:
+            return
+        try:
+            from .uc_window import UcCodeDialog
+        except Exception as e:
+            self._append_log("[UC] 提取码小窗不可用：%s" % e)
+            return
+        try:
+            hint = ""
+            try:
+                pws = self.state.all_passwords() or []
+                hint = str(pws[0]) if pws else ""
+            except Exception:
+                hint = ""
+            dlg = getattr(self, "_uc_code_dialog", None)
+            if dlg is None:
+                dlg = UcCodeDialog(self, win.current_share_url(), hint)
+                dlg.submitted.connect(lambda code: win.apply_code(code))
+                self._uc_code_dialog = dlg
+            else:
+                dlg.reset(win.current_share_url(), hint)
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            self._append_log("[UC] 该分享需要提取码，已弹出小窗")
+        except Exception as e:
+            self._append_log("[UC] 提取码小窗打开失败：%s" % e)
+
+    def _on_uc_code_result(self, ok, msg):
+        dlg = getattr(self, "_uc_code_dialog", None)
+        if dlg is not None:
+            try:
+                dlg.set_status(msg)
+            except Exception:
+                pass
+        self._append_log("[UC] 提取码%s：%s" % ("通过" if ok else "失败", msg))
 
     def _on_uc_download(self, url, filename=""):
         """浏览器拦截到下载直链 → 按配置交给 IDM / 默认浏览器 / 剪贴板。"""

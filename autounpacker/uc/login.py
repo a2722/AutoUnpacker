@@ -216,11 +216,12 @@ def js_ensure_agreement():
 
 
 def js_submit():
-    """勾选「我已阅读并同意…」后点登录。
+    """勾选协议 + 提交登录（多候选、按真实点击序列触发）。
 
-    真机坑（登录/注册页）：不勾协议直接点登录会弹红字「勾选同意注册协议，以完成
-    注册」，登录根本不发出。真实 DOM 里复选框是 `#agreement`（点击即可勾上），
-    外面还有 `.div_agreement` 可点区域做兜底。
+    真机坑：登录/注册页的黑色大按钮在不同状态下可能是 `input#submit_btn`，
+    也可能是同文案的 div/span；单纯 `.click()` 在部分框架（Rax/React 合成事件）
+    上会静默无效——用户看到的就是「点了没反应、验证码还留在框里」。
+    这里改成：逐个候选派发 pointerdown/mousedown/pointerup/mouseup/click 全序列。
     """
     return _wrap(r"""
       var cb = q('#agreement');
@@ -228,20 +229,69 @@ def js_submit():
       try { checked = !!(cb && cb.checked) } catch(e) { checked = false }
       if (cb && !checked) {
         clickIt(cb);
-        try {
-          if (!cb.checked) { clickIt(q('.div_agreement')); }
-        } catch(e) {}
+        try { if (!cb.checked) { clickIt(q('.div_agreement')); } } catch(e) {}
       }
       var now = false;
       try { now = !!(cb && cb.checked) } catch(e) { now = false }
-      var el = q('#submit_btn') ||
-               firstByText('input[type=button],input[type=submit]', ['登录/注册','登录']) ||
-               firstByText('button', ['登录/注册','登录']);
-      if(!el) return JSON.stringify({ok:false,msg:'没找到登录按钮'});
-      clickIt(el);
-      return JSON.stringify({ok:true,
-        msg: cb ? (now ? '已勾选协议并点击登录' : '已点击登录（协议未勾上，请手动勾选）')
-                : '已点击登录'});
+
+      function realClick(e){
+        if(!e) return false;
+        var r = null;
+        try { r = e.getBoundingClientRect() } catch(x) {}
+        var opt = {bubbles:true, cancelable:true, view:window,
+                   clientX: r ? (r.x + r.width/2) : 0,
+                   clientY: r ? (r.y + r.height/2) : 0};
+        try {
+          e.dispatchEvent(new PointerEvent('pointerdown', opt));
+          e.dispatchEvent(new MouseEvent('mousedown', opt));
+          e.dispatchEvent(new PointerEvent('pointerup', opt));
+          e.dispatchEvent(new MouseEvent('mouseup', opt));
+          e.dispatchEvent(new MouseEvent('click', opt));
+          return true;
+        } catch(x) { try { e.click(); return true } catch(y) { return false } }
+      }
+
+      var cands = [];
+      var s1 = q('#submit_btn'); if (s1) cands.push(s1);
+      var s2 = q('.btn_submit') || q('.submit-btn') || q('.btn.login-btn');
+      if (s2 && cands.indexOf(s2) < 0) cands.push(s2);
+      var t1 = exact('div,span,button,a', '登录/注册');
+      if (t1 && cands.indexOf(t1) < 0) cands.push(t1);
+      var t2 = exact('div,span,button,a', '登录');
+      if (t2 && cands.indexOf(t2) < 0) cands.push(t2);
+      if (!cands.length) return JSON.stringify({ok:false,msg:'没找到登录按钮'});
+
+      var tried = [];
+      for (var i=0;i<cands.length;i++){
+        try {
+          var rect = cands[i].getBoundingClientRect();
+          if (rect.width === 0 && rect.height === 0) { tried.push('skip-hidden'); continue }
+        } catch(x) {}
+        realClick(cands[i]);
+        tried.push(cands[i].tagName.toLowerCase() + (cands[i].id ? '#' + cands[i].id : ''));
+      }
+      return JSON.stringify({ok:true, tried:tried,
+        msg: now ? '已勾选协议并点击登录' : '已点击登录（协议未勾上，请手动勾选）'});
+    """)
+
+
+def js_submit_alt():
+    """提交的兜底手段：在验证码框里按 Enter（表单原生提交）+ 再点一次按钮。"""
+    return _wrap(r"""
+      var inp = q('#sms_code');
+      if (inp) {
+        try {
+          inp.focus();
+          ['keydown','keypress','keyup'].forEach(function(t){
+            inp.dispatchEvent(new KeyboardEvent(t, {key:'Enter', code:'Enter',
+              keyCode:13, which:13, bubbles:true, cancelable:true}));
+          });
+        } catch(e) {}
+      }
+      var el = exact('div,span,button,a', '登录/注册') || exact('div,span,button,a', '登录');
+      var ok = false;
+      if (el) { try { el.click(); ok = true } catch(e) {} }
+      return JSON.stringify({ok:ok, msg: ok ? '已用 Enter/兜底点击重试' : '兜底点击失败'});
     """)
 
 
@@ -323,4 +373,29 @@ def js_click_view():
       if(!el) return JSON.stringify({ok:false,msg:'没找到「查看文件」按钮'});
       clickIt(el);
       return JSON.stringify({ok:true,msg:'已点击查看文件'});
+    """)
+
+def js_debug_dump():
+    """诊断用：把登录页当前的输入框/按钮/可见文案全量吐出来（只读）。"""
+    return _wrap(r"""
+      var vis = function(e){ try { var r=e.getBoundingClientRect(); return r.width>0 && r.height>0 } catch(x){ return false } };
+      var inputs = Array.prototype.slice.call(document.querySelectorAll('input'))
+        .map(function(e){ return {id:e.id, type:e.type, ph:e.placeholder||'',
+                                  val:String(e.value||'').slice(0,12), vis:vis(e), dis:!!e.disabled} })
+        .filter(function(x){ return x.type !== 'hidden' });
+      var btns = [];
+      ['#submit_btn','.btn_submit','.submit-btn','.btn'].forEach(function(s){
+        var e=null; try { e=document.querySelector(s) } catch(x){}
+        if (e) btns.push({sel:s, tag:e.tagName.toLowerCase(), vis:vis(e),
+                          dis:!!e.disabled, txt:String(e.innerText||e.value||'').trim().slice(0,20)});
+      });
+      var texts = Array.prototype.slice.call(document.querySelectorAll('div,span,button,a'))
+        .filter(function(e){ var t=String(e.innerText||'').trim();
+                             return (t==='登录' || t==='登录/注册') && vis(e) })
+        .slice(0,5)
+        .map(function(e){ return {tag:e.tagName.toLowerCase(),
+                                  cls:String(e.className||'').slice(0,30)} });
+      var body = String((document.body && document.body.innerText) || '').replace(/\s+/g,' ');
+      return JSON.stringify({url:String(location.href).slice(-60), inputs:inputs,
+                             btns:btns, submit_texts:texts, body:body.slice(0,120)});
     """)

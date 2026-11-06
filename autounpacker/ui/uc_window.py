@@ -19,6 +19,7 @@
    （交给 IDM / 默认浏览器 / 剪贴板），不让浏览器自己落盘。
 4. 滑块一律由用户手动拖；本模块只负责「填号、点获取验证码、填码、点登录、点全部下载」。
 """
+import json
 import time
 
 from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal  # noqa: E402
@@ -210,6 +211,25 @@ if WEB_OK:
                 QTimer.singleShot(600, self._ensure_agreement)
             QTimer.singleShot(1500, self.refresh_state)
 
+        def _dbg(self, msg):
+            """诊断日志：直接走 status 信号（主窗口会加 [UC] 前缀写进运行日志）。
+
+            与 _set_status 的区别：不做去重、不改状态行文本，专门用来观察
+            「点登录后到底发生了什么」。
+            """
+            try:
+                self.status.emit("DBG " + str(msg)[:400])
+            except Exception:
+                pass
+
+        def _dump(self, tag, cb=None):
+            """把页面当前输入框/按钮状态打进日志，再执行后续动作。"""
+            def got(res):
+                self._dbg("%s | %s" % (tag, res))
+                if cb is not None:
+                    cb(res)
+            self._run(login.js_debug_dump(), got)
+
         def _ensure_agreement(self, then=None):
             """自动勾选同意协议；失败时把原因显示出来（用户可手动勾）。"""
             def got(res):
@@ -381,40 +401,61 @@ if WEB_OK:
 
             def after_submit(res):
                 st = self._parse(res)
+                self._dbg("submit 返回: %s" % (res if isinstance(res, str) else ""))
                 if not st.get("ok"):
                     self._set_status("点登录失败：%s" % st.get("msg"))
                     return
                 self._last_submit_at = time.time()
                 self._set_status("已提交登录，等待结果…")
-                QTimer.singleShot(1200, lambda: self._poll_login_result(3))
+                self._dump("提交后",
+                           lambda _r: QTimer.singleShot(
+                               1200, lambda: self._poll_login_result(3, code)))
 
             def step_fill(res):
                 st = self._parse(res)
+                self._dbg("fill_code 返回: %s | code=%s" % (res, code))
                 if not st.get("ok"):
                     self._set_status("填验证码失败：%s" % st.get("msg"))
                     return
                 self._run(login.js_submit(), after_submit)
 
-            self._run(login.js_fill_code(code), step_fill)
+            self._dump("提交前",
+                       lambda _r: self._run(login.js_fill_code(code), step_fill))
 
-        def _poll_login_result(self, left):
-            """提交后读页面：报错就明说，跳走了就回分享页，都不行才等下一轮。"""
+        def _poll_login_result(self, left, code=""):
+            """提交后读页面：报错就明说，跳走了就回分享页，都不行才等下一轮。
+
+            额外兜底：验证码**还留在输入框里**说明提交根本没触发（真机踩过：
+            按钮是 div/span，普通 .click() 被合成事件吞掉）——此时改用
+            Enter 键 + 兜底点击再试一次，而不是干等。
+            """
             if not self._on_login_page():
                 self._back_to_share()
                 return
 
             def got(res):
+                self._dbg("poll(%d) | %s" % (left, res))
                 st = self._parse(res)
                 err = (st.get("error") or "").strip()
                 if err:
                     self._set_status("登录未成功：%s（可重新获取验证码再试）" % err)
                     self.refresh_state()
                     return
+                still_there = (st.get("code_value") or "").strip()
+                if left == 3 and still_there:
+                    self._set_status("提交似乎没触发（验证码仍在框里），改用 Enter 重试…")
+                    self._dbg("验证码仍在框里 → 改用 Enter/兜底点击")
+                    self._run(
+                        login.js_submit_alt(),
+                        lambda _r: QTimer.singleShot(
+                            1200, lambda: self._poll_login_result(2, code)))
+                    return
                 if left <= 0:
-                    self._set_status("已提交但页面既没报错也没跳转，请手动看一眼")
+                    self._set_status("已提交但页面既没报错也没跳转，"
+                                     "请手动点页面上的「登录/注册」")
                     self.refresh_state()
                     return
-                QTimer.singleShot(1200, lambda: self._poll_login_result(left - 1))
+                QTimer.singleShot(1200, lambda: self._poll_login_result(left - 1, code))
 
             self._run(login.js_login_error(), got)
 

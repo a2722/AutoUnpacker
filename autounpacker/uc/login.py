@@ -183,6 +183,29 @@ def js_fill_code(code):
     """ % lit)
 
 
+def js_ensure_agreement():
+    """勾上「我已阅读并同意…」复选框（进登录页就勾，别等提交时才补）。
+
+    真机 DOM：`#agreement`（16x16，可见），外层可点区域 `.div_agreement`。
+    不勾时点「登录/注册」只会弹红字「勾选同意注册协议，以完成注册」。
+    """
+    return _wrap(r"""
+      var cb = q('#agreement') || q('input[type=checkbox][name*=agree]');
+      if(!cb) return JSON.stringify({ok:true, checked:false, before:false,
+                                    msg:'页面上没有同意协议勾选框'});
+      var before = false;
+      try { before = !!cb.checked } catch(e) { before = false }
+      if (!before) {
+        clickIt(cb);
+        try { if (!cb.checked) { clickIt(q('.div_agreement')); } } catch(e) {}
+      }
+      var now = false;
+      try { now = !!cb.checked } catch(e) { now = false }
+      return JSON.stringify({ok:true, checked:now, before:before,
+        msg: now ? '已勾选同意协议' : '勾选协议失败，请手动勾选'});
+    """)
+
+
 def js_submit():
     """勾选「我已阅读并同意…」后点登录。
 

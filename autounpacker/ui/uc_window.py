@@ -203,7 +203,22 @@ if WEB_OK:
 
         def _on_load_finished(self, ok):
             self._set_status("页面已加载" if ok else "页面加载失败（检查网络）")
+            if ok and self._on_login_page():
+                # 进登录页就把「已阅读并同意」勾上（不勾的话点登录只弹红字）
+                QTimer.singleShot(600, self._ensure_agreement)
             QTimer.singleShot(1500, self.refresh_state)
+
+        def _ensure_agreement(self, then=None):
+            """自动勾选同意协议；失败时把原因显示出来（用户可手动勾）。"""
+            def got(res):
+                st = self._parse(res)
+                if st.get("checked"):
+                    self._set_status("已自动勾选「已阅读并同意」")
+                elif st.get("msg"):
+                    self._set_status(st.get("msg"))
+                if then is not None:
+                    then()
+            self._run(login.js_ensure_agreement(), got)
 
         def _on_download_requested(self, item):
             """拦截浏览器下载：拿到直链后取消，交给外部下载器。"""
@@ -340,7 +355,9 @@ if WEB_OK:
                 if not st.get("ok"):
                     self._set_status("填手机号失败：%s" % st.get("msg"))
                     return
-                self._run(login.js_send_sms(), step_sms)
+                # 先把协议勾上再请求验证码（红字状态下手动点登录也会被拒）
+                self._ensure_agreement(
+                    then=lambda: self._run(login.js_send_sms(), step_sms))
 
             self._run(login.js_fill_phone(phone), step_fill)
 

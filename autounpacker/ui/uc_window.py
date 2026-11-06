@@ -21,6 +21,7 @@
 """
 import json
 import time
+from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel,  # noqa: E402
@@ -100,6 +101,20 @@ if WEB_OK:
                 prof.setHttpUserAgent(CHROME_UA)
             except Exception:
                 pass
+            # 默认 Profile 是「off-the-record」：不落盘 Cookie/缓存（用 loadAllCookies
+            # 读出来是 0 条）。UC 的登录/风控需要会话 Cookie 在页面跳转间保持，
+            # 调试阶段显式打开持久化，顺带能让登录态跨重启复用（少登录=少风控）。
+            try:
+                from .. import paths
+                store = Path(paths.DATA_DIR) / "uc_profile"
+                (store / "cache").mkdir(parents=True, exist_ok=True)
+                prof.setPersistentStoragePath(str(store))
+                prof.setCachePath(str(store / "cache"))
+                prof.setPersistentCookiesPolicy(
+                    QWebEngineProfile.ForcePersistentCookies)
+                prof.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
+            except Exception as e:
+                self._profile_err = str(e)
 
             self.view = QWebEngineView(self)
             self.view.loadFinished.connect(self._on_load_finished)
@@ -116,6 +131,11 @@ if WEB_OK:
                     self.view.setPage(self._page)
                 except Exception as e:
                     self._page = None
+                    self._js_console_error = str(e)
+                try:
+                    self.view.page().profile().cookieStore().cookieAdded.connect(
+                        self._on_cookie_added)
+                except Exception as e:
                     self._js_console_error = str(e)
 
             self._build_ui(phone)
@@ -237,6 +257,9 @@ if WEB_OK:
             self._set_status("页面已加载" if ok else "页面加载失败（检查网络）")
             if not ok:
                 self.snapshot("加载失败")
+            if not getattr(self, "_profile_logged", False):
+                self._profile_logged = True
+                self._log_profile_state()
             if ok and self._on_login_page():
                 # 进登录页就把「已阅读并同意」勾上（不勾的话点登录只弹红字）
                 QTimer.singleShot(600, self._ensure_agreement)
@@ -268,6 +291,29 @@ if WEB_OK:
             except Exception:
                 lv = str(level)
             self._dbg("JS[%s] %s (%s:%s)" % (lv, str(message)[:200], source, line))
+
+        def _on_cookie_added(self, cookie):
+            """实时记录新写入的 Cookie（只记域名/名字/是否会话，不记值）。"""
+            try:
+                self._cookie_count = getattr(self, "_cookie_count", 0) + 1
+                if self._cookie_count <= 40:
+                    self._dbg("Cookie+ %s/%s%s" % (
+                        cookie.domain(), cookie.name(),
+                        " (会话)" if cookie.isSessionCookie() else ""))
+            except Exception:
+                pass
+
+        def _log_profile_state(self):
+            """记录 WebEngine Profile 的关键状态（是否 OTR / Cookie 是否落盘）。"""
+            try:
+                pr = self.view.page().profile()
+                self._dbg("Profile: offTheRecord=%s cookiePolicy=%s storage=%s cache=%s" % (
+                    pr.isOffTheRecord(), int(pr.persistentCookiesPolicy()),
+                    pr.persistentStoragePath(), pr.cachePath()))
+            except Exception as e:
+                self._dbg("Profile 信息读取失败: %s" % e)
+            if getattr(self, "_profile_err", ""):
+                self._dbg("Profile 配置异常: %s" % self._profile_err)
 
         def _debug_dir(self):
             try:

@@ -225,14 +225,19 @@ def js_submit():
     """
     return _wrap(r"""
       var cb = q('#agreement');
-      var checked = false;
-      try { checked = !!(cb && cb.checked) } catch(e) { checked = false }
-      if (cb && !checked) {
-        clickIt(cb);
-        try { if (!cb.checked) { clickIt(q('.div_agreement')); } } catch(e) {}
-      }
-      var now = false;
-      try { now = !!(cb && cb.checked) } catch(e) { now = false }
+      // 强制勾上：页面的 validAgreement() 用 jQuery 的 :checked 判断，
+      // 单纯 click 有时会被自定义控件翻回去；
+      // 这里直接置 checked 并补发 change，再校验一遍 :checked 是否命中。
+      try {
+        if (cb) {
+          if (!cb.checked) { clickIt(cb); }
+          if (!cb.checked) { cb.checked = true; }
+          cb.dispatchEvent(new Event('change', {bubbles:true}));
+        }
+      } catch(e) {}
+      var checkedCount = 0;
+      try { checkedCount = document.querySelectorAll("input[name='agreement']:checked").length } catch(e) {}
+      var now = checkedCount > 0;
 
       function realClick(e){
         if(!e) return false;
@@ -270,7 +275,7 @@ def js_submit():
         realClick(cands[i]);
         tried.push(cands[i].tagName.toLowerCase() + (cands[i].id ? '#' + cands[i].id : ''));
       }
-      return JSON.stringify({ok:true, tried:tried,
+      return JSON.stringify({ok:true, tried:tried, agreement_ok: now,
         msg: now ? '已勾选协议并点击登录' : '已点击登录（协议未勾上，请手动勾选）'});
     """)
 
@@ -392,7 +397,9 @@ def js_debug_dump():
       var vis = function(e){ try { var r=e.getBoundingClientRect(); return r.width>0 && r.height>0 } catch(x){ return false } };
       var inputs = Array.prototype.slice.call(document.querySelectorAll('input'))
         .map(function(e){ return {id:e.id, type:e.type, ph:e.placeholder||'',
-                                  val:String(e.value||'').slice(0,12), vis:vis(e), dis:!!e.disabled} })
+                                  val:String(e.value||'').slice(0,12), vis:vis(e),
+                                  dis:!!e.disabled,
+                                  chk:(e.type==='checkbox' ? !!e.checked : undefined)} })
         .filter(function(x){ return x.type !== 'hidden' });
       var btns = [];
       ['#submit_btn','.btn_submit','.submit-btn','.btn'].forEach(function(s){
@@ -460,4 +467,29 @@ def js_submit_inline():
       }
       try { fn.call(b, {type:'click', target:b}); return JSON.stringify({ok:true, msg:'已直接调用 onclick'}) }
       catch(e) { return JSON.stringify({ok:false, msg:'调用 onclick 异常: '+e}) }
+    """)
+
+def js_precheck():
+    """提交前把各个门卫条件读出来（页面 submitForm 的门槛逐条对齐）。"""
+    return _wrap(r"""
+      var cb = q('#agreement');
+      var phoneEl = q('#login_name');
+      var codeEl = q('#sms_code');
+      var msg = q('#message');
+      var checkedSel = 0;
+      try { checkedSel = document.querySelectorAll("input[name='agreement']:checked").length } catch(e) {}
+      return JSON.stringify({
+        ok: true,
+        agreement_in_dom: !!cb,
+        agreement_checked_prop: !!(cb && cb.checked),
+        agreement_checked_selector: checkedSel,
+        phone: phoneEl ? String(phoneEl.value||'') : '',
+        phone_len: phoneEl ? String(phoneEl.value||'').length : 0,
+        code: codeEl ? String(codeEl.value||'') : '',
+        code_len: codeEl ? String(codeEl.value||'').length : 0,
+        has_captcha_id: !!q('#captcha_id'),
+        has_cwk_data: !!q('#cwk_data'),
+        message: msg ? String(msg.innerText||'') : '',
+        message_visible: msg ? (msg.getBoundingClientRect().height > 0) : false
+      });
     """)

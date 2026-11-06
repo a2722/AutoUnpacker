@@ -564,7 +564,11 @@ if WEB_OK:
                 if not st.get("ok"):
                     self._set_status("填验证码失败：%s" % st.get("msg"))
                     return
-                self._run(login.js_submit(), after_submit)
+
+                def pre(res2):
+                    self._dbg("precheck | %s" % res2)
+                    self._run(login.js_submit(), after_submit)
+                self._run(login.js_precheck(), pre)
 
             self._dump("提交前",
                        lambda _r: self._run(

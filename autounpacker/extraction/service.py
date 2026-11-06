@@ -6,6 +6,7 @@
 依赖：formats（探测/分卷判定）、engines（双引擎/错误归类）、post（提升/删除/staging）、
       ..passwords.resolution（密码候选与字典）。
 """
+import os
 import shutil
 import tempfile
 import time
@@ -20,7 +21,7 @@ from .formats import (_series_base, _volume_number, analyze_file,
                       detect_format_by_magic, find_sevenzip_path, is_archive_file,
                       is_do_not_extract, is_fake_volume_name, is_first_volume,
                       is_split_gap_error, is_volume_file, is_volume_name,
-                      should_skip_volume)
+                      should_skip_volume, spanned_zip_info)
 from .post import (_recycle_paths, _stage_rar_volumes, is_clean_success,
                    remove_empty_dirs, strip_embedded_zip, unique_dest_path)
 
@@ -69,6 +70,9 @@ class ExtractService:
         self.logs = []
         self.layer_records = []
         self.temp_dirs = set()
+        # staging 临时目录（RAR 规范化 / 跨卷 ZIP 重组）；extract() 每轮重新置空，
+        # 这里也初始化一次，保证方法可被单独调用（测试/复用）时不缺属性。
+        self.stage_dirs = []
         # 每个队列条目一个临时目录的自增序号（见 _make_temp）：同层可能解出
         # 多个归档，各条目必须各用各的目录，绝不互相清场。
         self._temp_seq = 0
@@ -167,6 +171,121 @@ class ExtractService:
         except Exception:
             pass
         return Path(tempfile.gettempdir())
+
+    def _locate_volume(self, name, roots, depth):
+        """在候选根目录里找某个分卷文件：先直系子项，再下探一层子目录。
+
+        下探一层是给「每卷各自解到同名子目录」的布局（E:\\x\\B4303.z01\\B4303.z01）。
+        只扫深度 1、限量、跳过回收站/临时目录前缀，避免在超大目录里卡住。
+        """
+        for root in roots:
+            try:
+                direct = root / name
+                if direct.is_file():
+                    return direct
+            except OSError:
+                pass
+            try:
+                it = root.iterdir()
+            except OSError:
+                continue
+            for n, sub in enumerate(it):
+                if n >= 800:
+                    break
+                try:
+                    if not sub.is_dir() or sub.name.startswith(("_", ".")):
+                        continue
+                    cand = sub / name
+                    if cand.is_file():
+                        return cand
+                except OSError:
+                    continue
+        return None
+
+    def _stage_spanned_zip(self, archive, span, depth):
+        """把散落的跨卷 ZIP 重组成 7-Zip 认得的 `<base>.zip` + `<base>.z01…`。
+
+        7-Zip 判断「跨卷 zip」只看**文件名**（`.zip` + `.z01`），不看内容：
+        末卷被改名成 `.MOV` 时报 "Cannot open the file as archive"，哪怕
+        全套卷就在旁边也一样。这里用硬链接把主卷挂成 `.zip`、各卷挂成 `.zNN`
+        放进临时目录再解，原文件一个不动、零拷贝。
+
+        卷凑不齐 / 大小不一致 / 跨盘无法硬链接 → 返回 None（绝不隐式复制
+        几十 GB）。成功返回临时目录里的主卷路径。
+        """
+        base = Path(archive).stem
+        need = int((span or {}).get("volumes") or 0) - 1
+        if need <= 0:
+            return None
+        roots = []
+        cur = Path(archive).parent
+        for _ in range(3):
+            if cur not in roots:
+                roots.append(cur)
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        found = {}
+        for i in range(1, need + 1):
+            hit = self._locate_volume("%s.z%02d" % (base, i), roots, depth)
+            if hit is None:
+                self.emit(f"[第{depth}层] 跨卷 zip 缺卷 {base}.z{i:02d}"
+                          f"（已找到 {len(found)}/{need} 卷），跳过重组")
+                return None
+            found[i] = hit
+        sizes = set()
+        for p in found.values():
+            try:
+                sizes.add(p.stat().st_size)
+            except OSError:
+                return None
+        if len(sizes) != 1 or 0 in sizes:
+            self.emit(f"[第{depth}层] 跨卷 zip 各卷大小不一致，跳过重组")
+            return None
+        try:
+            stage = Path(tempfile.mkdtemp(prefix="spanzip_", dir=str(self.temp_root)))
+        except OSError as e:
+            self.emit(f"[第{depth}层] 跨卷 zip 暂存目录创建失败: {e}")
+            return None
+        self.stage_dirs.append(stage)
+        try:
+            os.link(str(archive), str(stage / ("%s.zip" % base)))
+            for i, src in found.items():
+                os.link(str(src), str(stage / ("%s.z%02d" % (base, i))))
+        except OSError as e:
+            # 跨盘符时硬链接不可用：宁可不做，也不偷偷复制几十 GB
+            self.emit(f"[第{depth}层] 跨卷 zip 暂存失败（无法硬链接，可能跨盘）: {e}")
+            return None
+        self.emit(f"[第{depth}层] 跨卷 zip 已归拢 {need} 个分卷，"
+                  f"主卷改名为 {base}.zip（硬链接，零拷贝）")
+        return stage / ("%s.zip" % base)
+
+    def _retry_spanned_zip(self, result, archive, layer_task, depth):
+        """跨卷 ZIP 解压失败后的自愈重试。返回 (result, gap)。
+
+        gap=True 表示「确认是多卷 zip，但卷没凑齐/不一致」：调用方据此走
+        「分卷链不完整」语义（首层保留源文件、嵌套层留锚点等补齐），而不是
+        当成普通损坏吞掉。非跨卷包一律原样返回 (result, False)。
+        """
+        try:
+            span = spanned_zip_info(archive)
+        except Exception:
+            span = None
+        if not span or int(span.get("volumes") or 1) <= 1:
+            return result, False
+        staged = self._stage_spanned_zip(archive, span, depth)
+        if staged is None:
+            return result, True
+        retry_task = dict(layer_task)
+        retry_task["source_path"] = staged
+        try:
+            r2 = self.engine.extract(retry_task, self.options, depth)
+        except Exception as e:
+            self.emit(f"[第{depth}层] 跨卷 zip 重组后解压异常: {e}")
+            return result, False
+        if r2.get("success"):
+            self.emit(f"[第{depth}层] 跨卷 zip 重组后解压成功（{span['volumes']} 卷）")
+        return r2, False
 
     def _extract_inner(self, task):
         task_id = task["id"]
@@ -295,6 +414,15 @@ class ExtractService:
                 }
             else:
                 result = self.engine.extract(layer_task, self.options, depth)
+            # 跨卷 ZIP 自愈（真机案例 B4303）：末卷 + .z01… 只认「<base>.zip +
+            # <base>.zNN」这套命名，主文件被压成 .MOV 时 7-Zip 直接
+            # "Cannot open the file as archive"；网盘把每卷各包一层再各解到子
+            # 目录时，卷还会散落成兄弟文件夹。这里只在**确实失败**的 zip 上尝试
+            # 「找卷 → 硬链接改名 → 重试」，正常包走原路径、行为零变化。
+            span_gap = False
+            if not result["success"] and info.get("detected_format") == "zip":
+                result, span_gap = self._retry_spanned_zip(
+                    result, item["archive"], layer_task, depth)
             if (not result["success"]
                     and info["detected_format"] == "zip"
                     and isinstance(self.engine, SevenZipEngine)
@@ -384,8 +512,9 @@ class ExtractService:
                 if depth == 1:
                     self.emit(f"[第{depth}层] 解压失败: {result['error']}")
                     # 首卷打不开/被截断 ⇒ 分卷链不完整（缺兄弟分卷），不是终态失败
-                    split_incomplete = (root_is_first_volume
-                                        and is_archive_open_error(result_raw_error(result)))
+                    split_incomplete = ((root_is_first_volume
+                                         and is_archive_open_error(result_raw_error(result)))
+                                        or span_gap)
                     if split_incomplete:
                         self.emit(f"[第{depth}层] 分卷链不完整（缺少兄弟分卷，"
                                   f"首卷拼出的载荷不是有效归档），保留源文件等待到齐")
@@ -428,7 +557,8 @@ class ExtractService:
                 # 报 "Missing volume" 说明归档自身元数据已声明是多卷（缺 .z01/.r00
                 # 兄弟卷）。因此把 "Missing volume" 作为独立的判定依据。截断的独立
                 # zip 只报 Unexpected end of archive，不会误入此分支。
-                is_split_gap = is_split_gap_error(item["archive"].name, err_text)
+                is_split_gap = (is_split_gap_error(item["archive"].name, err_text)
+                                or span_gap)
                 if is_split_gap:
                     self.emit(f"[第{depth}层] 嵌套分卷缺卷（{err_text[:80]}），整体判失败待重试")
                     self.layer_records.append({

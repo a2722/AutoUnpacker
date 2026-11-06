@@ -8,6 +8,7 @@
 """
 import re
 import shutil
+import struct
 import zipfile
 from pathlib import Path
 
@@ -573,6 +574,49 @@ def _strip_download_suffix(name):
 def is_volume_name(name):
     """是否为分卷文件名：.001/.002、.z01、xxx.partN.rar 等（含脏字符归一后的）。"""
     return _is_volume_suffix(normalize_volume_name(name))
+
+
+# EOCD 一定落在尾部 64 KiB + 注释范围内；多读一点余量即可覆盖带注释的包。
+_SPAN_EOCD_TAIL = 70000
+
+
+def spanned_zip_info(path):
+    """path 若是「跨卷 ZIP」的某一卷，返回 {"index": 本盘号, "volumes": 总卷数}。
+
+    判定**只看尾部** End of Central Directory（`PK\\x05\\x06`）里的「本盘号 /
+    中央目录起始盘」字段：任一非 0 就是跨卷。不能靠文件头或扩展名——
+    中间卷的头部是任意压缩数据（不是 PK），末卷还可能被改名为 .MOV/.mp4；
+    真机案例 B4303 的末卷头部就完全不是 PK，只有尾部 EOCD 认得出来。
+
+    单卷普通 zip（两字段都是 0）返回 None；解析失败/IO 异常一律 None，绝不抛。
+    """
+    try:
+        p = Path(path)
+        size = p.stat().st_size
+        if size < 22:
+            return None
+        with open(p, "rb") as fh:
+            fh.seek(max(0, size - _SPAN_EOCD_TAIL))
+            tail = fh.read()
+        i = tail.rfind(b"PK\x05\x06")
+        if i < 0 or len(tail) - i < 22:
+            return None
+        disk, cd_disk = struct.unpack("<HH", tail[i + 4:i + 8])
+        if disk == 0xFFFF or cd_disk == 0xFFFF:
+            # Zip64：盘数写在 locator（PK\x06\x07，20 字节）里，紧贴 EOCD 之前
+            li = tail.rfind(b"PK\x06\x07")
+            if li < 0 or len(tail) - li < 20:
+                return None
+            disk64, _off64, total64 = struct.unpack("<IQI", tail[li + 4:li + 20])
+            if total64 <= 1:
+                return None
+            return {"index": int(disk64), "volumes": int(total64)}
+        idx = max(disk, cd_disk)
+        if idx <= 0:
+            return None
+        return {"index": idx, "volumes": idx + 1}
+    except Exception:
+        return None
 
 
 def is_split_gap_error(archive_name, err_text):

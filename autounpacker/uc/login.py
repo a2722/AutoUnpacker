@@ -306,8 +306,19 @@ def js_login_error():
       var body = ((document.body && document.body.innerText) || '').replace(/\s+/g,'');
       var m = body.match(/(请先输入短信验证码|请输入短信验证码|短信验证码无效或过期|验证码错误|验证码已失效|操作过于频繁)/);
       var el = q('#sms_code');
+      var nc = q('#nocaptcha') || q('.nc-container') || q('[class*=nc_wrapper]');
+      var ncVis = false;
+      try { var r = nc.getBoundingClientRect(); ncVis = r.width > 0 && r.height > 0 } catch(e) { ncVis = false }
+      var captcha = ncVis
+                    || body.indexOf('请完成安全验证') >= 0
+                    || body.indexOf('请按住滑块') >= 0
+                    || body.indexOf('拖动到最右边') >= 0;
+      var sb = q('#submit_btn');
+      var sbDis = false;
+      try { sbDis = !!(sb && sb.disabled) } catch(e) { sbDis = false }
       return JSON.stringify({ok:true, error: m ? m[1] : '',
-                             code_value: el ? (el.value || '') : ''});
+                             code_value: el ? (el.value || '') : '',
+                             captcha: captcha, submit_disabled: sbDis});
     """)
 
 
@@ -396,6 +407,11 @@ def js_debug_dump():
         .map(function(e){ return {tag:e.tagName.toLowerCase(),
                                   cls:String(e.className||'').slice(0,30)} });
       var body = String((document.body && document.body.innerText) || '').replace(/\s+/g,' ');
+      var nc = null; try { nc = document.querySelector('#nocaptcha') } catch(x) {}
+      var ncVis = false;
+      try { var rr = nc.getBoundingClientRect(); ncVis = rr.width > 0 && rr.height > 0 } catch(x) { ncVis = false }
+      var captcha = ncVis || body.indexOf('请完成安全验证') >= 0 || body.indexOf('请按住滑块') >= 0;
       return JSON.stringify({url:String(location.href).slice(-60), inputs:inputs,
-                             btns:btns, submit_texts:texts, body:body.slice(0,120)});
+                             btns:btns, submit_texts:texts, captcha:captcha,
+                             body:body.slice(0,120)});
     """)

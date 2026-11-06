@@ -422,12 +422,12 @@ if WEB_OK:
             self._dump("提交前",
                        lambda _r: self._run(login.js_fill_code(code), step_fill))
 
-        def _poll_login_result(self, left, code=""):
+        def _poll_login_result(self, left, code="", captcha_wait=0):
             """提交后读页面：报错就明说，跳走了就回分享页，都不行才等下一轮。
 
-            额外兜底：验证码**还留在输入框里**说明提交根本没触发（真机踩过：
-            按钮是 div/span，普通 .click() 被合成事件吞掉）——此时改用
-            Enter 键 + 兜底点击再试一次，而不是干等。
+            额外兜底：
+            - 出现安全验证滑块（连点太多次会被风控）→ 提示用户手动拖，继续等；
+            - 验证码**还留在输入框里**且没有滑块 → 说明提交没触发，用 Enter 再试一次。
             """
             if not self._on_login_page():
                 self._back_to_share()
@@ -436,6 +436,15 @@ if WEB_OK:
             def got(res):
                 self._dbg("poll(%d) | %s" % (left, res))
                 st = self._parse(res)
+                if st.get("captcha"):
+                    self._set_status("检测到安全验证：请把滑块拖到最右边（拖完会自动继续）")
+                    if captcha_wait < 30:
+                        QTimer.singleShot(
+                            2000, lambda: self._poll_login_result(
+                                left, code, captcha_wait + 1))
+                    else:
+                        self._set_status("安全验证一直未完成：请手动拖滑块后再点「登录」")
+                    return
                 err = (st.get("error") or "").strip()
                 if err:
                     self._set_status("登录未成功：%s（可重新获取验证码再试）" % err)

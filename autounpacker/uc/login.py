@@ -184,14 +184,32 @@ def js_fill_code(code):
 
 
 def js_submit():
-    """点「登录」。"""
+    """勾选「我已阅读并同意…」后点登录。
+
+    真机坑（登录/注册页）：不勾协议直接点登录会弹红字「勾选同意注册协议，以完成
+    注册」，登录根本不发出。真实 DOM 里复选框是 `#agreement`（点击即可勾上），
+    外面还有 `.div_agreement` 可点区域做兜底。
+    """
     return _wrap(r"""
+      var cb = q('#agreement');
+      var checked = false;
+      try { checked = !!(cb && cb.checked) } catch(e) { checked = false }
+      if (cb && !checked) {
+        clickIt(cb);
+        try {
+          if (!cb.checked) { clickIt(q('.div_agreement')); }
+        } catch(e) {}
+      }
+      var now = false;
+      try { now = !!(cb && cb.checked) } catch(e) { now = false }
       var el = q('#submit_btn') ||
-               firstByText('input[type=button],input[type=submit]', ['登录']) ||
-               firstByText('button', ['登录']);
+               firstByText('input[type=button],input[type=submit]', ['登录/注册','登录']) ||
+               firstByText('button', ['登录/注册','登录']);
       if(!el) return JSON.stringify({ok:false,msg:'没找到登录按钮'});
       clickIt(el);
-      return JSON.stringify({ok:true,msg:'已点击登录'});
+      return JSON.stringify({ok:true,
+        msg: cb ? (now ? '已勾选协议并点击登录' : '已点击登录（协议未勾上，请手动勾选）')
+                : '已点击登录'});
     """)
 
 

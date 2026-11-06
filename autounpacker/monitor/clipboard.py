@@ -939,6 +939,13 @@ class QRMonitor(threading.Thread):
                 # 链接是给网盘客户端下载整包用的，不是给浏览器看的网页。
                 if cfg.get("experimental_enabled") and self._handle_baidu_share(text):
                     continue
+                # 实验性：UC 分享页（与百度链路完全独立）。同样必须**先于**打开
+                # 浏览器判定：二维码/截图里解出的 fast/drive.uc.cn 分享页要交给
+                # 内嵌窗口，绝不能丢给默认浏览器（这正是 2.2.34 漏掉的一条入口）。
+                # 双开关门控，任一关闭时行为与改动前逐字节一致。
+                if (cfg.get("experimental_enabled") and cfg.get("uc_web_enabled")
+                        and self._handle_uc_share(text)):
+                    continue
                 url = self._extract_url(text)
                 if not url:
                     # 情况A：无链接（普通内容 / 多链接）。内容里若含提取码，
@@ -1078,12 +1085,33 @@ class QRMonitor(threading.Thread):
         self.hub.log("已开启实验性：pan.baidu 网址改走静默通道，不在浏览器打开")
         return True
 
+    def _uc_open_blocked(self, url):
+        """实验性 UC 链路开启时，UC 分享页一律改投内嵌窗口（True=已接管）。
+
+        与 `_baidu_open_blocked` 同构的兜底：任何残余路径（信任放行、以后的
+        新调用点）走到 `_open_browser` 时都不会把 UC 分享页交给默认浏览器。
+        配置/状态读不到或异常时一律按「不接管」处理，绝不打断既有流程。"""
+        try:
+            cfg = self.state.snapshot()
+            if not cfg.get("experimental_enabled"):
+                return False
+            if not cfg.get("uc_web_enabled"):
+                return False
+            from ..uc import detect as _uc_detect
+            if not _uc_detect.is_uc_share_url(url):
+                return False
+        except Exception:
+            return False
+        return self._handle_uc_share(url)
+
     def _open_browser(self, url):
         """在默认浏览器打开网址（供信任放行后执行）。
 
         UX-4：实验性开启时 pan.baidu 显式打开被总开关封禁（静默通道），
         只记一行说明、绝不调用 webbrowser。"""
         try:
+            if self._uc_open_blocked(url):
+                return
             if self._baidu_open_blocked(url):
                 return
             self.hub.log(f"识别到二维码 URL: {url}，正在打开...")
@@ -1399,6 +1427,18 @@ class QRMonitor(threading.Thread):
         # 的网址再访问，否则空格/中文会让 urllib 抛 "URL can't contain control
         # characters"（用户反馈的 drive.uc.cn 提取码场景）。
         if not (text or "").strip().lower().startswith(("http://", "https://")):
+            # 实验性 UC：真实复制的内容常带前缀（「26.11.01：https://… 码：abcd」），
+            # 链接不在开头 → 老逻辑直接 return，UC 通路根本看不到这条文本。这里在
+            # 双开关都开时给 UC 一次机会；_handle_uc_share 内部自行截 URL，非 UC
+            # 文本一律返回 False，因此非 UC 行为与改动前完全一致。
+            try:
+                _cfg0 = self.state.snapshot()
+                if (_cfg0.get("experimental_enabled")
+                        and _cfg0.get("uc_web_enabled")
+                        and self._handle_uc_share(text)):
+                    return
+            except Exception:
+                pass
             return
         raw = text            # 整段原文（可能含「提取码：XXXX」，分享链路要用）
         url = self._extract_url(text)

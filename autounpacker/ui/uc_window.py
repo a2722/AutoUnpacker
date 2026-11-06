@@ -510,9 +510,7 @@ if WEB_OK:
                     return
                 self._last_submit_at = time.time()
                 self._set_status("已提交登录，等待结果…")
-                self._dump("提交后",
-                           lambda _r: QTimer.singleShot(
-                               1200, lambda: self._poll_login_result(3, code)))
+                QTimer.singleShot(900, lambda: self._check_submit_called(code))
 
             def step_fill(res):
                 st = self._parse(res)
@@ -523,7 +521,52 @@ if WEB_OK:
                 self._run(login.js_submit(), after_submit)
 
             self._dump("提交前",
-                       lambda _r: self._run(login.js_fill_code(code), step_fill))
+                       lambda _r: self._run(
+                           login.js_instrument_submit(),
+                           lambda _r2: self._run(
+                               login.js_fill_code(code), step_fill)))
+
+        def _check_submit_called(self, code):
+            """点击后看 submitForm 有没有真的被调到（QtWebEngine 里踩到过没进处理器）。"""
+            def got(res):
+                st = self._parse(res)
+                calls = 0
+                try:
+                    calls = int(st.get("calls") or 0)
+                except Exception:
+                    calls = 0
+                self._dbg("submitForm calls=%d args=%s err=%s"
+                          % (calls, st.get("args"), st.get("err")))
+                if calls > 0:
+                    self._dump("提交后",
+                               lambda _r: QTimer.singleShot(
+                                   800, lambda: self._poll_login_result(3, code)))
+                    return
+                # 点击没进页面处理器 → 直接调用按钮的 onclick（等价于页面自己提交）
+                self._set_status("点击没进页面处理器，改为直接调用页面提交…")
+                self._run(login.js_submit_inline(),
+                          lambda _r: QTimer.singleShot(
+                              900, lambda: self._check_inline(code)))
+            self._run(login.js_submit_count(), got)
+
+        def _check_inline(self, code):
+            def got(res):
+                st = self._parse(res)
+                calls = 0
+                try:
+                    calls = int(st.get("calls") or 0)
+                except Exception:
+                    calls = 0
+                self._dbg("inline 后 submitForm calls=%d" % calls)
+                if calls > 0:
+                    self._dump("内联提交后",
+                               lambda _r: QTimer.singleShot(
+                                   800, lambda: self._poll_login_result(3, code)))
+                    return
+                self._set_status("自动提交无效：验证码已填好，"
+                                 "请手动点页面上的「登录/注册」")
+                self.snapshot("提交无效")
+            self._run(login.js_submit_count(), got)
 
         def _poll_login_result(self, left, code="", captcha_wait=0):
             """提交后读页面：报错就明说，跳走了就回分享页，都不行才等下一轮。

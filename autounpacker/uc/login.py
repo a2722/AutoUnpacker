@@ -415,3 +415,49 @@ def js_debug_dump():
                              btns:btns, submit_texts:texts, captcha:captcha,
                              body:body.slice(0,120)});
     """)
+
+def js_instrument_submit():
+    """给页面的 submitForm 装计数器，用来判断「点击到底有没有进到页面处理器」。
+
+    真机现象：QtWebEngine 里点击后按钮没禁用、验证码没清空、也没有报错——
+    要么事件没进处理器，要么处理器被风控静默拦下。计数器能把两者区分开。
+    """
+    return _wrap(r"""
+      if (typeof window.submitForm === 'function' && !window.__ucSubmitWrapped) {
+        var orig = window.submitForm;
+        window.__ucSubmitCalls = 0;
+        window.submitForm = function(){
+          window.__ucSubmitCalls = (window.__ucSubmitCalls || 0) + 1;
+          window.__ucSubmitLastArgs = Array.prototype.slice.call(arguments).join('|');
+          try { return orig.apply(this, arguments) } catch(e) { window.__ucSubmitErr = String(e); }
+        };
+        window.__ucSubmitWrapped = true;
+      }
+      return JSON.stringify({ok:true, wrapped: !!window.__ucSubmitWrapped,
+                             has: typeof window.submitForm});
+    """)
+
+
+def js_submit_count():
+    """读 submitForm 被调用次数 / 上次参数 / 异常。"""
+    return _wrap(r"""
+      return JSON.stringify({ok:true,
+                             calls: window.__ucSubmitCalls || 0,
+                             args: window.__ucSubmitLastArgs || '',
+                             err: window.__ucSubmitErr || ''});
+    """)
+
+
+def js_submit_inline():
+    """直接执行按钮上的 onclick（等价于页面自己的提交入口，绕过事件分发）。"""
+    return _wrap(r"""
+      var b = q('#submit_btn');
+      if (!b) return JSON.stringify({ok:false, msg:'没有 #submit_btn'});
+      var fn = b.onclick;
+      if (typeof fn !== 'function') {
+        try { b.click(); return JSON.stringify({ok:true, msg:'无 onclick，退回 click()'}) }
+        catch(e) { return JSON.stringify({ok:false, msg:'点击失败: '+e}) }
+      }
+      try { fn.call(b, {type:'click', target:b}); return JSON.stringify({ok:true, msg:'已直接调用 onclick'}) }
+      catch(e) { return JSON.stringify({ok:false, msg:'调用 onclick 异常: '+e}) }
+    """)

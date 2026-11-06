@@ -29,6 +29,24 @@ _PRELUDE = r"""
     var els=qa(sel);
     for(var i=0;i<els.length;i++){ for(var j=0;j<words.length;j++){ if(hasText(els[i],words[j])) return els[i] } }
     return null }
+  /* 取「文本恰好等于 word 且可见」的最内层元素。
+     真机坑：firstByText 用 indexOf 会先命中整个页面容器（div.index-bg 的
+     innerText 也含「登录UC网盘」），点了等于没点；必须找最内层那一个。 */
+  function exact(sel, word){
+    var els=qa(sel), best=null;
+    for(var i=0;i<els.length;i++){
+      var e=els[i];
+      if(norm(e)!==word) continue;
+      try{ if(!(e.getClientRects().length)) continue }catch(x){ continue }
+      var inner=false, kids=e.children||[];
+      for(var k=0;k<kids.length;k++){ if(norm(kids[k])===word){ inner=true; break } }
+      if(!inner) return e;
+      if(!best) best=e;
+    }
+    return best }
+  function frameOf(){ var fs=qa('iframe');
+    for(var i=0;i<fs.length;i++){ var s=fs[i].src||''; if(s.indexOf('api.open.uc.cn')>=0) return fs[i] }
+    return null }
   function setVal(e,v){ if(!e) return false;
     try{ var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
          d.set.call(e,v);
@@ -53,21 +71,42 @@ def _wrap(body):
             "try{" + body + "}catch(e){return JSON.stringify({ok:false,msg:'JS异常: '+e})}})()")
 
 
+# UC 账号中心（CAS）登录页本体。
+#
+# 真机事实：分享页点登录后弹出的面板里，表单在**跨域 iframe**
+# （api.open.uc.cn/cas/custom/login）内，主文档 runJavaScript 拿不到；QWebEngine
+# 也没法在指定子框架里执行脚本。而同一条 URL 单独打开时，`#login_name` /
+# `#sms_code` / `#send_sms_code` / `#submit_btn` 全部在主文档、可直接驱动
+# （已用真实 Edge 验证）。所以登录助手改成：**先把整页导航到这个 URL**，
+# 登录完再回到分享页——cookie 落在 .uc.cn 域，分享页随之变成已登录态。
+LOGIN_URL = ("https://api.open.uc.cn/cas/custom/login"
+             "?custom_login_type=mobile&client_id=519&display=pc")
+
+
+def is_login_url(url):
+    """当前地址是不是 UC 账号中心登录页。"""
+    return "api.open.uc.cn/cas/" in str(url or "")
+
+
 def js_state():
     """探测当前页面状态（只读，不点任何东西）。"""
     return _wrap(r"""
       var dl = q('.ant-btn.task-footer-down') || firstByText('button,a', ['全部下载']);
       var s = loginScope();
+      var box = q('.login-iframe-view');
       var phoneTab = firstByText('.login-item,div,span,button', ['手机登录']);
       var smsBtn = q('#send_sms_code') ||
                    firstByText('a,button,span', ['获取短信验证码','获取验证码']);
       var submit = q('#submit_btn') || firstByText('button,input[type=button],input[type=submit]', ['登录']);
-      var navLogin = firstByText('a,div,span,button', ['登录UC网盘']);
+      var navLogin = exact('div,span,button,a', '登录UC网盘') ||
+                     exact('div,span,button,a', '登录/注册') ||
+                     exact('div,span,button,a', '立即登录');
       return JSON.stringify({
         ok: true,
         url: location.href,
         title: document.title,
-        login_panel: (s !== document),
+        login_panel: (s !== document) || !!(box && box.getClientRects().length),
+        iframe: !!frameOf(),
         nav_login: !!navLogin,
         download_btn: !!dl,
         phone_tab: !!phoneTab,
@@ -80,19 +119,29 @@ def js_state():
 
 
 def js_open_login():
-    """点导航栏「登录UC网盘」，把登录面板叫出来。"""
+    """叫出登录面板。
+
+    真机 DOM：右上角是 `div.nav-item.login-btn`，文本「登录UC网盘」。必须用
+    exact（最内层）点击——父容器 innerText 也含这串字，点到容器等于没点。
+    找不到入口时兜底点「全部下载」：未登录状态下它一定会拉起登录抽屉。
+    """
     return _wrap(r"""
-      var el = firstByText('a,div,span,button', ['登录UC网盘']);
-      if(!el) return JSON.stringify({ok:false,msg:'页面上没找到「登录UC网盘」入口'});
-      clickIt(el);
-      return JSON.stringify({ok:true,msg:'已点击「登录UC网盘」'});
+      var el = exact('div,span,button,a', '登录UC网盘')
+            || exact('div,span,button,a', '登录/注册')
+            || exact('div,span,button,a', '立即登录')
+            || exact('div,span,button,a', '登录');
+      if(el){ clickIt(el); return JSON.stringify({ok:true,msg:'已点击登录入口'}) }
+      var dl = q('.ant-btn.task-footer-down');
+      if(dl){ clickIt(dl); return JSON.stringify({ok:true,msg:'无登录入口，已点「全部下载」拉起登录'}) }
+      return JSON.stringify({ok:false,msg:'页面上没找到登录入口'});
     """)
 
 
 def js_pick_phone_tab():
-    """切到「手机登录」标签页。"""
+    """切到「手机登录」标签（标签在**主文档**里，真正的表单在跨域 iframe 内）。"""
     return _wrap(r"""
-      var el = firstByText('.login-item,div,span,button', ['手机登录']);
+      var el = exact('.login-item', '手机登录')
+            || exact('div,span,li', '手机登录');
       if(!el) return JSON.stringify({ok:false,msg:'没找到「手机登录」标签（可能面板未展开）'});
       clickIt(el);
       return JSON.stringify({ok:true,msg:'已切到手机登录'});

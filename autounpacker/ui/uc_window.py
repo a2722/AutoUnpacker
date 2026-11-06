@@ -169,7 +169,13 @@ if WEB_OK:
 
         # ---------------- 状态 ----------------
         def _set_status(self, text):
+            """更新状态行。**同一句不重复 emit**——2 秒一次的状态轮询否则会把
+            「已就绪：可以点全部下载」刷满日志（真机见过重复 32 次）。"""
+            text = str(text or "")
             self.status_label.setText(text)
+            if text == getattr(self, "_last_status", None):
+                return
+            self._last_status = text
             try:
                 self.status.emit(text)
             except Exception:
@@ -213,6 +219,11 @@ if WEB_OK:
                     pass
 
         def refresh_state(self):
+            # 登录页上没有「全部下载」，别让 2 秒轮询去读分享页状态
+            if self._on_login_page():
+                self._set_status("登录页：填手机号 → 获取验证码（拖滑块）→ 登录")
+                return
+
             def cb(res):
                 st = self._parse(res)
                 if not st.get("ok"):
@@ -244,14 +255,37 @@ if WEB_OK:
                     target = rec["canonical"]
             except Exception:
                 pass
+            self._share_url = target
             self.view.load(QUrl(target))
             self._timer.start()
 
         def reload(self):
             self.view.reload()
 
+        # ---------------- 登录：直接导航到账号中心登录页 ----------------
+        # 分享页上的登录表单在跨域 iframe 里，主文档脚本够不到；而同一条 URL
+        # 单独打开时 #login_name / #sms_code / #send_sms_code / #submit_btn
+        # 全在主文档、可直接驱动（真实 Edge 验证过）。所以登录时把整页导航过去，
+        # 登录完成后再回到分享页（cookie 落在 .uc.cn，分享页随之变成已登录）。
+        def _on_login_page(self):
+            try:
+                return login.is_login_url(self.view.url().toString())
+            except Exception:
+                return False
+
+        def _goto_login_page(self):
+            self.view.load(QUrl(login.LOGIN_URL))
+            self._set_status("已进入 UC 登录页，请在上面完成手机号登录")
+
+        def _back_to_share(self):
+            url = getattr(self, "_share_url", "") or ""
+            if url:
+                self.view.load(QUrl(url))
+                self._set_status("已返回分享页")
+                self._timer.start()
+
         def do_open_login(self):
-            self._run(login.js_open_login(), lambda r: self._after(self._parse(r)))
+            self._goto_login_page()
 
         def do_send_code(self):
             phone = self.phone_edit.text().strip()
@@ -262,55 +296,69 @@ if WEB_OK:
                 self.phone_changed.emit(phone)
             except Exception:
                 pass
-            self._login_retry = 0
+            # 不在登录页就先跳过去，加载完再自动接着填（最多跳 2 次，防死循环）
+            if not self._on_login_page():
+                tries = getattr(self, "_login_nav_tries", 0)
+                if tries >= 2:
+                    self._login_nav_tries = 0
+                    self._set_status("登录页加载失败，请检查网络后重试")
+                    return
+                self._login_nav_tries = tries + 1
+                self._goto_login_page()
+                QTimer.singleShot(2500, self.do_send_code)
+                return
+            self._login_nav_tries = 0
 
-            def step_reopen(res):
+            def step_sms(res):
                 st = self._parse(res)
                 if not st.get("ok"):
-                    self._set_status("打开登录面板失败：%s" % st.get("msg"))
+                    self._set_status("点获取验证码失败：%s" % st.get("msg"))
                     return
-                # 面板刚展开，DOM 可能还没渲染完，等一拍再找「手机登录」
-                QTimer.singleShot(
-                    600, lambda: self._run(login.js_pick_phone_tab(), step_pick))
+                self._set_status("已请求验证码：请把滑块拖到底"
+                                 "（没收到短信就再点一次）")
 
-            def step_pick(res):
+            def step_fill(res):
                 st = self._parse(res)
                 if not st.get("ok"):
-                    # 最常见原因：登录面板没展开（刚加载完分享页就直接点助手）。
-                    # 自动叫出面板后重试一次；仍失败才把真实原因显示出来。
-                    if getattr(self, "_login_retry", 0) < 1:
-                        self._login_retry = 1
-                        self._set_status("登录面板未展开，正在自动打开…")
-                        self._run(login.js_open_login(), step_reopen)
-                    else:
-                        self._set_status("切换手机登录失败：%s" % st.get("msg"))
+                    self._set_status("填手机号失败：%s" % st.get("msg"))
                     return
+                self._run(login.js_send_sms(), step_sms)
 
-                def step_fill(r2):
-                    st2 = self._parse(r2)
-                    if not st2.get("ok"):
-                        self._set_status("填手机号失败：%s" % st2.get("msg"))
-                        return
-                    self._run(login.js_send_sms(),
-                              lambda r3: self._after(self._parse(r3),
-                                                     extra="（若没收到短信，请手动拖动滑块后再点一次）"))
-                self._run(login.js_fill_phone(phone), step_fill)
-
-            self._run(login.js_pick_phone_tab(), step_pick)
+            self._run(login.js_fill_phone(phone), step_fill)
 
         def do_login(self):
             code = self.code_edit.text().strip()
             if not code:
                 self._set_status("请先填短信验证码")
                 return
+            if not self._on_login_page():
+                self._goto_login_page()
+                self._set_status("请先在登录页获取验证码，再点「登录」")
+                return
+
+            def step_submit(res):
+                st = self._parse(res)
+                if not st.get("ok"):
+                    self._set_status("点登录失败：%s" % st.get("msg"))
+                    return
+                self._set_status("已提交登录，等待跳转…")
+                QTimer.singleShot(3000, self._after_login)
 
             def step_fill(res):
                 st = self._parse(res)
                 if not st.get("ok"):
                     self._set_status("填验证码失败：%s" % st.get("msg"))
                     return
-                self._run(login.js_submit(), lambda r2: self._after(self._parse(r2)))
+                self._run(login.js_submit(), step_submit)
+
             self._run(login.js_fill_code(code), step_fill)
+
+        def _after_login(self):
+            """登录提交后的收尾：还停在登录页说明没成功；已跳走就回分享页。"""
+            if self._on_login_page():
+                self.refresh_state()
+                return
+            self._back_to_share()
 
         def do_download_all(self):
             self._pending_downloads = 0
@@ -323,9 +371,16 @@ if WEB_OK:
         def _warn_if_no_download(self):
             if self._pending_downloads:
                 return
-            self._set_status(
-                "没有捕获到下载请求：若页面弹出了登录框，说明登录已过期——"
-                "请用上方助手重新登录后再点「② 全部下载」。")
+
+            def got(res):
+                st = self._parse(res)
+                if st.get("login_panel") or st.get("nav_login"):
+                    self._set_status("没有捕获到下载：登录已过期或未登录——"
+                                     "请点「① 打开登录面板」重新登录")
+                else:
+                    self._set_status("没有捕获到下载请求：请确认页面已加载完、"
+                                     "并已点过「② 全部下载」")
+            self._run(login.js_state(), got)
 
         def _toggle_helper(self):
             visible = self.method_box.isVisible()

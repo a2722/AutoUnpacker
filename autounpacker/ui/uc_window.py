@@ -262,11 +262,28 @@ if WEB_OK:
                 self.phone_changed.emit(phone)
             except Exception:
                 pass
+            self._login_retry = 0
+
+            def step_reopen(res):
+                st = self._parse(res)
+                if not st.get("ok"):
+                    self._set_status("打开登录面板失败：%s" % st.get("msg"))
+                    return
+                # 面板刚展开，DOM 可能还没渲染完，等一拍再找「手机登录」
+                QTimer.singleShot(
+                    600, lambda: self._run(login.js_pick_phone_tab(), step_pick))
 
             def step_pick(res):
                 st = self._parse(res)
                 if not st.get("ok"):
-                    self._set_status("切换手机登录失败：%s" % st.get("msg"))
+                    # 最常见原因：登录面板没展开（刚加载完分享页就直接点助手）。
+                    # 自动叫出面板后重试一次；仍失败才把真实原因显示出来。
+                    if getattr(self, "_login_retry", 0) < 1:
+                        self._login_retry = 1
+                        self._set_status("登录面板未展开，正在自动打开…")
+                        self._run(login.js_open_login(), step_reopen)
+                    else:
+                        self._set_status("切换手机登录失败：%s" % st.get("msg"))
                     return
 
                 def step_fill(r2):

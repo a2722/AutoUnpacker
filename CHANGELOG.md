@@ -5,6 +5,52 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.35] - 2026-11-09
+
+> **本轮重点**：百度分享的**图形验证码自动识别**（易混字符换图，绝不硬猜）、
+> **图片头 + 加密 7z 多段伪装**的识别修复，以及解压后处理里 _detect_nested
+> 的 13 倍提速（28,431 文件 147s → 11s）。UC 网页端链路就地标注「功能不完善」。
+
+### 新增
+
+- **百度分享：验证码 OCR 自动识别 + 调试通知开关**（实验性）
+  - 新增 aidu/captcha.py / aidu/_ocr_worker.py：errno=-20 判定为触发验证码 →
+    取 getvcode 图 → **子进程**调 ddddocr 识别（ddddocr 只装在 Python 3.11 环境，
+    主进程不 import，不污染运行时）→ 按 code_input / code_str 重发 sharedownload。
+  - 易混字符（v/y、m/rn、8/b、0/o 等）置信度不足时**换一张图重试**而不是硬猜；
+    重试仍不行就转人工小窗（ui/vcode_dialog.py，可「换一张」/「取消」）。
+  - 设置 › 实验性 › 百度网盘链路 新增「**验证码调试通知**」（默认关）：开启后每次
+    触发验证码都通知，**自动识别成功也通知**，方便观察真实成功率。
+  - 失败的请求现在会带上 errno / show_msg / 
+equest_id，便于定位。
+
+### 修复
+
+- **图片头 + 加密 7z 伪装被误判为「不是压缩包」**：_verify_polyglot_7z_rar 原来只认
+  7z l 返回 0，而**头部加密**的包会返回 255（输出 Enter password），于是被判失败。
+  现在识别「需要密码」类输出并放行，随后按密码本正常解密。
+  新增 	est_polyglot_encrypted_7z.py（11 项）。
+
+### 改进
+
+- **解压后处理提速（_detect_nested 逐文件嗅探）**
+  - 根因：_scan_front_for_archive 无条件 .read(32MB)（CPython 先按长度分配），
+    2.8 万个小文件每个白付 ~3.5ms。
+  - 改为按 min(文件大小, 32MB) 分块读、命中即停；并跳过「尾部扫描已经覆盖整个文件」
+    的小文件（≤64KB）。
+  - 实机 28,431 文件：**147.4s → 11.1s**（判定语义不变，命中结果逐项一致）。
+- **设置 › 实验性 › UC 网页端链路：就地标注「功能不完善」**
+  - 说明文案与分组标题都标出「功能不完善」，并说明：默认关闭、**推荐配置也不会开启**、
+    已知把直链交给 IDM 会因 CDN 校验 cookie 而 403。
+  - 仅文案与配色（warn），开关默认值与门控逻辑一字未改。
+
+### 测试
+
+- 新增 	est_polyglot_encrypted_7z.py（11 项）、	est_uc_lab_note.py（12 项，
+  含「推荐配置不写 uc_web_enabled」「除推荐项外其它键逐字不变」）。
+- 全量离线套件：**205** 个测试文件，4 个已知失败（	est_dead_share_flow、
+  	est_need_code_gate、	est_pyzip_subprocess、	est_ui_widgets_m2）。
+
 ## [2.2.34] - 2026-11-05
 
 > **本轮重点**：新增**实验性 UC 网盘网页端通路**（与百度链路完全独立、互不影响），

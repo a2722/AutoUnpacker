@@ -51,6 +51,7 @@ import time
 import urllib.parse
 import urllib.request
 
+from . import captcha
 from .db import MIN_WAKE_VERSION, client_version, parse_version, version_below
 from .manifest import detect_dead_share_page
 
@@ -752,7 +753,34 @@ def _wake_client(uri):
         return False, "唤起百度网盘客户端失败：%s" % e
 
 
-def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
+def _filelist_token(sd):
+    """从 sharedownload 响应里取 filelist 令牌（字符串）；取不到返回 None。
+
+    正常结构是 `{"list": "<不透明令牌>"}`；极少数返回为 list/dict，退化为取
+    首个元素的 dlink。绝不抛异常。"""
+    try:
+        blob = sd.get("list")
+        if isinstance(blob, str) and blob:
+            return blob
+        first = blob[0] if isinstance(blob, list) else blob
+        blob = first.get("dlink") if isinstance(first, dict) else None
+        return blob or None
+    except Exception:
+        return None
+
+
+def _emit_captcha(hook, ev):
+    """上报一条验证码事件给调用方；回调自身异常一律吞掉，绝不影响链路。"""
+    if hook is None:
+        return
+    try:
+        hook(ev)
+    except Exception:
+        pass
+
+
+def commit_download(prep, fs_ids=None, pairs=None, on_wake=None,
+                    captcha_hook=None, captcha_manual=None):
     """分享「提交」段：用 prep 调 sharedownload 并唤起客户端（步骤 5~10）。
 
     选中规则（优先级从高到低）：
@@ -782,6 +810,14 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
     - `on_wake`：可选回调。唤起成功后、复核轮询之前调用一次，收到
       `_wake_detail(bid, seq, 版本或 None)` 字符串；回调自身异常一律吞掉，
       绝不影响链路。
+    - `captcha_hook`：可选回调 `hook(event: dict)`。sharedownload 命中风控
+      （errno=-20）进入图形验证码重试时，每一轮的跳过 / 识别 / 手动结果都会
+      以事件字典上报（kind: skip/try/manual），供上层记日志与调试通知；
+      回调异常一律吞掉。
+    - `captcha_manual`：可选回调 `manual(img_bytes, attempt) -> str | None`。
+      自动 OCR 用尽仍失败时调用一次（用户手输兜底）：返回 4 位文本即带
+      vcode_input/vcode_str 再提交一次；返回 None（取消）或仍失败则按原
+      失败分支返回。工作线程内同步调用，UI 需自行投递回主线程弹窗。
 
     返回 (ok: bool, detail: str)：成功时 detail 为简述，失败时为原因。**绝不抛异常。**
     """
@@ -858,30 +894,110 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         #    失败时照实返回错误，不静默丢弃任何条目。
         if _deadline_hit(deadline):
             return False, _timeout_reason()
-        sd = json.loads(_post(
-            op,
-            f"{_S}/api/sharedownload?{_Q}"
-            f"&sign={urllib.parse.quote(sign)}&timestamp={ts}",
-            {"encrypt": "1",
-             "extra": json.dumps({"sekey": urllib.parse.unquote(randsk)},
-                                 ensure_ascii=False),
-             "product": "share",
-             "timestamp": str(ts),
-             "uk": share_uk,
-             "primaryid": shareid,
-             "fid_list": json.dumps(fids),
-             "path_list": json.dumps(paths)},
-            referer_share))
-        blob = sd.get("list")
-        if not isinstance(blob, str):
-            # 兜底：极少数返回结构为 list/dict，退化为取首个元素的 dlink。
-            try:
-                first = blob[0] if isinstance(blob, list) else blob
-                blob = first.get("dlink") if isinstance(first, dict) else None
-            except Exception:
-                blob = None
+        sd_url = (f"{_S}/api/sharedownload?{_Q}"
+                  f"&sign={urllib.parse.quote(sign)}&timestamp={ts}")
+        sd_form = {"encrypt": "1",
+                   "extra": json.dumps({"sekey": urllib.parse.unquote(randsk)},
+                                       ensure_ascii=False),
+                   "product": "share",
+                   "timestamp": str(ts),
+                   "uk": share_uk,
+                   "primaryid": shareid,
+                   "fid_list": json.dumps(fids),
+                   "path_list": json.dumps(paths)}
+        sd = json.loads(_post(op, sd_url, sd_form, referer_share))
+        blob = _filelist_token(sd)
+
+        # 5.1 风控图形验证码（errno=-20）：自动 OCR 重试，最多 MAX_ATTEMPTS 张。
+        #     必须复用同一个 opener（同一 CookieJar）：vcode_str 与会话绑定。
+        #     易混字符（v/y、8/b…）或低置信度**不硬猜**，直接换下一张；每轮
+        #     结果都经 captcha_hook 上报（含成功），供上层观察成功率。
+        if not blob and sd.get("errno") == -20:
+            for attempt in range(1, captcha.MAX_ATTEMPTS + 1):
+                if _deadline_hit(deadline):
+                    break
+                vcode_str, img = captcha.fetch_vcode(op, share_url)
+                if not vcode_str or not img:
+                    _emit_captcha(captcha_hook, {
+                        "kind": "skip", "attempt": attempt, "text": "",
+                        "confidence": 0.0, "reason": "fetch_fail"})
+                    continue
+                solved = captcha.solve(img)
+                if solved is None:
+                    # 无可用 OCR 解释器 / 子进程失败：不硬猜，换下一张。
+                    _emit_captcha(captcha_hook, {
+                        "kind": "skip", "attempt": attempt, "text": "",
+                        "confidence": 0.0, "reason": "no_ocr"})
+                    continue
+                text, conf = solved
+                if captcha.is_ambiguous(text, conf):
+                    _emit_captcha(captcha_hook, {
+                        "kind": "skip", "attempt": attempt, "text": text,
+                        "confidence": conf, "reason": "ambiguous"})
+                    continue
+                if _deadline_hit(deadline):
+                    break
+                form2 = dict(sd_form)
+                form2["vcode_input"] = text
+                form2["vcode_str"] = vcode_str
+                sd = json.loads(_post(op, sd_url, form2, referer_share))
+                blob = _filelist_token(sd)
+                _emit_captcha(captcha_hook, {
+                    "kind": "try", "attempt": attempt, "text": text,
+                    "confidence": conf, "ok": bool(blob),
+                    "errno": sd.get("errno"),
+                    "show_msg": sd.get("show_msg")})
+                if blob or sd.get("errno") != -20:
+                    # 成功，或已变成其它错误（不再是验证码问题）→ 退出重试。
+                    break
+
+        # 5.2 自动用尽仍是验证码问题 → 手动输入兜底（UI 弹窗，仅当上层给了回调）。
+        #     回调返回空串 = 用户点「换一张」：重新取图再问（手动同样最多 3 张，
+        #     vcode_str 始终与当前这张图配对，绝不错配提交）。
+        if not blob and sd.get("errno") == -20 and captcha_manual is not None:
+            for mi in range(1, captcha.MAX_ATTEMPTS + 1):
+                if _deadline_hit(deadline):
+                    break
+                vcode_str, img = captcha.fetch_vcode(op, share_url)
+                if not vcode_str or not img:
+                    break
+                manual_text = None
+                try:
+                    manual_text = captcha_manual(img, captcha.MAX_ATTEMPTS + mi)
+                except Exception:
+                    manual_text = None
+                if manual_text is None:
+                    _emit_captcha(captcha_hook, {
+                        "kind": "manual",
+                        "attempt": captcha.MAX_ATTEMPTS + mi,
+                        "ok": False, "cancelled": True,
+                        "errno": sd.get("errno"),
+                        "show_msg": sd.get("show_msg")})
+                    break
+                manual_text = str(manual_text).strip()
+                if not manual_text:
+                    continue  # 换一张
+                form2 = dict(sd_form)
+                form2["vcode_input"] = manual_text
+                form2["vcode_str"] = vcode_str
+                sd = json.loads(_post(op, sd_url, form2, referer_share))
+                blob = _filelist_token(sd)
+                _emit_captcha(captcha_hook, {
+                    "kind": "manual", "attempt": captcha.MAX_ATTEMPTS + mi,
+                    "ok": bool(blob), "cancelled": False,
+                    "errno": sd.get("errno"),
+                    "show_msg": sd.get("show_msg")})
+                if blob or sd.get("errno") != -20:
+                    break
+
         if not blob:
-            return False, f"sharedownload 未取到 filelist 令牌（errno={sd.get('errno')}）"
+            # 失败信息带全关键字段（errno / show_msg / request_id），便于排查
+            # 是验证码问题还是别的风控/参数错误。
+            return False, (
+                f"sharedownload 未取到 filelist 令牌"
+                f"（errno={sd.get('errno')}，"
+                f"show_msg={sd.get('show_msg')}，"
+                f"request_id={sd.get('request_id')}）")
 
         # 6. invoker/get：拿 browserId。
         if _deadline_hit(deadline):
@@ -965,17 +1081,21 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None):
         return False, str(e)
 
 
-def invoke_download(share_url, pwd="", on_wake=None):
+def invoke_download(share_url, pwd="", on_wake=None,
+                    captcha_hook=None, captcha_manual=None):
     """兼容保留：prepare_share + commit_download(prep, None) 的薄封装。
 
     签名与 (ok, detail) 返回值、以及所有现有调用方都不受影响——行为等价于旧的
     「下载该分享的全部条目」。需要让用户挑选文件时，请改用 `prepare_share()` 拿
     `entries`，再用 `commit_download(prep, 选中的 fs_id 列表)` 提交子集。
-    `on_wake` 原样透传给 `commit_download`（唤醒成功后、复核轮询之前调用一次）。
+    `on_wake` 原样透传给 `commit_download`（唤醒成功后、复核轮询之前调用一次）；
+    `captcha_hook` / `captcha_manual` 同样原样透传（图形验证码事件与手动兜底）。
     固定流程编号见 prepare_share（0~4）与 commit_download（5~10）。
     **绝不抛异常。**
     """
     ok, prep = prepare_share(share_url, pwd)
     if not ok:
         return False, prep
-    return commit_download(prep, None, on_wake=on_wake)
+    return commit_download(prep, None, on_wake=on_wake,
+                           captcha_hook=captcha_hook,
+                           captcha_manual=captcha_manual)

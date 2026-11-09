@@ -66,7 +66,8 @@ from .window import logview as _logview_home  # noqa: F401
 from .window import share_flow as _share_flow_home  # noqa: F401
 
 from .window.consts import (  # noqa: F401
-    SHARE_PREP_STALE_SEC, SHARE_PICK_WAIT_SEC, PENDING_SHARE_TTL_SEC,
+    SHARE_PREP_STALE_SEC, SHARE_PICK_WAIT_SEC, SHARE_VCODE_WAIT_SEC,
+    PENDING_SHARE_TTL_SEC,
     SHARE_INVOKE_BUSY_MAX_SEC, SHARE_GESTURE_DEDUP_SEC, PENDING_SHARE_TEXT,
     PENDING_SHARE_TAG, SHARE_RECENT_MAX_AGE_SEC, IMAGE_EXTS,
     _QR_DROP_MAX_BYTES, _QR_ARCHIVE_MAGICS,
@@ -3479,6 +3480,9 @@ class MainWindow(QMainWindow):
                 # 后台探测发现该分享需要提取码：在 Qt 线程弹询问面板（worker 绝不碰控件）
                 self._share_ask_code(item.get("item") or {}, item.get("url"),
                                      item.get("surl"))
+            elif item["type"] == "share_vcode":
+                # 验证码自动识别用尽：在 Qt 线程弹手动输入窗（worker 阻塞等待结果）
+                self._show_share_vcode(item)
             elif item["type"] == "share_used":
                 # 成功拉起回执（worker 线程投递）：该分享已成功提取，关闭同分享的
                 # 缺码小窗——它只为填写提取码而生，绝不让它赖到 120s 超时。
@@ -4014,7 +4018,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            ok, detail = bt.invoke_download(url, pwd=pwd, on_wake=on_wake)
+            ok, detail = bt.invoke_download(
+                url, pwd=pwd, on_wake=on_wake,
+                captcha_hook=getattr(self, "_on_baidu_vcode_event", None),
+                captcha_manual=getattr(self, "_ask_vcode_manual", None))
             if ok:
                 # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）。
                 self.hub.log(f"[分享] 链路完成: {detail}")
@@ -4282,9 +4289,15 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.hub.log(f"[分享] 重新准备出错: {e}")
                     return
-                ok3, detail = bs.commit_download(prep, pairs=pairs, on_wake=on_wake)
+                ok3, detail = bs.commit_download(
+                    prep, pairs=pairs, on_wake=on_wake,
+                    captcha_hook=getattr(self, "_on_baidu_vcode_event", None),
+                    captcha_manual=getattr(self, "_ask_vcode_manual", None))
             else:
-                ok3, detail = bs.commit_download(prep, None, on_wake=on_wake)
+                ok3, detail = bs.commit_download(
+                    prep, None, on_wake=on_wake,
+                    captcha_hook=getattr(self, "_on_baidu_vcode_event", None),
+                    captcha_manual=getattr(self, "_ask_vcode_manual", None))
             if ok3:
                 # 通知已在唤醒那一刻发出，这里只补一行链路完成日志（不再重复通知）；
                 # 子集选择相关的既有日志信息一律保留。
@@ -4314,6 +4327,100 @@ class MainWindow(QMainWindow):
             self.hub.q.put({"type": "notify", "title": title, "msg": msg})
         except Exception:
             pass
+
+    # ---------- 百度分享图形验证码（vcode）：事件通知 + 手动输入兜底 ----------
+    def _on_baidu_vcode_event(self, ev):
+        """百度验证码事件（worker 线程）：一律记日志；调试开关开启时再弹托盘通知。
+
+        事件来自 share.commit_download 的重试循环（kind: skip/try/manual）。
+        用户明确要求**即使自动成功也必须通知**（观察成功率），故通知门控只看
+        `vcode_debug_notify` 一个键；日志则无条件记录。绝不抛异常。"""
+        try:
+            if not isinstance(ev, dict):
+                return
+            kind = str(ev.get("kind") or "")
+            try:
+                attempt = int(ev.get("attempt") or 0)
+            except Exception:
+                attempt = 0
+            text = str(ev.get("text") or "")
+            try:
+                conf = float(ev.get("confidence") or 0.0)
+            except Exception:
+                conf = 0.0
+            msg = None
+            if kind == "skip":
+                reason = str(ev.get("reason") or "")
+                if reason == "ambiguous":
+                    try:
+                        from ..baidu import captcha as _bdc
+                        amb = "/".join(_bdc.ambiguous_chars(text)) or "?"
+                    except Exception:
+                        amb = "?"
+                    msg = (f"百度验证码 第{attempt}次：跳过"
+                           f"（字符易混 {amb}，不硬猜），换一张")
+                elif reason == "no_ocr":
+                    msg = (f"百度验证码 第{attempt}次：跳过"
+                           f"（OCR 不可用/识别失败），换一张")
+                else:
+                    msg = f"百度验证码 第{attempt}次：跳过（取图失败），换一张"
+            elif kind == "try":
+                if ev.get("ok"):
+                    msg = (f"百度验证码 第{attempt}次：识别 {text}"
+                           f"（置信度 {conf:.2f}）→ 通过")
+                else:
+                    msg = (f"百度验证码 第{attempt}次：识别 {text}"
+                           f"（置信度 {conf:.2f}）→ 识别错误，换一张")
+            elif kind == "manual":
+                if ev.get("cancelled"):
+                    msg = "百度验证码 手动输入：已取消"
+                elif ev.get("ok"):
+                    msg = "百度验证码 手动输入：通过"
+                else:
+                    msg = "百度验证码 手动输入：仍未通过"
+            if not msg:
+                return
+            self.hub.log(f"[分享] {msg}")
+            try:
+                debug_on = bool((self.state.snapshot() or {}).get(
+                    "vcode_debug_notify", False))
+            except Exception:
+                debug_on = False
+            if debug_on:
+                self._share_notify("百度验证码", msg)
+        except Exception:
+            pass
+
+    def _ask_vcode_manual(self, img, attempt):
+        """worker 线程：把验证码图投回 Qt 线程弹输入窗，阻塞等待结果。
+
+        与文件挑选窗同一套「hub.q 请求 + threading.Event 等待」模式：worker
+        绝不碰 Qt 控件。返回用户输入的 4 位文本 / ""（换一张）/ None（取消
+        或超时）。绝不抛异常。"""
+        try:
+            req = {"type": "share_vcode", "img": bytes(img or b""),
+                   "attempt": int(attempt or 1),
+                   "event": threading.Event(), "result": None}
+            self.hub.q.put(req)
+            req["event"].wait(SHARE_VCODE_WAIT_SEC)
+            r = req.get("result")
+            return r if isinstance(r, str) else None
+        except Exception:
+            return None
+
+    def _show_share_vcode(self, req):
+        """Qt 线程：弹验证码输入窗并把结果回写给等待中的 worker（绝不遗漏 set）。"""
+        try:
+            from .vcode_dialog import ask_vcode
+            req["result"] = ask_vcode(self, req.get("img") or b"",
+                                      req.get("attempt") or 1, refetch=None)
+        except Exception:
+            req["result"] = None
+        finally:
+            try:
+                req["event"].set()
+            except Exception:
+                pass
 
     def _show_share_pick(self, req):
         """Qt 线程：按 worker 准备好的 prep 弹出文件挑选窗（惰性导入）。

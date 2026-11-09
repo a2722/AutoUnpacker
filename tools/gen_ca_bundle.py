@@ -47,7 +47,12 @@ def _collect_pems() -> list[str]:
 # 本机 Windows 证书库可能含**非公共**根（自签名工具根 / MITM 根 / 设备唯一 ID 根），
 # 一旦随包发布就会泄漏机器指纹或用户装过的工具。构建期用 cryptography（若可用）
 # 按 subject 剔除；不可用则原样保留并在 stderr 提示。
-_PRIVATE_SUBJECT_MARKERS = ("steamcommunity", "intc-keyid-")
+_PRIVATE_SUBJECT_MARKERS = (
+    "steamcommunity", "intc-keyid-",
+    # 本机抓包/中间人代理的临时根：随包发布 = 把「中间人信任」装给所有用户，
+    # 还顺带泄漏机器指纹（2026-11-09 在随包根里发现 "Charles Proxy CA (…, DESKTOP-…)"）
+    "charles proxy", "mitmproxy", "fiddler", "burp suite", "zscaler",
+)
 
 
 def _looks_private_subject(subject):
@@ -81,16 +86,32 @@ def _strip_private_pems(pems):
     return out
 
 
+def _existing_pems():
+    """读出**已提交**的 cacert.pem 里的 PEM 块（与本次导出取并集用）。
+
+    为什么要并集：本机证书库只是「这台机器装了什么」的快照，换机器/重装系统后
+    会少掉一批公开根（本轮实测：仓库里 99 张，本机导出只有 42 张）。直接用本机
+    导出覆盖会让随包根证书**倒退**，干净机器上的 HTTPS 兜底就少了一大批根。
+    """
+    import re as _re
+    try:
+        text = OUT.read_text(encoding="ascii", errors="ignore")
+    except Exception:
+        return []
+    return [m.strip() for m in _re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text, _re.S)]
+
+
 def main() -> int:
     try:
-        pems = _collect_pems()
+        pems = list(dict.fromkeys(_collect_pems() + _existing_pems()))
     except Exception as e:
         print("!! 生成 CA 证书包失败：%s" % e)
         return 1
     if not pems:
         print("!! ROOT/CA 存储里一张证书都没读到，拒绝写空包")
         return 1
-    pems = _strip_private_pems(pems)
+    pems = sorted(_strip_private_pems(pems))
     content = "\n".join(pems) + "\n"
     try:
         if OUT.exists() and OUT.read_text(encoding="ascii") == content:

@@ -3692,6 +3692,12 @@ class MainWindow(QMainWindow):
             if not self.state.snapshot().get("experimental_enabled"):
                 self._append_log("实验性功能未开启，「用客户端下载分享」不可用")
                 return
+            # 实验性总开关只是**总闸**；这条链路本身还要「启用百度网盘链路」开着
+            # （2026-11-09 用户要求：没开链路时 Alt+2 不应生效）。
+            if not self.state.snapshot().get("baidu_auto_invoke"):
+                self._append_log(
+                    "「百度网盘链路」未开启，Alt+2 已忽略（设置 › 实验性 › 百度网盘链路）")
+                return
             # 剪贴板监听总开关关闭：本功能按压时要就地读剪贴板（A 快路径）——
             # 绝不读取，明确提示后放弃（与上面的实验性开关同一「记一行」发声口径）。
             if not self.state.snapshot().get("clipboard_enabled", True):
@@ -3824,6 +3830,10 @@ class MainWindow(QMainWindow):
             # 整条 2.F 属实验性功能：全局热键也可能被按下，这里必须再校验一次。
             if not self.state.snapshot().get("experimental_enabled"):
                 self._append_log("实验性功能未开启，「挑选文件下载分享」不可用")
+                return
+            if not self.state.snapshot().get("baidu_auto_invoke"):
+                self._append_log(
+                    "「百度网盘链路」未开启，Alt+3 已忽略（设置 › 实验性 › 百度网盘链路）")
                 return
             # 剪贴板监听总开关关闭：本功能按压时要就地读剪贴板（A 快路径）——
             # 绝不读取，明确提示后放弃（与上面的实验性开关同一「记一行」发声口径）。

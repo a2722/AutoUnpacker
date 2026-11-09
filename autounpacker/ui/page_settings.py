@@ -2604,17 +2604,22 @@ class SettingsPage(QWidget):
         baidu_task_db / baidu_client_proc_names），只换了展示位置。
         """
         g = self._group(box, "百度网盘链路")
+        # 分组卡的实体控件（_group 返回的是卡内布局，其 parentWidget 才是整块卡）：
+        # 实验性总开关关闭时整块隐藏，见 _apply_gates。
+        self._baidu_group_block = g.parentWidget()
+        # 子开关放**最上方**（2026-11-09 用户要求）：它是本链路的门，先看到门再看细项。
+        self.baidu_auto_invoke_cb = self._check(
+            g, "启用百度网盘链路", "baidu_auto_invoke",
+            "开启后：复制到百度网盘分享链接时自动交给网盘客户端下载（整包），"
+            "Alt+2 / Alt+3 手动热键也只在本开关开启时生效。"
+            "会自动触发下载，请确认来源可信。",
+            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
+            experimental=True)
         self.share_wait_spin = self._spin_row(
             g, "分享等待时长", "share_gesture_wait_sec",
             "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
             5, 600, syn=("分享", "手势", "等待", "超时", "解析中"),
             unit="秒", default=120, experimental=True)
-        self.baidu_auto_invoke_cb = self._check(
-            g, "启用百度网盘链路", "baidu_auto_invoke",
-            "开启后：复制到百度网盘分享链接时自动交给网盘客户端下载（整包）。"
-            "会自动触发下载，请确认来源可信。",
-            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
-            experimental=True)
         # 验证码调试通知：观察自动识别成功率用（含成功也通知）。
         # 刻意**不**走实验性门控登记表（_exp_gate/_exp_extra_gate 的计数被
         # 离线验收锁定，后加行不得扩它）；它只是日志/通知开关，不影响链路行为。
@@ -2706,6 +2711,7 @@ class SettingsPage(QWidget):
         验收锁定，后加行不得扩它）。
         """
         g = self._group(box, "UC 网页端链路（功能不完善）")
+        self._uc_group_block = g.parentWidget()
         self.uc_hint = self._hint(_UC_HINT_READY, g.parentWidget(), warn=True)
         g.addWidget(self.uc_hint)
 
@@ -4285,6 +4291,16 @@ class SettingsPage(QWidget):
                 ntf = bool(self._snapshot().get("notify_enabled", True))
             except Exception:
                 ntf = True
+        # 两条链路（百度网盘链路 / UC 网页端链路）是总开关**下面**的分组：
+        # 总开关关闭时整块隐藏（不是只置灰）——2026-11-09 用户要求「关了底下俩都要
+        # 隐藏」。分组卡实体由 _build_lab_baidu / _build_lab_uc 登记。
+        for _ga in ("_baidu_group_block", "_uc_group_block"):
+            _blk = getattr(self, _ga, None)
+            if _blk is not None:
+                try:
+                    _blk.setVisible(exp)
+                except Exception:
+                    pass
         for w in self._exp_subs:
             w.setEnabled(exp)
         for _host, badge in self._exp_badges:

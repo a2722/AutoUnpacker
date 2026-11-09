@@ -349,7 +349,8 @@ def apply_post_actions(result, source, output_dir, actions):
                     permanent_fallback=delete_policy_permanent_fallback(
                         action.get("delete_policy")),
                     quarantine_root=action.get("quarantine_root"),
-                    pre_hook=action.get("pre_hook"))
+                    pre_hook=action.get("pre_hook"),
+                    extra_targets=result.get("consumed_span_volumes"))
                 result["logs"].append(f"[后处理] {res['note']}")
                 if res["promoted"]:
                     result["promoted_dir"] = res["promoted"]
@@ -659,9 +660,19 @@ def _merge_dir(src, dst):
             shutil.move(str(entry), str(target))
 
 
+def _is_within(path, root):
+    """path 是否落在 root 之内（含相等）。异常一律按「在内部」处理（保守：不回收）。"""
+    try:
+        p = Path(path).resolve()
+        r = Path(root).resolve()
+        return p == r or r in p.parents
+    except Exception:
+        return True
+
+
 def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=False,
                               delete_src=False, permanent_fallback=True,
-                              quarantine_root=None, pre_hook=None):
+                              quarantine_root=None, pre_hook=None, extra_targets=None):
     """解压后处理：输出目录顶层只有 1 个文件夹时，把该文件夹提升到指定地区。
 
     delete_src=True 时，随后把源文件（含分卷）与输出目录移入回收站并回调 hook 标记
@@ -669,6 +680,9 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     False=保留源文件，见 delete_source）；quarantine_root 非 None（quarantine 策略）
     时移入隔离区，绝不永久删除。delete_src=False（默认，数据安全优先）时
     只做提升，绝不回收源文件/分卷，仅原地清理提升后空掉的输出目录。
+    extra_targets：额外可回收的「中间文件」（跨卷归拢借走的原始分卷，可能位于
+    上一个任务的输出目录）。只在 delete_src=True 且提升成功时参与回收；落在输出
+    目录/提升目标内、或与源文件重复的路径一律跳过；回收后其所在空目录原地清理。
     pre_hook(targets) 与 delete_source 同义：真正删除前回调，先落盘删除意图。
     条件不满足（0 个或多于 1 个顶层文件夹）时：delete_src=True 退化为仅删除源文件，
     delete_src=False 则原样保留源文件。
@@ -783,6 +797,24 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
                     and str(entry) not in targets
                     and str(entry) not in reused):
                 targets.append(str(entry))
+    # 跨卷归拢「借走」的原始分卷（2026-11-09 真机：第一部_1\\MMDsyosinsya.z01 16GB）：
+    # 整体解压成功了它们就是纯中间文件，不留。安全边界：只在 delete_src=True 且走到
+    # 这里（提升成功）时才回收；成品目录/提升目标内、以及与源文件重复的一律跳过。
+    extra_used = []
+    for _p in (extra_targets or ()):
+        try:
+            sp = str(_p)
+            if not sp or sp in targets or sp in reused:
+                continue
+            pp = Path(sp)
+            if not pp.is_file():
+                continue
+            if _is_within(pp, output_dir) or _is_within(pp, promote_to):
+                continue
+            targets.append(sp)
+            extra_used.append(sp)
+        except Exception:
+            continue
     if same_place:
         targets.extend(str(f) for f in top_files)
     elif output_dir.exists():
@@ -806,6 +838,16 @@ def promote_extracted_content(output_dir, promote_to, source, hook=None, merge=F
     failed = pre_failed + failed2
     if empty_intermediate:
         remove_empty_dirs(output_dir)   # 空中间目录原地删除：不进回收站、不记回溯
+
+    # 借来的分卷回收后，它原先所在的目录（往往是上一个任务留下的结果目录）若已空，
+    # 原地 rmdir 一并清掉 —— 不进回收站、不记回溯，避免回溯页凭空多出空文件夹。
+    for _sp in extra_used:
+        try:
+            _parent = Path(_sp).parent
+            if _parent.exists():
+                remove_empty_dirs(_parent)
+        except Exception:
+            pass
 
     if hook:
         hook(recycled, failed, qmap or None)

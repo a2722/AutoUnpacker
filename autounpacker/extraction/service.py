@@ -73,6 +73,9 @@ class ExtractService:
         # staging 临时目录（RAR 规范化 / 跨卷 ZIP 重组）；extract() 每轮重新置空，
         # 这里也初始化一次，保证方法可被单独调用（测试/复用）时不缺属性。
         self.stage_dirs = []
+        # 跨卷归拢时**借走**的原始分卷路径（.z01 等，可能在上一个任务的输出目录里）。
+        # 整体解压成功后由后处理一并回收，避免 16GB 的分卷孤零零留在结果目录里。
+        self.consumed_span_volumes = []
         # 每个队列条目一个临时目录的自增序号（见 _make_temp）：同层可能解出
         # 多个归档，各条目必须各用各的目录，绝不互相清场。
         self._temp_seq = 0
@@ -145,6 +148,7 @@ class ExtractService:
     def extract(self, task):
         self.temp_root = self._temp_root_for(task.get("output_dir"))
         self.stage_dirs = []
+        self.consumed_span_volumes = []
         self.recycle_cleanup = False
         try:
             result = self._extract_inner(task)
@@ -256,6 +260,15 @@ class ExtractService:
             # 跨盘符时硬链接不可用：宁可不做，也不偷偷复制几十 GB
             self.emit(f"[第{depth}层] 跨卷 zip 暂存失败（无法硬链接，可能跨盘）: {e}")
             return None
+        # 记下这些「被借走」的原始分卷：成功解压后由后处理回收（见 post.py
+        # promote_extracted_content 的 extra_targets）。只在整体成功时才用得上，
+        # 失败路径不碰它们。
+        for _vol in found.values():
+            try:
+                if _vol not in self.consumed_span_volumes:
+                    self.consumed_span_volumes.append(_vol)
+            except Exception:
+                pass
         self.emit(f"[第{depth}层] 跨卷 zip 已归拢 {need} 个分卷，"
                   f"主卷改名为 {base}.zip（硬链接，零拷贝）")
         return stage / ("%s.zip" % base)
@@ -801,6 +814,8 @@ class ExtractService:
             # 供 extract_one 据此只记录真实命中，杜绝未加密包误报。
             "encrypted": bool(_first.get("encrypted", False)) if self.layer_records else False,
             "layer_records": self.layer_records,
+            # 跨卷归拢借走的原始分卷（后处理据此在成功时回收，见 post.py）
+            "consumed_span_volumes": [str(p) for p in self.consumed_span_volumes],
             "logs": self.logs, "error": None,
         }
 

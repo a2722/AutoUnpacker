@@ -74,3 +74,6 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# UC 内嵌浏览器的持久化 Profile（含 Cookie/缓存，绝不能进仓库）
+uc_profile/

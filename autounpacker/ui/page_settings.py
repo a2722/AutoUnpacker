@@ -103,11 +103,18 @@ _CLIP_BADGE_TEXT = "需开启剪贴板监听"
 
 # UC 网盘通路（实验性）：两行说明文案。缺可选组件时用 MISSING 文案，避免用户
 # 开了开关却「点了没反应」。
+# ★ 2026-11-09（用户要求就地标注）：这条链路**功能不完善**，只做到「打开页面 →
+# 手动点下载」，自动识别 / 自动下载都没做完；已知把直链交给 IDM 会被 CDN 拒
+# （403，直链要校验 UC cookie）。默认关闭，且「推荐配置」也不会打开它。
+# 接口层面的完整调研结论见 `.omo/HANDOFF-2026-11-09-uc-protocol.md`。
 _UC_HINT_READY = (
-    "UC 网盘走「内嵌浏览器 + 登录态」，与上面的百度链路完全独立、互不影响。"
+    "【功能不完善】UC 网盘走「内嵌浏览器 + 登录态」，目前只到「打开页面 → 手动点下载」，"
+    "自动识别与自动下载尚未完成；已知把直链交给 IDM 会被拒（CDN 校验 cookie，返回 403）。"
+    "本功能默认关闭，「推荐配置」也不会开启 —— 不建议日常使用。"
     "登录一次可复用约 2~4 周；过期后再点一次「全部下载」重新登录即可。")
 _UC_HINT_MISSING = (
-    "UC 网盘通路需要可选组件 PyQtWebEngine（未安装）。未安装不影响其它任何功能；"
+    "【功能不完善】UC 网盘通路需要可选组件 PyQtWebEngine（未安装）。该功能本身也尚未完善"
+    "（默认关闭、推荐配置不开）。未安装不影响其它任何功能；"
     "需要时执行：pip install PyQtWebEngine==5.15.7")
 
 # 风险行左侧 danger 竖条宽度（与 style.py `QWidget#setRow[risk="true"]` 的
@@ -2608,6 +2615,15 @@ class SettingsPage(QWidget):
             "会自动触发下载，请确认来源可信。",
             syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
             experimental=True)
+        # 验证码调试通知：观察自动识别成功率用（含成功也通知）。
+        # 刻意**不**走实验性门控登记表（_exp_gate/_exp_extra_gate 的计数被
+        # 离线验收锁定，后加行不得扩它）；它只是日志/通知开关，不影响链路行为。
+        self.vcode_debug_cb = self._check(
+            g, "验证码调试通知", "vcode_debug_notify",
+            "每次识别都通知我，观察成功率（含自动成功；仅在分享链路命中"
+            "百度图形验证码时才有事件）。",
+            syn=("验证码", "vcode", "调试", "通知", "识别", "分享"),
+            default=False)
         # 注意：方案 §5.5 的「分享下载前先让我挑选文件」(baidu_pick_before_download)
         # 在本机 config 里已被 _sanitize_cfg 显式 pop（该功能 v2.1.6 退场）。若在此
         # 放一个活控件，用户一勾就写一个「加载即被丢弃」的键 → 回读校验必失败、
@@ -2689,15 +2705,16 @@ class SettingsPage(QWidget):
         门控走独立登记表 _exp_extra_gate/_exp_extra_badges（_exp_gate 的计数被离线
         验收锁定，后加行不得扩它）。
         """
-        g = self._group(box, "UC 网页端链路")
-        self.uc_hint = self._hint(_UC_HINT_READY, g.parentWidget())
+        g = self._group(box, "UC 网页端链路（功能不完善）")
+        self.uc_hint = self._hint(_UC_HINT_READY, g.parentWidget(), warn=True)
         g.addWidget(self.uc_hint)
 
         # ---- 行1：总开关 ----
         uh, ul = self._manual_row(g)
         uc_meta = _SettingRow(
             "启用 UC 网盘网页端",
-            "开启后：识别到 UC 分享链接时打开内嵌浏览器下载；与百度链路互不影响。",
+            "开启后：识别到 UC 分享链接时打开内嵌浏览器下载；与百度链路互不影响。"
+            "（功能不完善，默认关闭，不建议日常使用）",
             "uc_web_enabled", None, "lab", "UC 网页端链路",
             syn=("UC", "uc", "网盘", "uc网盘", "fast.uc.cn", "网页端", "实验性", "浏览器"))
         uc_meta.host = uh
@@ -3756,6 +3773,7 @@ class SettingsPage(QWidget):
                 self.share_wait_spin.setValue(
                     max(5, min(600, i("share_gesture_wait_sec", 60))))
                 self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
+                self.vcode_debug_cb.setChecked(b("vcode_debug_notify", False))
                 self.baidu_db_edit.setText(s("baidu_task_db"))
                 self.baidu_proc_edit.setText(s("baidu_client_proc_names"))
             # UC 网盘网页端（与百度链路完全独立的实验性通路）

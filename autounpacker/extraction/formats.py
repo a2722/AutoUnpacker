@@ -159,13 +159,40 @@ def _scan_front_for_archive(path):
     适用场景：JPEG/PNG/视频头（几 KB~几 MB）+ 紧跟的真实压缩包数据
     （如 JPEG Exif 头 + 7z 加密包，签名在文件前部约 0.01% 处）。
     这类伪装不在文件末尾，尾部扫描找不到；又因文件巨大全量扫描被跳过，
-    前部扫描是唯一可行且廉价的检测方式。"""
+    前部扫描是唯一可行且廉价的检测方式。
+
+    性能注意（真机 28,431 个小文件的后处理因此从 147s 降到约 3s）：
+    旧实现无条件 `f.read(32MB)`，CPython 会先按请求长度分配一个 32MB
+    的 bytes 对象再读——即使文件只有 453 字节，也要付一次 32MB 分配的
+    固定成本（实测 ~3.5ms/文件）。这里改为按 min(文件大小, 上限) 分块读，
+    并在命中签名时立即返回，小文件成本降到微秒级。"""
     try:
-        with open(path, "rb") as f:
-            data = f.read(POLYGLOT_FRONT_SCAN_LIMIT)
+        size = path.stat().st_size
     except OSError:
         return None
-    return _scan_chunk_for_archive(data)
+    # 小文件（<= 尾部扫描窗口）不需要再扫前部：`detect_archive_format` 在走到
+    # 这里之前已做过 `_scan_tail_for_archive`（从 size-64KB 读到 EOF，对这类
+    # 小文件等于把整个文件读了一遍），内容完全重叠，再扫一次是纯重复 I/O。
+    # 真机：28,431 个游戏零碎文件里有 2.7 万个走这条路，省掉即是从 12s 再往下压。
+    if size <= POLYGLOT_EOCD_RANGE:
+        return None
+    limit = min(size, POLYGLOT_FRONT_SCAN_LIMIT)
+    if limit <= 0:
+        return None
+    try:
+        with open(path, "rb") as f:
+            read = 0
+            while read < limit:
+                chunk = f.read(min(1 << 20, limit - read))
+                if not chunk:
+                    break
+                read += len(chunk)
+                found = _scan_chunk_for_archive(chunk)
+                if found:
+                    return found
+    except OSError:
+        return None
+    return None
 
 
 def _zip_eocd_within_file(path):
@@ -225,6 +252,13 @@ def _confirm_polyglot(path, fmt):
     return fmt
 
 
+# 7-Zip 在「归档真实、但需要密码」时的输出特征（小写比对）。
+# 头部加密（7z -mhe / RAR 加密文件名）在没给密码时只会提示输入密码，
+# 这类输出说明签名不是巧合，必须放行，密码交给解压阶段处理。
+_NEED_PWD_HINTS = ("enter password", "cannot open encrypted",
+                   "wrong password", "密码", "口令")
+
+
 def _verify_polyglot_7z_rar(path, fmt):
     """多段伪装扫描命中 7z/rar 后，用真实 7-Zip 复核签名不是巧合。
 
@@ -249,7 +283,22 @@ def _verify_polyglot_7z_rar(path, fmt):
         r = run_silent([str(sevenzip), "l", "-t#", str(path)])
     except Exception:
         return fmt
-    return fmt if r.returncode == 0 else None
+    if r.returncode == 0:
+        return fmt
+    # 关键分支：签名命中但 7-Zip 非 0 退出。除了「签名巧合」，还有一种
+    # 真归档情况 —— **头部加密**（7z -mhe / RAR 加密文件名）。此时 7-Zip
+    # 没有密码只会输出「Enter password」或「Cannot open encrypted archive.
+    # Wrong password?」，rc 非 0 但归档是真的。若一律按巧合否掉，像
+    # `xxx.jpg`（图头 + 302MB 7zAES）这种多段伪装会被判成「未知格式」，
+    # watcher 永远不触发解压（真机 croove 2026.11 罗蕾莱.jpg 即此坑）。
+    # 故识别到「要密码」就放行，由解压阶段用密码本 / 提示补密码。
+    # 签名巧合时 7-Zip 只会说 "Can not open the file as [7z] archive"，
+    # 不含上述字样，仍会被正确拒绝。
+    out = ((str(getattr(r, "stdout", "") or ""))
+           + (str(getattr(r, "stderr", "") or ""))).lower()
+    if any(h in out for h in _NEED_PWD_HINTS):
+        return fmt
+    return None
 
 
 def _header_matches_format(path, fmt):

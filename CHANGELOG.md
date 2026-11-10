@@ -5,6 +5,45 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.42] - 2026-11-10
+
+> **本轮重点**：按抓包对比结果，把百度网盘实验性链路「对齐浏览器」（A 档 + B 档）。
+> 起因：最近 /api/sharedownload 频繁回 errno=-20（验证码），而同一时间在 Edge
+> 里手动打开同一类分享完全没有验证码。
+
+### 修复
+
+- **请求太干净，被风控一眼认出**
+  - 抓包事实：浏览器从页面到 sharedownload 只有 6 秒，但这 6 秒里发了 40+ 个请求，
+    每个都带一整套浏览器请求头；我们只带 UA/Referer/Content-Type，urllib 还会
+    自动补上 Accept-Encoding: identity、Connection: close —— 这两项是管道机器人招牌。
+  - 补齐 Origin / X-Requested-With / Accept / Accept-Language /
+    Accept-Encoding: gzip, deflate / Sec-Fetch-Site|Mode|Dest / sec-ch-ua* /
+    Connection: keep-alive；UA 换成与抓包一致的 Edge 157；并自行按
+    Content-Encoding 解 gzip/deflate（声明了就得自己解）。
+- **cookie 不落地 → 每次都是「全新设备首次访问」**
+  - 新增 DATA_DIR/baidu_cookies.txt（MozillaCookieJar），跨运行复用
+    BAIDUID / PANWEB / BDCLND / csrfToken；文件损坏、目录不可写时静默
+    退化为进程内 jar，绝不影响链路。
+- **sharedownload 少了客户端通道标记**
+  - body 补 ct=pcygj&cv=<探测到的客户端版本，回落 7.14.1.6>（浏览器固定带这两项）。
+- **tplconfig 没问 jsToken**
+  - 改问 ields=sign,timestamp,jsToken；服务端下发时原样带进 sharedownload
+    （只有被风控盯上的会话才会下发）。
+- **风控标记预检（B 档）**
+  - verify 之后、sharedownload 之前补 /share/risklabel → /share/taskquery?scene=risk_label；
+    hit_risklabel=1 直接失败并提示「先在浏览器里手动打开一次」，不再白撞三次验证码。
+  - /share/list 返回 hitrisk=1 同样提前止损。接口异常 / 字段缺失一律放行，绝不误挡。
+- **验证码重试节奏**
+  - 自动 OCR 与手动兜底的重试之间加 0.8~1.5s 随机抖动：实测日志里「1 秒内连发 3 张图」
+    是教科书级机器人特征，只会把风控分越推越高。
+
+### 测试
+
+- 新增 	est_baidu_browser_parity.py（25 项）：请求头全套、UA、cookie 落盘/读回/损坏降级、
+  gzip 解码、ct/cv、jsToken 透传、risklabel 命中与放行、异常放行、hitrisk、重试抖动。
+- 全量离线套件：**211** 个测试文件，4 个已知失败（与上一版同）。
+
 ## [2.2.41] - 2026-11-10
 
 > **本轮重点**：分卷末段的识别**不再依赖文件名**——上传者把末卷改成什么名字

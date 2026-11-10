@@ -495,6 +495,17 @@ def normalize_volume_name(name):
         m = re.match(r"^(.*)\.([^\x00-\x7f]{1,4})(\d{3})$", s)
         if m:
             cands.append(f"{m.group(1)}.{m.group(3)}")
+        # 变异②：脏字符插在编号**中间或末尾**（真机 xxx.zip.00删掉2 实为 .002，
+        # 上传者把「删掉」二字塞进编号里防直链检测）。只接受**纯非 ASCII** 脏字符，
+        # 并把剩下的数字拼回编号；1of2 / .part1of2 这类含 ASCII 的正常名字不受影响。
+        if "." in s:
+            head, _, tail = s.rpartition(".")
+            if tail and tail[0].isdigit():
+                digits = "".join(ch for ch in tail if ch.isdigit())
+                junk = "".join(ch for ch in tail if not ch.isdigit())
+                if (junk and 2 <= len(digits) <= 3
+                        and all(ord(ch) > 0x7F for ch in junk)):
+                    cands.append(head + "." + digits)
         for c in cands:
             if c and _is_volume_suffix(c):
                 return c
@@ -1099,6 +1110,57 @@ def is_volume_file(source_name, candidate, stem):
     if final_part and candidate == final_part:
         return True
     return False
+
+
+def canonicalize_sibling_names(first_path):
+    """把同系列分卷里「名字被插了脏字符」的兄弟卷改回标准名（7-Zip 只认文件名）。
+
+    真机（2026-11-10）：东方鬼畜音MAD-1.zip.001 + 东方鬼畜音MAD-1.zip.00删掉2
+    —— 归一后是 .002，程序认得它是分卷，但 7-Zip 拼分卷只看**磁盘上的文件名**，
+    仍报 Unexpected end of archive，于是永远等不到「到齐」。
+
+    只处理「归一后与首卷同基础名 + 编号可识别 + 目标名不存在」的兄弟卷；
+    任一目标已存在 → 整组零动作（绝不覆盖）；失败只跳过，绝不抛异常。
+    返回 [(旧 Path, 新 Path), ...]（已实际改名）。
+    """
+    done = []
+    try:
+        first = Path(first_path)
+        src_base = _volume_base(first.name)
+        if not src_base:
+            return done
+        parent = first.parent
+        try:
+            entries = list(parent.iterdir())
+        except OSError:
+            return done
+        plan = []
+        for e in entries:
+            try:
+                if not e.is_file() or e.name == first.name:
+                    continue
+                norm = normalize_volume_name(e.name)
+                if norm == e.name:
+                    continue                      # 名字本来就干净
+                if _volume_base(norm) != src_base:
+                    continue                      # 不是同一系列
+                if _volume_number(norm) is None:
+                    continue
+                dest = e.with_name(norm)
+                if dest.exists():
+                    return []                     # 目标已占用：整组零动作
+                plan.append((e, dest))
+            except OSError:
+                continue
+        for old, dest in plan:
+            try:
+                old.rename(dest)
+                done.append((old, dest))
+            except OSError:
+                continue
+    except Exception:
+        return done
+    return done
 
 
 def _split_set_base(name):

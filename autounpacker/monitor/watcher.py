@@ -1328,6 +1328,15 @@ class FolderWatcher(threading.Thread):
             self._vol_wait.pop(abs_fp, None)
             return True
         name = fp.name
+        # 先把「名字被插了脏字符」的兄弟卷改回标准名：程序认得 `.00删掉2` 就是 `.002`，
+        # 但 7-Zip 拼分卷只看**磁盘文件名**，不改名永远报 Unexpected end of archive
+        # → 一直等「到齐」（2026-11-10 真机：东方鬼畜音MAD-1.zip.001）。
+        try:
+            for _old, _new in smart_extract.canonicalize_sibling_names(fp):
+                self.hub.log(f"分卷名已规范（7-Zip 只认文件名，可手动改回）: "
+                             f"{_old.name} → {_new.name}")
+        except Exception:
+            pass
         final_name = smart_extract._volume_final_name(name)
         try:
             vols = {}      # {卷号: 大小}（不含末卷）
@@ -1647,6 +1656,13 @@ class FolderWatcher(threading.Thread):
         False，绝不影响拖放解压流程。返回 True = 验证通过并已把改名兄弟卷改成首卷系列名。
         """
         try:
+            # 脏名分卷先规范（同上：7-Zip 只认文件名），再做跨名配对判定。
+            try:
+                for _old, _new in smart_extract.canonicalize_sibling_names(fp):
+                    self.hub.log(f"分卷名已规范（7-Zip 只认文件名，可手动改回）: "
+                                 f"{_old.name} → {_new.name}")
+            except Exception:
+                pass
             return self._pair_split_check(fp, {})
         except Exception:
             return False

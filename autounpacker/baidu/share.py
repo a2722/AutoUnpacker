@@ -40,20 +40,25 @@
 - §4 防反爬：`/share/verify` 每次调用最多发 **1 次**，失败即停（不换码重试）；
   两次 verify 之间强制间隔 ≥ `_VERIFY_MIN_GAP` 秒；一旦要求图形验证码立即放弃。
 """
+import gzip
 import http.cookiejar
 import json
 import logging
 import os
+import random
 import re
 import ssl
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
 
 from . import captcha
 from .db import MIN_WAKE_VERSION, client_version, parse_version, version_below
 from .manifest import detect_dead_share_page
+from ..paths import DATA_DIR
 
 # 本模块的进程内日志（版本探测软告警 / 诊断走标准 logging；未配置 handler 时
 # 由 lastResort 兜底，绝不抛异常、绝不影响链路）。
@@ -63,8 +68,19 @@ _log = logging.getLogger(__name__)
 # 公共查询串：chunlei Web 端固定参数，末尾的 `=` 不能省。
 _Q = "channel=chunlei&web=1&app_id=250528&clienttype=0&bdstoken="
 _S = "https://pan.baidu.com"
+# UA 与抓包里的 Edge 一字不差：2026-11 起 /api/sharedownload 前的风控会看
+# 客户端指纹一致性（UA 说是 Chrome 120、请求头却缺 sec-ch-ua/Sec-Fetch，
+# 反而比"老老实实一个 UA"更可疑）。
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0")
+_CH_UA = '"Not-A.Brand";v="99", "Microsoft Edge";v="157", "Chromium";v="157"'
+# sharedownload 的 cv：抓包里 Web 端固定带 `ct=pcygj&cv=7.14.1.6`
+# （pcygj = 网盘 PC 客户端通道）。我们不带上它时，请求看起来就是"裸网页 API"。
+_DEFAULT_CV = "7.14.1.6"
+# cookie 落盘文件名（DATA_DIR 下）：跨运行复用 BAIDUID/PANWEB/BDCLND 等，
+# 让服务端看到"有历史的客户端"而不是每次全新设备。
+_COOKIE_NAME = "baidu_cookies.txt"
+_COOKIE_LOCK = threading.Lock()
 # 分享链接路径段（/s/<surl_full>）；提取码从查询串取。
 _SURL_RE = re.compile(r"/s/([A-Za-z0-9_-]+)")
 # 百度「安全验证」页形态：/share/init?surl=<裸 surl>（前导 1 已被百度去掉）。
@@ -77,6 +93,11 @@ _SURL_QUERY_RE = re.compile(r"[?&]surl=([A-Za-z0-9_-]+)")
 # 新版分享的提取码是强制必填项：空码去提交必然失败。`prepare_share` 在死链判定之后、
 # 任何 tplconfig/verify 请求之前就此短路，把原因交回上层去询问用户（供测试/上层引用）。
 NEED_CODE_REASON = "该分享需要提取码"
+
+# 分享被百度风控打标时的统一提示（risklabel / taskquery / list.hitrisk 共用）。
+_RISK_BLOCKED_REASON = (
+    "该分享已被百度风控标记（命中 risklabel），自动拉起大概率只会撞验证码："
+    "建议先在浏览器里手动打开一次这个分享，稍后再试。")
 
 # 唤起已发出、但后续 `/api/invoker/check` 复核返回 errno≠0 时的统一前缀。
 # 上层据此把「唤醒已发出、客户端未确认接单」与普通拉起失败区分开，对已发出的
@@ -210,34 +231,178 @@ def _verify_wait():
         pass
 
 
-def _build_opener():
-    """构造共用 OpenerDirector（CookieJar + 忽略证书校验的 HTTPS）。"""
+def _cookie_path():
+    """cookie 落盘路径；拿不到目录时返回空串（退化为进程内 jar）。"""
+    try:
+        return str(DATA_DIR / _COOKIE_NAME)
+    except Exception:
+        return ""
+
+
+def _load_cookiejar():
+    """读取上次落盘的 cookie；文件缺失/损坏一律退化成空 jar，绝不抛异常。
+
+    整段外层兜底：本机 `os` 可能被测试替换成桩、`DATA_DIR` 也可能不可写，
+    这些都不该让「拿不到历史 cookie」升级成整条链路失败。
+    """
+    try:
+        path = _cookie_path()
+        if not path:
+            return http.cookiejar.CookieJar()
+        jar = http.cookiejar.MozillaCookieJar(path)
+        try:
+            exists = os.path.exists(path)
+        except Exception:
+            exists = False
+        if exists:
+            try:
+                with _COOKIE_LOCK:
+                    jar.load(ignore_discard=True, ignore_expires=True)
+            except Exception:
+                jar = http.cookiejar.MozillaCookieJar(path)
+        return jar
+    except Exception:
+        return http.cookiejar.CookieJar()
+
+
+def _persist(op):
+    """把 opener 的 CookieJar 落盘（失败静默：cookie 只是"锦上添花"）。"""
+    try:
+        cj = getattr(op, "_cj", None)
+        if not isinstance(cj, http.cookiejar.MozillaCookieJar):
+            return
+        with _COOKIE_LOCK:
+            cj.save(ignore_discard=True, ignore_expires=True)
+    except Exception:
+        pass
+
+
+def _build_opener(jar=None):
+    """构造共用 OpenerDirector（CookieJar + 忽略证书校验的 HTTPS）。
+
+    默认**复用落盘的 cookie jar**：浏览器每次请求都带着稳定的 BAIDUID/PANWEB，
+    我们如果每次新建空 jar，等于"每跑一次都是一个全新设备首次访问"，风控分直接拉满。
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    cj = http.cookiejar.CookieJar()
+    cj = jar if jar is not None else _load_cookiejar()
     op = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(cj),
         urllib.request.HTTPSHandler(context=ctx))
     op.addheaders = [("User-Agent", _UA)]
+    try:
+        op._cj = cj
+    except Exception:
+        pass
     return op
 
 
+def _req_headers(referer, ctype=None):
+    """对齐 Edge 的请求头。
+
+    抓包（2026-11-10）里浏览器每次必带、而 urllib 默认缺失的正是这几项：
+    Origin / X-Requested-With / Accept / Accept-Language /
+    Accept-Encoding(=identity 是 Python 的招牌) / Sec-Fetch-* / sec-ch-ua*。
+    """
+    h = {
+        "User-Agent": _UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Origin": _S,
+        "Referer": referer,
+        "X-Requested-With": "XMLHttpRequest",
+        "sec-ch-ua": _CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
+    if ctype:
+        h["Content-Type"] = ctype
+    return h
+
+
+def _decode_body(resp):
+    """按 Content-Encoding 解压（我们声明了 gzip/deflate，就必须自己解）。"""
+    raw = resp.read()
+    enc = (resp.headers.get("Content-Encoding") or "").lower()
+    try:
+        if "gzip" in enc:
+            raw = gzip.decompress(raw)
+        elif "deflate" in enc:
+            try:
+                raw = zlib.decompress(raw)
+            except Exception:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+    except Exception:
+        pass
+    return raw.decode("utf-8", "replace")
+
+
+def _human_gap(lo=0.8, hi=1.5):
+    """验证码重试之间的人类节奏抖动。
+
+    实测日志：1 秒内连发 3 张图（第1/2/3 次）是教科书级机器人特征，
+    只会把风控分越推越高。这里给 0.8~1.5s 的随机间隔。
+    """
+    try:
+        time.sleep(random.uniform(lo, hi))
+    except Exception:
+        pass
+
+
 def _get(op, url, referer):
-    """GET 文本（utf-8, 容错）。"""
-    rq = urllib.request.Request(url, headers={"Referer": referer})
+    """GET 文本（gzip 容错）。"""
+    rq = urllib.request.Request(url, headers=_req_headers(referer))
     with op.open(rq, timeout=15) as r:
-        return r.read().decode("utf-8", "replace")
+        text = _decode_body(r)
+    _persist(op)
+    return text
 
 
 def _post(op, url, data, referer):
-    """POST 表单（urlencoded）并返回文本。data 用 dict（保持插入顺序）。"""
+    """POST 表单（urlencoded，gzip 容错）。data 用 dict（保持插入顺序）。"""
     body = urllib.parse.urlencode(data).encode()
-    rq = urllib.request.Request(url, data=body, headers={
-        "Referer": referer,
-        "Content-Type": "application/x-www-form-urlencoded"})
+    rq = urllib.request.Request(url, data=body, headers=_req_headers(
+        referer, "application/x-www-form-urlencoded; charset=UTF-8"))
     with op.open(rq, timeout=15) as r:
-        return r.read().decode("utf-8", "replace")
+        text = _decode_body(r)
+    _persist(op)
+    return text
+
+
+def _risklabel_blocked(op, uk, share_id, pwd, referer):
+    """分享风控标记预检（2026-11 新握手）；确认被标记时返回中文原因。
+
+    浏览器点「下载」之前必走 `/share/risklabel` → `/share/taskquery?scene=risk_label`，
+    命中标记时随后的 sharedownload 会直接甩验证码。我们提前问一次：
+    被标记就**一个 sharedownload 都不发**地失败，省掉用户 OCR 和一次风控分。
+
+    只做提前止损：接口不存在 / errno≠0 / 字段缺失 / 异常 → 一律返回 None（放行），
+    绝不因为一次探测失败就挡住正常下载。
+    """
+    try:
+        qp = urllib.parse.quote(str(pwd or ""))
+        q = f"uk={uk}&share_id={share_id}&pwd={qp}&{_Q}"
+        j = json.loads(_post(op, f"{_S}/share/risklabel?{q}", {}, referer))
+        if not isinstance(j, dict) or j.get("errno") not in (0, None):
+            return None
+        if j.get("hit_risklabel") == 1:
+            return _RISK_BLOCKED_REASON
+        taskid = j.get("taskid")
+        if taskid:
+            q2 = (f"uk={uk}&share_id={share_id}&taskid={taskid}"
+                  f"&scene=risk_label&pwd={qp}&{_Q}")
+            j2 = json.loads(_post(op, f"{_S}/share/taskquery?{q2}", {}, referer))
+            if isinstance(j2, dict) and j2.get("hit_risklabel") == 1:
+                return _RISK_BLOCKED_REASON
+    except Exception:
+        return None
+    return None
 
 
 def _parse_share(share_url, pwd):
@@ -385,7 +550,8 @@ def prepare_share(share_url, pwd=""):
             return False, _timeout_reason()
         tpl = json.loads(_get(
             op,
-            f"{_S}/share/tplconfig?surl={surl_full}&fields=sign,timestamp"
+            f"{_S}/share/tplconfig?surl={surl_full}"
+            f"&fields=sign,timestamp,jsToken"
             f"&view_mode=1&{_Q}",
             referer_share))
         if not isinstance(tpl, dict):
@@ -397,6 +563,9 @@ def prepare_share(share_url, pwd=""):
         if not isinstance(d, dict) or "sign" not in d or "timestamp" not in d:
             return False, "分享信息获取失败（未返回 sign/timestamp）"
         sign, ts = d["sign"], d["timestamp"]
+        # 被风控盯上时服务端会额外下发 jsToken，浏览器会原样带进
+        # sharedownload；正常会话里这一项为空。
+        js_token = str(d.get("jsToken") or "")
 
         # 2. verify：校验提取码 → randsk（即 sekey），后面 extra 要用。
         #    §4：本次调用最多 1 次 verify——失败即停，不换码、不重试；
@@ -451,6 +620,10 @@ def prepare_share(share_url, pwd=""):
                 break
             if resp.get("errno"):
                 break
+            # 服务端在这一步就把"是否被风控打标"告诉页面了（浏览器正常返回 0）。
+            # 打标时继续下载只会换来验证码，直接给出可执行的提示。
+            if resp.get("hitrisk") == 1:
+                return False, _RISK_BLOCKED_REASON
             lst = resp.get("list")
             if not isinstance(lst, list):
                 break
@@ -490,6 +663,14 @@ def prepare_share(share_url, pwd=""):
         if not (share_uk and shareid):
             return False, "分享页未解析到 share_uk / shareid（链接可能失效或需提取码）"
 
+        # 4.5 风控标记预检：确认被标记就到此为止，绝不把一次注定撞验证码的
+        #     sharedownload 发出去（B 档）。
+        if _deadline_hit(deadline):
+            return False, _timeout_reason()
+        blocked = _risklabel_blocked(op, share_uk, shareid, pwd, referer_share)
+        if blocked:
+            return False, blocked
+
         # 客户端版本软探测（detect-and-report，不属于链路步骤）：每次准备只探测
         # 一次，结果随 prep 带到提交段进成功文案（None = 版本未知，文案保持干净）。
         # 只读、极快、绝不阻断任何后续步骤（见 _probe_client_version）。
@@ -501,6 +682,7 @@ def prepare_share(share_url, pwd=""):
             "pwd": pwd,
             "sign": sign,
             "ts": ts,
+            "jsToken": js_token,
             "randsk": randsk,
             "share_uk": share_uk,
             "shareid": shareid,
@@ -896,10 +1078,17 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None,
             return False, _timeout_reason()
         sd_url = (f"{_S}/api/sharedownload?{_Q}"
                   f"&sign={urllib.parse.quote(sign)}&timestamp={ts}")
+        js_token = str(prep.get("jsToken") or "")
+        if js_token:
+            sd_url += "&jsToken=" + urllib.parse.quote(js_token)
         sd_form = {"encrypt": "1",
                    "extra": json.dumps({"sekey": urllib.parse.unquote(randsk)},
                                        ensure_ascii=False),
                    "product": "share",
+                   # 浏览器固定带这两项（pcygj = 网盘 PC 客户端通道 + 客户端版本）；
+                   # 缺了它们，服务端看到的是一句"裸网页 API 调用"。
+                   "ct": "pcygj",
+                   "cv": str(prep.get("_client_version") or _DEFAULT_CV),
                    "timestamp": str(ts),
                    "uk": share_uk,
                    "primaryid": shareid,
@@ -916,6 +1105,8 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None,
             for attempt in range(1, captcha.MAX_ATTEMPTS + 1):
                 if _deadline_hit(deadline):
                     break
+                if attempt > 1:
+                    _human_gap()
                 vcode_str, img = captcha.fetch_vcode(op, share_url)
                 if not vcode_str or not img:
                     _emit_captcha(captcha_hook, {
@@ -958,6 +1149,8 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None,
             for mi in range(1, captcha.MAX_ATTEMPTS + 1):
                 if _deadline_hit(deadline):
                     break
+                if mi > 1:
+                    _human_gap()
                 vcode_str, img = captcha.fetch_vcode(op, share_url)
                 if not vcode_str or not img:
                     break

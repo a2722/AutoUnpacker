@@ -77,3 +77,7 @@ desktop.ini
 
 # UC 内嵌浏览器的持久化 Profile（含 Cookie/缓存，绝不能进仓库）
 uc_profile/
+
+# 百度分享链路的持久化 cookie（含 BDCLND/BAIDUID，绝不进仓库）
+baidu_cookies.txt
+baidu_cookies.txt.tmp

@@ -65,14 +65,25 @@ def fetch_vcode(op, referer):
     绑定，换会话提交必失败。响应里的图片 URL 带 `\\/` 转义，需还原后再 GET。
     """
     try:
-        rq = urllib.request.Request(_GETVCODE_URL, headers={"Referer": referer})
+        # 与分享链路同一套浏览器特征：验证码接口也是一次 XHR，只带 Referer
+        # 会显得格外脚本（抓包里浏览器必带 Origin / X-Requested-With / Accept）。
+        rq = urllib.request.Request(_GETVCODE_URL, headers={
+            "Referer": referer,
+            "Origin": "https://pan.baidu.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "X-Requested-With": "XMLHttpRequest"})
         with op.open(rq, timeout=15) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
         vcode = data.get("vcode")
         img_url = str(data.get("img") or "").replace("\\/", "/")
         if not vcode or not img_url:
             return None, None
-        rq2 = urllib.request.Request(img_url, headers={"Referer": referer})
+        rq2 = urllib.request.Request(img_url, headers={
+            "Referer": referer,
+            "Accept": ("image/avif,image/webp,image/apng,image/svg+xml,"
+                       "image/*,*/*;q=0.8"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
         with op.open(rq2, timeout=15) as r:
             img = r.read()
         if not img:

@@ -56,6 +56,7 @@ import urllib.request
 import zlib
 
 from . import captcha
+from . import netpref
 from .db import MIN_WAKE_VERSION, client_version, parse_version, version_below
 from .manifest import detect_dead_share_page
 from ..paths import DATA_DIR
@@ -356,22 +357,36 @@ def _human_gap(lo=2.0, hi=3.5):
         pass
 
 
+def _ipv4_enabled():
+    """是否优先走 IPv4（默认**开**）；实现与缓存都在 netpref 里。
+
+    百度对 v6 出站的分享下载几乎必弹验证码；改 hosts 要管理员权限且重装即丢，
+    不适合分发，所以在进程内做（只影响本线程解析）。
+    """
+    try:
+        return netpref.prefer_ipv4()
+    except Exception:
+        return True
+
+
 def _get(op, url, referer):
-    """GET 文本（gzip 容错）。"""
+    """GET 文本（gzip 容错，优先 IPv4）。"""
     rq = urllib.request.Request(url, headers=_req_headers(referer))
-    with op.open(rq, timeout=15) as r:
-        text = _decode_body(r)
+    with netpref.ipv4_only(_ipv4_enabled()):
+        with op.open(rq, timeout=15) as r:
+            text = _decode_body(r)
     _persist(op)
     return text
 
 
 def _post(op, url, data, referer):
-    """POST 表单（urlencoded，gzip 容错）。data 用 dict（保持插入顺序）。"""
+    """POST 表单（urlencoded，gzip 容错，优先 IPv4）。data 用 dict（保持插入顺序）。"""
     body = urllib.parse.urlencode(data).encode()
     rq = urllib.request.Request(url, data=body, headers=_req_headers(
         referer, "application/x-www-form-urlencoded; charset=UTF-8"))
-    with op.open(rq, timeout=15) as r:
-        text = _decode_body(r)
+    with netpref.ipv4_only(_ipv4_enabled()):
+        with op.open(rq, timeout=15) as r:
+            text = _decode_body(r)
     _persist(op)
     return text
 

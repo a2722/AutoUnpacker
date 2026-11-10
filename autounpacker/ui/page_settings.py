@@ -2724,6 +2724,29 @@ class SettingsPage(QWidget):
         bridge_meta.widget = self.baidu_bridge_combo
         self._rows.append(bridge_meta)
         self._exp_extra_gate.append((dh, (self.baidu_bridge_combo,)))
+        # 优先 IPv4（2026-11-10）：百度对 v6 出站的分享下载几乎必弹验证码。
+        # 只影响百度域名的解析（进程内做，不需要改 hosts / 管理员权限）。
+        vh, vl = self._manual_row(g)
+        v4_meta = _SettingRow(
+            "优先用 IPv4",
+            "百度对 IPv6 出站的分享下载几乎必弹验证码（社区长期反馈）。开启后"
+            "只影响百度域名的解析：直连只取 A 记录，浏览器桥也钉到 A 记录；"
+            "其它网站、其它功能完全不受影响。不需要改 hosts、不需要管理员权限。",
+            "baidu_force_ipv4", None, "lab", "百度网盘链路",
+            syn=("百度", "IPv6", "IPv4", "验证码", "hosts", "网络", "解析"))
+        v4_meta.host = vh
+        v4_meta.note = _EXP_NOTE
+        vl.addWidget(self._make_name(vh, "优先用 IPv4", v4_meta))
+        vl.addWidget(self._exp_extra_badge(vh, vh), 0, Qt.AlignVCenter)
+        self.baidu_v4_cb = _Switch(vh)
+        self.baidu_v4_cb.toggled.connect(
+            lambda checked: self._commit("baidu_force_ipv4", bool(checked)))
+        self._reg("baidu_force_ipv4", self.baidu_v4_cb)
+        vl.addWidget(self.baidu_v4_cb)
+        vl.addStretch(1)
+        v4_meta.widget = self.baidu_v4_cb
+        self._rows.append(v4_meta)
+        self._exp_extra_gate.append((vh, (self.baidu_v4_cb,)))
         self.share_nologin_hint = self._hint(
             "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
             "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
@@ -3819,6 +3842,8 @@ class SettingsPage(QWidget):
                     _bmv = s("baidu_bridge_mode", "headless") or "headless"
                     _bmi = self.baidu_bridge_combo.findData(_bmv)
                     self.baidu_bridge_combo.setCurrentIndex(_bmi if _bmi >= 0 else 0)
+                if hasattr(self, "baidu_v4_cb"):
+                    self.baidu_v4_cb.setChecked(b("baidu_force_ipv4", True))
             # UC 网盘网页端（与百度链路完全独立的实验性通路）
             if hasattr(self, "uc_web_cb"):
                 self.uc_web_cb.setChecked(b("uc_web_enabled", False))

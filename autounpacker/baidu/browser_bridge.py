@@ -37,6 +37,7 @@ import threading
 import time
 import urllib.parse
 
+from . import netpref
 from .cdp import CDP, CDPError, WebSocket
 from ..paths import DATA_DIR
 
@@ -167,6 +168,35 @@ def _http_json(url, timeout=2.0):
 
 
 # ---------------------------------------------------------------- 会话
+def _launch_args(edge, mode, port, profile, map_ip=None):
+    """拼 Edge 启动参数（纯函数，便于离线测试）。
+
+    map_ip 非空时加 --host-resolver-rules=MAP pan.baidu.com <ip>：
+    把百度域名**钉死到 IPv4**（百度对 v6 出站的分享下载几乎必弹验证码；
+    实测 --disable-ipv6 无效，只有 MAP 规则生效）。
+    """
+    args = [edge]
+    if mode == "headless":
+        args += ["--headless=new",
+                 "--user-agent=" + _UA,
+                 "--window-size=1600,900",
+                 "--force-device-scale-factor=1"]
+    else:
+        args += ["--window-size=1280,860", "--window-position=120,80"]
+    args += [
+        "--remote-debugging-port=%d" % port,
+        "--user-data-dir=%s" % profile,
+        "--no-first-run", "--no-default-browser-check",
+        "--disable-extensions", "--disable-sync",
+        "--disable-features=msEdgeSidebarV2,msHubApps",
+        "--no-proxy-server",
+    ]
+    if map_ip:
+        args.append("--host-resolver-rules=MAP pan.baidu.com " + str(map_ip))
+    args.append("about:blank")
+    return args
+
+
 class _Session(object):
     """一个常驻 Edge 实例 + 一个已附着的页面 target。"""
 
@@ -180,6 +210,7 @@ class _Session(object):
         self.edge = ""
         self.started_at = 0.0
         self.page_url = ""
+        self.map_ip = ""
 
     # ---- 启动 ----
     def start(self):
@@ -188,26 +219,19 @@ class _Session(object):
             raise CDPError("没有找到 Edge（msedge.exe）")
         self.edge = edge
         profile = _profile_dir()
+        # 优先 IPv4：先挑一个**能连上**的 A 记录，再用 MAP 规则把它钉死。
+        # 拿不到就退回系统默认解析（有 v6 也照用，绝不让桥因为网络偏好起不来）。
+        self.map_ip = ""
+        try:
+            if netpref.prefer_ipv4():
+                self.map_ip = netpref.resolve_ipv4_first("pan.baidu.com", 443,
+                                                         timeout=1.5) or ""
+        except Exception:
+            self.map_ip = ""
         last_err = None
         for _ in range(3):
             port = _free_port()
-            args = [edge]
-            if self.mode == "headless":
-                args += ["--headless=new",
-                         "--user-agent=" + _UA,
-                         "--window-size=1600,900",
-                         "--force-device-scale-factor=1"]
-            else:
-                args += ["--window-size=1280,860",
-                         "--window-position=120,80"]
-            args += [
-                "--remote-debugging-port=%d" % port,
-                "--user-data-dir=%s" % profile,
-                "--no-first-run", "--no-default-browser-check",
-                "--disable-extensions", "--disable-sync",
-                "--disable-features=msEdgeSidebarV2,msHubApps",
-                "--no-proxy-server", "about:blank",
-            ]
+            args = _launch_args(edge, self.mode, port, profile, self.map_ip)
             try:
                 self.proc = subprocess.Popen(
                     args,

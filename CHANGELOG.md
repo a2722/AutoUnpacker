@@ -5,6 +5,46 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.44] - 2026-11-10
+
+> **本轮重点**：**优先用 IPv4**。百度对 IPv6 出站的分享下载几乎必弹验证码，
+> 而之前靠改 hosts 强制 v4 的办法要管理员权限、重装即丢 —— 现在改成进程内做。
+
+### 新增
+
+- **优先用 IPv4（实验性，默认开）**
+  - 现场数据：程序直连 **3/3 次都走 240e:...（IPv6）**；同一时间用户的 Edge
+    走的却是 36.110.192.103（IPv4），全程没有验证码。这解释了「手动没验证码、
+    程序老验证码」的一大半差异。
+  - 实现（不需要 hosts、不需要管理员权限）：
+    - 
+etpref.ipv4_only()：**线程局部**地把 socket.getaddrinfo 过滤成只返回
+      A 记录，于是 urllib / ssl / http.client 全部自动走 v4；
+    - 浏览器桥：实测 --disable-ipv6 **无效**（仍走 v6），改用
+      --host-resolver-rules=MAP pan.baidu.com <A记录> 把域名钉死到 v4；
+      启动前先做一次 TCP 探测，挑一个真能连上的 A 记录，拿不到就不加规则。
+  - 影响面：只影响**百度域名**的解析；其他线程、其他网站、显式要 AF_INET6 的
+    调用完全不受影响；没有任何 A 记录时原样退回系统解析。
+  - 开关：设置 → 实验性 → 百度网盘链路 →「优先用 IPv4」（默认开）。
+
+### 修复
+
+- 验证码取图（/api/getvcode 与图片下载）也纳入 IPv4 优先 —— 之前只有
+  tplconfig/verify/list/sharedownload 走 v4，取图仍可能走 v6。
+
+### 技术
+
+- 新增 utounpacker/baidu/netpref.py（IPv4 优先 + A 记录探测，零依赖）。
+- 浏览器桥启动参数抽成纯函数 _launch_args()，便于离线断言。
+- 新增配置 aidu_force_ipv4（默认 True）。
+
+### 测试
+
+- 新增 	est_netpref_ipv4.py（29 项）：解析过滤/恢复/线程隔离/显式 v6 不受影响/
+  无 A 记录时退回/配置缓存与异常兜底/MAP 启动参数/UI 接线。
+- 	est_baidu_resilience.py C2 期望 6/6 → 7/7。
+- 全量离线套件：**213** 个测试文件，4 个已知失败（与上一版同）。
+
 ## [2.2.43] - 2026-11-10
 
 > **本轮重点**：给百度链路加一个「浏览器桥」—— 直连被风控（errno=-20 验证码）时，

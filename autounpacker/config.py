@@ -159,6 +159,13 @@ DEFAULT_CONFIG = {
     #   "headless" = 静默拉起独立 profile 的 Edge，在页面里重放请求（默认，无窗口）
     #   "visible"  = 同上但显示真窗口（指纹 100% 真，适合静默仍被拦时）
     "baidu_bridge_mode": "headless",
+    # 实验性：优先用 IPv4 访问百度（默认开）。
+    # 百度对 IPv6 出站的分享下载几乎必弹图形验证码（社区长期反馈；本机实测直连
+    # 3/3 次走 240e: 段 v6，而 Edge 走 36.110.192.x 就没有验证码）。原先靠改 hosts
+    # 强制 v4，但改 hosts 要管理员权限、重装即丢，不适合分发 —— 这里改为进程内做：
+    # 只影响百度域名的解析（直连只取 A 记录；浏览器桥用 MAP 规则钉到 A 记录），
+    # 其它网站、其它线程完全不受影响。
+    "baidu_force_ipv4": True,
     "vcode_debug_notify": False,    # 实验性：验证码调试通知（每次识别都通知，含成功，观察成功率；默认关）
     # 实验性：客户端进程映像名（半角/全角逗号分隔；留空 = 使用内置默认 3 个）。
     # 百度更换客户端进程名后无需改代码，两个「客户端是否在运行」检测点共用
@@ -472,6 +479,7 @@ def _sanitize_cfg(cfg):
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
         _bm = str(cfg.get("baidu_bridge_mode", "headless") or "headless").strip().lower()
         cfg["baidu_bridge_mode"] = _bm if _bm in ("off", "headless", "visible") else "headless"
+        cfg["baidu_force_ipv4"] = bool(cfg.get("baidu_force_ipv4", True))
         cfg["vcode_debug_notify"] = bool(cfg.get("vcode_debug_notify", False))
         # 客户端进程名（逗号分隔字符串）：缺键/非字符串回退内置默认字符串；
         # **空串合法**（= 用内置默认，拆分与回退在 baidu/share.py），只去首尾

@@ -43,8 +43,38 @@ def ensure_min_height(widget):
     return False
 
 
+def ensure_natural_height(widget):
+    """把**不折行**标签的最小高度抬到它的自然高度（sizeHint().height()）。
+
+    为什么需要（真机 bug，2026-11-10「检测状态显示成叠字」）：只读值芯片
+    （QLabel#roval：`padding: 6px 11px` + 1px 边框）的自然高度是 27px
+    （字体 13 + 上下 padding 12 + 边框 2），而 ensure_min_height 只把它抬到
+    lineSpacing()+3 = 18px —— **最小高度低于自然高度**。于是上游布局一旦欠
+    9px（页面内容高度在 QSS 把芯片垫高之前就已同步过一次，滚动区此后不再
+    重算），行就有权把芯片压到 18px：文字上下各被裁掉约 4px，屏幕上表现为
+    「叠字 / 糊字」，而不是干净的截断。
+
+    只处理**不折行**标签：它们的 sizeHint().height() 与宽度无关，钉死它不会
+    引起布局抖动；折行标签（#hint / #stripHint）的 sizeHint 随宽度变，仍只走
+    ensure_min_height 的字体级兜底。
+
+    幂等（只抬不降）；任何异常静默返回 False。
+    """
+    try:
+        need = int(widget.sizeHint().height())
+        if widget.minimumHeight() < need:
+            widget.setMinimumHeight(need)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def fit_text_heights(root):
     """把 root 下所有「会绘制文本」的 QLabel 抬到 lineSpacing()+3。
+
+    不折行的标签额外钉到自然高度（含 QSS padding / 边框，见
+    ensure_natural_height —— 否则只读值芯片会被上游欠额压扁成叠字）。
 
     返回被抬高的标签数（0 = 无 / 全已达标 / root 为空或异常）。
     root 自身若是 QLabel 也会被处理；空文本（含全空白）标签绝不触碰。
@@ -67,6 +97,14 @@ def fit_text_heights(root):
                 continue
         except Exception:
             continue
-        if ensure_min_height(lbl):
+        changed = ensure_min_height(lbl)
+        wrapped = True
+        try:
+            wrapped = bool(lbl.wordWrap())
+        except Exception:
+            pass
+        if not wrapped:
+            changed = ensure_natural_height(lbl) or changed
+        if changed:
             fixed += 1
     return fixed

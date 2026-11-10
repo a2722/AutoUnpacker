@@ -154,6 +154,11 @@ DEFAULT_CONFIG = {
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
     "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
+    # 实验性：取 filelist 令牌的通道。直连被风控（errno=-20）时才升级到浏览器桥：
+    #   "off"      = 只用直连（老行为）
+    #   "headless" = 静默拉起独立 profile 的 Edge，在页面里重放请求（默认，无窗口）
+    #   "visible"  = 同上但显示真窗口（指纹 100% 真，适合静默仍被拦时）
+    "baidu_bridge_mode": "headless",
     "vcode_debug_notify": False,    # 实验性：验证码调试通知（每次识别都通知，含成功，观察成功率；默认关）
     # 实验性：客户端进程映像名（半角/全角逗号分隔；留空 = 使用内置默认 3 个）。
     # 百度更换客户端进程名后无需改代码，两个「客户端是否在运行」检测点共用
@@ -465,6 +470,8 @@ def _sanitize_cfg(cfg):
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
+        _bm = str(cfg.get("baidu_bridge_mode", "headless") or "headless").strip().lower()
+        cfg["baidu_bridge_mode"] = _bm if _bm in ("off", "headless", "visible") else "headless"
         cfg["vcode_debug_notify"] = bool(cfg.get("vcode_debug_notify", False))
         # 客户端进程名（逗号分隔字符串）：缺键/非字符串回退内置默认字符串；
         # **空串合法**（= 用内置默认，拆分与回退在 baidu/share.py），只去首尾

@@ -343,11 +343,12 @@ def _decode_body(resp):
     return raw.decode("utf-8", "replace")
 
 
-def _human_gap(lo=0.8, hi=1.5):
+def _human_gap(lo=2.0, hi=3.5):
     """验证码重试之间的人类节奏抖动。
 
-    实测日志：1 秒内连发 3 张图（第1/2/3 次）是教科书级机器人特征，
-    只会把风控分越推越高。这里给 0.8~1.5s 的随机间隔。
+    实测（2026-11-10）：同一分享 40 秒内连发 3 次 sharedownload 必吃
+    errno=-20，隔 2 分钟单发又恢复正常 —— 说明拦截主要看**频率**。
+    所以这里给 2.0~3.5s 的随机间隔，宁可慢一点也别把风控分越推越高。
     """
     try:
         time.sleep(random.uniform(lo, hi))
@@ -373,6 +374,50 @@ def _post(op, url, data, referer):
         text = _decode_body(r)
     _persist(op)
     return text
+
+
+def _bridge_mode(cfg=None):
+    """取「下载请求通道」配置：off / headless / visible（默认 headless）。"""
+    try:
+        if cfg is None:
+            from ..config import load_config
+            cfg = load_config()
+        m = str(cfg.get("baidu_bridge_mode") or "headless").strip().lower()
+        return m if m in ("off", "headless", "visible") else "headless"
+    except Exception:
+        return "headless"
+
+
+def _bridge_fetch_token(share_url, prep, fids, paths, mode, captcha_hook):
+    """用真 Edge 在页面里重放「取 filelist 令牌」；失败返回 {'ok': False}。
+
+    只在直连被风控（errno=-20）时调用。**绝不抛异常**：桥挂了就当没发生，
+    调用方继续走原来的 OCR 兜底。
+    """
+    try:
+        from . import browser_bridge
+        if not browser_bridge.available():
+            return {"ok": False, "reason": "没有找到 Edge"}
+
+        def _solver(img):
+            solved = captcha.solve(img)
+            if solved is None:
+                return None
+            text, conf = solved
+            if captcha.is_ambiguous(text, conf):
+                return None
+            return (text, conf)
+
+        def _ev(e):
+            payload = dict(e) if isinstance(e, dict) else {"kind": "event"}
+            payload["via"] = "bridge"
+            _emit_captcha(captcha_hook, payload)
+
+        return browser_bridge.share_download_prep(
+            share_url, prep.get("pwd") or "", fids, paths, mode=mode,
+            timeout=90.0, vcode_solver=_solver, on_event=_ev, max_vcode=2)
+    except Exception as e:
+        return {"ok": False, "reason": "浏览器桥异常：%s" % e}
 
 
 def _risklabel_blocked(op, uk, share_id, pwd, referer):
@@ -1096,6 +1141,25 @@ def commit_download(prep, fs_ids=None, pairs=None, on_wake=None,
                    "path_list": json.dumps(paths)}
         sd = json.loads(_post(op, sd_url, sd_form, referer_share))
         blob = _filelist_token(sd)
+
+        # 5.05 浏览器桥（实验性）：直连被风控时，把「取令牌」交给真 Edge 在页面里
+        #      重放一次（页面自带 ab_sr / ndut_fmt / jsToken，是直连永远拿不到的）。
+        #      桥失败**不改任何后续行为**，照旧走下面的 OCR 兜底。
+        if not blob and sd.get("errno") == -20:
+            _bm = _bridge_mode()
+            if _bm != "off":
+                br = _bridge_fetch_token(share_url, prep, fids, paths, _bm,
+                                         captcha_hook)
+                if br.get("ok"):
+                    blob = br.get("list") or ""
+                    _log.info("浏览器桥已取到 filelist 令牌（mode=%s）", _bm)
+                    _emit_captcha(captcha_hook, {"kind": "bridge", "ok": True,
+                                                 "mode": _bm})
+                else:
+                    _log.info("浏览器桥未成功（mode=%s）：%s", _bm, br.get("reason"))
+                    _emit_captcha(captcha_hook, {"kind": "bridge", "ok": False,
+                                                 "mode": _bm,
+                                                 "reason": br.get("reason")})
 
         # 5.1 风控图形验证码（errno=-20）：自动 OCR 重试，最多 MAX_ATTEMPTS 张。
         #     必须复用同一个 opener（同一 CookieJar）：vcode_str 与会话绑定。

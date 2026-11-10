@@ -2691,6 +2691,39 @@ class SettingsPage(QWidget):
         proc_row.note = _EXP_NOTE
         self._rows.append(proc_row)
         self._exp_extra_gate.append((pah, (self.baidu_proc_edit,)))
+        # 下载请求通道（2026-11-10）：直连拿不到令牌时，是否借本机 Edge 的手在
+        # **页面上下文里**重放请求（页面自带 ab_sr/ndut_fmt/jsToken）。
+        # 走 _exp_extra_gate —— _exp_gate/_exp_badges 的计数被离线验收锁定，
+        # 后加行不得扩它。
+        dh, dl = self._manual_row(g)
+        bridge_meta = _SettingRow(
+            "下载请求通道",
+            "直连被百度风控（要求图形验证码）时，是否借本机 Edge 在页面里重发请求。"
+            "静默模式不显示任何窗口；可见模式会开一个浏览器窗口但指纹最真；"
+            "只用直连 = 不使用浏览器。",
+            "baidu_bridge_mode", None, "lab", "百度网盘链路",
+            syn=("百度", "验证码", "风控", "浏览器", "通道", "Edge", "静默", "headless"))
+        bridge_meta.host = dh
+        bridge_meta.note = _EXP_NOTE
+        dl.addWidget(self._make_name(dh, "下载请求通道", bridge_meta))
+        dl.addWidget(self._exp_extra_badge(dh, dh), 0, Qt.AlignVCenter)
+        dl.addStretch(1)
+        self.baidu_bridge_combo = QComboBox(dh)
+        for _label, _val in (
+                ("静默浏览器（推荐，不显示窗口）", "headless"),
+                ("可见浏览器（指纹最真，会开窗口）", "visible"),
+                ("只用直连（不用浏览器）", "off"),):
+            self.baidu_bridge_combo.addItem(_label, _val)
+        self.baidu_bridge_combo.setMinimumWidth(280)
+        self.baidu_bridge_combo.currentIndexChanged.connect(
+            lambda _i: self._commit(
+                "baidu_bridge_mode",
+                str(self.baidu_bridge_combo.currentData() or "headless")))
+        self._reg("baidu_bridge_mode", self.baidu_bridge_combo)
+        dl.addWidget(self.baidu_bridge_combo)
+        bridge_meta.widget = self.baidu_bridge_combo
+        self._rows.append(bridge_meta)
+        self._exp_extra_gate.append((dh, (self.baidu_bridge_combo,)))
         self.share_nologin_hint = self._hint(
             "⚠ 实验性提示：该链路不携带浏览器登录态，也不使用浏览器 cookie。"
             "若百度网盘客户端未在运行，唤起可能让客户端进入未登录状态；"
@@ -3782,6 +3815,10 @@ class SettingsPage(QWidget):
                 self.vcode_debug_cb.setChecked(b("vcode_debug_notify", False))
                 self.baidu_db_edit.setText(s("baidu_task_db"))
                 self.baidu_proc_edit.setText(s("baidu_client_proc_names"))
+                if hasattr(self, "baidu_bridge_combo"):
+                    _bmv = s("baidu_bridge_mode", "headless") or "headless"
+                    _bmi = self.baidu_bridge_combo.findData(_bmv)
+                    self.baidu_bridge_combo.setCurrentIndex(_bmi if _bmi >= 0 else 0)
             # UC 网盘网页端（与百度链路完全独立的实验性通路）
             if hasattr(self, "uc_web_cb"):
                 self.uc_web_cb.setChecked(b("uc_web_enabled", False))
@@ -4330,6 +4367,18 @@ class SettingsPage(QWidget):
             for w in widgets:
                 if w is not None:
                     w.setEnabled(exp)
+        # 浏览器桥：本机找不到 Edge 时禁用下拉并说明（开着也用不了，别让人干瞪眼）。
+        if hasattr(self, "baidu_bridge_combo"):
+            try:
+                from ..baidu import browser_bridge as _bb
+                _has_edge = bool(_bb.available())
+            except Exception:
+                _has_edge = False
+            if not _has_edge:
+                self.baidu_bridge_combo.setEnabled(False)
+                self.baidu_bridge_combo.setToolTip(
+                    "本机没有找到 Edge（msedge.exe），浏览器桥不可用；"
+                    "链路会自动只用直连。")
         # UC 网盘通路：除实验性总开关外，还要求可选组件 PyQtWebEngine 存在。
         # 缺组件时开关仍可见（解释得清），但一律禁用并换成「去装组件」的说明，
         # 避免用户开了开关却「点了没反应」。

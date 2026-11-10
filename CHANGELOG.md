@@ -5,6 +5,51 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.43] - 2026-11-10
+
+> **本轮重点**：给百度链路加一个「浏览器桥」—— 直连被风控（errno=-20 验证码）时，
+> 借本机真 Edge 的手**在页面上下文里**重发请求。用户零操作、不需要登录。
+
+### 新增
+
+- **浏览器桥（实验性）：下载请求通道**
+  - 现场证据：-20 只出现在裸 HTTP 客户端；同一分享用 Edge 打开就没有。抓包对比发现
+    页面每次请求都带 b_sr(306B) / 
+dut_fmt(64B) / 被标记时还有 jsToken ——
+    这三个都由页面 JS 生成，urllib 永远拿不到。
+  - 做法：起一个**独立 profile 的 Edge**（不碰用户自己的浏览器、不读它的 cookie、
+    不需要登录），打开分享页，在页面里 etch tplconfig → verify → sharedownload，
+    拿回 filelist 令牌；只替换「取令牌」这一步，invoker/* 与唤起客户端仍走原链路。
+  - 三种模式（实验性页 →「百度网盘链路」→「下载请求通道」）：
+    - **静默浏览器（默认）**：--headless=new，实测 **0 个可见窗口**、任务栏无图标；
+      并补掉 headless 的三个破绽：UA 里的 HeadlessChrome、screen 800×600、
+      缺失的 
+avigator.userAgentData。
+    - **可见浏览器**：普通窗口（会看见），指纹 100% 真实，适合静默仍被拦时。
+    - **只用直连**：等于关闭本功能（老行为）。
+  - 纪律：只在 errno=-20 时升级；桥失败**完全不改后续行为**（照旧 OCR 兜底）；
+    本机没有 Edge 时下拉自动禁用并说明；进程常驻复用（冷启 ~6.9s，暖机 2.4s），
+    闲置 180s 自动关掉，不长期占内存。
+- **验证码重试间隔 0.8~1.5s → 2.0~3.5s**
+  - 实测：同一分享 40 秒内连发 3 次 sharedownload 必吃 -20，隔 2 分钟单发又恢复正常
+    —— 拦截主要看**频率**，不是像不像浏览器。
+
+### 技术
+
+- 新增 utounpacker/baidu/cdp.py：**零依赖**的最小 WebSocket + CDP 客户端
+  （运行期 Python 是 3.10，环境里没有 websockets / playwright；只实现握手、掩码帧、
+  ping/pong，分片帧明确报错而不是挂死）。
+- 新增 utounpacker/baidu/browser_bridge.py：Edge 定位（注册表 App Paths → 常见路径 →
+  AUTOUNPACKER_EDGE 环境变量）、进程常驻与闲置回收、失败一律返回原因绝不抛。
+- 新增配置 aidu_bridge_mode（off/headless/isible，默认 headless）。
+
+### 测试
+
+- 新增 	est_browser_bridge.py（40 项）：拒绝路径 / 成功路径 / 验证码翻盘与「易混不硬猜」/
+  CDP 异常不外泄 / share.py 接入契约 / WebSocket 帧编解码（3 种长度 + 分片拒绝 + error 转异常）。
+- 	est_baidu_resilience.py C2 期望 5/5 → 6/6（多了一行「下载请求通道」）。
+- 全量离线套件：**212** 个测试文件，4 个已知失败（与上一版同）。
+
 ## [2.2.42] - 2026-11-10
 
 > **本轮重点**：按抓包对比结果，把百度网盘实验性链路「对齐浏览器」（A 档 + B 档）。

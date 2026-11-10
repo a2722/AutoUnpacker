@@ -81,3 +81,6 @@ uc_profile/
 # 百度分享链路的持久化 cookie（含 BDCLND/BAIDUID，绝不进仓库）
 baidu_cookies.txt
 baidu_cookies.txt.tmp
+
+# 浏览器桥的独立 Edge profile（Cookie/缓存，绝不进仓库）
+edge-profile/

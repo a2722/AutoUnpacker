@@ -1112,6 +1112,72 @@ def is_volume_file(source_name, candidate, stem):
     return False
 
 
+_ZIP_START_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x06\x06",
+                      b"PK\x07\x08")
+
+
+def _zip_start_magic(path):
+    """文件开头是否是 zip 结构起始（完整包/首卷）——是则不像「分卷末段」。"""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) in _ZIP_START_MAGICS
+    except OSError:
+        return True          # 读不到：保守当作「像完整包」，不参与配对
+
+
+def find_split_last_part_by_content(first_path):
+    """按**内容**（不是名字）找 split 分卷的最后一段；找不到/不唯一返回 None。
+
+    判定：同目录普通文件、不是首卷、大小 > 0、末尾含 zip EOCD（`has_zip_eocd`）、
+    且**开头不是** zip 起始标记（完整包自带包头 + EOCD，不能当末段）。
+
+    为什么不看名字：上传者会把末卷改成 `.tnt` / `.jpg` / `.00删掉2` / `.00x2`…
+    任何写法（真机 2026-11-10）。内容特征才是可靠信号。绝不抛异常。
+    """
+    try:
+        first = Path(first_path)
+        cands = []
+        for e in first.parent.iterdir():
+            try:
+                if not e.is_file() or e.name == first.name:
+                    continue
+                if e.stat().st_size <= 0:
+                    continue
+                if not has_zip_eocd(e):
+                    continue
+                if _zip_start_magic(e):
+                    continue      # 自带包头：更像另一个完整包
+                cands.append(e)
+            except OSError:
+                continue
+        if len(cands) == 1:
+            return cands[0]
+        return None
+    except Exception:
+        return None
+
+
+def _numbered_sibling_count(first_path):
+    """同系列（归一后同基础名）的分卷个数，含首卷。"""
+    n = 0
+    try:
+        first = Path(first_path)
+        base = _volume_base(first.name)
+        if not base:
+            return 0
+        for e in first.parent.iterdir():
+            try:
+                if not e.is_file():
+                    continue
+                if _volume_base(e.name) == base and _volume_number(e.name) is not None:
+                    n += 1
+            except OSError:
+                continue
+    except Exception:
+        return n
+    return n
+
+
 def canonicalize_sibling_names(first_path):
     """把同系列分卷里「名字被插了脏字符」的兄弟卷改回标准名（7-Zip 只认文件名）。
 
@@ -1158,6 +1224,34 @@ def canonicalize_sibling_names(first_path):
                 done.append((old, dest))
             except OSError:
                 continue
+        # ---- 名字里连数字都被藏掉（`.00x2` / `.删掉02` / 干脆改成 `.jpg`）时的兜底：
+        # 按**内容**认末卷（尾部 EOCD + 开头不是归档起始），改名成标准编号。
+        # 只在「本系列目前只有首卷一个编号分卷」且目标名不存在时动手，绝不猜顺序。
+        if _numbered_sibling_count(first) <= 1:
+            cand = find_split_last_part_by_content(first)
+            if cand is not None:
+                nums = [1]
+                try:
+                    n1 = _volume_number(first.name) or 1
+                    nums = [n1]
+                except Exception:
+                    pass
+                nxt = (max(nums) if nums else 1) + 1
+                m = re.search(r"\.([zZ])(\d{2})$", first.name)
+                if m:
+                    new_name = first.name[:m.start()] + f".{m.group(1)}{nxt:02d}"
+                else:
+                    m3 = re.search(r"\.(\d{3})$", first.name)
+                    if not m3:
+                        return done
+                    new_name = first.name[:m3.start()] + f".{nxt:03d}"
+                dest = cand.with_name(new_name)
+                if not dest.exists():
+                    try:
+                        cand.rename(dest)
+                        done.append((cand, dest))
+                    except OSError:
+                        pass
     except Exception:
         return done
     return done

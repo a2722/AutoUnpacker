@@ -2069,10 +2069,18 @@ class FolderWatcher(threading.Thread):
             self._set_dir_state(wc.get("path"), "extracting", 0, name)
             # 任务行只在「所有 defer 闸门都过、真正要解压」时创建；重试路径先复用同目录
             # 同名的未完成任务行，避免每次重试都新建行、把队列堆满死行。
-            tid = db.find_open_task(wc.get("path"), name) or db.add_task(
-                file_name=name, file_size=(ident[0] if ident else None),
-                source_dir=wc.get("path"), output_dir=out_dir,
-                mode=str(wc.get("mode") or "surface"), state="queued")
+            # source_dir 记**文件真实父目录**：表层模式下等于监听根；百度清单模式
+            # 会把包下到子目录（E:/test/1031/xxx），记成监听根会让"重试"找不到源文件
+            # （2026-11-10 真机：文件明明在，却提示"源文件已不在监听目录"）。
+            _src_dir = str(fp.parent)
+            # 先按真实父目录找，再按监听根找（兼容旧行：以前记的是监听根）。
+            # 少了第二个，旧行会被当成「不存在」→ 新建一行，旧行永远停在 queued。
+            tid = (db.find_open_task(_src_dir, name)
+                   or db.find_open_task(str(wc.get("path")), name)
+                   or db.add_task(
+                       file_name=name, file_size=(ident[0] if ident else None),
+                       source_dir=_src_dir, output_dir=out_dir,
+                       mode=str(wc.get("mode") or "surface"), state="queued"))
             _tasks_changed(self.hub)
             db.update_task_state(tid, "extracting", started_at=int(time.time()))
             _tasks_changed(self.hub)

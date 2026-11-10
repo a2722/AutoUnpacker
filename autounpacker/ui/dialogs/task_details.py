@@ -16,7 +16,7 @@
 import os
 import time
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QDialog, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                              QPushButton, QVBoxLayout, QWidget)
@@ -62,7 +62,7 @@ def _fmt_ts(value):
 # 动作集合的**唯一真源**已下沉到叶子模块 `ui.task_actions`（本弹窗、队列行内按钮、
 # 右栏「需要处理」三处共用）；这里再导出一次，保持既有 `from ...task_details import
 # source_exists, task_action_set` 的引用路径可用。
-from ..task_actions import source_exists, task_action_set  # noqa: F401
+from ..task_actions import resolve_source_path, source_exists, task_action_set  # noqa: F401
 
 
 
@@ -260,6 +260,28 @@ class TaskDetailsDialog(QDialog):
             actions = []
         self._rebuild(state=task, actions=actions)
         self.feedback.clear()
+        # 重试按钮按「源文件是否还在」决定给不给（绝不假报「已排队」）。这里把原因
+        # 说清楚：用户看到的就是「没有重试按钮」而不知道为啥（2026-11-10 反馈）。
+        try:
+            if (task and _task_state_key(task) in ("failed", "need_password", "canceled")
+                    and not source_exists(task)):
+                self.feedback.setText(
+                    "源文件已不在该目录（含一级子目录），无法重试；"
+                    "请重新下载，或把文件拖进窗口。")
+        except Exception:
+            pass
+
+    def _reload_if_alive(self):
+        """延后刷新入口：窗已关/记录已删就什么都不做（绝不复活已关闭的窗）。"""
+        try:
+            if not self.isVisible():
+                return
+            if not db.get_task(self.task_id):
+                self.reject()
+                return
+        except Exception:
+            return
+        self._reload()
 
     def _set_badge(self, text):
         self.head_badge.setText(str(text or ""))
@@ -294,6 +316,14 @@ class TaskDetailsDialog(QDialog):
             self.reject()
             return
         self.actionRequested.emit(int(self.task_id), kind)
+        if kind == "retry":
+            # 重试是异步的：宿主那边要建任务行、起后台解压，状态几百毫秒后才变。
+            # 立刻 _reload() 只会看到旧状态，再补一次延后刷新，用户才看得到
+            # 「正在解压 / 已排队」的反馈。
+            try:
+                QTimer.singleShot(700, self._reload_if_alive)
+            except Exception:
+                pass
         # 「收尾类」动作点完即关闭详情窗（用户预期：这一条已经处理完了，窗口不该留着）：
         #   - 「从队列移除」(ignore)：条目已离开队列；
         #   - 「忽略」(mark_done)：条目被人工转为完成，同样离开「待处理」范围；
@@ -331,6 +361,14 @@ class TaskDetailsDialog(QDialog):
         self._notify("已复制%s到剪贴板" % what)
 
     def _full_path(self, task):
+        # 优先用「真实路径解析器」：百度清单模式的任务行有可能只记了监听根，
+        # 文件实际在一级子目录里（见 ui/task_actions.resolve_source_path）。
+        try:
+            real = resolve_source_path(task)
+            if real:
+                return real
+        except Exception:
+            pass
         src = str((task or {}).get("source_dir") or "").strip()
         name = _row_file(task or {}).strip()
         try:

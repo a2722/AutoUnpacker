@@ -26,16 +26,46 @@ from pathlib import Path
 from .widgets.common import _task_state_key
 
 
-def source_exists(task):
-    """源文件是否仍在监听目录（重试类动作的成立条件）。"""
+def resolve_source_path(task, max_dirs=800):
+    """定位任务源文件的真实路径；找不到返回 None。
+
+    先在 source_dir 直系找，再**下探一层子目录**（限量 800，跳 "_"/"." 前缀）。
+    为什么要下探：百度清单模式（Tier-2）会把分享下载到**子目录**里，而历史任务行
+    记录的 source_dir 是监听根（E:/test），真实文件在 E:/test/1031/xxx —— 只查直系
+    就会误判"源文件已不在监听目录"，连重试按钮都不给（2026-11-10 真机）。
+    """
     try:
         src = str((task or {}).get("source_dir") or "")
         name = str((task or {}).get("file_name") or "")
         if not src or not name:
-            return False
-        return os.path.isfile(os.path.join(src, name))
+            return None
+        direct = os.path.join(src, name)
+        if os.path.isfile(direct):
+            return direct
+        if not os.path.isdir(src):
+            return None
+        n = 0
+        with os.scandir(src) as it:
+            for entry in it:
+                n += 1
+                if n > max_dirs:
+                    break
+                try:
+                    if not entry.is_dir() or entry.name.startswith(("_", ".")):
+                        continue
+                except OSError:
+                    continue
+                cand = os.path.join(entry.path, name)
+                if os.path.isfile(cand):
+                    return cand
+        return None
     except Exception:
-        return False
+        return None
+
+
+def source_exists(task):
+    """源文件是否还能找到（重试类动作的成立条件）：直系或一级子目录里存在即算。"""
+    return resolve_source_path(task) is not None
 
 
 def task_action_set(state, src_exists):

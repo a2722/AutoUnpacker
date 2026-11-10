@@ -1859,14 +1859,11 @@ class MainWindow(QMainWindow):
         if state not in ("failed", "need_password", "canceled"):
             self._append_log(f"[任务] {name} 当前不需要重试（状态：{state or '未知'}）")
             return
-        path = None
+        # 定位源文件：直系 + **一级子目录**（百度清单模式把包下到子目录里，
+        # 历史任务行的 source_dir 却是监听根 → 之前在这里误判"已不在监听目录"）。
         try:
-            import os
-            src = str(task.get("source_dir") or "")
-            if src and name:
-                cand = os.path.join(src, name)
-                if os.path.isfile(cand):
-                    path = cand
+            from .task_actions import resolve_source_path
+            path = resolve_source_path(task)
         except Exception:
             path = None
         if path is None:

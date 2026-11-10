@@ -830,12 +830,16 @@ class MainWindow(QMainWindow):
         import threading
         threading.Thread(target=_work, daemon=True).start()
 
-    def _handle_drop_file(self, path):
+    def _handle_drop_file(self, path, task_id=0):
         """后台线程处理单个拖入文件（不阻塞界面）。
 
         队列「重试」也复用本入口（见 _retry_task）：重试是用户显式动作，不受
         「拖拽行为」总开关约束（`_drop_from_retry` 为真时跳过总开关判定，其余
         行为设置照常生效）。
+
+        `task_id`：重试时由调用方传入**用户点的那一行**，整个解压过程直接改这一行
+        的状态。不传（拖入）才按「目录 + 文件名」找/建行 —— 否则重试会另建一行，
+        原行永远停在 need_password，用户再点一次就报「源文件已不在」（2026-11-10）。
         """
         import os as _os
         from pathlib import Path
@@ -958,14 +962,25 @@ class MainWindow(QMainWindow):
         # 对齐），失败时 tid=0 也不影响解压本身。
         tid = 0
         try:
-            tid = (db.find_open_task(str(path.parent), path.name)
-                   or db.add_task(
-                       file_name=path.name,
-                       file_size=(path.stat().st_size if path.exists() else None),
-                       source_dir=str(path.parent), output_dir=None,
-                       mode="drop", state="queued"))
+            tid = int(task_id or 0)
         except Exception:
             tid = 0
+        if tid:
+            try:
+                if not db.get_task(tid):
+                    tid = 0        # 记录已被删：退回拖放语义（新建行）
+            except Exception:
+                tid = 0
+        if not tid:
+            try:
+                tid = (db.find_open_task(str(path.parent), path.name)
+                       or db.add_task(
+                           file_name=path.name,
+                           file_size=(path.stat().st_size if path.exists() else None),
+                           source_dir=str(path.parent), output_dir=None,
+                           mode="drop", state="queued"))
+            except Exception:
+                tid = 0
         if tid:
             self._emit_tasks_changed()
 
@@ -1867,16 +1882,37 @@ class MainWindow(QMainWindow):
         except Exception:
             path = None
         if path is None:
+            # 文件确实没了：若同名文件已被另一条任务处理完成（典型：此前重试走
+            # 拖放入口另建了一行并成功），把线索说出来，别让用户以为是坏账。
+            hint = ""
+            try:
+                for row in (db.list_tasks(scope="history", limit=200) or []):
+                    # 只认**真正 done 的其它行**：list_tasks 的 scope 语义会混进
+                    # 其它状态，自己再筛一遍，且不能把自己算成「同名已完成」。
+                    if str(row.get("state") or "") != "done":
+                        continue
+                    if int(row.get("id") or 0) == int(task_id or 0):
+                        continue
+                    if str(row.get("file_name") or "") != name:
+                        continue
+                    hint = (f"；同名文件已由任务 #{row.get('id')} 处理完成"
+                            f"（输出：{row.get('output_dir') or '—'}），"
+                            f"可以把本行「忽略」")
+                    break
+            except Exception:
+                hint = ""
             self._append_log(
-                f"[任务] 重试失败：源文件已不在监听目录（{name}）；"
-                f"请重新下载或把文件拖进窗口")
+                f"[任务] 重试失败：源文件已不在该目录（{name}）；"
+                f"请重新下载或把文件拖进窗口{hint}")
             return
         self._append_log(f"[任务] 重试：已把 {name} 重新交给解压引擎（拖放入口）")
         # 重试是用户显式动作：不受「拖拽行为」总开关约束（用一次性标记跳过该
         # 判定，其余行为设置仍照常生效）；异常路径也必定清标记，绝不残留。
         self._drop_from_retry = True
         try:
-            self._handle_drop_file(path)
+            # 传 task_id：让这次解压直接驱动**用户点的那一行**（不再另建一行，
+            # 避免原行永远停在 need_password、再点一次就报「源文件已不在」）。
+            self._handle_drop_file(path, task_id=task_id)
         except Exception as e:
             self._append_log(f"[任务] 重试出错: {e}")
         finally:

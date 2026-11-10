@@ -52,6 +52,11 @@ _PRIVATE_SUBJECT_MARKERS = (
     # 本机抓包/中间人代理的临时根：随包发布 = 把「中间人信任」装给所有用户，
     # 还顺带泄漏机器指纹（2026-11-09 在随包根里发现 "Charles Proxy CA (…, DESKTOP-…)"）
     "charles proxy", "mitmproxy", "fiddler", "burp suite", "zscaler",
+    # 游戏加速器 / 安全软件的「网页加速/防护」私有根（同样是本机中间人根，
+    # 2026-11-09 又逮到一个自签的 "UU Game Booster CA"（ST=Mars））
+    "uu game booster", "uu booster", "leigod", "xunyou", "迅游", "雷神",
+    "奇游", "biubiu", "netch", "clash", "v2ray", "sing-box",
+    "kaspersky", "avast", "avg web shield", "eset", "bitdefender", "dr.web",
 )
 
 

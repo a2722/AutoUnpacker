@@ -5,6 +5,42 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.46] - 2026-11-10
+
+### 修复
+
+- **开启实验性百度链路后，剪贴板里有分享链接就直接自动下载，不用 Alt+2**
+  （真机反馈；此前是「必须有 Alt+2 手势才准拉起」）。
+  根因：2026-11-09 那次改动把两种语义焊在同一个键 `baidu_auto_invoke` 上 ——
+  ① 链路门（Alt+2/Alt+3 是否生效）② 复制链接后自动拉起。于是"想用手势就必须
+  连复制即下载一起打开"，进门即自动下载。
+
+### 改动：拆成两个键
+
+| 键 | 设置页名称 | 作用 | 默认 |
+|---|---|---|---|
+| `baidu_link_enabled` | 启用百度网盘链路 | 只是链路门：Alt+2/Alt+3 与分组细项是否可用 | 关 |
+| `baidu_auto_invoke` | 复制链接后自动拉起下载 | 复制到分享链接后**自动**下载 | 关 |
+
+- 自动拉起项**只在链路门开着时可勾**（二级门控；链路门关 → 该行置灰禁用）。
+- **迁移口径 A**（用户 2026-11-10 定）：老配置没有新键时，用老的
+  `baidu_auto_invoke` 值继承"链路门"，同时把自动拉起降级为关 —— 升级后回到
+  "手势才下载"，绝不让人被动下载。迁移在 `load_config` 合并默认值**之前**判断
+  （否则默认键会让迁移永不触发），且幂等。
+- `config.baidu_link_on(cfg)` 统一解析有效值：优先新键；旧配置 / 外部注入的快照
+  没有新键时回落到旧键，保持老语义（不破坏任何既有调用方与测试桩）。
+
+### 测试
+
+- 新增 `test_baidu_link_gate_split.py`（29 项）：迁移三态与幂等、`baidu_link_on`
+  回退与异常安全、main_window 三处接线、UI 两行顺序、链路门↔自动拉起联动、
+  实验性总开关联动、覆盖契约。
+- 同步旧用例（键语义变化）：`test_baidu_resilience`（extra 表 8/8）、
+  `test_exp_switch_layout`（G6~G10 改指链路门）、`test_experimental_page`、
+  `test_clipboard_master_switch_ui`、`test_page_settings`、`test_share_pick_gesture`、
+  `test_u4_consent`、`test_w4_flow`。
+- 全量离线套件：**215** 个测试文件，4 个已知失败（与前几版相同）。
+
 ## [2.2.45] - 2026-11-10
 
 ### 修复

@@ -31,7 +31,7 @@ from .. import db
 from .. import hub
 from ..config import (parse_hotkey, HOTKEY_ID, HOTKEY_ID_SHARE,
                       HOTKEY_ID_SHARE_PICK, MOD_NOREPEAT,
-                      bomb_options_from_cfg)
+                      bomb_options_from_cfg, baidu_link_on)
 from ..trust import add_trust_entry
 from ..utils import (_norm_path_for_cfg, split_urls, is_baidu_pan_url,  # noqa: F401
                      watch_path_conflict)
@@ -3470,10 +3470,15 @@ class MainWindow(QMainWindow):
                     self._pending_share_gesture = None
                     self._dispatch_pending_share(_pend)
                     continue
-                # 实验性：开启「自动拉起」时才处理（默认关）。
+                # 实验性：只有「链路门 + 自动拉起」都开着才真的自动派发（默认关）。
+                # 2026-11-10 拆键后：只开链路门（挪到 baidu_link_enabled）时，复制到
+                # 分享链接**只记录 + 提示**（下方小窗 / Alt+2 / Alt+3 接管），绝不自动
+                # 下载；要恢复"复制即下载"必须再单独勾「复制链接后自动拉起下载」。
                 # 链路含网络 IO，禁止阻塞 Qt 事件循环 → 交给后台线程。
-                if (self.state.snapshot().get("experimental_enabled")
-                        and self.state.snapshot().get("baidu_auto_invoke")):
+                _cfg_ev = self.state.snapshot()
+                if (_cfg_ev.get("experimental_enabled")
+                        and baidu_link_on(_cfg_ev)
+                        and _cfg_ev.get("baidu_auto_invoke")):
                     url = item.get("url")
                     pwd = item.get("pwd") or ""
                     surl = item.get("surl") or url   # d7 去重键：surl（缺失时退回 url）
@@ -3727,7 +3732,10 @@ class MainWindow(QMainWindow):
                 return
             # 实验性总开关只是**总闸**；这条链路本身还要「启用百度网盘链路」开着
             # （2026-11-09 用户要求：没开链路时 Alt+2 不应生效）。
-            if not self.state.snapshot().get("baidu_auto_invoke"):
+            # 2026-11-10：链路门独立成 baidu_link_enabled（此前与「自动拉起」共用
+            # baidu_auto_invoke，导致想用手势就必须连"复制即下载"一起打开）。
+            # 有效值统一由 config.baidu_link_on 解析（保留旧键回落）。
+            if not baidu_link_on(self.state.snapshot()):
                 self._append_log(
                     "「百度网盘链路」未开启，Alt+2 已忽略（设置 › 实验性 › 百度网盘链路）")
                 return
@@ -3864,7 +3872,7 @@ class MainWindow(QMainWindow):
             if not self.state.snapshot().get("experimental_enabled"):
                 self._append_log("实验性功能未开启，「挑选文件下载分享」不可用")
                 return
-            if not self.state.snapshot().get("baidu_auto_invoke"):
+            if not baidu_link_on(self.state.snapshot()):
                 self._append_log(
                     "「百度网盘链路」未开启，Alt+3 已忽略（设置 › 实验性 › 百度网盘链路）")
                 return

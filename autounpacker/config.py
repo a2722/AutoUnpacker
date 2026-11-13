@@ -153,7 +153,8 @@ DEFAULT_CONFIG = {
     "tls_skip_verify": False,   # 允许不验证 HTTPS 证书（默认关，开启有 MITM 风险）
     "experimental_enabled": False,  # 实验性功能总开关（默认关；开启后可只读探测百度任务库）
     "baidu_task_db": "",            # 实验性：BaiduYunGuanjia.db 路径（留空自动探测）
-    "baidu_auto_invoke": False,     # 实验性：检测到剪贴板里的百度分享链接时自动拉起客户端下载（默认关）
+    "baidu_link_enabled": False,    # 实验性：百度网盘链路总门（Alt+2/Alt+3 与分组是否可用；默认关）
+    "baidu_auto_invoke": False,     # 实验性：复制到分享链接后自动拉起客户端下载（默认关；需链路门开着）
     # 实验性：取 filelist 令牌的通道。直连被风控（errno=-20）时才升级到浏览器桥：
     #   "off"      = 只用直连（老行为）
     #   "headless" = 静默拉起独立 profile 的 Edge，在页面里重放请求（默认，无窗口）
@@ -245,6 +246,24 @@ def get_str(cfg, key, default):
     一致——键缺失取 default；键存在时一律 str()（None→"None"）。不含 strip /
     合法性校验，那些属于各键的额外策略，由调用方按需自行处理。"""
     return str(cfg.get(key, default))
+
+
+def baidu_link_on(cfg):
+    """百度网盘链路门（**有效值**）：Alt+2/Alt+3 是否生效只看它。
+
+    历史：2026-11-09 之前这个门就是 `baidu_auto_invoke`（同一个键既管链路又管
+    "复制即下载"），2026-11-10 拆成两键后本函数负责兼容：
+      - 有 `baidu_link_enabled` → 以它为准（运行期配置经 _sanitize_cfg 一定有）；
+      - 没有这个键（旧配置 / 外部注入的快照 / 老测试桩）→ 回落到
+        `baidu_auto_invoke`，保持"只带旧键也表示链路开着"的老语义。
+    绝不抛异常；任何异常都当作"链路没开"（宁可不动作）。
+    """
+    try:
+        if "baidu_link_enabled" in cfg:
+            return bool(cfg.get("baidu_link_enabled"))
+        return bool(cfg.get("baidu_auto_invoke", False))
+    except Exception:
+        return False
 
 
 # 防 zip bomb 配置键（冻结契约的一部分：bomb_options_from_cfg 只抽这几项）。
@@ -476,6 +495,19 @@ def _sanitize_cfg(cfg):
         cfg["tls_skip_verify"] = bool(cfg.get("tls_skip_verify", False))
         cfg["experimental_enabled"] = bool(cfg.get("experimental_enabled", False))
         cfg["baidu_task_db"] = str(cfg.get("baidu_task_db", "") or "").strip()
+        # 「启用百度网盘链路」独立成门（2026-11-10）：此前它和「自动拉起」共用
+        # baidu_auto_invoke —— 想用 Alt+2 就必须连"复制即下载"一起打开，用户升级后
+        # 只想要手势、却被自动拉起。现在拆成两个键：
+        #   baidu_link_enabled = 链路总门（Alt+2/Alt+3 是否生效）
+        #   baidu_auto_invoke  = 复制链接后自动拉起下载（默认关，且要求链路门开着）
+        # 迁移口径 A（用户 2026-11-10 定）：老配置没有新键时，按老的 auto_invoke 值
+        # 继承"链路门"，同时把自动拉起降级为关 —— 绝不让人升级后被动下载。
+        # 新键一旦存在就按实际值走，不再触发迁移（用户此后可自由勾回自动拉起）。
+        if "baidu_link_enabled" not in cfg:
+            _legacy_auto = bool(cfg.get("baidu_auto_invoke", False))
+            cfg["baidu_link_enabled"] = _legacy_auto
+            cfg["baidu_auto_invoke"] = False
+        cfg["baidu_link_enabled"] = bool(cfg.get("baidu_link_enabled", False))
         cfg["baidu_auto_invoke"] = bool(cfg.get("baidu_auto_invoke", False))
         _bm = str(cfg.get("baidu_bridge_mode", "headless") or "headless").strip().lower()
         cfg["baidu_bridge_mode"] = _bm if _bm in ("off", "headless", "visible") else "headless"
@@ -561,6 +593,15 @@ def load_config():
                 if ("hotkey_share_code" in data
                         and "hotkey_share_pick" not in data):
                     data["hotkey_share_pick"] = data["hotkey_share_code"]
+                # 一次性迁移（2026-11-10）：百度链路门与「复制链接后自动拉起下载」
+                # 拆键。老配置只有 baidu_auto_invoke（它同时充当链路门与自动下载），
+                # 口径 A：链路门继承老值、自动拉起降级为关 —— 绝不让人升级后被动
+                # 下载。同样**必须在合并默认值之前**判断：DEFAULT_CONFIG 里已经有
+                # baidu_link_enabled，合并后就永远分不清用户是否显式设过。
+                if ("baidu_link_enabled" not in data
+                        and "baidu_auto_invoke" in data):
+                    data["baidu_link_enabled"] = bool(data["baidu_auto_invoke"])
+                    data["baidu_auto_invoke"] = False
                 merged = json.loads(json.dumps(DEFAULT_CONFIG))
                 merged.update(data)
                 return _sanitize_cfg(merged)

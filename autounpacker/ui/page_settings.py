@@ -60,6 +60,7 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
 
 from ..config import DEFAULT_CONFIG, _sanitize_cfg
 from ..config import load_config
+from ..config import baidu_link_on
 from .. import sevenzip as sz
 from ..winrar import find_winrar
 from . import style as ui_style
@@ -757,6 +758,8 @@ class SettingsPage(QWidget):
         self._clip_badges = []     # [(host, #clipBadge)] 剪贴板门控行名旁小标（显隐随总开关）
         # 门控目标列表：懒建后「实验性 / 通知」领域可能尚未物化，先给空元组兜底，
         # 使 _apply_gates() 在任意物化顺序下都不会因缺少列表而抛异常。
+        # _exp_subs 仍是原来那 4 个（离线验收锁定）：链路门那一行改走
+        # _exp_extra_gate + _baidu_link_subs（见 _build_lab_baidu）。
         self._notify_subs = ()
         self._notify_labels = ()
         self._exp_subs = ()
@@ -765,6 +768,10 @@ class SettingsPage(QWidget):
         # 门控效果与 _exp_gate 完全一致）。
         self._exp_extra_gate = []    # [(host, 控件簇)] 整行置灰 + 禁用控件簇
         self._exp_extra_badges = []  # [(host, #expBadge)] 小标显隐随总开关
+        # 百度链路**内部**的二级门（2026-11-10 拆键）：链路门 baidu_link_enabled
+        # 关着时，「复制链接后自动拉起下载」这类子项必须一起置灰 + 禁用，否则
+        # 用户勾了也无效、还以为是 bug。条目 = (host, 控件簇)。
+        self._baidu_link_subs = []
         self._hotkey_reason_labels = {}  # 热键配置键 -> 行内失败原因 QLabel
         self._hotkey_states = {}   # 热键配置键 -> (state, msg)（测试 / 重贴用）
         self._warn_labels = []     # 需要随主题重贴 warn 色的说明文字
@@ -2600,21 +2607,55 @@ class SettingsPage(QWidget):
         """百度网盘通路（实验性子开关 + 细项）。
 
         原来在「链接与网盘」页的「网盘与分享」组，2026-11 整体搬到这里，
-        与 UC 通路并列。**行为与配置键一个都没改**（baidu_auto_invoke /
-        baidu_task_db / baidu_client_proc_names），只换了展示位置。
+        与 UC 通路并列。2026-11-10 拆键：链路门 baidu_link_enabled 与
+        「复制链接后自动拉起下载」baidu_auto_invoke 分家（此前共用一个键，
+        想用 Alt+2 就必须连自动下载一起打开）。
         """
         g = self._group(box, "百度网盘链路")
         # 分组卡的实体控件（_group 返回的是卡内布局，其 parentWidget 才是整块卡）：
         # 实验性总开关关闭时整块隐藏，见 _apply_gates。
         self._baidu_group_block = g.parentWidget()
-        # 子开关放**最上方**（2026-11-09 用户要求）：它是本链路的门，先看到门再看细项。
-        self.baidu_auto_invoke_cb = self._check(
-            g, "启用百度网盘链路", "baidu_auto_invoke",
-            "开启后：复制到百度网盘分享链接时自动交给网盘客户端下载（整包），"
-            "Alt+2 / Alt+3 手动热键也只在本开关开启时生效。"
-            "会自动触发下载，请确认来源可信。",
-            syn=("网盘", "自动拉起", "客户端", "百度", "下载"), default=False,
-            experimental=True)
+        # ①② 两行（2026-11-10 拆键，用户口径 A）：
+        #   ①「启用百度网盘链路」→ baidu_link_enabled：**只是链路门**（Alt+2/Alt+3
+        #     是否生效）。以前它和「自动拉起」共用 baidu_auto_invoke，导致想用手势
+        #     就必须连「复制即下载」一起打开 —— 现在拆开，进门不等于自动下载。
+        #   ②「复制链接后自动拉起下载」→ baidu_auto_invoke：真正的自动下载，默认关，
+        #     且只在①开着时可勾（二级门控见 _apply_gates 的 _baidu_link_subs）。
+        # ①沿用 _check(experimental=True)：它顶替的正是原来那行（_exp_gate/_exp_badges
+        # 因此仍是 5 条，离线验收锁定值不变，只换了键与文案）。②是**新增**行，走
+        # 手工行 + _exp_extra_gate/_exp_extra_badge（后加行不得扩锁定表）。
+        self.baidu_link_cb = self._check(
+            g, "启用百度网盘链路", "baidu_link_enabled",
+            "开启后：Alt+2 / Alt+3 才能把剪贴板里的百度分享链接交给网盘客户端下载；"
+            "本组细项也才可用。**本项不会自动下载** —— 复制到分享链接只记录，"
+            "要自动下载请再开下一项「复制链接后自动拉起下载」。",
+            syn=("网盘", "链路", "百度", "启用", "Alt+2", "Alt+3", "手势"),
+            default=False, experimental=True)
+        # 链路门一变，②那一行的可用性要立刻跟着变（否则勾了也无效）。
+        self.baidu_link_cb.toggled.connect(lambda _c: self._apply_gates())
+
+        ah, al = self._manual_row(g)
+        auto_meta = _SettingRow(
+            "复制链接后自动拉起下载",
+            "开启后：复制到百度网盘分享链接时**自动**交给网盘客户端下载（整包）。"
+            "默认关 —— 关着时只记录链接，用 Alt+2 / Alt+3 手动拉起。"
+            "会自动触发下载，请确认来源可信；本项需要「启用百度网盘链路」开着。",
+            "baidu_auto_invoke", None, "lab", "百度网盘链路",
+            syn=("自动拉起", "复制", "自动", "客户端", "下载", "百度"))
+        auto_meta.host = ah
+        auto_meta.note = _EXP_NOTE
+        al.addWidget(self._make_name(ah, "复制链接后自动拉起下载", auto_meta))
+        al.addWidget(self._exp_extra_badge(ah, ah), 0, Qt.AlignVCenter)
+        al.addStretch(1)
+        self.baidu_auto_invoke_cb = _Switch(ah)
+        self.baidu_auto_invoke_cb.toggled.connect(
+            lambda checked: self._commit("baidu_auto_invoke", bool(checked)))
+        self._reg("baidu_auto_invoke", self.baidu_auto_invoke_cb)
+        al.addWidget(self.baidu_auto_invoke_cb)
+        auto_meta.widget = self.baidu_auto_invoke_cb
+        self._rows.append(auto_meta)
+        self._exp_extra_gate.append((ah, (self.baidu_auto_invoke_cb,)))
+        self._baidu_link_subs = [(ah, (self.baidu_auto_invoke_cb,))]
         self.share_wait_spin = self._spin_row(
             g, "分享等待时长", "share_gesture_wait_sec",
             "分享手势最多等「解析中链接」多少秒；超时取消、不回退旧链接（5~600）。",
@@ -3834,6 +3875,7 @@ class SettingsPage(QWidget):
             if hasattr(self, "share_wait_spin"):
                 self.share_wait_spin.setValue(
                     max(5, min(600, i("share_gesture_wait_sec", 60))))
+                self.baidu_link_cb.setChecked(baidu_link_on(self._snapshot()))
                 self.baidu_auto_invoke_cb.setChecked(b("baidu_auto_invoke", False))
                 self.vcode_debug_cb.setChecked(b("vcode_debug_notify", False))
                 self.baidu_db_edit.setText(s("baidu_task_db"))
@@ -4392,6 +4434,25 @@ class SettingsPage(QWidget):
             for w in widgets:
                 if w is not None:
                     w.setEnabled(exp)
+        # 百度链路内部的二级门（2026-11-10 拆键）：链路门关着时，子项（复制链接后
+        # 自动拉起下载）一并置灰 + 禁用。顺序必须在上面 _exp_extra_gate 之后 ——
+        # 那里只按实验性总开关给 exp，这里再与「链路门」取 AND，最终状态才对。
+        # 懒建时链路开关可能还没物化 → 退化为读配置（baidu_link_on 保留旧键回落）。
+        if hasattr(self, "baidu_link_cb"):
+            _lnk = bool(self.baidu_link_cb.isChecked())
+        else:
+            try:
+                _lnk = baidu_link_on(self._snapshot())
+            except Exception:
+                _lnk = False
+        for host, cluster in getattr(self, "_baidu_link_subs", ()):
+            if host is not None:
+                host.setProperty("off", (not exp) or (not _lnk))
+                repolish_tree(host)
+            widgets = cluster if isinstance(cluster, (tuple, list)) else (cluster,)
+            for w in widgets:
+                if w is not None:
+                    w.setEnabled(exp and _lnk)
         # 浏览器桥：本机找不到 Edge 时禁用下拉并说明（开着也用不了，别让人干瞪眼）。
         if hasattr(self, "baidu_bridge_combo"):
             try:

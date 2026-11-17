@@ -299,6 +299,9 @@ class FolderWatcher(threading.Thread):
         self._disk_warned = set()
         # 跨目录分卷等待期 {norm_source_path: {anchor, ident, since, last_check, last_sig}}
         self._split_pending = {}
+        # 非首卷到达时「回头找首卷并归拢」的冷却表 {norm_key: last_try_ts}：
+        # rglob 全监听根有成本，同一分卷系列 15 秒内最多找一次。
+        self._consolidate_try = {}
         # 当前离线的监听路径 {norm_path: 进入离线时刻}：目录不存在或无法枚举时进入，
         # 枚举成功才由 _mark_online 清除（每段离线只记一次日志、超 5 分钟通知一次）。
         self._offline = {}
@@ -1947,6 +1950,13 @@ class FolderWatcher(threading.Thread):
         # 自动继续，不打断下方任何既有闸门。
         if not self._disk_space_ok(fp, wc):
             return "defer"
+        # 源文件已不存在：事件排队期间它可能已被**同批次的成功解压**回收
+        #（2026-11-17 真机事故：.z01 那套解压成功后 4 个源卷立即进回收站，
+        # 队列里还压着一条 .zip 的旧事件，轮到它时文件已经没了 → 被当成
+        # 「解压失败: 未知错误」并弹了失败通知）。不存在 = 已了结，静默跳过。
+        if not fp.exists():
+            self.hub.log(f"文件已不存在（可能已被同批次成功解压回收），跳过: {name}")
+            return "done"
         if smart_extract.is_incomplete_download(fp):
             self.hub.log(f"下载未完成，暂不解压（等待后缀消失）: {name}")
             self._set_dir_state(wc.get("path"), "waiting", name=name)
@@ -1971,6 +1981,12 @@ class FolderWatcher(threading.Thread):
         # 非首卷分卷（.part2.rar / .002 / .z02 / .r01 等）不是解压入口，
         # 单独交给 7-Zip 必然失败；等首卷出现时统一处理整个分卷。
         elif smart_extract.is_non_first_volume(name):
+            # 2026-11-17 修（真机：一套 30GB 分卷被分享上传到 3 个不同子目录，
+            # z02/z03 各落一处 —— 旧实现只记一句「等待首卷」就进 seen，从此再也
+            # 没人归拢，躺了三天）。现在：任意非首卷到达都回头找首卷，找到就把
+            # 整套卷归拢到首卷目录并立即让首卷接单。
+            if self._consolidate_to_first_volume(fp, wc):
+                return "done"
             self.hub.log(f"非首卷分卷，等待首卷处理整个分卷: {name}")
             return "done"
         # 还原豁免：该源文件是用户从删除回溯里**还原**回来的。两条判定都算：
@@ -2285,6 +2301,12 @@ class FolderWatcher(threading.Thread):
                         self.hub.log(f"{name} 部分完成: {err}（已保留已解出的内容）")
                         self.hub.notify("智能解压部分完成",
                                         f"{name}\n{err}\n已解出的内容已保留在输出目录")
+                    elif "文件不存在" in str(err) and not fp.exists():
+                        # 源文件在解压过程中被回收（同批次另一条已成功）：
+                        # 这是"已了结"，不是"解压失败"，别弹失败通知吓人。
+                        self.hub.log(
+                            f"{name} 源文件已不存在（可能已被同批次成功解压回收），"
+                            f"按已了结处理，不报失败")
                     else:
                         self.hub.log(f"{name} 解压失败: {err}")
                         self.hub.notify("智能解压失败", f"{name}\n{err}")
@@ -2340,6 +2362,10 @@ class FolderWatcher(threading.Thread):
             if not root.exists():
                 continue
             try:
+                # 先**收集**再搬：rglob 是惰性遍历目录的，边遍历边 shutil.move 会把
+                # 正被枚举的目录搬空/改结构，导致后面的兄弟卷被漏掉（真机复现：
+                # 一次调用只搬了 z02，z03 留在原目录，要等下一次触发才补上）。
+                pending = []
                 candidates = root.rglob("*") if recursive else root.iterdir()
                 for cand in candidates:
                     try:
@@ -2352,21 +2378,94 @@ class FolderWatcher(threading.Thread):
                                 and smart_extract.is_volume_file(
                                     anchor.name, cand.name, anchor.stem)
                                 and _can_open_append(cand)):
-                            dest = anchor.parent / cand.name
-                            if dest.exists():
-                                continue
-                            shutil.move(str(cand), str(dest))
-                            moved += 1
-                            self.hub.log(f"跨目录分卷归拢: {cand} -> {dest}")
-                            try:
-                                cand.parent.rmdir()   # 搬空则清掉来源目录
-                            except OSError:
-                                pass
+                            pending.append(cand)
+                    except OSError:
+                        continue
+                for cand in pending:
+                    try:
+                        dest = anchor.parent / cand.name
+                        if dest.exists():
+                            continue
+                        shutil.move(str(cand), str(dest))
+                        moved += 1
+                        self.hub.log(f"跨目录分卷归拢: {cand} -> {dest}")
+                        try:
+                            cand.parent.rmdir()   # 搬空则清掉来源目录
+                        except OSError:
+                            pass
                     except OSError:
                         continue
             except OSError:
                 continue
         return moved
+
+    def _find_first_volume(self, fp, wc):
+        """在监听范围内找「某个非首卷所属分卷系列」的首卷；找不到返回 None。
+
+        只认监听白名单（watch_path 与显式 output_dir），绝不越界搜索；隔离区里
+        的文件不参与（那是待还原副本）。判定复用 formats 的公开谓词：候选必须
+        本身是首卷，且与 fp 属于同一分卷系列（`is_volume_file` 严格比基础名，
+        不会把 xx.mp4 当成 xx.z02 的兄弟）。
+        """
+        fp = Path(fp)
+        roots = []
+        for p in (wc.get("path"), (wc.get("output_dir") or "").strip() or None):
+            if p:
+                roots.append(Path(p))
+        # 与 _gather_and_consolidate 同一口径：实验性（百度清单）模式才递归子目录，
+        # 否则只看各根表层 —— 两处范围必须一致，否则会「找到了首卷但归拢不了」。
+        recursive = baidu_manifest.is_enabled(self.state)
+        for root in roots:
+            try:
+                if not root.exists():
+                    continue
+                for cand in (root.rglob("*") if recursive else root.iterdir()):
+                    try:
+                        if cand == fp or _in_quarantine(cand) or not cand.is_file():
+                            continue
+                        if (smart_extract.is_volume_name(cand.name)
+                                and smart_extract.is_first_volume(cand.name)
+                                and smart_extract.is_volume_file(
+                                    cand.name, fp.name, cand.stem)):
+                            return cand
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return None
+
+    def _consolidate_to_first_volume(self, fp, wc):
+        """非首卷到达时：回头找首卷，把整套卷归拢到首卷目录，再让首卷接单。
+
+        背景（2026-11-17 真机）：一套 29.9GB 的 zip 跨卷被上传者放进了 3 个不同
+        子目录（z01 在 A、z02 在 B、z03 在 C）。归拢只在「首卷等缺末卷」那一次
+        跑过一次，之后 z02/z03 落地时只记「非首卷，等待首卷」就进了 seen ——
+        那套卷再也没被处理。这里把「非首卷到达」也变成一次归拢触发点。
+
+        返回 True 表示**已经找到首卷并完成一次归拢**（内部已让首卷接单，调用方
+        不必再记"等待首卷"）；False 表示没找到首卷 / 没东西可搬 / 冷却中。
+        任何异常都吞掉并返回 False —— 归拢是优化，绝不阻断常规流程。
+        """
+        try:
+            fp = Path(fp)
+            key = self._norm_path(fp.parent) + "|" + fp.name
+            now = time.time()
+            if now - self._consolidate_try.get(key, 0.0) < 15.0:
+                return False        # 冷却：避免每个非首卷每轮都 rglob 整个监听根
+            self._consolidate_try[key] = now
+            anchor = self._find_first_volume(fp, wc)
+            if anchor is None:
+                return False
+            moved = self._gather_and_consolidate(anchor, wc)
+            if moved <= 0:
+                return False
+            self.hub.log(f"非首卷到达触发归拢 {moved} 个 -> {anchor.parent}"
+                         f"（首卷 {anchor.name}）")
+            out = {}
+            self._handle(anchor, wc, traced=True, out=out)
+            return True
+        except Exception:
+            return False
 
     def _split_recheck(self, fp, wc):
         """跨目录分卷等待期复查（由 _handle 的等待捷径调用，每 SPLIT_RECHECK_INTERVAL

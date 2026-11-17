@@ -5,7 +5,7 @@ _ACTIVE_TOASTS 是包内唯一的共享强引用列表（本模块定义，包 _
 ToastBubble 与 show_toast 都只操作这一个列表对象。"""
 
 from PyQt5.QtWidgets import QLabel, QApplication, QGraphicsOpacityEffect, QWidget
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt5.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint)
 
 from ..textfit import fit_text_heights
 # ---------------------------------------------------------------------------
@@ -144,3 +144,40 @@ def show_toast(anchor_widget, global_pos, text, msec=900):
         return toast
     except Exception:
         return None
+
+
+def show_toast_top(anchor_widget, text, msec=1800, top_offset=12):
+    """**应用内顶部居中**的临时提示（非阻塞），返回控件或 None。
+
+    为什么单独一个入口：像「该口令已在密码本中」这类"只是告诉你一声"的反馈，
+    过去用 QMessageBox.information 弹模态框 —— 用户必须点 OK 才能继续，等于把
+    任何一次误重复操作都变成一次打断。这里改用气泡：不抢焦点（
+    WA_ShowWithoutActivating + WA_TransparentForMouseEvents）、不拦鼠标、
+    1.8 秒自动淡出，用户可以完全无视它继续干活。
+
+    定位：以 anchor_widget 所在**顶层窗口**为准，水平居中、顶部下移 top_offset。
+    ToastBubble 的宽度只有构造后才知道，所以先按中线坐标建，再按实际宽度回正；
+    该窗口不在屏幕上（隐藏 / 最小化）时退回气泡自带的屏幕钳制，不会跑到屏幕外。
+
+    任何异常静默返回 None —— 提示绝不打断主流程（调用方也不需要 try）。
+    """
+    try:
+        parent = anchor_widget if isinstance(anchor_widget, QWidget) else None
+        win = anchor_widget.window() if isinstance(anchor_widget, QWidget) else None
+        geo = (win or anchor_widget).geometry() if (win or anchor_widget) else None
+        if geo is None:
+            return None
+        center_x = geo.center().x()
+        pos = QPoint(center_x, geo.top() + int(top_offset))
+        toast = show_toast(anchor_widget, pos, text, msec)
+        if toast is not None:
+            # 回正：按实际宽度水平居中（失败也不影响已显示的提示）
+            try:
+                toast.move(center_x - toast.width() // 2,
+                           int(geo.top()) + int(top_offset))
+            except Exception:
+                pass
+        return toast
+    except Exception:
+        return None
+

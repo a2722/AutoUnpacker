@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
                              QVBoxLayout, QWidget)
 
 from ..widgets import Glyph, SegControl, show_toast
+from ..widgets import show_toast_top
 
 from .data import _PwData, _hit_count, _passes_filter, _row_matches
 from .dialogs import _PasswordEditDialog
@@ -541,6 +542,23 @@ class PasswordBookPage(QWidget):
         except Exception:
             pass
 
+    def _toast_top(self, text, msec=1800):
+        """应用内**顶部居中**的非阻塞提示（重复口令等「只是告诉你一声」的反馈）。
+
+        以前这两处用 QMessageBox.information 弹模态框：重复添加/重命名只是提醒，
+        却要用户点 OK 才能继续 —— 用户 2026-11-15 明确要求改成不打断任何操作的
+        临时小弹窗。气泡不抢焦点、鼠标穿透、到点自动淡出；万一气泡建不出来
+        （例如无窗口/测试桩），退回页脚 notice，任何情况下都不弹模态框。"""
+        try:
+            if show_toast_top(self, str(text), msec) is not None:
+                return
+        except Exception:
+            pass
+        try:
+            self.notice.emit(str(text))
+        except Exception:
+            pass
+
     def _ask_edit(self, title, current, note, focus_note=False):
         """弹新增 / 编辑对话框（口令 + 备注）；取消返回 None（口令绝不进日志）。
 
@@ -585,7 +603,10 @@ class PasswordBookPage(QWidget):
         if not password:
             return
         if password in self._data.book():
-            QMessageBox.information(self, "新增口令", "该口令已在密码本中。")
+            # 非阻塞：应用内顶部居中的临时提示（2026-11-15 用户要求）。
+            # 以前是 QMessageBox.information（模态）—— 重复添加只是"告诉你一声"，
+            # 却逼用户点 OK 才能继续，等于每次误重都打断一次操作。
+            self._toast_top("该口令已在密码本中")
             return
         if not self._data.add(password, result["note"] or ""):
             self.notice.emit("新增失败：无法写入密码本")
@@ -642,7 +663,8 @@ class PasswordBookPage(QWidget):
         if not new:
             return
         if new != old and new in self._data.book():
-            QMessageBox.information(self, "编辑口令", "该口令已在密码本中。")
+            # 同新增路径：重复口令只做**非阻塞**顶部提示，绝不弹模态框。
+            self._toast_top("该口令已在密码本中")
             return
         if new == old and (note is None or note == old_note):
             return                                 # 口令与备注都没改

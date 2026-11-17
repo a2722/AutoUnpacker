@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.47] - 2026-11-15
+
+### 改进
+
+- **密码本「该口令已在密码本中」不再弹模态框**（真机反馈：重复添加/重命名时弹
+  `QMessageBox`，必须点 OK 才能继续，打断操作）。
+  现在改成**应用内顶部居中的临时气泡**：不抢焦点、鼠标穿透、1.8 秒自动淡出，
+  用户可以完全无视它继续干活。
+  - 新增 `ui/widgets/toast.py: show_toast_top(anchor, text, msec)`：以锚点所在
+    **顶层窗口**为准水平居中、顶部下移 12px；气泡宽度只有构造后才知道，所以先按
+    中线建、再按实际宽度回正；窗口隐藏/最小化时退回气泡自带的屏幕钳制。
+  - `ui/page_pwbook/page.py`：新增 `_toast_top()`，重复新增 / 重复重命名两处改用它；
+    气泡建不出来时退回页脚 `notice`，任何情况下都不再弹模态框。
+  - 破坏性操作（删除 / 清空字典等）仍保留 `QMessageBox.question/warning` 二次确认
+    —— 那些**必须**阻塞。
+
+### 测试
+
+- 新增 `test_pwbook_dup_toast.py`（22 项）：源码接线（无 `QMessageBox.information(`）、
+  气泡非模态/不抢焦点/鼠标穿透/计时器 1.8s、水平居中与顶部偏移、注销、
+  非 QWidget 锚点静默返回、页面重复新增只弹气泡且不弹模态框。
+- 同步 `test_page_pwbook.py` 的 F4 / F7：断言从"弹了 information"改成
+  "弹了气泡 + **没**弹 information"。
+- 全量离线套件：**216** 个测试文件，4 个已知失败（与之前相同）。
+
 ## [2.2.46] - 2026-11-10
 
 ### 修复

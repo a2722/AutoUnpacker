@@ -5,6 +5,49 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.50] - 2026-11-18
+
+### 修复：`xxx.part1/2/3`（**无 `.rar` 结尾**）的 RAR5 分卷被拆开解压
+
+真机现场（`[醉春楼汉化组]poko●●●`，10GB）：
+
+```
+xxx_rar.part1.baiduyun.p.downloading   ← 首卷还在下
+xxx_rar.part2                          ← 已下完 → 19:49:43 报「密码错误」失败
+xxx_rar.part3                          ← 已下完 → 19:50:59 再报一次
+（19:58 part1 下完 → 被当独立 RAR 解 → 只回收 part1，part2/part3 变 6GB 孤儿）
+```
+
+`rar a -v4g xxx.part1 …` 造出来的卷名就是 `xxx.part1` / `xxx.part2` / …（**扩展名
+本身就是 `.partN`**）。旧判据只认 `.partN.rar` / `.001` / `.z01` / `.r00`，于是每个
+编号卷都被当成独立压缩包 → 中间卷报错刷屏、首卷也只按「单卷」消费。
+
+修复分五层：
+
+1. **命名判据**（`formats.py`）：`_is_volume_suffix` 认 `.partN$`；`_part_info`
+   允许**没有结尾扩展名**；`detect_volumes_quick` 对这类名字返回
+   「首卷 master=自己、其余 master=首卷」。顺带补齐 `.r00/.r01` 的
+   `is_volume_name`（此前只有 `_volume_number` 认得）。
+2. **不再误判为「改后缀的完整包」**：`is_fake_volume_name` 对 `.partN` 直接返回
+   False —— 否则缺首卷时 part2/part3 会被当成「内容其实是完整包」而真的去解。
+3. **解压层硬闸门**：`extract_one` 的「非首卷不解析」从 `is_non_first_rar_part`
+   扩到 `is_non_first_volume`（覆盖 `.002` / `.z02` / `.r01` / `.part2` …，
+   「改后缀迷惑」仍放行）。任何一层误传都不会再单独解开中间卷。
+4. **回收不留孤儿**（`post.delete_source`）：除 `is_volume_file` 外，再按
+   **系列键**兜一层 —— 同系列且本身是分卷名的文件一起回收；`xxx.rar` 与
+   `xxx.7z` 这种「同基础名但不是分卷」的绝不牵连。
+5. **同系列仍在下载就先不解压**（`formats.series_key` /
+   `downloading_series_sibling` + `_handle` 闸门）：同目录里有同系列
+   `.baiduyun.p.downloading` 时 defer（日志 60s 节流，不刷屏）；**试探解压失败
+   但同系列仍在下载时不报「失败」**，只记「已保留源文件、下完再试」。
+
+### 测试
+
+- 新增 `test_volume_part_noext.py`（36 项）：命名判据 / 系列键 / 监听层两道闸门 /
+  `extract_one` 硬闸门 / **真 RAR5 多卷端到端**（Rar.exe 造卷 → 去 `.rar` 尾巴 →
+  从 part1 一次解开、全部卷被回收、无失败通知）/ 回收不过度。
+- 全量离线套件：**219** 个测试文件，4 个已知失败（与之前相同）。
+
 ## [2.2.49] - 2026-11-18
 
 ### 改进

@@ -460,9 +460,16 @@ def _is_volume_suffix(name):
         ext = Path(low).suffix
         if len(ext) == 4 and ext[1:].isdigit():
             return True
-        if len(ext) == 4 and ext[1].lower() == "z" and ext[2:].isdigit():
+        if len(ext) == 4 and ext[1].lower() in ("z", "r") and ext[2:].isdigit():
             return True
         if ".part" in low and low.endswith(".rar"):
+            return True
+        # RAR5「自定义首卷名」风格：`rar a -v4g xxx.part1 …` 生成的卷名就是
+        # `xxx.part1` / `xxx.part2` / …，**没有** `.rar` 结尾（扩展名本身就是
+        # `.partN`）。真机 2026-11-18：一套 11GB 的 RAR5 分卷正是
+        # `[醉…]poko●●●_rar.part1/2/3` —— 旧判定认不出来，于是 part3、part2
+        # 各自被当成独立压缩包交给 7-Zip，连报「密码错误」失败通知。
+        if re.search(r"\.part\d+$", low):
             return True
         return False
     except Exception:
@@ -559,6 +566,23 @@ def detect_volumes_quick(path):
         master = parent / f"{stem}.001"
         if master.exists():
             return True, master
+        return True, None
+    # 无结尾扩展名的 `.partN` 卷名（RAR5 自定义首卷名，见 _is_volume_suffix 注释）：
+    # 首卷即入口；非首卷把「同系列首卷」作为主卷（存在才算），供 _stage_/改名等
+    # 逻辑复用。放在最后，绝不改变上面既有各风格的返回口径。
+    info = _part_info(name)
+    if info:
+        if info[1] == 1:
+            return True, path
+        try:
+            for e in parent.iterdir():
+                if not e.is_file():
+                    continue
+                ei = _part_info(e.name)
+                if ei and ei[0] == info[0] and ei[1] == 1:
+                    return True, e
+        except OSError:
+            pass
         return True, None
     return False, None
 
@@ -717,6 +741,84 @@ def volume_download_pending(path):
                 and is_volume_file(path.name, target, stem)):
             return True
     return False
+
+
+def series_key(name):
+    """把「同系列文件名」归一成比较键（用于判断同目录下载中的文件是否同系列）。
+
+    与 `is_volume_file` 不同，这里**不要求**认得标准分卷命名：只要剥掉
+    「未完成下载后缀 → 分卷编号 → 归档扩展名」后基础名一致，就算同一系列。
+    这样 7-Zip / WinRAR / 上传者各种奇形怪状的命名都能兜住。
+
+    例（同一系列 → 同一个键）：
+      xxx_rar.part3                        → xxx_rar
+      xxx_rar.part1.baiduyun.p.downloading → xxx_rar
+      剧集包.7z.002                         → 剧集包
+      剧集包.7z                             → 剧集包
+      剧集包.z01                            → 剧集包
+
+    键太短（<4 字符）或得不到键 → 返回 ""（调用方据此不做任何拦截）。
+    绝不抛异常。
+    """
+    try:
+        s = _strip_download_suffix(str(name or ""))
+        if not s:
+            return ""
+        # 防和谐标记（删 / 除 / 全角空格）会出现在任意位置，比较前一律去掉
+        for junk in ("\u5220", "删除", "除", "\u3000"):
+            if junk in s:
+                s = s.replace(junk, "")
+        info = _part_info(s)
+        if info:
+            s = info[0]
+        else:
+            s = re.sub(r"\.(?:[zr]\d{2,3}|\d{3})$", "", s, flags=re.I)
+        low = s.lower()
+        for ext in (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst"):
+            if low.endswith(ext):
+                s = s[:len(s) - len(ext)]
+                break
+        s = s.strip().lower()
+        # 键太短就没有区分力（例 `a` / `ab`），一律当「无法判断」。按 UTF-8 字节
+        # 长度算，让两三个汉字的基础名（`剧集包` / `3顆球`）也能用；纯 ASCII 要
+        # 至少 6 字节（`ab` 这种两字符名没有区分力）。
+        return s if len(s.encode("utf-8")) >= 6 else ""
+    except Exception:
+        return ""
+
+
+def downloading_series_sibling(path):
+    """同目录里是否有「同系列」的文件还在下载（.baiduyun.p.downloading 等）。
+
+    `volume_download_pending` 只认标准分卷命名（.001/.z01/.partN.rar）且要求
+    `is_volume_file` 承认兄弟关系；真机会出现它认不出的组合 —— 例如
+    `xxx_rar.part1.baiduyun.p.downloading` 还在下、`xxx_rar.part3` 已经下完，
+    于是程序拿 part3 直接开解，7-Zip 报「密码错误 / 缺卷」并弹失败通知。
+
+    本函数按「系列键」比较，与分卷命名风格无关：只要同目录有**仍在写入**的
+    文件与 path 属于同一系列，就返回那个文件，调用方应「先不解压」。
+    找不到/无法判断一律返回 None。绝不抛异常。
+    """
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return None
+        key = series_key(p.name)
+        if not key:
+            return None
+        for e in p.parent.iterdir():
+            try:
+                if e.name == p.name or not e.is_file():
+                    continue
+                if not is_incomplete_download(e):
+                    continue
+                if series_key(e.name) == key:
+                    return e
+            except OSError:
+                continue
+    except Exception:
+        return None
+    return None
 
 
 def analyze_file(path, manual_format=None):
@@ -917,9 +1019,11 @@ def _part_info(name):
     三者基础名都是 feal，但不加标记就会把 feal.part02.rar 误当成
     feal.part01(1).rar 的兄弟卷，导致解压后把下一层的源卷误删。
 
-    兼容：标准 .partN.rar、非标准后缀 .partN.除rar、带括号 .partN(2).rar。"""
+    兼容：标准 .partN.rar、非标准后缀 .partN.除rar、带括号 .partN(2).rar，
+    以及 **无结尾扩展名**的 RAR5 自定义卷名 `xxx.partN`（`rar a -v4g xxx.part1`
+    生成的那种；真机 2026-11-18 `[醉…]poko●●●_rar.part1/2/3`）。"""
     m = re.match(
-        r"^(?P<base>.+)\.part(?P<num>\d+)(?:\((?P<mark>[^)]*)\))?\.(?P<ext>[^.]+)$",
+        r"^(?P<base>.+)\.part(?P<num>\d+)(?:\((?P<mark>[^)]*)\))?(?:\.(?P<ext>[^.]+))?$",
         name, re.I)
     if m:
         base = m.group("base")
@@ -1036,6 +1140,15 @@ def is_fake_volume_name(path):
         info = analyze_file(path)
     except Exception:
         return False
+    # `.partN`（无结尾扩展名）是 RAR5 的自定义卷名，不存在「改后缀迷惑」的完整包
+    # 这种情形；缺首卷时更不能把它判成「内容是完整压缩包」——真机 2026-11-18 就是
+    # 这样把 part1 当独立 RAR 解开（只解出 part1 范围内的内容）、回收后让
+    # part2/part3 变成 6GB 孤儿。RAR 卷一律交给分卷逻辑处理。
+    try:
+        if re.search(r"\.part\d+$", Path(path).name.lower()):
+            return False
+    except Exception:
+        pass
     if not (info.get("is_volume") and not info.get("volume_master")):
         return False
     num = _volume_number(Path(path).name)

@@ -302,6 +302,8 @@ class FolderWatcher(threading.Thread):
         # 非首卷到达时「回头找首卷并归拢」的冷却表 {norm_key: last_try_ts}：
         # rglob 全监听根有成本，同一分卷系列 15 秒内最多找一次。
         self._consolidate_try = {}
+        # 「同系列仍在下载，暂不解压」日志节流表 {norm_path: (兄弟名, ts)}
+        self._dl_wait_sig = {}
         # 当前离线的监听路径 {norm_path: 进入离线时刻}：目录不存在或无法枚举时进入，
         # 枚举成功才由 _mark_online 清除（每段离线只记一次日志、超 5 分钟通知一次）。
         self._offline = {}
@@ -2018,6 +2020,22 @@ class FolderWatcher(threading.Thread):
             self.hub.log(f"分卷未到齐（其他分卷仍在下载），暂不解压，等待下载完成: {name}")
             self._set_dir_state(wc.get("path"), "waiting", name=name)
             return "defer"
+        # 同系列仍在下载的兜底（不依赖分卷命名是否标准）：同目录里还有
+        # `.baiduyun.p.downloading` 等同系列文件时，先**不要开始解压**。
+        # 真机 2026-11-18：`…_rar.part1.baiduyun.p.downloading` 还在下，而
+        # `…_rar.part3` 已下完 —— 旧逻辑认不出同一系列，拿 part3 直接开解，
+        # 7-Zip 报「密码错误」并弹失败通知（后续还把 part1 单独解掉）。
+        _dl_sib = None
+        try:
+            _dl_fn = getattr(smart_extract, "downloading_series_sibling", None)
+            if callable(_dl_fn):
+                _dl_sib = _dl_fn(fp)
+        except Exception:
+            _dl_sib = None
+        if _dl_sib is not None:
+            self._note_series_wait(fp, Path(_dl_sib).name)
+            self._set_dir_state(wc.get("path"), "waiting", name=name)
+            return "defer"
         # 相同/嵌套监听路径下，防止同一个压缩包被重复处理；
         # 用「大小+时间」识别身份：同名新文件（内容不同）不会被跳过
         abs_fp = self._norm_path(fp)
@@ -2308,8 +2326,23 @@ class FolderWatcher(threading.Thread):
                             f"{name} 源文件已不存在（可能已被同批次成功解压回收），"
                             f"按已了结处理，不报失败")
                     else:
-                        self.hub.log(f"{name} 解压失败: {err}")
-                        self.hub.notify("智能解压失败", f"{name}\n{err}")
+                        _soft_dl = None
+                        try:
+                            _dl2_fn = getattr(smart_extract,
+                                              "downloading_series_sibling", None)
+                            if callable(_dl2_fn):
+                                _soft_dl = _dl2_fn(fp)
+                        except Exception:
+                            _soft_dl = None
+                        if _soft_dl is not None:
+                            # 试探解压失败、但同系列仍在下载：不是「解压失败」，只是
+                            # 还没到齐。源文件保留，等兄弟卷下完后下一轮自然重解。
+                            self.hub.log(
+                                f"{name} 解压未完成（{err}），但同系列文件仍在下载，"
+                                f"已保留源文件、不报失败，下完再试")
+                        else:
+                            self.hub.log(f"{name} 解压失败: {err}")
+                            self.hub.notify("智能解压失败", f"{name}\n{err}")
                     _tasks_changed(self.hub)
                     self._set_dir_state(wc.get("path"), "error", name=name)
                     if record is not None:
@@ -2466,6 +2499,24 @@ class FolderWatcher(threading.Thread):
             return True
         except Exception:
             return False
+
+    def _note_series_wait(self, fp, sibling_name):
+        """记录一次「同系列仍在下载，暂不解压」的等待日志（节流）。
+
+        `_handle` 返回 defer 后每轮轮询都会再进来一次，所以只在「等待的兄弟文件
+        变了」或「距上次记录超过 60s」时打日志，避免每 2 秒刷一行。绝不抛异常。
+        """
+        try:
+            key = self._norm_path(fp)
+            now = time.time()
+            st = self._dl_wait_sig.get(key)
+            if st and st[0] == sibling_name and now - st[1] < 60.0:
+                return
+            self._dl_wait_sig[key] = (sibling_name, now)
+            self.hub.log(f"同系列文件仍在下载，暂不解压: {fp.name}"
+                         f"（等待 {sibling_name}）")
+        except Exception:
+            pass
 
     def _split_recheck(self, fp, wc):
         """跨目录分卷等待期复查（由 _handle 的等待捷径调用，每 SPLIT_RECHECK_INTERVAL

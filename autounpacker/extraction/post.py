@@ -25,7 +25,7 @@ from .engines import CREATE_NO_WINDOW
 from .formats import (
     PART_RE, _part_info, _volume_base, _volume_final_name, _volume_number,
     find_renamed_final_volume, is_incomplete_download, is_volume_file,
-    is_volume_name, normalize_volume_name)
+    is_volume_name, normalize_volume_name, series_key)
 
 
 def strip_embedded_zip(path, dest_dir):
@@ -600,6 +600,23 @@ def delete_source(source, hook=None, permanent_fallback=True, quarantine_root=No
             renamed = None
         if renamed is not None and renamed not in targets:
             targets.append(renamed)
+        # 「同系列分卷」第二道网：7-Zip / WinRAR 跟随分卷只看**磁盘上的名字**，
+        # 因此解压时可能已经读了 `.part2` / `.part3` 这些卷，但 `is_volume_file`
+        # 若因命名怪异（无扩展名的 `.partN`、脏字符等）认不出，就会把它们留成
+        # 孤儿（真机 2026-11-18：part1 解完只回收了 part1，part2/part3 6GB 白占
+        # 空间）。这里按「系列键」再兜一层：**同系列且本身是分卷名**的文件才算，
+        # 普通同名压缩包（xxx.rar + xxx.7z）不在此列。
+        try:
+            src_key = series_key(source.name)
+            if src_key:
+                for entry in parent.iterdir():
+                    if (entry in targets or not entry.is_file()
+                            or not is_volume_name(entry.name)):
+                        continue
+                    if series_key(entry.name) == src_key:
+                        targets.append(entry)
+        except Exception:
+            pass
     if not targets:
         if hook:
             hook([], [], None)

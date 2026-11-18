@@ -78,6 +78,7 @@ from .extraction.formats import (  # noqa: F401
     _scan_tail_for_archive, _series_base, _strip_download_suffix, _volume_base,
     _volume_final_name, _volume_number, analyze_file, detect_archive_format,
     detect_format_by_magic, detect_steganography, detect_volumes_quick,
+    downloading_series_sibling,
     extract_password_from_filename, find_renamed_final_volume, find_sevenzip_path,
     format_from_extension,
     has_zip_eocd, infer_volume_name_from_siblings, is_archive_file,
@@ -86,7 +87,7 @@ from .extraction.formats import (  # noqa: F401
     is_non_first_rar_part, is_non_first_volume, is_split_gap_error,
     is_volume_file, is_volume_name, normalize_volume_name,
     parse_sevenzip_listing,
-    perform_sanitization, sanitize_filename, should_skip_volume,
+    perform_sanitization, sanitize_filename, series_key, should_skip_volume,
     volume_download_pending)
 from .extraction.post import (  # noqa: F401
     _dirs_conflict, _final_output_targets, _merge_dir, _recycle_paths,
@@ -124,7 +125,8 @@ __all__ = [
     "create_engine", "ctypes", "default_output_dir",
     "delete_policy_permanent_fallback", "delete_source", "deletion_engine", "deque",
     "detect_archive_format", "detect_format_by_magic", "detect_steganography",
-    "detect_volumes_quick", "extract_one", "extract_password_from_filename",
+    "detect_volumes_quick", "downloading_series_sibling", "extract_one",
+    "extract_password_from_filename",
     "find_renamed_final_volume", "find_sevenzip_path", "format_from_extension",
     "get_dict_passwords",
     "get_password_for_layer", "has_zip_eocd", "infer_volume_name_from_siblings", "is_archive_file",
@@ -136,6 +138,7 @@ __all__ = [
     "looks_like_complete_content", "main", "move_result_dir", "os", "parse_passwords",
     "parse_sevenzip_listing", "perform_sanitization", "print_analysis",
     "promote_extracted_content", "re", "remove_empty_dirs", "result_raw_error",
+    "series_key",
     "run_script", "run_silent", "sanitize_filename", "save_password_dict",
     "should_skip_volume", "shutil", "stamp_output_now", "strip_embedded_zip", "struct",
     "subprocess", "sys", "tempfile", "threading", "time", "unique_dest_path", "uuid",
@@ -236,8 +239,15 @@ def extract_one(engine, source, out_arg, user_passwords, options, args,
     if is_do_not_extract(source.name):
         print(f"移动安装包/交付物，保持原样不自动解压（需手动处理）: {source.name}")
         return None
-    if is_non_first_rar_part(source):
-        print(f"非首卷 RAR 分卷，跳过（等待 .part1 处理整个分卷）: {source.name}")
+    # 非首卷分卷不是解压入口：单独交给 7-Zip 只会解出「这一卷里恰好完整的文件」，
+    # 然后把源卷当成功消费掉 —— 剩下的编号卷就永远解不开了（真机 2026-11-18：
+    # `[醉…]poko●●●_rar.part1` 被当独立 RAR 解出 10GB 内容并回收，part2/part3
+    # 成了孤儿）。旧判据只覆盖 `.partN.rar`，这里改成覆盖所有非首卷命名
+    #（.002 / .z02 / .r01 / .part2 / .part2.rar …）；「文件名像分卷、内容是完整包」
+    # 的改后缀迷惑情形仍放行。
+    if (is_non_first_volume(source.name)
+            and not is_fake_volume_name(source)):
+        print(f"非首卷分卷，跳过（等待首卷处理整个分卷）: {source.name}")
         return None
     info = analyze_file(source)
     if info.get("is_incomplete"):

@@ -92,6 +92,8 @@ from .window.share_flow import (  # noqa: F401
     _share_uk_for_surl, _mark_gesture_launch, _gesture_launched_recently,
     _share_invoke_busy_stale, _call_start_share_pick,
     _queue_share_intent, _pop_queued_share_intent,
+    _queue_auto_share_intent, _pop_due_auto_share_intent,
+    _auto_share_queue_len,
     _manual_reinvoke_guard, _share_parent_usable,
     _share_notify_via, _notify_fallback_allowed,
     _take_share_ask_notified, _announce_ask_code_hidden,
@@ -3371,6 +3373,31 @@ class MainWindow(QMainWindow):
                                                  manual=True)
                 except Exception as e:
                     self._append_log(f"[分享] 排队的手动拉起补执行出错: {e}")
+            else:
+                # 手动队列空了才轮到**自动**队列（复制链接即自动拉起那一路）：连点
+                # 复制两条链接时，第二条排在上一条之后，且两条之间插 3~7s 抖动（真机
+                # 事故 2026-11-18 10:22:38 里第二条被直接丢弃）。到点才 pop，未到点
+                # 只是空转一次 tick，绝不打断在跑的管线。
+                _qa = _pop_due_auto_share_intent(self)
+                if isinstance(_qa, dict):
+                    # 重放期间关掉「已有自动排队就再排队」那条判断：本条的兄弟可能
+                    # 还排在后头，不关的话它会把自己又塞回队尾（死循环）。
+                    self._auto_share_replaying = True
+                    try:
+                        if _qa.get("kind") == "pick":
+                            _call_start_share_pick(
+                                self, _qa.get("url"), _qa.get("surl"),
+                                _qa.get("pwd") or "", manual=False,
+                                item=_qa.get("item"),
+                                force_pick=bool(_qa.get("force_pick")))
+                        else:
+                            self._start_share_invoke(_qa.get("url"),
+                                                     _qa.get("pwd") or "",
+                                                     manual=False)
+                    except Exception as e:
+                        self._append_log(f"[分享] 排队的自动拉起补执行出错: {e}")
+                    finally:
+                        self._auto_share_replaying = False
         while True:
             try:
                 item = self.hub.q.get_nowait()
@@ -4000,7 +4027,8 @@ class MainWindow(QMainWindow):
 
     def _start_share_invoke(self, url, pwd, manual=False):
         """统一的分享拉起入口：**手动**意图忙时排队（由 `_drain` 在忙标志释放后按序
-        补执行，绝不丢弃本次按压），自动意图忙时跳过；不忙则起后台 daemon 线程
+        补执行，绝不丢弃本次按压），自动意图忙时**排队**（其间插入几秒抖动，见
+        `_pop_due_auto_share_intent`）；不忙则起后台 daemon 线程
         （不阻塞界面）。
 
         `invoke_download` 的复核轮询最多约 4.5s，但**绝不能**在 UI 线程调用。
@@ -4019,8 +4047,22 @@ class MainWindow(QMainWindow):
                     "pwd": pwd, "manual": True, "item": None,
                     "force_pick": False, "at": time.time()})
                 return
+            # 自动意图（复制链接即拉起）忙时也排队，不再丢弃；间隔抖动见
+            # _pop_due_auto_share_intent。排队失败（超限/异常）回落老行为。
+            if _queue_auto_share_intent(self, {
+                    "kind": "invoke", "tag": "auto", "url": url, "surl": url,
+                    "pwd": pwd, "item": None, "force_pick": False}):
+                return
             self._append_log("[分享] 上一个拉起尚未结束，已跳过")
             return
+        if (not manual
+                and not getattr(self, "_auto_share_replaying", False)
+                and _auto_share_queue_len(self) > 0):
+            # 不忙、但已有自动排队：保持先来后到，后到者同样排队（否则抖动白设）
+            if _queue_auto_share_intent(self, {
+                    "kind": "invoke", "tag": "auto", "url": url, "surl": url,
+                    "pwd": pwd, "item": None, "force_pick": False}):
+                return
         self._share_invoke_busy = True
         try:
             self._share_invoke_started_ts = time.time()
@@ -4142,7 +4184,8 @@ class MainWindow(QMainWindow):
     def _start_share_pick(self, url, surl, pwd, manual=False, item=None,
                           force_pick=False):
         """统一的分享管线入口：**手动**意图忙时排队（由 `_drain` 在忙标志释放后按序
-        补执行，`force_pick` 原样保留），自动意图忙时跳过；不忙则起后台 daemon 线程
+        补执行，`force_pick` 原样保留），自动意图忙时同样排队（两条自动拉起之间
+        插几秒抖动）；不忙则起后台 daemon 线程
         （不阻塞界面）。
 
         `prepare_share` / `commit_download` / `list_share_dir` 均含网络 IO，**绝不能**
@@ -4170,8 +4213,22 @@ class MainWindow(QMainWindow):
                     "surl": surl, "pwd": pwd, "manual": True, "item": item,
                     "force_pick": force_pick, "at": time.time()})
                 return
+            # 自动意图忙时也排队（真机 2026-11-18 10:22:38：连点复制两条链接，
+            # 第二条被旧行为直接丢弃）。item/force_pick 原样保留，重放口径一致。
+            if _queue_auto_share_intent(self, {
+                    "kind": "pick", "tag": "auto", "url": url, "surl": surl,
+                    "pwd": pwd, "item": item, "force_pick": force_pick}):
+                return
             self._append_log("[分享] 上一个拉起尚未结束，已跳过")
             return
+        if (not manual
+                and not getattr(self, "_auto_share_replaying", False)
+                and _auto_share_queue_len(self) > 0):
+            # 不忙、但已有自动排队：保持先来后到（抖动窗口内后到的链接不许插队）
+            if _queue_auto_share_intent(self, {
+                    "kind": "pick", "tag": "auto", "url": url, "surl": surl,
+                    "pwd": pwd, "item": item, "force_pick": force_pick}):
+                return
         # 小窗统一取值：属于该分享的小窗里若有校验通过的码，覆盖本次 pwd（覆盖
         # Alt+3 / 询问 / 自动三条路）。此处**只**读小窗，不重算 recent——自动路径的
         # 码由调用方决定，绝不在此改口径。

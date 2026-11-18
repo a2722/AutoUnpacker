@@ -5,6 +5,7 @@ Stage 6f 从 ui/main_window.py 原样拆出；函数体/签名/文档字符串�
 （仅函数内相对导入深度随目录调整）。归属：MainWindow 经
 `from .window.share_flow import ...` 再导出使用。
 """
+import random
 import time
 
 from PyQt5.QtWidgets import QApplication, QWidget
@@ -13,7 +14,9 @@ from ...utils import split_urls, is_baidu_pan_url
 from ... import baidu_manifest as bm
 from .consts import (PENDING_SHARE_TTL_SEC, SHARE_GESTURE_DEDUP_SEC,
                      SHARE_INVOKE_BUSY_MAX_SEC, PENDING_SHARE_TAG,
-                     QUEUED_SHARE_INTENT_MAX, _SHARE_ASK_NOTIFIED)
+                     QUEUED_SHARE_INTENT_MAX, QUEUED_AUTO_SHARE_INTENT_MAX,
+                     AUTO_SHARE_GAP_MIN_SEC, AUTO_SHARE_GAP_MAX_SEC,
+                     AUTO_SHARE_INTENT_TTL_SEC, _SHARE_ASK_NOTIFIED)
 from .logview import _share_log
 
 # ---------------------------------------------------------------------------
@@ -557,6 +560,112 @@ def _queue_share_intent(win, intent):
                    f"[分享] 上一个拉起尚未结束，已排到其后自动拉起（{_tag}）: {url}")
     except Exception:
         pass
+
+
+def _auto_share_queue(win):
+    """取（惰性创建）自动拉起意图队列 `win._queued_auto_share_intents`。绝不抛异常。"""
+    try:
+        q = getattr(win, "_queued_auto_share_intents", None)
+        if not isinstance(q, list):
+            q = []
+            setattr(win, "_queued_auto_share_intents", q)
+        return q
+    except Exception:
+        return []
+
+
+def _auto_share_queue_len(win):
+    """自动排队条数（只在排队中的，不含正在跑的那条）。绝不抛异常。"""
+    try:
+        q = getattr(win, "_queued_auto_share_intents", None)
+        return len(q) if isinstance(q, list) else 0
+    except Exception:
+        return 0
+
+
+def _queue_auto_share_intent(win, intent):
+    """忙（或已有自动排队）时把**自动**拉起意图排队，返回 True 表示已入队。
+
+    真机事故（2026-11-18 10:22:38）：连续复制两条分享链接，第二条落在第一条拉起的
+    忙窗口里 → 旧行为只记一行「上一个拉起尚未结束，已跳过」就丢弃，用户得再按一次
+    快捷键或翻日志才知道要手动补。现在改成排到第一条之后自动拉起。
+
+    与手动队列**分开存放**：`_drain` 先取手动队列（用户的显式按压永远优先，且不
+    吃抖动延迟），手动队列空了才轮到自动队列。抖动延迟在「第一次可以拉起时」才
+    开始计时（见 `_pop_due_auto_share_intent`），所以间隔是从上一条真正结束起算的
+    几秒钟，而不是从复制那一刻起算。同一 surl 重复入队会被静默忽略（幂等）。
+    绝不抛异常；上限/异常均返回 False，让调用方回落到「已跳过」老行为。"""
+    try:
+        url = str(intent.get("url") or "")
+        surl = str(intent.get("surl") or url)
+        q = _auto_share_queue(win)
+        if surl:
+            for it in q:
+                if str(it.get("surl") or "") == surl:
+                    _share_log(win, f"[分享] 该分享已在自动排队中，忽略重复: {url}")
+                    return True
+        if len(q) >= QUEUED_AUTO_SHARE_INTENT_MAX:
+            _share_log(win,
+                       f"[分享] 自动排队已达上限（{QUEUED_AUTO_SHARE_INTENT_MAX}），"
+                       f"本次未排队: {url}")
+            return False
+        it = dict(intent)
+        it["manual"] = False
+        it["tag"] = str(it.get("tag") or "auto")
+        it["at"] = time.time()
+        it["due_at"] = 0.0
+        q.append(it)
+        _share_log(
+            win,
+            f"[分享] 上一条拉起尚未结束，已排到其后自动拉起"
+            f"（队列第 {len(q)} 条，间隔 "
+            f"{AUTO_SHARE_GAP_MIN_SEC:.0f}~{AUTO_SHARE_GAP_MAX_SEC:.0f}s 抖动）: {url}")
+        return True
+    except Exception:
+        return False
+
+
+def _pop_due_auto_share_intent(win):
+    """取出队首「已到点」的自动拉起意图；未到点/队列空一律 None。绝不抛异常。
+
+    抖动在两处发生：队首第一次被问到时才把 `due_at` 定成 now+rand(3,7)，并记一行
+    「约 N 秒后拉起下一条」；之后每次 tick（200ms）只是比较时间，到点才 pop。
+    超过 AUTO_SHARE_INTENT_TTL_SEC 的意图直接作废并记一行（防御忙标志异常/意图早
+    已过期）。"""
+    try:
+        q = getattr(win, "_queued_auto_share_intents", None)
+        if not isinstance(q, list) or not q:
+            return None
+        now = time.time()
+        head = q[0]
+        if not isinstance(head, dict):
+            q.pop(0)
+            return None
+        try:
+            age = now - float(head.get("at") or now)
+        except Exception:
+            age = 0.0
+        if age > AUTO_SHARE_INTENT_TTL_SEC:
+            q.pop(0)
+            _share_log(win,
+                       f"[分享] 自动排队等候过久（{int(age)}s），已作废: "
+                       f"{head.get('url')}")
+            return None
+        try:
+            due = float(head.get("due_at") or 0.0)
+        except Exception:
+            due = 0.0
+        if due <= 0.0:
+            gap = random.uniform(AUTO_SHARE_GAP_MIN_SEC, AUTO_SHARE_GAP_MAX_SEC)
+            head["due_at"] = now + gap
+            _share_log(win, f"[分享] {gap:.1f}s 后自动拉起下一条: {head.get('url')}")
+            return None
+        if now < due:
+            return None
+        q.pop(0)
+        return head
+    except Exception:
+        return None
 
 
 def _pop_queued_share_intent(win):

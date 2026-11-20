@@ -3701,6 +3701,14 @@ class MainWindow(QMainWindow):
                 return
             _mark_gesture_launch(self, surl)
             self._bump_share_launch(surl)
+            # 记下「本轮计数是谁计入的」：worker 里若最终**没有真正发起到客户端**
+            # （客户端预检拦下 / 提取码错误 / 链接失效 / 用户取消挑选 / 提交前失败），
+            # 要能把这次计数撤回 —— 否则一次失败尝试会被当成「已拉起过」，用户改好
+            # 提取码再复制一次还得再按一次 Alt+2 才放行（真机 2026-11-20 22:10）。
+            try:
+                self._share_launch_bumped_surl = str(surl or "")
+            except Exception:
+                pass
             self._start_share_invoke(url, code, manual=True)
         except Exception as e:
             self._append_log(f"拉起客户端出错: {e}")
@@ -3877,6 +3885,10 @@ class MainWindow(QMainWindow):
             _mark_gesture_launch(self, _surl)
             # 手动路径即用户明确同意：直接拉起，同时计数（与自动路径共用 d7 计数）
             self._bump_share_launch(_surl)
+            try:
+                self._share_launch_bumped_surl = str(_surl or "")
+            except Exception:
+                pass
             self._start_share_invoke(rec.get("url"), rec.get("pwd") or "", manual=True)
         except Exception as e:
             self._append_log(f"拉起客户端出错: {e}")
@@ -4178,6 +4190,21 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.hub.log(f"[分享] 拉取出错: {e}")
         finally:
+            # 全程没发出过唤醒（预检拦下 / 拉起失败）→ 撤回本轮「已拉起」计数：
+            # 只有调用方确实为**这个 surl** 计入过（`_share_launch_bumped_surl`）
+            # 才动手，避免误伤同一分享此前真正成功的拉起。没发出唤醒就谈不上
+            # 重复下载，用户改好提取码重新复制后应直接生效，不必再按一次 Alt+2。
+            try:
+                # 本入口只拿到 url：本轮计入的 surl 记在 `_share_launch_bumped_surl`，
+                # 并用「surl 出现在 url 里」确认它确实属于本次拉起（防陈旧标记误撤）。
+                _mk = str(getattr(self, "_share_launch_bumped_surl", "") or "")
+                if not fired["done"] and _mk and _mk in str(url or ""):
+                    self._share_launch_bumped_surl = ""
+                    _rev = getattr(self, "_revoke_share_launch", None)
+                    if callable(_rev):
+                        _rev(url, _mk, "拉起失败，未发出唤醒")
+            except Exception:
+                pass
             self._share_invoke_busy = False
 
     # ---------- d3：分享「准备 →（可选）挑选 → 提交」管线 ----------
@@ -4270,6 +4297,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._bump_share_launch(surl)
+        # 记下「本轮计数是谁计入的」：worker 里若最终**没有真正发起到客户端**，
+        # 要把这次计数撤回（详见 _pick_share_worker 的 _revoke_once）。
+        try:
+            self._share_launch_bumped_surl = str(surl or "")
+        except Exception:
+            pass
         threading.Thread(target=self._pick_share_worker,
                          args=(url, surl, pwd, manual, item, force_pick),
                          daemon=True).start()
@@ -4284,20 +4317,42 @@ class MainWindow(QMainWindow):
         确需提取码才把「询问」请求投回 Qt 线程。异常一律吞掉，忙标志在 finally 复位。
 
         `force_pick=True`：无条件打开挑选窗（Alt+3 挑选手势）。"""
+        # 唤醒是否真的发出去了（on_wake 只回调一次）；没发出 = 本次没有真正拉起。
+        fired = {"done": False}
+        # 撤回只做一次（预检分支与 finally 都可能触发）。
+        _revoked = {"done": False}
+
+        def _revoke_once(reason=""):
+            """本次没真正发起到客户端 → 撤回「已拉起」计数（下次无需再按一次）。
+
+            只撤回**本轮**计入的那一次（`_share_launch_bumped_surl` 对得上才动手），
+            避免误伤同一分享此前真正成功的拉起。绝不抛异常。"""
+            if _revoked["done"]:
+                return
+            _revoked["done"] = True
+            try:
+                if str(getattr(self, "_share_launch_bumped_surl", "")) != str(surl or ""):
+                    return
+                self._share_launch_bumped_surl = ""
+            except Exception:
+                return
+            _rev = getattr(self, "_revoke_share_launch", None)
+            if callable(_rev):
+                try:
+                    _rev(url, surl, reason)
+                except Exception:
+                    pass
+
         try:
             if self._share_gate_blocked(manual, where="准备管线"):
                 # 与 _invoke_share_worker 同一口径：预检拦下＝什么都没拉起，
                 # 撤回本次计数（本入口已在起线程前同步计入）。
-                _revoke = getattr(self, "_revoke_share_launch", None)
-                if callable(_revoke):
-                    _revoke(url, surl)
+                _revoke_once("客户端未运行")
                 return
             from .. import baidu_share as bs
             # 唤醒即通知：与 `_invoke_share_worker` 同一策略——链路一发出唤醒就
             # 告知「已请求客户端下载」，不等复核轮询。通知标题/正文与原先成功分支
             # 保持逐字一致，只把时机提前；一次性守卫保证最多触发一次。
-            fired = {"done": False}
-
             def on_wake(detail):
                 if fired["done"]:
                     return
@@ -4418,6 +4473,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.hub.log(f"[分享] 准备出错: {e}")
         finally:
+            # 全程没发出过唤醒（预检拦下 / 提取码错误 / 链接失效 / 用户取消挑选 /
+            # 准备阶段异常）→ 收回本次「已拉起」计数：这不是一次真正的拉起，
+            # 用户改好提取码重新复制后应直接生效，不必再按一次 Alt+2。
+            if not fired["done"]:
+                _revoke_once("准备阶段未完成（提取码/链接/客户端）")
             self._share_invoke_busy = False
 
     def _share_notify(self, title, msg):
@@ -4766,12 +4826,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _revoke_share_launch(self, url, surl=None):
-        """撤回本次「已拉起」计数：客户端预检拦下＝什么都没拉起，不算「已拉起过」。
+    def _revoke_share_launch(self, url, surl=None, reason=""):
+        """撤回本次「已拉起」计数：没真正发起到客户端＝不算「已拉起过」。
 
         d7 计数由调用方在起 worker **之前**同步计入（保住「再按一次确认」的时序），
-        而客户端预检在 worker 内；预检拦下时本次没有发出任何唤醒、不存在重复下载
-        风险 → 撤回该计数与进程内集合兜底，用户之后重试无需再按一次 Alt+2。
+        而真正的失败点在 worker 内（客户端预检拦下、提取码校验失败、链接失效、
+        用户取消挑选、准备阶段异常）。这些情形都没有发出任何唤醒、不存在重复下载
+        风险 → 撤回该计数与进程内兜底，用户之后重试无需再按一次 Alt+2
+        （真机 2026-11-20 22:10：先填错提取码失败，改好后还得再按一次）。
+        `reason` 只影响日志文案（默认＝客户端未运行，保持既有文案逐字不变）。
         键优先用 surl，其次从 url 解析；解析不出则静默放弃。绝不抛异常。"""
         try:
             key = str(surl or "").strip()
@@ -4793,8 +4856,24 @@ class MainWindow(QMainWindow):
                     _seen.discard(key)
             except Exception:
                 pass
+            # 「该分享刚由手势拉起」的 30s 静默去重也要一并清掉，否则改好提取码
+            # 重新复制后，自动拉起会被这条回声当成重复而跳过。
+            try:
+                _ts = getattr(self, "_share_gesture_launch_ts", None)
+                if isinstance(_ts, dict):
+                    _ts.pop(key, None)
+            except Exception:
+                pass
+            # 「待确认」布防同样作废：下次按压应是清爽的第一次。
+            try:
+                _armed = getattr(self, "_manual_reinvoke_armed", None)
+                if isinstance(_armed, dict) and _armed.get("surl") == key:
+                    self._manual_reinvoke_armed = None
+            except Exception:
+                pass
+            _why = str(reason or "").strip() or "客户端未运行"
             self.hub.log(
-                "[分享] 本次未真正拉起（客户端未运行），已撤回「已拉起」计数："
+                f"[分享] 本次未真正拉起：{_why}；已撤回「已拉起」计数，"
                 "重试无需再按一次 Alt+2")
         except Exception:
             pass

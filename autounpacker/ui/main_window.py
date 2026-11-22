@@ -312,6 +312,23 @@ class _ClearLogsConfirmBox(QMessageBox):
             return False
 
 
+# 拖放解压「分卷未到齐」类错误的识别词：只对这类失败做「稍后自动重试」。
+# 真机 2026-11-22 19:33：三个拖入的 mp4 分别装着同一套 Sayumi7 分卷的一段
+# （z02 / z01 / zip 末卷）；串行化之后仍可能出现「先跑的那条缺兄弟卷」，
+# 松开门闸等兄弟卷产出后整包重试即可，绝不把这种情况当永久失败。
+_GAP_HINTS = ("Missing volume", "Unexpected end of archive", "缺卷",
+              "分卷未到齐", "分卷不完整", "Cannot open the file as")
+
+
+def _is_split_gap_text(err):
+    """错误文本是否属于「分卷未到齐」类（可用于稍后重试）。绝不抛异常。"""
+    try:
+        e = str(err or "")
+        return any(k in e for k in _GAP_HINTS)
+    except Exception:
+        return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state, hub, show_event=None, pauser=None,
                  defer_initial_load=False):
@@ -440,6 +457,12 @@ class MainWindow(QMainWindow):
         # 抢占任务行终态。键在起线程前置位、worker 的 finally 里必定移除（异常也不漏）。
         self._drop_inflight = {}
         self._drop_inflight_lock = threading.Lock()
+        # 拖放解压串行闸：同一时刻只跑一条拖放流水线。一次拖入多个**属于同一套分卷**
+        # 的文件时（真机 2026-11-22 19:33：三个 mp4 分别装着 Sayumi7 的 z02 / z01 /
+        # zip 末卷），三条流水线会并行去解、互相抢占/移动同一批卷文件 —— 结果一条
+        # 报「时间戳校准失败（文件被占用）」、另一条因缺卷报「密码错误」。
+        # 串行后：前两条先各自解出分卷并保留，最后一条归拢整套再解，全部正确。
+        self._drop_extract_lock = threading.Lock()
 
     # ---------- 首批数据装载（首屏优先：可延后到 show 之后） ----------
     def _do_initial_load(self):
@@ -1052,10 +1075,38 @@ class MainWindow(QMainWindow):
                         pass
                     self._emit_tasks_changed()
                 try:
-                    result = smart_extract.extract_one(
-                        engine, str(path), None, passwords, options, args,
-                        progress_cb=self._progress_cb, pauser=self.pauser,
-                        task_id=tid)   # 拖放同样要能用数据库任务 id 被「忽略」精确打断
+                    result = None
+                    _try = 0
+                    while True:
+                        _lock = getattr(self, "_drop_extract_lock", None)
+                        if _lock is not None:
+                            if _lock.locked():
+                                self.hub.log(
+                                    f"拖放: 另一个拖放任务正在解压，排队等待: {path.name}")
+                            with _lock:
+                                result = smart_extract.extract_one(
+                                    engine, str(path), None, passwords, options,
+                                    args, progress_cb=self._progress_cb,
+                                    pauser=self.pauser, task_id=tid)
+                        else:
+                            result = smart_extract.extract_one(
+                                engine, str(path), None, passwords, options,
+                                args, progress_cb=self._progress_cb,
+                                pauser=self.pauser, task_id=tid)
+                        if result and result.get("success"):
+                            break
+                        # 分卷未到齐（缺兄弟卷）→ 松开门闸后等一下再整包重试：
+                        # 同批拖入的其它文件可能正在产出所缺的卷（见 _drop_extract_lock
+                        # 注释）。只对「缺卷类」错误重试，密码错误/格式不对不重试。
+                        _err = str((result or {}).get("error") or "")
+                        if _try >= 2 or not _is_split_gap_text(_err):
+                            break
+                        _try += 1
+                        _wait = 6 * _try
+                        self.hub.log(
+                            f"拖放: {path.name} 分卷未到齐（{_err[:60]}），"
+                            f"{_wait}s 后自动重试（第 {_try}/2 次）")
+                        time.sleep(_wait)
                 finally:
                     self.hub.q.put({"type": "progress_done"})
                 # C2：后处理（删除源/提升/移动/脚本）的日志与失败对用户可见。

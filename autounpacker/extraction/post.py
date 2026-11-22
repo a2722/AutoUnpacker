@@ -452,21 +452,37 @@ def _set_created_time(path, ts):
         kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
-def stamp_output_now(paths):
+def stamp_output_now(paths, retries=3, delay=0.35):
     """把产物顶层条目的 修改/访问/创建时间 校准为现在。
 
     7-Zip 解压目录时会还原归档里保存的目录时间戳（含创建时间），穿透/提升后的
     成品文件夹会带着压缩包里的旧日期，在大目录里按日期排序就沉到底部找不到。
     这里只校准传入的条目本身，不递归子文件；单个条目失败只记录问题、绝不抛出，
-    不影响解压结果。返回 (已校准的路径列表, 失败描述列表)。"""
+    不影响解压结果。
+
+    **占用类错误（WinError 32/33）会短重试几次**：拖入多个属于同一套分卷的文件时，
+    另一条流水线的 7-Zip 可能正好还占着这个文件（真机 2026-11-22 19:33:59：
+    `Sayumi7.z02` 被另一个任务的解压进程占着 → 直接报「校准失败」）。纯占用不是
+    真错误，稍等一下基本都能成功。返回 (已校准的路径列表, 失败描述列表)。"""
     now = time.time()
     stamped, problems = [], []
     for p in paths:
         p = Path(p)
-        try:
-            os.utime(p, (now, now))
-        except OSError as e:
-            problems.append(f"{p.name}: {e}")
+        err = None
+        for attempt in range(max(1, int(retries))):
+            try:
+                os.utime(p, (now, now))
+                err = None
+                break
+            except OSError as e:
+                err = e
+                # 只对「被占用 / 共享冲突」重试；不存在、权限等一律立刻放弃
+                if getattr(e, "winerror", None) not in (32, 33) and e.errno not in (13,):
+                    break
+                if attempt + 1 < max(1, int(retries)):
+                    time.sleep(delay)
+        if err is not None:
+            problems.append(f"{p.name}: 被占用（{err}）")
             continue
         try:
             if not _set_created_time(p, now):
@@ -525,7 +541,10 @@ def _stamp_output_times(result, out_dir, pre_entries, args):
         print(msg)
         result["logs"].append(msg)
     if problems:
-        warn = f"输出时间戳部分校准失败（不影响解压）: {'; '.join(problems[:2])}"
+        # 只是「时间戳没校准」这一装饰性动作没做全，不影响解压结果；用不吓人的
+        # 措辞（旧文案说「失败」，日志会被判成 error 级，而实际文件内容完好）。
+        warn = ("输出时间戳未校准（不影响解压；文件可能正被其他程序占用）: "
+                + "; ".join(problems[:2]))
         print(warn)
         result["logs"].append(warn)
 

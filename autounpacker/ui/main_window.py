@@ -1021,6 +1021,20 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             try:
+                # 源文件已不在（同批次的分卷已被成功解压并回收 / 用户自己删了）：
+                # 直接按「已了结」收尾，不再排队、不再解压、更不报失败。
+                if not path.exists():
+                    self.hub.log(f"拖放: 源文件已不存在（可能已被同批次的解压回收），"
+                                 f"跳过: {path.name}")
+                    if tid:
+                        try:
+                            db.update_task_state(
+                                tid, "done", finished_at=int(time.time()),
+                                error="源文件已被同批次处理（已回收），跳过")
+                        except Exception:
+                            pass
+                        self._emit_tasks_changed()
+                    return
                 # 跨名分卷链配对（与监听路径同一套）：验证通过即把改名兄弟卷改成首卷系列名，
                 # 让 7-Zip 能正确重拼；失败/无链则原样继续。
                 if smart_extract.is_volume_name(path.name):
@@ -1078,6 +1092,13 @@ class MainWindow(QMainWindow):
                     result = None
                     _try = 0
                     while True:
+                        if not path.exists():
+                            # 排队期间源文件被同批次任务回收：按已了结处理，
+                            # 不再尝试解压（否则 extract_one 只会返回 None）。
+                            self.hub.log(
+                                f"拖放: 排队期间源文件已被同批次处理并回收，"
+                                f"跳过: {path.name}")
+                            break
                         _lock = getattr(self, "_drop_extract_lock", None)
                         if _lock is not None:
                             if _lock.locked():
@@ -1133,15 +1154,34 @@ class MainWindow(QMainWindow):
                         self._emit_tasks_changed()
                 else:
                     err = (result or {}).get("error") or "未知错误"
-                    self.hub.log(f"拖放解压失败: {path.name} ({err})")
-                    self.hub.notify("智能解压失败", f"{path.name}\n{err}")
-                    if tid:
-                        try:
-                            db.update_task_state(
-                                tid, ("need_password" if "密码" in err else "failed"),
-                                error=err, finished_at=int(time.time()))
-                        except Exception:
-                            pass
+                    # 源文件已经不在：最常见的原因是**同批次另一条拖入任务**（同一套
+                    # 分卷的另一个卷）刚刚成功解压、把整套源卷一起回收了
+                    # （真机 2026-11-22 20:50：先拖入的 Sayumi7.zip 成功并回收了
+                    # z01/z02/zip；队列里排着的 Sayumi7.z01 随后启动，源文件已没了
+                    # → extract_one 返回 None → 旧文案报「未知错误」并弹失败通知）。
+                    # 这属于「已了结」，不是失败：静默记一行 + 任务记完成，绝不回档。
+                    if not path.exists():
+                        msg = (f"拖放: 源文件已不存在（同批次的分卷可能已被成功解压并"
+                               f"回收），跳过: {path.name}")
+                        self.hub.log(msg)
+                        if tid:
+                            try:
+                                db.update_task_state(
+                                    tid, "done", finished_at=int(time.time()),
+                                    error="源文件已被同批次处理（已回收），跳过")
+                            except Exception:
+                                pass
+                            self._emit_tasks_changed()
+                    else:
+                        self.hub.log(f"拖放解压失败: {path.name} ({err})")
+                        self.hub.notify("智能解压失败", f"{path.name}\n{err}")
+                        if tid:
+                            try:
+                                db.update_task_state(
+                                    tid, ("need_password" if "密码" in err else "failed"),
+                                    error=err, finished_at=int(time.time()))
+                            except Exception:
+                                pass
                         self._emit_tasks_changed()
             except Exception as ex:
                 self.hub.log(f"拖放处理出错: {path.name}: {ex}")

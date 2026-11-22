@@ -735,6 +735,70 @@ def check_duplicate(server_path, size, db_path=None):
     return hits or None
 
 
+def _disk_complete(local_path, size=None):
+    """任务从客户端活动列表消失时，按**磁盘事实**判断它是否已经下完。
+
+    真机 2026-11-22 18:12：用户手动暂停过一次下载（客户端在 error_code 留下
+    1000001），之后任务完成并从活动列表移除；同一拍里历史表还没落库 → 被判成
+    「移除但历史未确认」(gone)，于是 17.47GB 已经完整的文件再也没人处理。
+
+    判定口径（宁可漏判也不误判）：
+    - 文件必须在盘上、非 0 字节；
+    - 不能带未完成下载后缀（`.baiduyun.p.downloading` 等，说明还在写）；
+    - 给了期望大小就要求实际大小 ≥ 期望的 99%（客户端按块对齐，允许极小差
+      ；明显偏小说明只下了一半，绝不能当完成）。
+    任何异常一律 False（保守）。绝不抛异常。
+    """
+    try:
+        p = Path(str(local_path or ""))
+        cands = [p]
+        # 跟踪记录里可能是「下载中」的名字（xxx.mp4.baiduyun.p.downloading）；
+        # 客户端下完后会把它改名为正式文件名 —— 两个名字都要看。
+        try:
+            from ..extraction import formats as _fmt
+            _final = _fmt._strip_download_suffix(p.name)
+        except Exception:
+            _final = str(p.name)
+            for _s in (".baiduyun.p.downloading", ".downloading", ".crdownload",
+                       ".download", ".part", ".tmp", ".partial", ".opdownload"):
+                if _final.lower().endswith(_s):
+                    _final = _final[:len(_final) - len(_s)]
+                    break
+        if _final and _final != p.name:
+            cands.append(p.with_name(_final))
+        usable = []
+        for c in cands:
+            try:
+                if not c.is_file():
+                    continue
+                try:
+                    from ..extraction import formats as _fmt2
+                    if _fmt2.is_incomplete_download(c):
+                        continue
+                except Exception:
+                    low = str(c.name).lower()
+                    if low.endswith((".downloading", ".crdownload", ".download",
+                                     ".part", ".tmp", ".partial", ".opdownload")):
+                        continue
+                usable.append(c)
+            except OSError:
+                continue
+        if not usable:
+            return False
+        st = usable[-1].stat()          # 优先看改名后的正式文件
+        if st.st_size <= 0:
+            return False
+        try:
+            want = int(size) if size is not None else 0
+        except Exception:
+            want = 0
+        if want > 0:
+            return st.st_size >= want * 0.99
+        return True
+    except Exception:
+        return False
+
+
 def observe_tasks(rows, hist_rows=None):
     """用一拍的 download_file（+历史）更新跟踪状态，返回本次事件。
 
@@ -814,6 +878,27 @@ def observe_tasks(rows, hist_rows=None):
         if changed:
             events["failed"].append(dict(info))
     _TRACK["active_ids"] = cur_ids
+    # 「移除但历史未确认」不是终态：客户端写历史行有延迟，而磁盘上的事实随时可查。
+    # 真机 2026-11-22 18:12：任务消失那一拍历史还没落库 → 判 gone；几十秒后历史
+    # 行才出现（也可能永远不出现，只留下完整文件），但 gone 已定型 → 再没人处理。
+    # 这里每拍复查一次：历史命中或磁盘已完整就复活成 done，交给 _baidu_poll 处理。
+    _revived = set()
+    for info in _TRACK["files"].values():
+        if info.get("state") != "gone":
+            continue
+        ok = _hist_match(hist_rows, info.get("server_path"), info.get("size"))
+        by_disk = False
+        if not ok:
+            by_disk = _disk_complete(info.get("local_path"), info.get("size"))
+            ok = by_disk
+        if not ok:
+            continue
+        info["state"] = "done"
+        _ev = dict(info)
+        if by_disk:
+            _ev["confirmed_by"] = "disk"
+        events["done"].append(_ev)
+        _revived.add(id(info))
     # 按「是否仍在当前 downloading 集合」判定完成 / 失联 —— 而不是只看相邻两拍
     # 的差集。原因：同一路径被重新下载时任务 id 会变，用旧 task_id 去查差集必然
     # 落空，状态会永远停在 active（→ _baidu_poll 只处理 done，于是永不解压）。
@@ -825,8 +910,17 @@ def observe_tasks(rows, hist_rows=None):
         if _as_text(info.get("task_id")) in cur_ids:
             continue
         ok = _hist_match(hist_rows, info.get("server_path"), info.get("size"))
+        by_disk = False
+        if not ok:
+            # 历史没写（暂停/续传后口径不同、或落库延迟）但文件已经完整在盘上：
+            # 照样算完成 —— 否则它就是「没人处理的完整文件」。
+            by_disk = _disk_complete(info.get("local_path"), info.get("size"))
+            ok = by_disk
         info["state"] = "done" if ok else "gone"
-        (events["done"] if ok else events["gone"]).append(dict(info))
+        _ev = dict(info)
+        if by_disk:
+            _ev["confirmed_by"] = "disk"
+        (events["done"] if ok else events["gone"]).append(_ev)
     return events
 
 
@@ -1172,12 +1266,16 @@ def report_events(events, hub, notify=True, max_lines=12):
              f"（客户端的 error_code 是「上次错误」留存标记，续传成功也不清零；"
              f"此提示每条任务只报一次）")
     for it in (events.get("gone") or []):
-        _log(f"网盘任务从列表移除但历史未确认：{it.get('local_path')}")
+        _log(f"网盘任务从列表移除但历史未确认：{it.get('local_path')}"
+             f"（每轮会再按历史/磁盘复查，下完即补处理）")
 
     notified = []
     done = events.get("done") or []
     for it in done:
-        _log(f"网盘任务完成：{it.get('local_path')}")
+        if it.get("confirmed_by") == "disk":
+            _log(f"网盘任务完成（历史未记录，按磁盘文件确认）：{it.get('local_path')}")
+        else:
+            _log(f"网盘任务完成：{it.get('local_path')}")
     for b in {it.get("batch") for it in done}:
         fs = batch_files(b)
         n, a, d, g = batch_state(b)

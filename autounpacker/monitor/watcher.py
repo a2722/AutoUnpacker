@@ -51,6 +51,24 @@ def _mark_deleting(rid, targets):
         pass
 
 
+_INTERNAL_TEMP_MARKERS = (".au_winrar_",)
+
+
+def _is_internal_temp_artifact(name):
+    """是否本程序自己的临时产物（绝不能再被当成新压缩包解一遍）。
+
+    典型：给 WinRAR 用的同盘硬链接 `<原名>.au_winrar_<hex>.zip`。以前它建在源文件
+    同目录（往往是监听目录），监听线程会把这条临时链接当成新压缩包再解一次 ——
+    同一份内容因此被解出两份（真机 2026-11-23 21:35）。落点已改到 ExtractTemp，
+    这里再兜一层：历史残留 / 未来新增的同类产物一律跳过。绝不抛异常。
+    """
+    try:
+        low = str(name or "").lower()
+        return any(m in low for m in _INTERNAL_TEMP_MARKERS)
+    except Exception:
+        return False
+
+
 def _in_quarantine(path):
     """路径是否位于隔离区（_已删除）之内：任一路径段等于 QUARANTINE_DIRNAME 即命中。
 
@@ -1962,6 +1980,10 @@ class FolderWatcher(threading.Thread):
         if smart_extract.is_incomplete_download(fp):
             self.hub.log(f"下载未完成，暂不解压（等待后缀消失）: {name}")
             self._set_dir_state(wc.get("path"), "waiting", name=name)
+            return "done"
+        # 本程序自己的临时产物（WinRAR 友好硬链接等）绝不重复解压
+        if _is_internal_temp_artifact(name):
+            self.hub.log(f"跳过本程序的临时解压产物（避免同一内容被解两份）: {name}")
             return "done"
         if smart_extract.is_do_not_extract(name):
             self.hub.log(f"移动安装包，保持原样不自动解压: {name}")

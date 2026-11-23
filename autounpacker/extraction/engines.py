@@ -324,6 +324,22 @@ def _dir_size(path):
     return total
 
 
+def _same_volume_scratch(archive):
+    """给「WinRAR 友好路径」找一个与 archive **同盘**、但不在监听目录里的落点。
+
+    与解压服务的临时根同一口径（`<盘符>:\\ExtractTemp`）；源在系统盘时退回系统
+    临时目录。任何异常都退回系统临时目录。绝不抛异常。
+    """
+    try:
+        anchor = Path(archive).anchor
+        sys_anchor = Path(tempfile.gettempdir()).anchor
+        if anchor and len(anchor) == 3 and anchor.lower() != str(sys_anchor).lower():
+            return Path(anchor) / "ExtractTemp"
+    except Exception:
+        pass
+    return Path(tempfile.gettempdir())
+
+
 def _detect_7z_only_format(path):
     """嗅探文件头部魔数：若格式只有 7-Zip 能解、内置 zipfile 引擎解不了，
     返回格式名（rar/7z/tar/gz/bz2/xz），否则返回 None（ZIP 或无法判断）。
@@ -1046,7 +1062,14 @@ class WinRarEngine:
         返回 (path, temp_link_or_None)。调用方必须在用完后清理 temp_link。
         原路径已是压缩包后缀 → 原样返回。否则尝试同盘硬链接；失败则复制到
         临时目录（同盘优先，避免跨盘大文件复制）。任何异常都退回原路径
-        （宁可按原样试一次，也绝不因造链失败而放弃）。"""
+        （宁可按原样试一次，也绝不因造链失败而放弃）。
+
+        **落点绝不在源文件同目录**：那里往往正是监听目录，临时硬链接
+        `xxx.mp4.au_winrar_xxxx.zip` 会被监听线程当成**新的压缩包**再解一遍 ——
+        同一份内容因此解出两份（真机 2026-11-23 21:35：`1-手元配信_1.mp4` 与它的
+        临时 `.zip` 各跑一条流水线，分别产出 `Hilichurl's Ambition` 的两份拷贝）。
+        改为放在与源同盘的 `ExtractTemp`（与解压服务的临时根同口径）。
+        """
         try:
             if archive.suffix.lower() in self._ARCHIVE_EXTS:
                 return archive, None
@@ -1054,9 +1077,9 @@ class WinRarEngine:
             return archive, None
         link = None
         try:
-            # 同盘硬链接：放在源文件同目录（保证同卷），名字加唯一后缀避免冲突
-            link = archive.with_name(
-                archive.name + ".au_winrar_" + uuid.uuid4().hex[:8] + ".zip")
+            scratch = _same_volume_scratch(archive)
+            scratch.mkdir(parents=True, exist_ok=True)
+            link = scratch / ("au_winrar_" + uuid.uuid4().hex[:8] + ".zip")
             os.link(str(archive), str(link))
             return link, link
         except OSError:

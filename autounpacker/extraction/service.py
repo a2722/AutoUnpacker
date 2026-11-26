@@ -326,12 +326,18 @@ class ExtractService:
         depth_exceeded = False    # 达到最大深度限制：仍有归档未处理，整体不算成功
         depth_left = 0            # 触顶时仍未处理的排队归档数（含当前项）
 
+        # 每项都带 `dest_base`：该归档的**内容**最终应落在输出目录的哪个子目录。
+        # 首层解到输出目录本身（dest_base="."）；每往下一层，就把「归档在本层
+        # 解压目录里的相对目录」累加进来 —— 这样嵌套包解出的文件会留在它原本的
+        # 目录层级里，而不是全部摊平到输出根（真机 2026-11-26：一堆不同角色的
+        # 小动画 zip 各含 1.jpg…18.jpg，摊平后变成 1 (1).jpg / 1 (2).jpg 79 个散件）。
         queue = deque([{"archive": Path(task["source_path"]),
-                        "depth": 1}])
+                        "depth": 1, "dest_base": Path(".")}])
 
         while queue:
             item = queue.popleft()
             depth = item["depth"]
+            dest_base = Path(item.get("dest_base") or ".")
             if depth > max_depth:
                 # 触顶：剩余排队归档（含当前项）一律不再处理。必须留痕，否则整体
                 # 结果仍会被判「干净成功」→ 源文件被删除策略回收，未处理的深层
@@ -688,7 +694,10 @@ class ExtractService:
                 if looks_like_complete_content(extracted_files):
                     self.emit(f"[第{depth}层] 解压内容已是成品内容（大量大小不一的零碎文件），判定解压完成，停止继续剥壳")
                     if not is_direct:
-                        self.move_to_output(extract_dir, output_dir)
+                        target = self._layer_dest_dir(
+                            extract_dir, output_dir / dest_base, dest_base,
+                            item["archive"], bool(item.get("force_stem")))
+                        self.move_to_output(extract_dir, output_dir / target)
                     self.emit(f"[第{depth}层] 完成")
                 else:
                     self.emit(f"[第{depth}层] 检测到嵌套压缩包，继续解压下一层")
@@ -702,7 +711,8 @@ class ExtractService:
                             if not is_direct and not any(
                                     is_volume_file(nf.name, f.name, nf.stem)
                                     for nf in nested_files):
-                                self.move_file(f, extract_dir, output_dir)
+                                self.move_file(f, extract_dir,
+                                               output_dir / dest_base)
                     # 把散落在子目录里的分卷兄弟收集到首卷旁边：
                     # 多段伪装解出的分卷可能被 7-Zip 按内部目录结构展开
                     #（如 1\xxx.7z.002、2\xxx.7z.003），首卷 .001 在根目录时
@@ -726,25 +736,47 @@ class ExtractService:
                                         self.emit(f"[第{depth}层] 已归拢分卷兄弟: {cand.name} -> {dest.name}")
                                     except OSError as e:
                                         self.emit(f"[第{depth}层] 归拢分卷兄弟失败: {cand.name}: {e}")
-                    queued_any = False
+                    # 先分类：真分卷兄弟（.z02 之于 .z01 / base.zip）留给首卷一起
+                    # 处理，只记日志不排队；其余才各自排队。
+                    _to_queue = []
                     for f in nested_files:
-                        # 假分卷名的完整压缩包（改后缀迷惑）不是分卷，应继续剥壳；
-                        # 真分卷（如 .z01 的兄弟 .z02）才跳过，留给首卷一起处理
+                        # 假分卷名的完整压缩包（改后缀迷惑）不是分卷，应继续剥壳
                         if (should_skip_volume(f.name)
                                 and not is_fake_volume_name(f)):
                             self.emit(f"[第{depth}层] 跳过分卷文件: {f.name}")
                             continue
-                        queue.append({"archive": f, "depth": depth + 1})
+                        _to_queue.append(f)
+                    # 同一目录下并列多个**独立**嵌套归档（如 庄方宜/ 下的 小动画.zip、
+                    # 庄方宜.zip、庄方宜动画.zip）：整组各自套上归档名子目录，否则
+                    # 先落的占住 1.jpg，后面的只能变成 1 (1).jpg / 1 (2).jpg。
+                    # 注意只统计真正排队的归档 —— 同一套分卷的兄弟卷不算「并列」。
+                    _dir_counts = {}
+                    for _f in _to_queue:
+                        _dir_counts[_f.parent] = _dir_counts.get(_f.parent, 0) + 1
+                    queued_any = False
+                    for f in _to_queue:
+                        # 本层的结构性前缀：归档在本层解压目录里的相对目录
+                        try:
+                            rel_dir = f.parent.relative_to(extract_dir)
+                        except Exception:
+                            rel_dir = Path(".")
+                        queue.append({"archive": f, "depth": depth + 1,
+                                      "dest_base": dest_base / rel_dir,
+                                      "force_stem": _dir_counts.get(f.parent, 0) > 1})
                         queued_any = True
                     if not queued_any and not is_direct:
                         # 所有嵌套文件都是非首卷（缺首卷）等异常：不能留在临时目录
                         # 被清理丢弃，移入输出目录保留，避免数据丢失。
                         for f in nested_files:
-                            self.move_file(f, extract_dir, output_dir)
+                            self.move_file(f, extract_dir,
+                                           output_dir / dest_base)
                         self.emit(f"[第{depth}层] 嵌套分卷缺少首卷，已保留到输出目录（未丢弃）")
             else:
                 if not is_direct:
-                    self.move_to_output(extract_dir, output_dir)
+                    target = self._layer_dest_dir(
+                        extract_dir, output_dir / dest_base, dest_base,
+                        item["archive"], bool(item.get("force_stem")))
+                    self.move_to_output(extract_dir, output_dir / target)
                 self.emit(f"[第{depth}层] 完成")
 
         if failed_layers or depth_exceeded:
@@ -1037,6 +1069,36 @@ class ExtractService:
             return WinRarEngine(exe)
         except Exception:
             return None
+
+    @staticmethod
+    def _layer_dest_dir(extract_dir, target_root, dest_base, archive,
+                        force_stem=False):
+        """嵌套层内容的落点：默认沿用旧行为，**只有会撞名时**才套 `<归档名>/`。
+
+        真机 2026-11-26：同一角色目录下并列好几个 zip（小动画.zip / 庄方宜.zip /
+        庄方宜动画.zip），每个都含 1.jpg…18.jpg。若全部摊在同一层，只能靠
+        `1 (1).jpg` / `1 (2).jpg` 区分，既看不清归属也没了层级。
+        反过来，单 payload / 单个顶层目录这类常见情形仍按老样子直接落位，
+        绝不无谓多套一层。
+        """
+        if force_stem:
+            stem = Path(archive).stem or Path(archive).name
+            return Path(dest_base) / stem
+        try:
+            entries = list(Path(extract_dir).iterdir())
+        except OSError:
+            entries = []
+        if not entries:
+            return Path(dest_base)
+        try:
+            existing = {p.name for p in Path(target_root).iterdir()}
+        except OSError:
+            existing = set()
+        names = {p.name for p in entries}
+        if not (names & existing):
+            return Path(dest_base)          # 不撞名：直接落位（旧行为）
+        stem = Path(archive).stem or Path(archive).name
+        return Path(dest_base) / stem
 
     def move_to_output(self, src_dir, dst_dir):
         dst_dir.mkdir(parents=True, exist_ok=True)
